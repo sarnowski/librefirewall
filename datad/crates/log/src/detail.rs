@@ -26,11 +26,23 @@ use lfw_clock::UtcNanos;
 
 use net_headers::Ipv4Address;
 
-use crate::event::{DialOutcome, NextHopVia, OnboardEnd, Primitive};
+use crate::event::{
+    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, Primitive, TlsIncompatible, TlsRefusal,
+};
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
 /// against, and the whole of a [`Cause`]'s storage.
 pub const MAX_CAUSE_LEN: usize = 40;
+
+/// Code points of one kind a record carries out of a client's offer.
+///
+/// A client lists as many as it likes and the domain that reads them keeps the
+/// first few with the number really listed beside them, so a record that
+/// dropped some says so rather than reading as the whole offer. Eight, which is
+/// two operand words exactly — the record's storage is what decides this, so it
+/// is stated here where that storage is, and the domain that fills it holds its
+/// own bound equal to this one.
+pub const MAX_OFFERED_POINTS: usize = 8;
 
 /// Why a byte string is not a [`Cause`]. Names the position, never the byte:
 /// an adversary-chosen byte must not reach an operator surface.
@@ -425,6 +437,95 @@ pub enum DomainDetail<C = &'static str> {
         /// Bytes the terminating domain answered with that there was no room for.
         /// **Ours** rather than the peer's.
         refused: u64,
+    },
+    /// How one handshake on the onboarding port ended, and — where it
+    /// completed — the three code points it settled on.
+    ///
+    /// The first of seven that report a handshake, and they share the
+    /// `onboard-tls=` key so a boot's onboarding story is one grep. This one is
+    /// the successful end: [`Self::OnboardingEnded`] and the five after it are
+    /// the ways it does not complete.
+    ///
+    /// Code points and not names, on [`Self::Session`]'s terms: the names are
+    /// the registries' to change, and an operator comparing a boot against a
+    /// specification is comparing numbers either way.
+    ///
+    /// **No key, no traffic secret and no plaintext has a representation
+    /// here**, and that holds for every one of the seven. What a peer sent is
+    /// its own and reaches no surface at all; what these carry is which
+    /// protocol was settled on, or which of a closed set of ways it was not.
+    OnboardingHandshake {
+        outcome: OnboardOutcome,
+        version: u16,
+        suite: u16,
+        group: u16,
+    },
+    /// A handshake that ended carrying nothing beyond the way it did.
+    ///
+    /// The outcomes with no fact of their own — a peer that said nothing, one
+    /// that went away, neither end able to progress — and the one whose facts
+    /// are a record of their own: an exhausted arena is reported with the
+    /// [`Self::Arena`] record beside it, which is where this appliance already
+    /// states what was asked for against what was left.
+    OnboardingEnded {
+        outcome: OnboardOutcome,
+    },
+    /// A handshake the library and the peer had no protocol in common for, in
+    /// the library's own vocabulary.
+    ///
+    /// The outcome travels beside the reason because the two answer different
+    /// questions: whether the offer was rejected before there was a suite to
+    /// compare, and which incompatibility it was.
+    OnboardingIncompatible {
+        outcome: OnboardOutcome,
+        incompatible: TlsIncompatible,
+    },
+    /// A handshake this appliance refused, as the library's own error variant.
+    OnboardingRefused {
+        outcome: OnboardOutcome,
+        refusal: TlsRefusal,
+    },
+    /// The fatal alert a peer gave up with, as the registry numbers it.
+    ///
+    /// A code point on [`Self::OnboardingHandshake`]'s terms. It is the peer's
+    /// own statement about why it went away, which is a different fact from
+    /// anything this end decided.
+    OnboardingAlert {
+        outcome: OnboardOutcome,
+        alert: u16,
+    },
+    /// A direction of one handshake that outgrew what a session holds, carrying
+    /// what it would have had to hold.
+    ///
+    /// The count is this appliance's own arithmetic over a peer's pacing, and
+    /// it is the number that says whether a bound is too tight or a peer is
+    /// misbehaving — which is why it is on the record rather than implied by
+    /// the token.
+    OnboardingBacklogged {
+        outcome: OnboardOutcome,
+        held: u64,
+    },
+    /// The cipher suites a client offered, where none of them was one this
+    /// appliance has.
+    ///
+    /// Its own record rather than a field beside the outcome, and so is the
+    /// group list after it: eight code points and a count do not fit beside a
+    /// token, and the two lists together are what an administrator compares
+    /// against what this appliance offers. Emitted only where the offer is what
+    /// the failure is about.
+    ///
+    /// `offered` is what the client really listed, which may exceed what
+    /// `points` holds — so a record that dropped some says so rather than
+    /// reading as the whole offer.
+    OnboardingSuites {
+        points: [u16; MAX_OFFERED_POINTS],
+        offered: u16,
+    },
+    /// The key-exchange groups a client offered, on [`Self::OnboardingSuites`]'s
+    /// terms.
+    OnboardingGroups {
+        points: [u16; MAX_OFFERED_POINTS],
+        offered: u16,
     },
     /// The two sequence numbers behind an unacceptable acknowledgement: what the
     /// peer claimed, and what this end had actually sent.

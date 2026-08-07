@@ -81,6 +81,24 @@ pub const LOG_NEXT_HOP_VIA_COUNT: u8 = 3;
 /// `lfw_log::OnboardEnd::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
 pub const LOG_ONBOARD_END_COUNT: u8 = 4;
 
+/// How many ways a handshake on the onboarding port may end —
+/// `lfw_log::OnboardOutcome::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_ONBOARD_OUTCOME_COUNT: u8 = 10;
+
+/// How many incompatibilities the adopted TLS library may report —
+/// `lfw_log::TlsIncompatible::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_TLS_INCOMPATIBLE_COUNT: u8 = 23;
+
+/// How many refusals that library may report —
+/// `lfw_log::TlsRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_TLS_REFUSAL_COUNT: u8 = 23;
+
+/// Code points of one kind an offer record carries —
+/// `lfw_log::MAX_OFFERED_POINTS`. Eight, which is [`LOG_OPERANDS`] halved:
+/// four sixteen-bit points ride in each of two words, most significant first,
+/// on the order every wider value in this ABI crosses in.
+pub const LOG_OFFERED_POINTS: usize = 8;
+
 /// Lifecycle points a domain reports — `lfw_log::DomainState::ALL`.
 pub const LOG_DOMAIN_STATE_COUNT: u8 = 4;
 
@@ -213,6 +231,23 @@ pub enum LogDetailKind {
     /// it reports beside a session's account. Its own discriminant rather than a
     /// wider operand array, on [`Self::DialRoute`]'s terms.
     OnboardingPort,
+    /// The seven a **handshake** on that port produces, as the domain that
+    /// terminates it reports. Appended, never inserted, on [`Self::Identity`]'s
+    /// terms — and seven discriminants rather than one, for [`Self::DialRoute`]'s
+    /// reason: a completed handshake carries three code points, a refused one
+    /// carries a token out of a different vocabulary from an incompatible one,
+    /// and an offer carries eight code points and a count. One kind holding all
+    /// of them would render fields no outcome named.
+    OnboardingHandshake,
+    OnboardingEnded,
+    OnboardingIncompatible,
+    OnboardingRefused,
+    OnboardingAlert,
+    OnboardingBacklogged,
+    /// The two an offer takes: the suites a client listed and the groups it
+    /// listed, each eight code points and the number really offered.
+    OnboardingSuites,
+    OnboardingGroups,
 }
 
 impl LogDetailKind {
@@ -246,6 +281,14 @@ impl LogDetailKind {
             Self::DialSequence => 24,
             Self::Onboarded => 25,
             Self::OnboardingPort => 26,
+            Self::OnboardingHandshake => 27,
+            Self::OnboardingEnded => 28,
+            Self::OnboardingIncompatible => 29,
+            Self::OnboardingRefused => 30,
+            Self::OnboardingAlert => 31,
+            Self::OnboardingBacklogged => 32,
+            Self::OnboardingSuites => 33,
+            Self::OnboardingGroups => 34,
         }
     }
 
@@ -279,6 +322,14 @@ impl LogDetailKind {
             24 => Some(Self::DialSequence),
             25 => Some(Self::Onboarded),
             26 => Some(Self::OnboardingPort),
+            27 => Some(Self::OnboardingHandshake),
+            28 => Some(Self::OnboardingEnded),
+            29 => Some(Self::OnboardingIncompatible),
+            30 => Some(Self::OnboardingRefused),
+            31 => Some(Self::OnboardingAlert),
+            32 => Some(Self::OnboardingBacklogged),
+            33 => Some(Self::OnboardingSuites),
+            34 => Some(Self::OnboardingGroups),
             _ => None,
         }
     }
@@ -854,6 +905,53 @@ impl LogRecord {
                 overflowed: self.operands[2],
                 refused: self.operands[3],
             },
+            // The seven a handshake produces. The outcome token takes the
+            // leading word wherever a detail's first word names a vocabulary,
+            // exactly as `Dialled`'s does, and what follows it is ranged for the
+            // shape it will be rendered as: a code point is sixteen bits
+            // wherever a TLS registry numbers one, and a second token is held to
+            // its own set.
+            Some(LogDetailKind::OnboardingHandshake) => CheckedDetail::OnboardingHandshake {
+                outcome: onboard_outcome_token(self.operands[0])?,
+                version: code_point(self.operands[1])?,
+                suite: code_point(self.operands[2])?,
+                group: code_point(self.operands[3])?,
+            },
+            Some(LogDetailKind::OnboardingEnded) => CheckedDetail::OnboardingEnded {
+                outcome: onboard_outcome_token(self.operands[0])?,
+            },
+            Some(LogDetailKind::OnboardingIncompatible) => CheckedDetail::OnboardingIncompatible {
+                outcome: onboard_outcome_token(self.operands[0])?,
+                incompatible: tls_incompatible_token(self.operands[1])?,
+            },
+            Some(LogDetailKind::OnboardingRefused) => CheckedDetail::OnboardingRefused {
+                outcome: onboard_outcome_token(self.operands[0])?,
+                refusal: tls_refusal_token(self.operands[1])?,
+            },
+            Some(LogDetailKind::OnboardingAlert) => CheckedDetail::OnboardingAlert {
+                outcome: onboard_outcome_token(self.operands[0])?,
+                alert: code_point(self.operands[1])?,
+            },
+            // The count is unranged on `Received`'s terms: every bit pattern of
+            // it is a number of bytes the emitting domain could have been asked
+            // to hold.
+            Some(LogDetailKind::OnboardingBacklogged) => CheckedDetail::OnboardingBacklogged {
+                outcome: onboard_outcome_token(self.operands[0])?,
+                held: self.operands[1],
+            },
+            // Two words of packed code points and the number really offered.
+            // Nothing in the points can be refused — each is sixteen bits by
+            // where it sits, on `Fingerprint`'s terms — so the count is the only
+            // word with a shape, and it is one wherever a client states how many
+            // it listed.
+            Some(LogDetailKind::OnboardingSuites) => CheckedDetail::OnboardingSuites {
+                points: offered_points(self.operands[0], self.operands[1]),
+                offered: code_point(self.operands[2])?,
+            },
+            Some(LogDetailKind::OnboardingGroups) => CheckedDetail::OnboardingGroups {
+                points: offered_points(self.operands[0], self.operands[1]),
+                offered: code_point(self.operands[2])?,
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -965,6 +1063,47 @@ fn onboard_end_token(raw: u64) -> Result<u8, LogRecordError> {
         Ok(narrow) if narrow < LOG_ONBOARD_END_COUNT => Ok(narrow),
         _ => Err(LogRecordError::OnboardEndUnknown { end: raw }),
     }
+}
+
+/// A handshake-outcome token carried in an operand word, on
+/// `dial_outcome_token`'s terms.
+fn onboard_outcome_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_ONBOARD_OUTCOME_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::OnboardOutcomeUnknown { outcome: raw }),
+    }
+}
+
+/// An incompatibility token carried in an operand word, on the same terms.
+fn tls_incompatible_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_TLS_INCOMPATIBLE_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::TlsIncompatibleUnknown { incompatible: raw }),
+    }
+}
+
+/// A refusal token carried in an operand word, on the same terms.
+fn tls_refusal_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_TLS_REFUSAL_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::TlsRefusalUnknown { refusal: raw }),
+    }
+}
+
+/// Eight sixteen-bit code points out of two operand words, four to a word and
+/// most significant first — the order every wider value in this ABI crosses in.
+///
+/// Total by construction and nothing to refuse: every bit pattern of the two
+/// words is eight code points, and which of them a reader should look at is the
+/// count beside them rather than anything here.
+fn offered_points(high: u64, low: u64) -> [u16; LOG_OFFERED_POINTS] {
+    let mut points = [0_u16; LOG_OFFERED_POINTS];
+    for (index, slot) in points.iter_mut().enumerate() {
+        let word = if index < 4 { high } else { low };
+        let shift = 48 - 16 * (index % 4);
+        *slot = ((word >> shift) & 0xffff) as u16;
+    }
+    points
 }
 
 /// A TCP sequence number carried in an operand word. Every one of the
@@ -1413,6 +1552,51 @@ pub enum CheckedDetail {
         overflowed: u64,
         refused: u64,
     },
+    /// A handshake on that port that completed, and the three code points it
+    /// settled on.
+    OnboardingHandshake {
+        outcome: u8,
+        version: u16,
+        suite: u16,
+        group: u16,
+    },
+    /// One that ended carrying nothing beyond the way it did.
+    OnboardingEnded {
+        outcome: u8,
+    },
+    /// One the library and the peer had no protocol in common for, in the
+    /// library's own vocabulary.
+    OnboardingIncompatible {
+        outcome: u8,
+        incompatible: u8,
+    },
+    /// One this appliance refused, as the library's own error variant.
+    OnboardingRefused {
+        outcome: u8,
+        refusal: u8,
+    },
+    /// The fatal alert a peer gave up with, as the registry numbers it.
+    OnboardingAlert {
+        outcome: u8,
+        alert: u16,
+    },
+    /// A direction that outgrew what one session holds, and what it would have
+    /// had to hold.
+    OnboardingBacklogged {
+        outcome: u8,
+        held: u64,
+    },
+    /// The cipher suites a client offered, and how many it really listed.
+    OnboardingSuites {
+        points: [u16; LOG_OFFERED_POINTS],
+        offered: u16,
+    },
+    /// The key-exchange groups it offered, on [`Self::OnboardingSuites`]'s
+    /// terms.
+    OnboardingGroups {
+        points: [u16; LOG_OFFERED_POINTS],
+        offered: u16,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1502,6 +1686,15 @@ pub enum LogRecordError {
     },
     OnboardEndUnknown {
         end: u64,
+    },
+    OnboardOutcomeUnknown {
+        outcome: u64,
+    },
+    TlsIncompatibleUnknown {
+        incompatible: u64,
+    },
+    TlsRefusalUnknown {
+        refusal: u64,
     },
     /// An operand carrying a TCP sequence number wider than the thirty-two bits
     /// one has.
@@ -1596,6 +1789,19 @@ impl fmt::Display for LogRecordError {
             Self::OnboardEndUnknown { end } => write!(
                 f,
                 "onboarding session-end token {end} is not below {LOG_ONBOARD_END_COUNT}"
+            ),
+            Self::OnboardOutcomeUnknown { outcome } => write!(
+                f,
+                "onboarding handshake outcome token {outcome} is not below \
+                 {LOG_ONBOARD_OUTCOME_COUNT}"
+            ),
+            Self::TlsIncompatibleUnknown { incompatible } => write!(
+                f,
+                "TLS incompatibility token {incompatible} is not below {LOG_TLS_INCOMPATIBLE_COUNT}"
+            ),
+            Self::TlsRefusalUnknown { refusal } => write!(
+                f,
+                "TLS refusal token {refusal} is not below {LOG_TLS_REFUSAL_COUNT}"
             ),
             Self::DialOutcomeUnknown { outcome } => write!(
                 f,

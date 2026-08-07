@@ -1,6 +1,7 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
+use lfw_log::{DomainDetail, OnboardOutcome, TlsIncompatible, TlsRefusal};
 use rustls::{
     AlertDescription, CipherSuite, Error, NamedGroup, PeerIncompatible, ServerConfig,
     crypto::CryptoProvider,
@@ -35,7 +36,13 @@ pub const HELD_MAX: usize = 2 * (5 + (1 << 14) + 256);
 /// the number it really listed beside them — so a record that dropped some
 /// says so rather than reading as the whole offer. Eight, because the question
 /// the record answers is whether the client offered anything this appliance
-/// has, and this appliance has one of each.
+/// has, and this appliance has one of each — and because eight is what the
+/// console record holds, which is the harder bound of the two.
+///
+/// It is held equal to that one by the type rather than by an assertion:
+/// [`ServerOutcome::records`] hands an `[u16; Self]` to a field declared
+/// `[u16; lfw_log::MAX_OFFERED_POINTS]`, so a disagreement is a type error at
+/// the one place the two meet.
 pub const OFFER_KEPT: usize = 8;
 
 /// Code points a client offered.
@@ -47,6 +54,22 @@ pub struct Offered {
 }
 
 impl Offered {
+    /// The first few code points a client listed, with the number it really
+    /// listed beside them.
+    ///
+    /// The one constructor, so the relationship between the two — how much of
+    /// `kept` is the offer — is decided once. Crate-visible rather than public:
+    /// what builds one is the capture below, and what states one is this
+    /// crate's own tests.
+    pub(crate) fn of(kept: [u16; OFFER_KEPT], offered: u16) -> Self {
+        let length = usize::from(offered).min(OFFER_KEPT);
+        Self {
+            kept,
+            length: u8::try_from(length).unwrap_or(u8::MAX),
+            offered,
+        }
+    }
+
     /// The code points kept, in the order the client listed them.
     #[must_use]
     pub fn points(&self) -> &[u16] {
@@ -122,6 +145,205 @@ pub enum ServerOutcome {
     Backlogged { held: usize },
     /// Neither the library nor this end could make progress.
     Stalled,
+}
+
+/// The most console records one outcome owes.
+///
+/// Three, and it is the mismatch that decides it: the outcome itself, the
+/// suites a client offered, and the groups it offered. Every other outcome
+/// takes one or two.
+pub const OUTCOME_RECORDS: usize = 3;
+
+impl ServerOutcome {
+    /// The console records this outcome owes, in the order they are emitted.
+    ///
+    /// Here rather than in the protection domain that emits them, because the
+    /// two vocabularies it maps from are the adopted library's and this is the
+    /// only crate that sees them — so a release that renames a variant fails
+    /// this build rather than a domain nothing host-tests. What the domain
+    /// supplies is the lifecycle point they ride on; what is decided here is
+    /// which facts reach an operator.
+    ///
+    /// **Neither the library's rendering nor a peer's bytes travel.** Each
+    /// variant is named by a token out of a closed vocabulary and accompanied
+    /// by numbers this end computed or a registry defines, so nothing an
+    /// adversary chose reaches a console line as itself.
+    #[must_use]
+    pub fn records(&self) -> [Option<DomainDetail>; OUTCOME_RECORDS] {
+        let one = |detail| [Some(detail), None, None];
+        match self {
+            Self::Established(Established {
+                version,
+                suite,
+                group,
+            }) => one(DomainDetail::OnboardingHandshake {
+                outcome: OnboardOutcome::Established,
+                version: *version,
+                suite: *suite,
+                group: *group,
+            }),
+            Self::NoClientHello => one(ended(OnboardOutcome::NoClientHello)),
+            Self::PeerClosed => one(ended(OnboardOutcome::PeerClosed)),
+            Self::Stalled => one(ended(OnboardOutcome::Stalled)),
+            Self::Incompatible(incompatible) => one(DomainDetail::OnboardingIncompatible {
+                outcome: OnboardOutcome::Incompatible,
+                incompatible: named(incompatible),
+            }),
+            // Three, because the offer is the whole of what makes a mismatch
+            // actionable: an administrator compares two lists against what this
+            // appliance carries, and a token saying only that they did not
+            // intersect sends them nowhere.
+            Self::NothingInCommon {
+                incompatible,
+                offer,
+            } => [
+                Some(DomainDetail::OnboardingIncompatible {
+                    outcome: OnboardOutcome::NothingInCommon,
+                    incompatible: named(incompatible),
+                }),
+                Some(DomainDetail::OnboardingSuites {
+                    points: offer.suites.kept,
+                    offered: offer.suites.offered,
+                }),
+                Some(DomainDetail::OnboardingGroups {
+                    points: offer.groups.kept,
+                    offered: offer.groups.offered,
+                }),
+            ],
+            // The alert as the registry numbers it and not as the library
+            // spells it, on the same terms the version, the suite and the group
+            // above cross under: a name is the registry's to change, and an
+            // operator holding a capture against a specification is comparing
+            // numbers either way.
+            Self::AlertReceived(alert) => one(DomainDetail::OnboardingAlert {
+                outcome: OnboardOutcome::AlertReceived,
+                alert: u16::from(u8::from(*alert)),
+            }),
+            Self::Refused(error) => one(DomainDetail::OnboardingRefused {
+                outcome: OnboardOutcome::Refused,
+                refusal: refusal(error),
+            }),
+            // Two: the outcome, and what was asked for against what was left —
+            // which is the record this appliance already states an arena's
+            // shortfall on, so a starved session at boot and one under a peer
+            // read the same way.
+            Self::ArenaExhausted(ArenaExhausted {
+                requested,
+                remaining,
+            }) => [
+                Some(ended(OnboardOutcome::ArenaExhausted)),
+                Some(DomainDetail::Arena {
+                    bytes: *remaining as u64,
+                    bound: *requested as u64,
+                }),
+                None,
+            ],
+            Self::Backlogged { held } => one(DomainDetail::OnboardingBacklogged {
+                outcome: OnboardOutcome::Backlogged,
+                held: *held as u64,
+            }),
+        }
+    }
+}
+
+/// An outcome whose whole fact is the way it ended.
+const fn ended(outcome: OnboardOutcome) -> DomainDetail {
+    DomainDetail::OnboardingEnded { outcome }
+}
+
+/// The library's incompatibility as the console names it.
+///
+/// Every member is matched explicitly, so a release that renames one fails this
+/// build. The wildcard is not slack: the library's type is open, so a release
+/// that *adds* a member has to land somewhere, and it lands on a token that
+/// says this build cannot name it rather than on a neighbour that would read as
+/// a diagnosis.
+fn named(incompatible: &PeerIncompatible) -> TlsIncompatible {
+    match incompatible {
+        PeerIncompatible::EcPointsExtensionRequired => TlsIncompatible::EcPointsExtensionRequired,
+        PeerIncompatible::ExtendedMasterSecretExtensionRequired => {
+            TlsIncompatible::ExtendedMasterSecretExtensionRequired
+        }
+        PeerIncompatible::IncorrectCertificateTypeExtension => {
+            TlsIncompatible::IncorrectCertificateTypeExtension
+        }
+        PeerIncompatible::KeyShareExtensionRequired => TlsIncompatible::KeyShareExtensionRequired,
+        PeerIncompatible::NamedGroupsExtensionRequired => {
+            TlsIncompatible::NamedGroupsExtensionRequired
+        }
+        PeerIncompatible::NoCertificateRequestSignatureSchemesInCommon => {
+            TlsIncompatible::NoCertificateRequestSignatureSchemesInCommon
+        }
+        PeerIncompatible::NoCipherSuitesInCommon => TlsIncompatible::NoCipherSuitesInCommon,
+        PeerIncompatible::NoEcPointFormatsInCommon => TlsIncompatible::NoEcPointFormatsInCommon,
+        PeerIncompatible::NoKxGroupsInCommon => TlsIncompatible::NoKxGroupsInCommon,
+        PeerIncompatible::NoSignatureSchemesInCommon => TlsIncompatible::NoSignatureSchemesInCommon,
+        PeerIncompatible::NullCompressionRequired => TlsIncompatible::NullCompressionRequired,
+        PeerIncompatible::ServerDoesNotSupportTls12Or13 => {
+            TlsIncompatible::ServerDoesNotSupportTls12Or13
+        }
+        PeerIncompatible::ServerSentHelloRetryRequestWithUnknownExtension => {
+            TlsIncompatible::ServerSentHelloRetryRequestWithUnknownExtension
+        }
+        PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig => {
+            TlsIncompatible::ServerTlsVersionIsDisabledByOurConfig
+        }
+        PeerIncompatible::SignatureAlgorithmsExtensionRequired => {
+            TlsIncompatible::SignatureAlgorithmsExtensionRequired
+        }
+        PeerIncompatible::SupportedVersionsExtensionRequired => {
+            TlsIncompatible::SupportedVersionsExtensionRequired
+        }
+        PeerIncompatible::Tls12NotOffered => TlsIncompatible::Tls12NotOffered,
+        PeerIncompatible::Tls12NotOfferedOrEnabled => TlsIncompatible::Tls12NotOfferedOrEnabled,
+        PeerIncompatible::Tls13RequiredForQuic => TlsIncompatible::Tls13RequiredForQuic,
+        PeerIncompatible::UncompressedEcPointsRequired => {
+            TlsIncompatible::UncompressedEcPointsRequired
+        }
+        PeerIncompatible::UnsolicitedCertificateTypeExtension => {
+            TlsIncompatible::UnsolicitedCertificateTypeExtension
+        }
+        PeerIncompatible::ServerRejectedEncryptedClientHello(_) => {
+            TlsIncompatible::ServerRejectedEncryptedClientHello
+        }
+        _ => TlsIncompatible::Unrecognized,
+    }
+}
+
+/// The library's error as the console names it, on [`named`]'s terms.
+///
+/// The top-level variant and no deeper. Several of these carry a vocabulary of
+/// their own naming which field of which message was malformed, and mirroring
+/// those would multiply this list many times over to separate causes an
+/// administrator answers identically — the peer is not speaking this protocol
+/// correctly. Where the difference *is* actionable the library puts it in a
+/// different variant, which is what this list carries.
+fn refusal(error: &Error) -> TlsRefusal {
+    match error {
+        Error::InappropriateMessage { .. } => TlsRefusal::InappropriateMessage,
+        Error::InappropriateHandshakeMessage { .. } => TlsRefusal::InappropriateHandshakeMessage,
+        Error::InvalidEncryptedClientHello(_) => TlsRefusal::InvalidEncryptedClientHello,
+        Error::InvalidMessage(_) => TlsRefusal::InvalidMessage,
+        Error::NoCertificatesPresented => TlsRefusal::NoCertificatesPresented,
+        Error::UnsupportedNameType => TlsRefusal::UnsupportedNameType,
+        Error::DecryptError => TlsRefusal::DecryptError,
+        Error::EncryptError => TlsRefusal::EncryptError,
+        Error::PeerIncompatible(_) => TlsRefusal::PeerIncompatible,
+        Error::PeerMisbehaved(_) => TlsRefusal::PeerMisbehaved,
+        Error::AlertReceived(_) => TlsRefusal::AlertReceived,
+        Error::InvalidCertificate(_) => TlsRefusal::InvalidCertificate,
+        Error::InvalidCertRevocationList(_) => TlsRefusal::InvalidCertRevocationList,
+        Error::General(_) => TlsRefusal::General,
+        Error::FailedToGetCurrentTime => TlsRefusal::FailedToGetCurrentTime,
+        Error::FailedToGetRandomBytes => TlsRefusal::FailedToGetRandomBytes,
+        Error::HandshakeNotComplete => TlsRefusal::HandshakeNotComplete,
+        Error::PeerSentOversizedRecord => TlsRefusal::PeerSentOversizedRecord,
+        Error::NoApplicationProtocol => TlsRefusal::NoApplicationProtocol,
+        Error::BadMaxFragmentSize => TlsRefusal::BadMaxFragmentSize,
+        Error::InconsistentKeys(_) => TlsRefusal::InconsistentKeys,
+        Error::Other(_) => TlsRefusal::Other,
+        _ => TlsRefusal::Unrecognized,
+    }
 }
 
 /// What one turn of the server produced.
@@ -705,17 +927,15 @@ fn keep<T: Copy + Into<u16>>(into: &[AtomicU16; OFFER_KEPT], count: &AtomicU32, 
 }
 
 fn read(from: &[AtomicU16; OFFER_KEPT], count: &AtomicU32) -> Offered {
-    let offered = count.load(Ordering::Relaxed);
     let mut kept = [0_u16; OFFER_KEPT];
     for (slot, point) in kept.iter_mut().zip(from.iter()) {
         *slot = point.load(Ordering::Relaxed);
     }
-    let length = usize::try_from(offered)
-        .unwrap_or(OFFER_KEPT)
-        .min(OFFER_KEPT);
-    Offered {
+    // Saturated rather than wrapped: a client listing more than a `u16` can
+    // count is one whose hello did not fit a record, and the number that says
+    // "more than this record can state" is the widest one it can.
+    Offered::of(
         kept,
-        length: u8::try_from(length).unwrap_or(u8::MAX),
-        offered: u16::try_from(offered).unwrap_or(u16::MAX),
-    }
+        u16::try_from(count.load(Ordering::Relaxed)).unwrap_or(u16::MAX),
+    )
 }

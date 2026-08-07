@@ -67,7 +67,9 @@ use std::{
     path::Path,
 };
 
-use lfw_log::{DialOutcome, MAX_CAUSE_LEN, RejectReason};
+use lfw_log::{
+    DialOutcome, MAX_CAUSE_LEN, OnboardOutcome, RejectReason, TlsIncompatible, TlsRefusal,
+};
 use lfw_metrics::{
     ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, RULE_HITS,
     SHARD_COUNT, SHARDS,
@@ -233,6 +235,7 @@ pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
     check_causes(&literals, &console, &mut findings);
     check_reject_reasons(&console, &mut findings);
     check_dial_outcomes(&console, &mut findings);
+    check_onboarding_vocabularies(&console, &mut findings);
     check_metric_families(&metrics, &mut findings);
     check_stated_counts(&status, &mut findings);
 
@@ -243,7 +246,7 @@ pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
         println!(
             "reference: {CONSOLE_PAGE} and {METRICS_PAGE} agree with the code they describe: \
              every refusal cause token, every `rejected=` reason, every `dial-outcome=` token, \
-             and every metric family with its type, labels and publishing domains; and every count \
+             every token the onboarding port's three vocabularies carry, and every metric family with its type, labels and publishing domains; and every count \
              {STATUS_DETAIL_PAGE} states about the gate agrees with the list it is about"
         );
         return Ok(());
@@ -682,6 +685,120 @@ fn check_dial_outcomes(console: &str, findings: &mut Vec<String>) {
         None => findings.push(format!(
             "{CONSOLE_PAGE} states no total before \"outcomes:\", so the size of the \
              `dial-outcome=` vocabulary cannot be checked"
+        )),
+    }
+}
+
+/// The three vocabularies the onboarding port's handshake records carry, each
+/// against its own table in the chapter and the total it states about itself.
+///
+/// Read for [`check_dial_outcomes`]'s reason and with the same at stake: this is
+/// what an administrator whose client will not reach the appliance reads the
+/// failure through, so a token the code can emit and the chapter does not
+/// explain is a failure with no documented meaning, and one the chapter explains
+/// and the code cannot emit is somebody waiting for a line that never comes.
+///
+/// Two of the three are mirrors of the adopted TLS library's own vocabularies,
+/// which is what makes the comparison worth more here than anywhere else: those
+/// lists grow when a dependency is bumped, and a bump that added a member and
+/// left the chapter alone is precisely the drift nothing else in this build
+/// would notice.
+fn check_onboarding_vocabularies(console: &str, findings: &mut Vec<String>) {
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["handshake outcome", "what it means"],
+            total: "handshake outcomes:",
+            code: "lfw_log::OnboardOutcome",
+            tokens: &OnboardOutcome::ALL.map(OnboardOutcome::name),
+        },
+    );
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["incompatibility", "what it means"],
+            total: "incompatibilities:",
+            code: "lfw_log::TlsIncompatible",
+            tokens: &TlsIncompatible::ALL.map(TlsIncompatible::name),
+        },
+    );
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["refusal", "what it means"],
+            total: "refusals:",
+            code: "lfw_log::TlsRefusal",
+            tokens: &TlsRefusal::ALL.map(TlsRefusal::name),
+        },
+    );
+}
+
+/// One closed vocabulary, its table in the chapter, and the total the chapter
+/// states about it.
+struct Tabulated<'a> {
+    /// The table's own header cells, which is how this check finds it.
+    header: [&'a str; 2],
+    /// The words the chapter's own total is written before.
+    total: &'a str,
+    /// The type the tokens are read from, named so a finding says where to look.
+    code: &'a str,
+    tokens: &'a [&'a str],
+}
+
+/// Both directions of one vocabulary table, plus the total it states.
+fn check_vocabulary_table(console: &str, findings: &mut Vec<String>, about: &Tabulated<'_>) {
+    let code: BTreeSet<&str> = about.tokens.iter().copied().collect();
+    let tables = tables(console);
+    let Some(table) = tables.iter().find(|table| table.header == about.header) else {
+        findings.push(format!(
+            "{CONSOLE_PAGE} carries no `| {} | {} |` table, so the {} token(s) `{}` can emit are \
+             compared against nothing",
+            about.header[0],
+            about.header[1],
+            code.len(),
+            about.code,
+        ));
+        return;
+    };
+
+    let book: BTreeSet<String> = table
+        .rows
+        .iter()
+        .filter_map(|row| row.first())
+        .flat_map(|cell| backticked(cell))
+        .collect();
+
+    for token in &code {
+        if !book.contains(*token) {
+            findings.push(format!(
+                "{} `{token}`: `{}` carries it and {CONSOLE_PAGE} does not list it",
+                about.header[0], about.code,
+            ));
+        }
+    }
+    for token in &book {
+        if !code.contains(token.as_str()) {
+            findings.push(format!(
+                "{} `{token}`: {CONSOLE_PAGE} lists it and `{}` has no such variant",
+                about.header[0], about.code,
+            ));
+        }
+    }
+    match stated_count_before(&flatten(console), about.total) {
+        Some(stated) if stated == code.len() => {}
+        Some(stated) => findings.push(format!(
+            "{CONSOLE_PAGE} says there are {stated} \"{}\" and `{}` carries {}",
+            about.total,
+            about.code,
+            code.len()
+        )),
+        None => findings.push(format!(
+            "{CONSOLE_PAGE} states no total before \"{}\", so the size of the `{}` vocabulary \
+             cannot be checked",
+            about.total, about.code,
         )),
     }
 }

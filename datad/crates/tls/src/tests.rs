@@ -1382,3 +1382,219 @@ fn every_server_outcome_is_its_own_value() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// What an outcome puts on the console
+// ---------------------------------------------------------------------------
+//
+// The records are what an administrator whose client will not connect actually
+// gets, there being no shell and no CLI, so they are held here as rendered
+// lines rather than as values: a token that reached the wrong field, a number
+// in the wrong base, and a record that renders as nothing are all invisible in
+// a comparison of values and all obvious in a comparison of lines.
+
+/// The lifecycle point the domain that terminates a session emits under. Fixed
+/// here so a rendered line is the line an operator reads, minus the instant.
+fn console(detail: lfw_log::DomainDetail) -> String {
+    let mut buffer = [0_u8; lfw_log::MAX_LINE_LEN];
+    let written = lfw_log::render(
+        lfw_log::Stamp::Unsynchronized,
+        &lfw_log::Event::Domain {
+            domain: lfw_log::Domain::Crypto,
+            state: lfw_log::DomainState::Ready,
+            detail,
+        },
+        &mut buffer,
+    )
+    .expect("every record of this shape fits a console line");
+    let line = std::str::from_utf8(&buffer[..written]).expect("the grammar is ASCII");
+    line.replace("LFW-PD time=unsynchronized domain=crypto state=ready", "")
+        .trim()
+        .to_owned()
+}
+
+/// The lines one outcome puts on the console, in the order it puts them.
+fn lines(outcome: &ServerOutcome) -> Vec<String> {
+    outcome
+        .records()
+        .into_iter()
+        .flatten()
+        .map(console)
+        .collect()
+}
+
+/// Every variant reaches the console, and every one reaches it under a token of
+/// its own. This is the property the whole vocabulary exists for: a failure to
+/// establish the management connection is answered from these lines alone, so
+/// two causes sharing a token would leave an administrator with a line that
+/// names neither.
+#[test]
+fn every_outcome_puts_its_own_token_on_the_console() {
+    let outcomes = [
+        ServerOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }),
+        ServerOutcome::NoClientHello,
+        ServerOutcome::Incompatible(PeerIncompatible::SupportedVersionsExtensionRequired),
+        ServerOutcome::NothingInCommon {
+            incompatible: PeerIncompatible::NoCipherSuitesInCommon,
+            offer: offer_of(&[0x1301, 0x1302], 2, &[0x11ec], 1),
+        },
+        ServerOutcome::AlertReceived(AlertDescription::UnknownCA),
+        ServerOutcome::Refused(rustls::Error::InvalidMessage(
+            rustls::InvalidMessage::InvalidContentType,
+        )),
+        ServerOutcome::PeerClosed,
+        ServerOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 262_144,
+            remaining: 262_143,
+        }),
+        ServerOutcome::Backlogged { held: 33_291 },
+        ServerOutcome::Stalled,
+    ];
+    let mut tokens: Vec<String> = Vec::new();
+    for outcome in &outcomes {
+        let rendered = lines(outcome);
+        let first = rendered.first().unwrap_or_else(|| {
+            panic!("{outcome:?} reaches the console with no record at all");
+        });
+        let token = first
+            .split_whitespace()
+            .next()
+            .expect("a record is at least one field")
+            .to_owned();
+        assert!(
+            token.starts_with("onboard-tls="),
+            "{outcome:?} leads with {token}, which is not the key a reader greps for"
+        );
+        assert!(
+            !tokens.contains(&token),
+            "{outcome:?} shares {token} with an outcome before it"
+        );
+        tokens.push(token);
+    }
+    assert_eq!(tokens.len(), lfw_log::OnboardOutcome::ALL.len());
+}
+
+/// The lines themselves, for the six an administrator is most likely to be
+/// holding. Written out rather than derived, because what this asserts is what
+/// a person reads.
+#[test]
+fn the_console_lines_are_the_ones_an_administrator_reads() {
+    assert_eq!(
+        lines(&ServerOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        })),
+        [
+            "onboard-tls=established onboard-tls-version=0x0304 onboard-tls-suite=0x1303 \
+             onboard-tls-group=0x11ec"
+        ]
+    );
+    assert_eq!(
+        lines(&ServerOutcome::Incompatible(
+            PeerIncompatible::SupportedVersionsExtensionRequired
+        )),
+        ["onboard-tls=incompatible onboard-tls-incompatible=supported-versions-extension-required"]
+    );
+    assert_eq!(
+        lines(&ServerOutcome::NothingInCommon {
+            incompatible: PeerIncompatible::NoCipherSuitesInCommon,
+            offer: offer_of(&[0x1301, 0x1302], 2, &[0x11ec], 1),
+        }),
+        [
+            "onboard-tls=nothing-in-common onboard-tls-incompatible=no-cipher-suites-in-common",
+            "onboard-tls-suites=0x1301,0x1302 onboard-tls-suites-offered=2",
+            "onboard-tls-groups=0x11ec onboard-tls-groups-offered=1",
+        ]
+    );
+    assert_eq!(
+        lines(&ServerOutcome::AlertReceived(AlertDescription::UnknownCA)),
+        ["onboard-tls=alert-received onboard-tls-alert=0x0030"]
+    );
+    assert_eq!(
+        lines(&ServerOutcome::Refused(rustls::Error::InvalidMessage(
+            rustls::InvalidMessage::InvalidContentType
+        ))),
+        ["onboard-tls=refused onboard-tls-error=invalid-message"]
+    );
+    assert_eq!(
+        lines(&ServerOutcome::Backlogged { held: 33_291 }),
+        ["onboard-tls=backlogged onboard-tls-held=33291"]
+    );
+    // Two records, the second of which is the one this appliance already states
+    // an arena's shortfall on — so a starved session at boot and one starved
+    // under a peer read the same way.
+    assert_eq!(
+        lines(&ServerOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 262_144,
+            remaining: 262_143,
+        })),
+        [
+            "onboard-tls=arena-exhausted",
+            "arena-bytes=262143 arena-bound=262144",
+        ]
+    );
+}
+
+/// An offer longer than the record keeps renders what was kept beside how many
+/// there really were, and an offer of nothing renders a word rather than an
+/// empty field a reader cannot look up.
+#[test]
+fn an_offer_renders_what_was_kept_beside_what_was_listed() {
+    let many: Vec<u16> = (0..12_u16).map(|point| 0x1400 + point).collect();
+    let rendered = lines(&ServerOutcome::NothingInCommon {
+        incompatible: PeerIncompatible::NoCipherSuitesInCommon,
+        offer: offer_of(&many, 40, &[], 0),
+    });
+    assert_eq!(
+        rendered.get(1).map(String::as_str),
+        Some(
+            "onboard-tls-suites=0x1400,0x1401,0x1402,0x1403,0x1404,0x1405,0x1406,0x1407 \
+             onboard-tls-suites-offered=40"
+        )
+    );
+    assert_eq!(
+        rendered.get(2).map(String::as_str),
+        Some("onboard-tls-groups=none onboard-tls-groups-offered=0")
+    );
+}
+
+/// The offer a client really put on the wire, taken through the whole path: a
+/// hello, the server, the outcome, and the console line. What this holds that
+/// the value comparison above cannot is the join — a record naming a suite the
+/// client did not offer would pass every check that reads the value alone.
+#[test]
+fn the_offer_on_the_console_is_the_offer_the_client_sent() {
+    let (outcome, _) = against(
+        0x66,
+        &client_hello(&[0x1301, 0x1302, 0x1304], &[0x11ec], &[0x0304], 0),
+    );
+    assert_eq!(
+        lines(&outcome),
+        [
+            "onboard-tls=nothing-in-common onboard-tls-incompatible=no-cipher-suites-in-common",
+            "onboard-tls-suites=0x1301,0x1302,0x1304 onboard-tls-suites-offered=3",
+            "onboard-tls-groups=0x11ec onboard-tls-groups-offered=1",
+        ]
+    );
+}
+
+/// An offer of the shape the capture leaves, built here because `Offered`'s
+/// fields are the capture's to write and a test needs to state one.
+fn offer_of(suites: &[u16], listed: u16, groups: &[u16], grouped: u16) -> crate::PeerOffer {
+    fn kept(points: &[u16], offered: u16) -> crate::Offered {
+        let mut slots = [0_u16; crate::OFFER_KEPT];
+        for (slot, point) in slots.iter_mut().zip(points) {
+            *slot = *point;
+        }
+        crate::Offered::of(slots, offered)
+    }
+    crate::PeerOffer {
+        suites: kept(suites, listed),
+        groups: kept(groups, grouped),
+    }
+}

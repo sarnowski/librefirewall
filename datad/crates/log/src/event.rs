@@ -189,6 +189,164 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// How one handshake on the onboarding port ended, as the domain that
+    /// terminates it reports.
+    ///
+    /// **One token per cause, and that is the whole design of this list**, on
+    /// [`DialOutcome`]'s terms and for the same reason: an administrator whose
+    /// client cannot establish the management connection has the console and
+    /// nothing else, so a token covering three causes names none of them. The
+    /// handshake that succeeded is a member here rather than a separate record,
+    /// because one key an operator greps for is what makes a boot's onboarding
+    /// story readable in one pass.
+    ///
+    /// Three of these carry a second token beside them — the library's own
+    /// account of what it would not accept — and four carry numbers. The order
+    /// is the wire encoding, so a variant is appended and never inserted.
+    OnboardOutcome {
+        /// The handshake completed. The three code points it settled on are on
+        /// the record beside this token.
+        Established => "established",
+        /// The peer opened the connection and sent no byte at all.
+        NoClientHello => "no-client-hello",
+        /// The peer and this appliance had no protocol in common, before there
+        /// was a suite or a group to compare. [`TlsIncompatible`] says which.
+        Incompatible => "incompatible",
+        /// The peer offered no cipher suite, or no key-exchange group, that
+        /// this appliance has. What it did offer is on the two records beside
+        /// this one.
+        NothingInCommon => "nothing-in-common",
+        /// The peer gave up with a fatal alert, whose registry code point is on
+        /// the record beside this token.
+        AlertReceived => "alert-received",
+        /// This appliance refused the session. [`TlsRefusal`] says what it
+        /// decided.
+        Refused => "refused",
+        /// The peer went away before the handshake completed.
+        PeerClosed => "peer-closed",
+        /// The bounded allocator had less than one phase's reserve free. What
+        /// was asked for and what was left is on the `arena-` record beside
+        /// this token.
+        ArenaExhausted => "arena-exhausted",
+        /// A direction outgrew what one session holds, carrying what it would
+        /// have had to hold.
+        Backlogged => "backlogged",
+        /// Neither the library nor this appliance could make progress.
+        Stalled => "stalled",
+    }
+}
+
+closed_vocabulary! {
+    /// Why the adopted TLS library and a peer had no protocol in common: its
+    /// own `PeerIncompatible`, as a console token.
+    ///
+    /// **A mirror of a third party's vocabulary, and deliberately whole.** The
+    /// alternative was one token for the lot, and the three cases that provoke
+    /// it most — a client with no TLS 1.3, one that sent no supported-versions
+    /// extension at all, and one whose suites this appliance does not have —
+    /// are three separate things for an administrator to go and change. The
+    /// library already tells them apart; folding them here would be this
+    /// appliance losing the distinction on the way to the operator.
+    ///
+    /// It is a *naming* of that vocabulary and never a claim about the
+    /// library's behaviour: the one call site that maps it names every variant
+    /// explicitly, so a release that renames one fails the build. A release
+    /// that *adds* one lands on [`Self::Unrecognized`], which is what that
+    /// token is for — the library's type is open, so a mirror that pretended to
+    /// be closed would be the lie.
+    ///
+    /// Several members cannot arise on a server that offers one version, one
+    /// suite and one group and asks for no client certificate. They are here
+    /// because a partial mirror is one somebody has to keep deciding the
+    /// boundary of. The order is the wire encoding, so a variant is appended
+    /// and never inserted.
+    TlsIncompatible {
+        EcPointsExtensionRequired => "ec-points-extension-required",
+        ExtendedMasterSecretExtensionRequired => "extended-master-secret-extension-required",
+        IncorrectCertificateTypeExtension => "incorrect-certificate-type-extension",
+        KeyShareExtensionRequired => "key-share-extension-required",
+        NamedGroupsExtensionRequired => "named-groups-extension-required",
+        NoCertificateRequestSignatureSchemesInCommon =>
+            "no-certificate-request-signature-schemes-in-common",
+        NoCipherSuitesInCommon => "no-cipher-suites-in-common",
+        NoEcPointFormatsInCommon => "no-ec-point-formats-in-common",
+        NoKxGroupsInCommon => "no-kx-groups-in-common",
+        NoSignatureSchemesInCommon => "no-signature-schemes-in-common",
+        NullCompressionRequired => "null-compression-required",
+        ServerDoesNotSupportTls12Or13 => "server-does-not-support-tls12-or13",
+        ServerSentHelloRetryRequestWithUnknownExtension =>
+            "server-sent-hello-retry-request-with-unknown-extension",
+        ServerTlsVersionIsDisabledByOurConfig => "server-tls-version-is-disabled-by-our-config",
+        SignatureAlgorithmsExtensionRequired => "signature-algorithms-extension-required",
+        SupportedVersionsExtensionRequired => "supported-versions-extension-required",
+        Tls12NotOffered => "tls12-not-offered",
+        Tls12NotOfferedOrEnabled => "tls12-not-offered-or-enabled",
+        Tls13RequiredForQuic => "tls13-required-for-quic",
+        UncompressedEcPointsRequired => "uncompressed-ec-points-required",
+        UnsolicitedCertificateTypeExtension => "unsolicited-certificate-type-extension",
+        ServerRejectedEncryptedClientHello => "server-rejected-encrypted-client-hello",
+        /// A member the library grew after this mirror was written. Its own
+        /// token rather than a nearby one, so an operator reading it knows the
+        /// answer is "this build cannot name it" and not "this is what
+        /// happened".
+        Unrecognized => "unrecognized",
+    }
+}
+
+closed_vocabulary! {
+    /// What this appliance decided against a peer's bytes: the adopted TLS
+    /// library's own `Error`, as a console token.
+    ///
+    /// [`TlsIncompatible`]'s mirror on the other of the two vocabularies that
+    /// reach an operator from the library, under all of its reasoning. It is
+    /// **the error variant and not the alert byte that went out beside it**:
+    /// the library exposes no outgoing alert on this path, so a table from one
+    /// to the other would be a first-party claim about a third party's
+    /// behaviour that a version bump falsifies with nothing failing.
+    ///
+    /// It stops at the top-level variant. Several of them carry a nested
+    /// vocabulary of their own — which field of which message was malformed —
+    /// and mirroring those would multiply this list many times over to separate
+    /// causes an administrator answers identically: the peer is not speaking
+    /// this protocol correctly. Where the distinction *is* actionable the
+    /// library puts it in a different variant, which is what this list carries.
+    ///
+    /// The order is the wire encoding, so a variant is appended and never
+    /// inserted.
+    TlsRefusal {
+        InappropriateMessage => "inappropriate-message",
+        InappropriateHandshakeMessage => "inappropriate-handshake-message",
+        InvalidEncryptedClientHello => "invalid-encrypted-client-hello",
+        InvalidMessage => "invalid-message",
+        NoCertificatesPresented => "no-certificates-presented",
+        UnsupportedNameType => "unsupported-name-type",
+        DecryptError => "decrypt-error",
+        EncryptError => "encrypt-error",
+        PeerIncompatible => "peer-incompatible",
+        PeerMisbehaved => "peer-misbehaved",
+        AlertReceived => "alert-received",
+        InvalidCertificate => "invalid-certificate",
+        InvalidCertRevocationList => "invalid-cert-revocation-list",
+        General => "general",
+        FailedToGetCurrentTime => "failed-to-get-current-time",
+        FailedToGetRandomBytes => "failed-to-get-random-bytes",
+        HandshakeNotComplete => "handshake-not-complete",
+        PeerSentOversizedRecord => "peer-sent-oversized-record",
+        NoApplicationProtocol => "no-application-protocol",
+        BadMaxFragmentSize => "bad-max-fragment-size",
+        InconsistentKeys => "inconsistent-keys",
+        /// The library's own residual, which it uses for a failure a provider
+        /// reported. Distinct from [`Self::Unrecognized`] below: this one is
+        /// the library saying it has no better name, and that one is this build
+        /// having none.
+        Other => "other",
+        /// A member the library grew after this mirror was written, on
+        /// [`TlsIncompatible::Unrecognized`]'s terms.
+        Unrecognized => "unrecognized",
+    }
+}
+
+closed_vocabulary! {
     /// The lifecycle points a domain reports. `Negotiated` sits between the
     /// other two because a device that answered and a device whose queues are
     /// primed are different failures to be looking at: one is a bring-up
@@ -510,6 +668,10 @@ mod tests {
         check_vocabulary!(RejectReason);
         check_vocabulary!(DialOutcome);
         check_vocabulary!(NextHopVia);
+        check_vocabulary!(OnboardEnd);
+        check_vocabulary!(OnboardOutcome);
+        check_vocabulary!(TlsIncompatible);
+        check_vocabulary!(TlsRefusal);
     }
 
     #[test]

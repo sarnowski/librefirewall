@@ -84,9 +84,10 @@ use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
-    LOG_ONBOARD_END_COUNT,
-    LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
-    LogRecord, LogRecordError, LogText, TextImage, ValueImage,
+    LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_ONBOARD_END_COUNT,
+    LOG_ONBOARD_OUTCOME_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
+    LOG_TLS_INCOMPATIBLE_COUNT, LOG_TLS_REFUSAL_COUNT, LogRecord, LogRecordError, LogText,
+    TextImage, ValueImage,
 };
 
 /// Bytes one record occupies, and so what one corpus entry is.
@@ -110,7 +111,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The twenty-five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s
+/// The thirty-five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s
 /// terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
@@ -139,7 +140,15 @@ const DETAIL_DIAL_SEGMENTS: u8 = 23;
 const DETAIL_DIAL_SEQUENCE: u8 = 24;
 const DETAIL_ONBOARDED: u8 = 25;
 const DETAIL_ONBOARDING_PORT: u8 = 26;
-const DETAIL_COUNT: u8 = 27;
+const DETAIL_ONBOARDING_HANDSHAKE: u8 = 27;
+const DETAIL_ONBOARDING_ENDED: u8 = 28;
+const DETAIL_ONBOARDING_INCOMPATIBLE: u8 = 29;
+const DETAIL_ONBOARDING_REFUSED: u8 = 30;
+const DETAIL_ONBOARDING_ALERT: u8 = 31;
+const DETAIL_ONBOARDING_BACKLOGGED: u8 = 32;
+const DETAIL_ONBOARDING_SUITES: u8 = 33;
+const DETAIL_ONBOARDING_GROUPS: u8 = 34;
+const DETAIL_COUNT: u8 = 35;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -573,7 +582,11 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
                 | DETAIL_DELEGATED | DETAIL_DIALLED | DETAIL_DIAL_ROUTE
                 | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE
-                | DETAIL_ONBOARDED | DETAIL_ONBOARDING_PORT => {
+                | DETAIL_ONBOARDED | DETAIL_ONBOARDING_PORT | DETAIL_ONBOARDING_HANDSHAKE
+                | DETAIL_ONBOARDING_ENDED | DETAIL_ONBOARDING_INCOMPATIBLE
+                | DETAIL_ONBOARDING_REFUSED | DETAIL_ONBOARDING_ALERT
+                | DETAIL_ONBOARDING_BACKLOGGED | DETAIL_ONBOARDING_SUITES
+                | DETAIL_ONBOARDING_GROUPS => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -813,6 +826,38 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // does not carry is one the record check reads and this one calls
         // unknown.
         DETAIL_ONBOARDING_PORT => None,
+        // The seven a handshake on that port produces. Every one of them leads
+        // with a token naming how the handshake ended, and each ranges what
+        // follows for the shape it will be rendered as — restated here in the
+        // order the ABI reads them, so the first refusal a record earns is the
+        // one this harness expects.
+        DETAIL_ONBOARDING_ENDED | DETAIL_ONBOARDING_BACKLOGGED => onboard_outcome(record.operands[0]),
+        DETAIL_ONBOARDING_HANDSHAKE => onboard_outcome(record.operands[0])
+            .or_else(|| wide_code_point(record.operands[1]))
+            .or_else(|| wide_code_point(record.operands[2]))
+            .or_else(|| wide_code_point(record.operands[3])),
+        DETAIL_ONBOARDING_ALERT => {
+            onboard_outcome(record.operands[0]).or_else(|| wide_code_point(record.operands[1]))
+        }
+        DETAIL_ONBOARDING_INCOMPATIBLE => onboard_outcome(record.operands[0]).or_else(|| {
+            (record.operands[1] >= u64::from(LOG_TLS_INCOMPATIBLE_COUNT)).then_some(
+                LogRecordError::TlsIncompatibleUnknown {
+                    incompatible: record.operands[1],
+                },
+            )
+        }),
+        DETAIL_ONBOARDING_REFUSED => onboard_outcome(record.operands[0]).or_else(|| {
+            (record.operands[1] >= u64::from(LOG_TLS_REFUSAL_COUNT)).then_some(
+                LogRecordError::TlsRefusalUnknown {
+                    refusal: record.operands[1],
+                },
+            )
+        }),
+        // The two offer details range one word and no more: the eight code
+        // points are sixteen bits each by where they sit in the two words that
+        // carry them, so no bit pattern of those is refusable, and what is left
+        // is the count of how many the client really listed.
+        DETAIL_ONBOARDING_SUITES | DETAIL_ONBOARDING_GROUPS => wide_code_point(record.operands[2]),
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the
@@ -883,6 +928,13 @@ fn vocabulary(raw: u8, count: u8, error: LogRecordError) -> Option<LogRecordErro
 /// A code point wider than the sixteen bits a TLS registry numbers one in.
 fn wide_code_point(value: u64) -> Option<LogRecordError> {
     (value > u64::from(u16::MAX)).then_some(LogRecordError::CodePointTooWide { value })
+}
+
+/// A leading word that names no way for a handshake on the onboarding port to
+/// have ended.
+fn onboard_outcome(value: u64) -> Option<LogRecordError> {
+    (value >= u64::from(LOG_ONBOARD_OUTCOME_COUNT))
+        .then_some(LogRecordError::OnboardOutcomeUnknown { outcome: value })
 }
 
 /// A word wider than the thirty-two bits a TCP sequence number has.
@@ -1462,6 +1514,97 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The seven a **handshake** on that port produces. Each is
+            // committed because each ranges a different set of words behind one
+            // leading token, and a uniform draw over a discriminant plus four
+            // words reaches none of these discriminants at all.
+            (
+                "valid_domain_onboarding_handshake",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_HANDSHAKE,
+                    // The three code points a real handshake settles on, behind
+                    // the outcome token: no two alike, so a field read out of
+                    // the wrong word is visible rather than symmetric.
+                    operands: [0, 0x0304, 0x1303, 0x11ec],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_ended",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_ENDED,
+                    // A peer that went away, and three words this detail does
+                    // not name — poisoned, so a decode that read one would be
+                    // refused rather than silently reporting a number.
+                    operands: [6, u64::MAX, u64::MAX, u64::MAX],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_incompatible",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_INCOMPATIBLE,
+                    operands: [3, 6, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_refused",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_REFUSED,
+                    operands: [5, 3, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_alert",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_ALERT,
+                    // `unknown_ca`, as the registry numbers it.
+                    operands: [4, 0x30, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_backlogged",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_BACKLOGGED,
+                    // The count at the widest it can be, which is what a rule
+                    // that crept a range onto it would refuse.
+                    operands: [8, u64::MAX, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            // The two offer details, whose eight code points are packed four to
+            // a word. Committed with every one of the eight distinct, because a
+            // packer that dropped a nibble or reversed a word is invisible in a
+            // record whose points are alike.
+            (
+                "valid_domain_onboarding_suites",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_SUITES,
+                    operands: [
+                        0x1301_1302_1303_1304,
+                        0x1305_1306_1307_1308,
+                        40,
+                        0,
+                    ],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_groups",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_GROUPS,
+                    operands: [
+                        0x001d_0017_0018_0019,
+                        0x001e_0100_0101_11ec,
+                        u64::from(u16::MAX),
+                        0,
+                    ],
+                    ..domain_record()
+                }),
+            ),
             // Every byte the writer could set, set.
             ("every_byte_set", vec![0xFF; RECORD_BYTES]),
         ];
@@ -1594,6 +1737,40 @@ mod tests {
             &|token| LogRecord {
                 detail: DETAIL_ONBOARDED,
                 operands: [u64::from(token), u64::MAX, u64::MAX, u64::MAX],
+                ..domain_record()
+            },
+        );
+        // And the three a handshake on that port carries, on the same terms.
+        // The outcome token leads every one of the seven handshake details, so
+        // it is paired once on the narrowest of them; the two library
+        // vocabularies are paired on the details that carry them.
+        pair(
+            "onboard_outcome_at_its_last_token",
+            "onboard_outcome_one_past_its_last_token",
+            LOG_ONBOARD_OUTCOME_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDING_ENDED,
+                operands: [u64::from(token), 0, 0, 0],
+                ..domain_record()
+            },
+        );
+        pair(
+            "tls_incompatible_at_its_last_token",
+            "tls_incompatible_one_past_its_last_token",
+            LOG_TLS_INCOMPATIBLE_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDING_INCOMPATIBLE,
+                operands: [3, u64::from(token), 0, 0],
+                ..domain_record()
+            },
+        );
+        pair(
+            "tls_refusal_at_its_last_token",
+            "tls_refusal_one_past_its_last_token",
+            LOG_TLS_REFUSAL_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDING_REFUSED,
+                operands: [5, u64::from(token), 0, 0],
                 ..domain_record()
             },
         );

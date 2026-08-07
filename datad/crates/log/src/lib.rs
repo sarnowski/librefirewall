@@ -65,10 +65,13 @@ mod stamp;
 use core::cell::Cell;
 
 pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter};
-pub use detail::{Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, Refusal, RefusalDetail};
+pub use detail::{
+    Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, MAX_OFFERED_POINTS, Refusal, RefusalDetail,
+};
 pub use event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, Primitive, RejectReason, Value,
+    ObjectKind, OnboardEnd, OnboardOutcome, Primitive, RejectReason, TlsIncompatible, TlsRefusal,
+    Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};

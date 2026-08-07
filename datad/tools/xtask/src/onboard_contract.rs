@@ -57,7 +57,7 @@
 
 use std::path::Path;
 
-use lfw_log::{Domain, DomainState, OnboardEnd};
+use lfw_log::{Domain, DomainState, OnboardEnd, OnboardOutcome};
 
 use crate::console_records::{LIFECYCLE_PREFIX, field, lifecycle_records, value};
 use crate::dial_contract::Count;
@@ -68,6 +68,23 @@ const RELAYED: &str = "onboard-relayed";
 const RECEIVED: &str = "onboard-received";
 const SENT: &str = "onboard-sent";
 const ENDED: &str = "onboard-ended";
+
+/// The field the terminating domain leads its account of the handshake with.
+const HANDSHAKE: &str = "onboard-tls";
+
+/// What that field must say on every one of these boots.
+///
+/// The station delivers the opening of a TLS record and never the rest of it,
+/// so the server holds those bytes and decides nothing about them — and what
+/// ends the session is the transport going away under it, however this
+/// station chose to take it away. A close, a reset and a session ended beside a
+/// crowded port all reach the peer having gone, which is what this token names.
+///
+/// Asserted here rather than left to the handshake boot, and this is the point
+/// of asserting it at all: these three boots decide how a session *ends*, and a
+/// server that reported an ending of its own — a record it refused, an arena it
+/// ran out of — would still satisfy every count below.
+const OWED_OUTCOME: OnboardOutcome = OnboardOutcome::PeerClosed;
 
 /// The fields of the port's own totals, which the network end alone reports.
 const ACCEPTED: &str = "onboard-accepted";
@@ -162,10 +179,11 @@ pub(crate) fn judge(
                 log.display()
             ));
         }
-        // Exact for the other reason: the domain that terminates a session
-        // answers with nothing today, and both ends report that as a fact rather
-        // than as a placeholder. The station holds the same claim on the wire,
-        // refusing a single byte back on the connection.
+        // Exact for the other reason: what this station delivers is the opening
+        // of a TLS record and never the whole of one, so the server behind the
+        // relay holds it and answers nothing at all — and both ends report that
+        // as a fact rather than as a placeholder. The station holds the same
+        // claim on the wire, refusing a single byte back on the connection.
         let sent = number(record, SENT, log)?;
         if sent != 0 {
             return Err(format!(
@@ -204,6 +222,23 @@ pub(crate) fn judge(
              saw — a relay that lost something, which reads in either account alone as a session \
              that simply carried less\n  network end: {network:?}\n  terminating end: \
              {terminating:?}\n  full run log: {}",
+            log.display()
+        ));
+    }
+
+    // What the server behind the relay made of the session, which no count
+    // above can state: every one of these boots hands it half a record and
+    // takes the transport away, so the one outcome it may report is the peer
+    // having gone.
+    let handshake = one_handshake(&text, log)?;
+    let outcome = read(handshake, HANDSHAKE, log)?;
+    if outcome != OWED_OUTCOME.name() {
+        return Err(format!(
+            "the cryptography domain reports the handshake ended `{outcome}` and this station \
+             took the transport away under one that had decided nothing, which is `{}`: \
+             {handshake:?}. Each of the ten is a different thing for an administrator to go and \
+             change\n  full run log: {}",
+            OWED_OUTCOME.name(),
             log.display()
         ));
     }
@@ -306,6 +341,15 @@ fn sessions(text: &str, domain: Domain) -> Vec<&str> {
         .collect()
 }
 
+/// The terminating domain's account of the handshake: its `ready` record
+/// carrying `onboard-tls=`.
+fn handshakes(text: &str) -> Vec<&str> {
+    ours(text, Domain::Crypto)
+        .into_iter()
+        .filter(|record| value(record, HANDSHAKE).is_some())
+        .collect()
+}
+
 /// The port's own totals: the network end's `ready` records carrying
 /// `onboard-accepted=`.
 fn port_records(text: &str) -> Vec<&str> {
@@ -338,6 +382,23 @@ fn one_session<'a>(text: &'a str, domain: Domain, log: &Path) -> Result<&'a str,
             found.len(),
             LIFECYCLE_PREFIX.trim_end(),
             domain.name(),
+            log.display()
+        ));
+    };
+    Ok(record)
+}
+
+fn one_handshake<'a>(text: &'a str, log: &Path) -> Result<&'a str, String> {
+    let found = handshakes(text);
+    let [record] = found[..] else {
+        return Err(format!(
+            "the console carried {} `{}` record(s) for the cryptography domain accounting for the \
+             handshake, and a boot that opens one session produces exactly one. None means a \
+             session was carried and how it ended reached no surface, which is the one thing an \
+             administrator whose client will not connect has to read\n  records observed: \
+             {found:#?}\n  full run log: {}",
+            found.len(),
+            LIFECYCLE_PREFIX.trim_end(),
             log.display()
         ));
     };
@@ -397,6 +458,8 @@ mod tests {
     const TERMINATING: &str = "LFW-PD time=2026-08-07T00:00:00Z domain=crypto state=ready \
                                onboard-relayed=4 onboard-received=19 onboard-sent=0 \
                                onboard-ended=peer";
+    const HANDSHAKE_RECORD: &str =
+        "LFW-PD time=2026-08-07T00:00:00Z domain=crypto state=ready onboard-tls=peer-closed";
 
     /// A capture of the shape a passing boot leaves: the three records, among
     /// the other domains' lifecycle lines.
@@ -432,7 +495,7 @@ mod tests {
     #[test]
     fn a_session_both_domains_agree_on_is_accepted() {
         let proved = judge(
-            capture(&[NETWORK, PORT, TERMINATING]).as_bytes(),
+            capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).as_bytes(),
             log(),
             completed(),
             account(OnboardBehaviour::Completes),
@@ -444,14 +507,16 @@ mod tests {
 
     #[test]
     fn the_records_are_what_the_run_waits_on() {
-        assert!(reported(capture(&[NETWORK, PORT, TERMINATING]).as_bytes()));
+        assert!(reported(
+            capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).as_bytes()
+        ));
         // Each of the three on its own is a boot that has not finished
         // reporting, and a capture cut before any of them is not one to judge.
         for partial in [
             capture(&[]),
             capture(&[NETWORK]),
             capture(&[NETWORK, PORT]),
-            capture(&[NETWORK, TERMINATING]),
+            capture(&[NETWORK, TERMINATING, HANDSHAKE_RECORD]),
         ] {
             assert!(!reported(partial.as_bytes()), "{partial}");
         }
@@ -460,8 +525,8 @@ mod tests {
     #[test]
     fn a_session_one_domain_never_reported_is_refused_by_the_domain_that_is_silent() {
         for (records, domain) in [
-            (vec![PORT, TERMINATING], "management"),
-            (vec![NETWORK, PORT], "crypto"),
+            (vec![PORT, TERMINATING, HANDSHAKE_RECORD], "management"),
+            (vec![NETWORK, PORT, HANDSHAKE_RECORD], "crypto"),
         ] {
             let verdict = judge(
                 capture(&records).as_bytes(),
@@ -478,7 +543,7 @@ mod tests {
     #[test]
     fn a_session_reported_twice_by_one_domain_is_refused() {
         let verdict = judge(
-            capture(&[NETWORK, NETWORK, PORT, TERMINATING]).as_bytes(),
+            capture(&[NETWORK, NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).as_bytes(),
             log(),
             completed(),
             account(OnboardBehaviour::Completes),
@@ -490,7 +555,7 @@ mod tests {
     #[test]
     fn a_port_record_missing_beside_an_account_is_refused() {
         let verdict = judge(
-            capture(&[NETWORK, TERMINATING]).as_bytes(),
+            capture(&[NETWORK, TERMINATING, HANDSHAKE_RECORD]).as_bytes(),
             log(),
             completed(),
             account(OnboardBehaviour::Completes),
@@ -502,7 +567,7 @@ mod tests {
     #[test]
     fn an_ending_neither_this_station_produced_is_refused_by_both_tokens() {
         for record in [NETWORK, TERMINATING] {
-            let text = capture(&[NETWORK, PORT, TERMINATING]).replace(
+            let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).replace(
                 record,
                 &record.replace("onboard-ended=peer", "onboard-ended=forgotten"),
             );
@@ -526,7 +591,7 @@ mod tests {
             ended: OnboardEnd::Forgotten,
             forgotten: Count::Exactly(1),
         };
-        let text = capture(&[NETWORK, PORT, TERMINATING])
+        let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
             .replace("onboard-ended=peer", "onboard-ended=forgotten")
             .replace("onboard-forgotten=0", "onboard-forgotten=1");
         judge(
@@ -539,7 +604,7 @@ mod tests {
 
         // And a port that lost nothing under a station that reset is the
         // connection having been given up some other way.
-        let kept = capture(&[NETWORK, PORT, TERMINATING])
+        let kept = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
             .replace("onboard-ended=peer", "onboard-ended=forgotten");
         let verdict = judge(
             kept.as_bytes(),
@@ -553,7 +618,7 @@ mod tests {
 
     #[test]
     fn a_byte_count_short_of_what_the_station_delivered_is_refused() {
-        let text = capture(&[NETWORK, PORT, TERMINATING])
+        let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
             .replace("onboard-received=19", "onboard-received=11");
         let verdict = judge(
             text.as_bytes(),
@@ -568,8 +633,8 @@ mod tests {
 
     #[test]
     fn a_byte_answered_back_is_refused_though_nothing_answers_yet() {
-        let text =
-            capture(&[NETWORK, PORT, TERMINATING]).replace("onboard-sent=0", "onboard-sent=5");
+        let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
+            .replace("onboard-sent=0", "onboard-sent=5");
         let verdict = judge(
             text.as_bytes(),
             log(),
@@ -585,7 +650,7 @@ mod tests {
     #[test]
     fn the_item_count_is_a_floor_rather_than_an_equality() {
         for relayed in ["3", "4", "97"] {
-            let text = capture(&[NETWORK, PORT, TERMINATING])
+            let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
                 .replace("onboard-relayed=4", &format!("onboard-relayed={relayed}"));
             judge(
                 text.as_bytes(),
@@ -596,7 +661,7 @@ mod tests {
             .unwrap_or_else(|verdict| panic!("{relayed} items: {verdict}"));
         }
         for relayed in ["0", "2"] {
-            let text = capture(&[NETWORK, PORT, TERMINATING])
+            let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
                 .replace("onboard-relayed=4", &format!("onboard-relayed={relayed}"));
             let verdict = judge(
                 text.as_bytes(),
@@ -613,7 +678,7 @@ mod tests {
     /// about how many items crossed.
     #[test]
     fn two_domains_that_counted_different_item_runs_are_refused() {
-        let text = capture(&[NETWORK, PORT, TERMINATING]).replace(
+        let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).replace(
             "domain=crypto state=ready onboard-relayed=4",
             "domain=crypto state=ready onboard-relayed=5",
         );
@@ -629,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_second_accepted_connection_is_refused_as_one_that_became_no_session() {
-        let text = capture(&[NETWORK, PORT, TERMINATING])
+        let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD])
             .replace("onboard-accepted=1", "onboard-accepted=2");
         let verdict = judge(
             text.as_bytes(),
@@ -647,7 +712,7 @@ mod tests {
             ("onboard-overflowed=0", "onboard-overflowed=7", "overflowed"),
             ("onboard-refused=0", "onboard-refused=7", "refused"),
         ] {
-            let text = capture(&[NETWORK, PORT, TERMINATING]).replace(from, to);
+            let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).replace(from, to);
             let verdict = judge(
                 text.as_bytes(),
                 log(),
@@ -667,7 +732,7 @@ mod tests {
         let mut observed = account(OnboardBehaviour::Crowds);
         observed.crowd_answers = 1;
         let verdict = judge(
-            capture(&[NETWORK, PORT, TERMINATING]).as_bytes(),
+            capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).as_bytes(),
             log(),
             completed(),
             observed,
@@ -684,7 +749,7 @@ mod tests {
         let mut observed = account(OnboardBehaviour::Crowds);
         observed.crowded = false;
         let verdict = judge(
-            capture(&[NETWORK, PORT, TERMINATING]).as_bytes(),
+            capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).as_bytes(),
             log(),
             completed(),
             observed,
@@ -700,7 +765,7 @@ mod tests {
             (" onboard-sent=0", "onboard-sent"),
             (" onboard-relayed=4", "onboard-relayed"),
         ] {
-            let text = capture(&[NETWORK, PORT, TERMINATING]).replace(from, "");
+            let text = capture(&[NETWORK, PORT, TERMINATING, HANDSHAKE_RECORD]).replace(from, "");
             let verdict = judge(
                 text.as_bytes(),
                 log(),
@@ -720,6 +785,7 @@ mod tests {
             &NETWORK.replace("domain=management", "domain=recorder"),
             PORT,
             TERMINATING,
+            HANDSHAKE_RECORD,
         ]);
         let verdict = judge(
             text.as_bytes(),

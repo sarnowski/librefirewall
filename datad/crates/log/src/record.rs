@@ -51,7 +51,8 @@ const DIGEST_BYTES: usize = 32;
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, Primitive, RejectReason, Value,
+    ObjectKind, OnboardEnd, OnboardOutcome, Primitive, RejectReason, TlsIncompatible, TlsRefusal,
+    Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -97,6 +98,9 @@ pub enum Vocabulary {
     DialOutcome,
     NextHopVia,
     OnboardEnd,
+    OnboardOutcome,
+    TlsIncompatible,
+    TlsRefusal,
 }
 
 impl Vocabulary {
@@ -116,6 +120,9 @@ impl Vocabulary {
             Self::DialOutcome => DialOutcome::ALL.len(),
             Self::NextHopVia => NextHopVia::ALL.len(),
             Self::OnboardEnd => OnboardEnd::ALL.len(),
+            Self::OnboardOutcome => OnboardOutcome::ALL.len(),
+            Self::TlsIncompatible => TlsIncompatible::ALL.len(),
+            Self::TlsRefusal => TlsRefusal::ALL.len(),
         }
     }
 
@@ -135,6 +142,9 @@ impl Vocabulary {
             Self::DialOutcome => "dial outcome",
             Self::NextHopVia => "next hop choice",
             Self::OnboardEnd => "onboarding session end",
+            Self::OnboardOutcome => "onboarding handshake outcome",
+            Self::TlsIncompatible => "TLS incompatibility",
+            Self::TlsRefusal => "TLS refusal",
         }
     }
 }
@@ -191,6 +201,21 @@ fn next_hop_via_of(token: u8) -> Result<NextHopVia, DecodeError> {
 /// A session-end token as the member it selects, on the same terms.
 fn onboard_end_of(token: u8) -> Result<OnboardEnd, DecodeError> {
     variant(OnboardEnd::ALL, Vocabulary::OnboardEnd, token)
+}
+
+/// A handshake-outcome token as the member it selects, on the same terms.
+fn onboard_outcome_of(token: u8) -> Result<OnboardOutcome, DecodeError> {
+    variant(OnboardOutcome::ALL, Vocabulary::OnboardOutcome, token)
+}
+
+/// An incompatibility token as the member it selects, on the same terms.
+fn tls_incompatible_of(token: u8) -> Result<TlsIncompatible, DecodeError> {
+    variant(TlsIncompatible::ALL, Vocabulary::TlsIncompatible, token)
+}
+
+/// A refusal token as the member it selects, on the same terms.
+fn tls_refusal_of(token: u8) -> Result<TlsRefusal, DecodeError> {
+    variant(TlsRefusal::ALL, Vocabulary::TlsRefusal, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -546,6 +571,58 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::OnboardingPort.to_bits();
                     record.operands = [*accepted, *forgotten, *overflowed, *refused];
                 }
+                // The seven a handshake on the onboarding port produces. The
+                // outcome token takes the leading word, where every detail whose
+                // first word names a vocabulary carries it — `Dialled`'s own
+                // order — and what follows is the fact that outcome holds.
+                DomainDetail::OnboardingHandshake {
+                    outcome,
+                    version,
+                    suite,
+                    group,
+                } => {
+                    record.detail = LogDetailKind::OnboardingHandshake.to_bits();
+                    record.operands = [
+                        *outcome as u64,
+                        u64::from(*version),
+                        u64::from(*suite),
+                        u64::from(*group),
+                    ];
+                }
+                DomainDetail::OnboardingEnded { outcome } => {
+                    record.detail = LogDetailKind::OnboardingEnded.to_bits();
+                    record.operands = [*outcome as u64, 0, 0, 0];
+                }
+                DomainDetail::OnboardingIncompatible {
+                    outcome,
+                    incompatible,
+                } => {
+                    record.detail = LogDetailKind::OnboardingIncompatible.to_bits();
+                    record.operands = [*outcome as u64, *incompatible as u64, 0, 0];
+                }
+                DomainDetail::OnboardingRefused { outcome, refusal } => {
+                    record.detail = LogDetailKind::OnboardingRefused.to_bits();
+                    record.operands = [*outcome as u64, *refusal as u64, 0, 0];
+                }
+                DomainDetail::OnboardingAlert { outcome, alert } => {
+                    record.detail = LogDetailKind::OnboardingAlert.to_bits();
+                    record.operands = [*outcome as u64, u64::from(*alert), 0, 0];
+                }
+                DomainDetail::OnboardingBacklogged { outcome, held } => {
+                    record.detail = LogDetailKind::OnboardingBacklogged.to_bits();
+                    record.operands = [*outcome as u64, *held, 0, 0];
+                }
+                // The two offer records, whose points are wider than an operand
+                // and so cross packed four to a word, most significant first —
+                // the order a digest and an identifier already cross in.
+                DomainDetail::OnboardingSuites { points, offered } => {
+                    record.detail = LogDetailKind::OnboardingSuites.to_bits();
+                    record.operands = offer_words(points, *offered);
+                }
+                DomainDetail::OnboardingGroups { points, offered } => {
+                    record.detail = LogDetailKind::OnboardingGroups.to_bits();
+                    record.operands = offer_words(points, *offered);
+                }
                 DomainDetail::Delegated {
                     device,
                     signatures,
@@ -844,6 +921,55 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             overflowed: *overflowed,
             refused: *refused,
         },
+        // The seven a handshake produces. Each carries a token `wire` ranged to
+        // the vocabulary this crate then maps, so the only refusal any of them
+        // can earn is that mapping's — a token inside the ABI's bound naming no
+        // variant this build has.
+        CheckedDetail::OnboardingHandshake {
+            outcome,
+            version,
+            suite,
+            group,
+        } => DomainDetail::OnboardingHandshake {
+            outcome: onboard_outcome_of(*outcome)?,
+            version: *version,
+            suite: *suite,
+            group: *group,
+        },
+        CheckedDetail::OnboardingEnded { outcome } => DomainDetail::OnboardingEnded {
+            outcome: onboard_outcome_of(*outcome)?,
+        },
+        CheckedDetail::OnboardingIncompatible {
+            outcome,
+            incompatible,
+        } => DomainDetail::OnboardingIncompatible {
+            outcome: onboard_outcome_of(*outcome)?,
+            incompatible: tls_incompatible_of(*incompatible)?,
+        },
+        CheckedDetail::OnboardingRefused { outcome, refusal } => DomainDetail::OnboardingRefused {
+            outcome: onboard_outcome_of(*outcome)?,
+            refusal: tls_refusal_of(*refusal)?,
+        },
+        CheckedDetail::OnboardingAlert { outcome, alert } => DomainDetail::OnboardingAlert {
+            outcome: onboard_outcome_of(*outcome)?,
+            alert: *alert,
+        },
+        CheckedDetail::OnboardingBacklogged { outcome, held } => {
+            DomainDetail::OnboardingBacklogged {
+                outcome: onboard_outcome_of(*outcome)?,
+                held: *held,
+            }
+        }
+        // Total: `wire` unpacked eight code points out of two words, which every
+        // bit pattern of them is, and ranged the count to the width one has.
+        CheckedDetail::OnboardingSuites { points, offered } => DomainDetail::OnboardingSuites {
+            points: *points,
+            offered: *offered,
+        },
+        CheckedDetail::OnboardingGroups { points, offered } => DomainDetail::OnboardingGroups {
+            points: *points,
+            offered: *offered,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and both counts are tallies, so every bit pattern
         // of the four words is one a delegating domain could have read.
@@ -930,6 +1056,42 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     }
                     DomainDetail::Peer { device } => DomainDetail::Peer { device },
                     DomainDetail::Arena { bytes, bound } => DomainDetail::Arena { bytes, bound },
+                    DomainDetail::OnboardingHandshake {
+                        outcome,
+                        version,
+                        suite,
+                        group,
+                    } => DomainDetail::OnboardingHandshake {
+                        outcome,
+                        version,
+                        suite,
+                        group,
+                    },
+                    DomainDetail::OnboardingEnded { outcome } => {
+                        DomainDetail::OnboardingEnded { outcome }
+                    }
+                    DomainDetail::OnboardingIncompatible {
+                        outcome,
+                        incompatible,
+                    } => DomainDetail::OnboardingIncompatible {
+                        outcome,
+                        incompatible,
+                    },
+                    DomainDetail::OnboardingRefused { outcome, refusal } => {
+                        DomainDetail::OnboardingRefused { outcome, refusal }
+                    }
+                    DomainDetail::OnboardingAlert { outcome, alert } => {
+                        DomainDetail::OnboardingAlert { outcome, alert }
+                    }
+                    DomainDetail::OnboardingBacklogged { outcome, held } => {
+                        DomainDetail::OnboardingBacklogged { outcome, held }
+                    }
+                    DomainDetail::OnboardingSuites { points, offered } => {
+                        DomainDetail::OnboardingSuites { points, offered }
+                    }
+                    DomainDetail::OnboardingGroups { points, offered } => {
+                        DomainDetail::OnboardingGroups { points, offered }
+                    }
                     DomainDetail::Operation { primitive, cycles } => {
                         DomainDetail::Operation { primitive, cycles }
                     }
@@ -1134,6 +1296,27 @@ fn digest_words(digest: &[u8; DIGEST_BYTES]) -> [u64; LOG_OPERANDS] {
     words
 }
 
+/// An offer as the operand words it crosses in: eight code points packed four
+/// to a word, most significant first, and the number really offered in the
+/// third.
+///
+/// Total over the array: the zip stops at the shorter side and the shift is
+/// derived from the slot's own position, so no index can leave either.
+fn offer_words(points: &[u16; crate::MAX_OFFERED_POINTS], offered: u16) -> [u64; LOG_OPERANDS] {
+    let mut words = [0_u64; LOG_OPERANDS];
+    for (index, point) in points.iter().enumerate() {
+        let word = if index < 4 { 0 } else { 1 };
+        let shift = 48 - 16 * (index % 4);
+        if let Some(slot) = words.get_mut(word) {
+            *slot |= u64::from(*point) << shift;
+        }
+    }
+    if let Some(slot) = words.get_mut(2) {
+        *slot = u64::from(offered);
+    }
+    words
+}
+
 /// [`digest_words`]'s inverse, on the same terms.
 fn digest_bytes(words: &[u64; LOG_OPERANDS]) -> [u8; DIGEST_BYTES] {
     let mut digest = [0_u8; DIGEST_BYTES];
@@ -1159,6 +1342,10 @@ const _: () = {
     assert!(DialOutcome::ALL.len() == wire::LOG_DIAL_OUTCOME_COUNT as usize);
     assert!(NextHopVia::ALL.len() == wire::LOG_NEXT_HOP_VIA_COUNT as usize);
     assert!(OnboardEnd::ALL.len() == wire::LOG_ONBOARD_END_COUNT as usize);
+    assert!(OnboardOutcome::ALL.len() == wire::LOG_ONBOARD_OUTCOME_COUNT as usize);
+    assert!(TlsIncompatible::ALL.len() == wire::LOG_TLS_INCOMPATIBLE_COUNT as usize);
+    assert!(TlsRefusal::ALL.len() == wire::LOG_TLS_REFUSAL_COUNT as usize);
+    assert!(crate::MAX_OFFERED_POINTS == wire::LOG_OFFERED_POINTS);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);
     assert!(crate::MAX_CAUSE_LEN == wire::LOG_CAUSE_BYTES);

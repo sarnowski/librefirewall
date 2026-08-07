@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -58,7 +58,7 @@ written waits forever:
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` records carrying `delegated-signatures=` and `delegated-certificate=`, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain and whose certificate size must not have, one appliance having one certificate; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, one further `ready` per **onboarding session** this domain terminated, carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=` — and, where it refused one, a `ready` carrying the refusal group beside it. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` records carrying `delegated-signatures=` and `delegated-certificate=`, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain and whose certificate size must not have, one appliance having one certificate; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, per **onboarding session** this domain terminated: a `ready` carrying `onboard-tls=`, which says how the handshake on that session ended and carries whatever that ending holds — up to two more `ready` records with it where the ending is an offer this appliance had nothing in common with, or an arena that ran short — and then a `ready` carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`. Where it refused the session at the relay, a `ready` carrying the refusal group comes first. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -320,6 +320,115 @@ node: an operator holding a silent appliance still has only the external act.
   **No byte of the exchange reaches any of these records.** What the station said is a payload, and
   a payload reaches the two recording sinks and nowhere else; what an operator reads here is where
   the appliance went, what the link answered, and how the connection ended.
+- `onboard-tls=<outcome>` — **how the TLS handshake on one onboarding session ended.** One record
+  per session, written by the domain that terminates it, and it is the first thing to read when a
+  client will not connect: a deployed appliance has no shell and no log to fetch, so this line is
+  the whole of the diagnosis.
+
+  It carries whatever its outcome holds. A handshake that completed adds `onboard-tls-version=`,
+  `onboard-tls-suite=` and `onboard-tls-group=`, the three code points as the protocol registries
+  number them — code points rather than names for `tls-version=`'s reason, an operator comparing a
+  boot against a specification comparing numbers either way. An incompatibility adds
+  `onboard-tls-incompatible=`; a refusal this appliance decided adds `onboard-tls-error=`; an alert
+  a peer sent adds `onboard-tls-alert=`, again as the registry numbers it; a direction that outgrew
+  what a session holds adds `onboard-tls-held=`, the bytes it would have had to hold. An exhausted
+  arena adds nothing of its own and is followed by the `arena-bytes=` record, which is where this
+  appliance already states what was asked for against what was left.
+
+  **No key, no traffic secret and no byte of the session has a representation here, and none
+  ever will.** What a peer sent is its own; what this line carries is which protocol was settled on,
+  or which of ten ways it was not.
+
+  `onboard-tls=` is one of 10 handshake outcomes:
+
+  | handshake outcome | what it means |
+  |---|---|
+  | `established` | the handshake completed. The three code points beside it are what it settled on, and they are the only healthy line in this table. |
+  | `no-client-hello` | the peer opened the connection and **sent no byte at all**. A port scanner, a health check, or a client that could not start. |
+  | `incompatible` | the peer and this appliance had no protocol in common, decided before there was a suite or a group to compare. `onboard-tls-incompatible=` says which — most often a client too old to offer TLS 1.3. |
+  | `nothing-in-common` | the peer offered no cipher suite, or no key-exchange group, that this appliance has. The two records after it carry **what it did offer**, which is what an administrator compares against this appliance's one suite and one group. |
+  | `alert-received` | the peer gave up and said why. `onboard-tls-alert=` is the alert it sent, and the usual one is `0x0030` — the client does not trust the certificate, which is expected until its fingerprint has been compared against the console. |
+  | `refused` | **this appliance** refused the session. `onboard-tls-error=` says what it decided; a peer that is not speaking TLS at all reaches `invalid-message`. |
+  | `peer-closed` | the peer went away before the handshake completed. A client that timed out, a network that dropped, or a connection something else reset. |
+  | `arena-exhausted` | the bounded allocator had less than one phase's reserve free, so the session refused itself rather than faulting. The `arena-bytes=` record beside it says by how much. |
+  | `backlogged` | one direction of the session outgrew what it holds, and `onboard-tls-held=` is what it would have had to. A peer pacing this appliance rather than this appliance running out. |
+  | `stalled` | neither the library nor this appliance could make progress. **This appliance's own defect**, and it should never appear. |
+
+  `onboard-tls-incompatible=` is the adopted TLS library's own account of an offer, quoted rather
+  than folded into one token: a client with no TLS 1.3, one that sent no supported-versions
+  extension at all, and one whose suites this appliance does not have are three different things to
+  go and change. Several members of the list cannot arise on a server that offers one version, one
+  suite and one group and asks for no client certificate; they are listed because a partial mirror
+  of somebody else's vocabulary is one whose boundary has to keep being decided. It is one of 23
+  incompatibilities:
+
+  | incompatibility | what it means |
+  |---|---|
+  | `supported-versions-extension-required` | the client sent no supported-versions extension, which is what a client that has only ever spoken TLS 1.2 looks like. **The most likely line in this table**, and the fix is a newer client. |
+  | `no-cipher-suites-in-common` | none of the suites the client offered is the one this appliance has. |
+  | `no-kx-groups-in-common` | none of the key-exchange groups it offered is the one this appliance has. Post-quantum hybrid key exchange is required here, so a client without it reaches this. |
+  | `key-share-extension-required` | the client sent no key share. |
+  | `named-groups-extension-required` | the client named no key-exchange groups. |
+  | `signature-algorithms-extension-required` | the client named no signature algorithms. |
+  | `null-compression-required` | the client offered a compression method, which TLS 1.3 does not have. |
+  | `no-signature-schemes-in-common` | none of the signature schemes it offered is one this appliance signs with. |
+  | `ec-points-extension-required` | the client sent no elliptic-curve-point-formats extension where one was required. |
+  | `no-ec-point-formats-in-common` | it offered no point format in common. |
+  | `uncompressed-ec-points-required` | it offered only compressed elliptic-curve points. |
+  | `extended-master-secret-extension-required` | it sent no extended-master-secret extension. |
+  | `incorrect-certificate-type-extension` | its certificate-type extension named something unusable. |
+  | `unsolicited-certificate-type-extension` | it sent a certificate-type extension nothing asked for. |
+  | `no-certificate-request-signature-schemes-in-common` | it offered no signature scheme for a certificate request. |
+  | `tls12-not-offered` | TLS 1.2 was required and not offered. |
+  | `tls12-not-offered-or-enabled` | the same, where this end has it disabled. |
+  | `tls13-required-for-quic` | TLS 1.3 was required for QUIC and not offered. |
+  | `server-does-not-support-tls12-or13` | a server offered neither version. |
+  | `server-tls-version-is-disabled-by-our-config` | a server chose a version this end has disabled. |
+  | `server-sent-hello-retry-request-with-unknown-extension` | a server's retry request carried an extension this end does not know. |
+  | `server-rejected-encrypted-client-hello` | a server rejected the encrypted client hello. |
+  | `unrecognized` | **the library grew a member this build cannot name.** Read it as "this appliance cannot say", never as a diagnosis; the fix is a build that knows the newer library. |
+
+  `onboard-tls-error=` is that library's error vocabulary, and it is what **this end decided** rather
+  than the alert byte that went out beside it: the library exposes no outgoing alert on this path,
+  so a table from one to the other would be a claim about somebody else's behaviour that a version
+  bump could falsify with nothing failing. It stops at the top-level variant, because the
+  vocabularies nested under several of them separate causes an administrator answers identically —
+  the peer is not speaking this protocol correctly. It is one of 23 refusals:
+
+  | refusal | what it means |
+  |---|---|
+  | `invalid-message` | the peer sent something that is not a well-formed TLS message. **A peer speaking some other protocol to this port reaches this**, and so does a middlebox rewriting the stream. |
+  | `peer-misbehaved` | the peer kept to the syntax and departed from the protocol. |
+  | `inappropriate-message` | a message arrived that is not valid at this point in the exchange. |
+  | `inappropriate-handshake-message` | the same, for a handshake message. |
+  | `decrypt-error` | a record would not decrypt. On an established session this is a peer whose keys have diverged from this appliance's. |
+  | `encrypt-error` | this appliance could not encrypt a record it had to send. **Its own defect.** |
+  | `peer-sent-oversized-record` | the peer sent a record longer than the protocol allows. |
+  | `no-certificates-presented` | no certificate was presented where one was required. |
+  | `invalid-certificate` | a certificate would not validate. |
+  | `invalid-cert-revocation-list` | a revocation list would not validate. |
+  | `unsupported-name-type` | a name of a kind this appliance's verifier does not handle. |
+  | `invalid-encrypted-client-hello` | the encrypted client hello would not process. |
+  | `no-application-protocol` | no application protocol was agreed. |
+  | `bad-max-fragment-size` | a maximum-fragment-size value outside what the protocol allows. |
+  | `handshake-not-complete` | something was asked of the session that only an established one can answer. **This appliance's own defect.** |
+  | `failed-to-get-current-time` | the time could not be read. This appliance's clock domain is what to look at. |
+  | `failed-to-get-random-bytes` | the generator would not answer. This appliance's own cryptography domain is what to look at, and its boot records say why. |
+  | `inconsistent-keys` | the certificate and the signing key do not belong together. **The two halves of this appliance's identity disagree** — read it beside the `domain=store` records. |
+  | `peer-incompatible` | an incompatibility that reached this vocabulary rather than its own. It should not appear: such a failure is reported as `onboard-tls=incompatible` with a token of its own. |
+  | `alert-received` | as above, for an alert. It should not appear either, for the same reason. |
+  | `general` | the library had no better name for it. |
+  | `other` | a failure a provider reported, which the library passes on unnamed. |
+  | `unrecognized` | **the library grew a member this build cannot name**, on the incompatibility table's terms. |
+- `onboard-tls-suites=<…> onboard-tls-suites-offered=<n>` and `onboard-tls-groups=<…>
+  onboard-tls-groups-offered=<n>` — **what a client offered**, written only beside a
+  `nothing-in-common` outcome. The two lists are code points as the registries number them,
+  comma-separated, and `none` where the client listed nothing at all rather than an empty field a
+  reader cannot look up. The `-offered=` count is **how many the client really listed**, which may
+  be more than the list beside it holds: a record keeps the first eight of each, so a client with a
+  long list is reported as the first eight of it and the number it really sent. What to do with them
+  is compare them against what this appliance has — one suite and one group — which the
+  `crypto-profile` chapter states.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -349,7 +458,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 19 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 47 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 48 the `crypto` domain
 raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -517,6 +626,7 @@ of a vector's contents.
 | the bounded allocator's own proof (`detail=` is the refusal count for the first and the headroom that was left for the last; the middle carries none) | `arena-allocation-refused`, `arena-starvation-unreachable`, `starved-session-established` |
 | the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid` and the certificate's length on `delegated-certificate-not-the-key`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid`, `delegated-certificate-unanswered`, `delegated-certificate-refused`, `delegated-certificate-faulted`, `delegated-certificate-not-the-key` |
 | the onboarding session this domain terminates, refused at the relay carrying it (`detail=` is the operation that named a session there was none of, or the length that was past what one item may carry; the rest carry none) | `relay-no-connection`, `relay-payload-too-long`, `relay-no-such-operation`, `relay-session-failed` |
+| a session opened on a boot whose cryptography never established (a `ready` record, no `detail=`) | `onboarding-cryptography-unproven` |
 
 **The `delegated-*` group is about the other domain**, and it is the one group here whose subject is
 not this domain's own code. This appliance's private key lives in the domain that owns the medium it

@@ -349,6 +349,59 @@ fn every_domain_detail_shape_survives_the_crossing() {
             claimed: u32::MAX,
             expected: 1,
         },
+        // The onboarding port's two, and the seven a handshake on it produces.
+        // No two fields of one shape are equal here for the channel's reason:
+        // a field read out of the wrong operand word survives a symmetric
+        // fixture and nothing else.
+        DomainDetail::Onboarded {
+            relayed: 4,
+            received: 19,
+            sent: 7,
+            ended: OnboardEnd::Consumer,
+        },
+        DomainDetail::OnboardingPort {
+            accepted: 1,
+            forgotten: 2,
+            overflowed: 3,
+            refused: u64::MAX,
+        },
+        DomainDetail::OnboardingHandshake {
+            outcome: OnboardOutcome::Established,
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        },
+        DomainDetail::OnboardingEnded {
+            outcome: OnboardOutcome::PeerClosed,
+        },
+        DomainDetail::OnboardingIncompatible {
+            outcome: OnboardOutcome::NothingInCommon,
+            incompatible: TlsIncompatible::NoKxGroupsInCommon,
+        },
+        DomainDetail::OnboardingRefused {
+            outcome: OnboardOutcome::Refused,
+            refusal: TlsRefusal::InvalidMessage,
+        },
+        DomainDetail::OnboardingAlert {
+            outcome: OnboardOutcome::AlertReceived,
+            alert: 0x0030,
+        },
+        DomainDetail::OnboardingBacklogged {
+            outcome: OnboardOutcome::Backlogged,
+            held: 33_291,
+        },
+        DomainDetail::OnboardingSuites {
+            points: [
+                0x1301, 0x1302, 0x1303, 0x1304, 0x1305, 0x1306, 0x1307, 0x1308
+            ],
+            offered: 40,
+        },
+        DomainDetail::OnboardingGroups {
+            points: [
+                0x001d, 0x0017, 0x0018, 0x0019, 0x001e, 0x0100, 0x0101, 0x11ec
+            ],
+            offered: 8,
+        },
     ];
     for operands in [
         RefusalDetail::None,
@@ -875,6 +928,47 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
         ),
         any::<(u32, u32)>()
             .prop_map(|(claimed, expected)| DomainDetail::DialSequence { claimed, expected }),
+        (any::<(u64, u64, u64)>(), pick(OnboardEnd::ALL)).prop_map(
+            |((relayed, received, sent), ended)| DomainDetail::Onboarded {
+                relayed,
+                received,
+                sent,
+                ended,
+            }
+        ),
+        any::<(u64, u64, u64, u64)>().prop_map(|(accepted, forgotten, overflowed, refused)| {
+            DomainDetail::OnboardingPort {
+                accepted,
+                forgotten,
+                overflowed,
+                refused,
+            }
+        }),
+        (pick(OnboardOutcome::ALL), any::<(u16, u16, u16)>()).prop_map(
+            |(outcome, (version, suite, group))| DomainDetail::OnboardingHandshake {
+                outcome,
+                version,
+                suite,
+                group,
+            }
+        ),
+        pick(OnboardOutcome::ALL).prop_map(|outcome| DomainDetail::OnboardingEnded { outcome }),
+        (pick(OnboardOutcome::ALL), pick(TlsIncompatible::ALL)).prop_map(
+            |(outcome, incompatible)| DomainDetail::OnboardingIncompatible {
+                outcome,
+                incompatible,
+            }
+        ),
+        (pick(OnboardOutcome::ALL), pick(TlsRefusal::ALL))
+            .prop_map(|(outcome, refusal)| DomainDetail::OnboardingRefused { outcome, refusal }),
+        (pick(OnboardOutcome::ALL), any::<u16>())
+            .prop_map(|(outcome, alert)| DomainDetail::OnboardingAlert { outcome, alert }),
+        (pick(OnboardOutcome::ALL), any::<u64>())
+            .prop_map(|(outcome, held)| DomainDetail::OnboardingBacklogged { outcome, held }),
+        any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()
+            .prop_map(|(points, offered)| DomainDetail::OnboardingSuites { points, offered }),
+        any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()
+            .prop_map(|(points, offered)| DomainDetail::OnboardingGroups { points, offered }),
         (
             any_cause(),
             prop_oneof![

@@ -493,6 +493,7 @@ name = "lfw-tls"
 version = "0.1.0"
 dependencies = [
  "lfw-crypto",
+ "lfw-log",
  "lfw-x509",
  "rustls",
 ]

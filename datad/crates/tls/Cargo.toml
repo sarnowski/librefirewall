@@ -9,6 +9,12 @@ license.workspace = true
 [dependencies]
 lfw-crypto = { path = "../crypto" }
 lfw-x509 = { path = "../x509" }
+# The console vocabulary an onboarding handshake's outcome is reported in. It is
+# here rather than in the protection domain that emits the records because the
+# mapping is from the adopted library's two error vocabularies, which only this
+# crate sees — and putting it here is what makes it host-testable arm by arm.
+# The dependency runs this way and never back: `lfw-log` reaches for no TLS.
+lfw-log = { path = "../log" }
 # TLS itself. `default-features = false` drops `std`, the aws-lc-rs provider
 # and its C toolchain, TLS 1.2, and the logging facade; `custom-provider` is
 # how rustls is told that the provider comes from here and that no process-wide

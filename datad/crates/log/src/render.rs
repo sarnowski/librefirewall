@@ -151,6 +151,36 @@ fn write_stamp(at: Stamp, cursor: &mut Cursor<'_>) -> fmt::Result {
 /// The `cause` key, named because its width decides whether a cause was written.
 const CAUSE_KEY: &str = " cause=";
 
+/// One offer list as its own field: the code points a client listed, comma
+/// separated, bounded by what the record holds rather than by what the client
+/// claimed.
+///
+/// `offered` is the client's own number and may exceed the storage beside it,
+/// which is the whole reason it is on the record — so it bounds nothing here
+/// and only says how much of the offer was kept.
+fn write_offer(
+    cursor: &mut Cursor<'_>,
+    key: &str,
+    points: &[u16; crate::MAX_OFFERED_POINTS],
+    offered: u16,
+) -> fmt::Result {
+    cursor.write_str(key)?;
+    let kept = usize::from(offered).min(points.len());
+    let Some(listed) = points.get(..kept) else {
+        return cursor.write_str("none");
+    };
+    if listed.is_empty() {
+        return cursor.write_str("none");
+    }
+    for (index, point) in listed.iter().enumerate() {
+        if index > 0 {
+            cursor.write_str(",")?;
+        }
+        write!(cursor, "0x{point:04x}")?;
+    }
+    Ok(())
+}
+
 /// The tail of an `LFW-PD` line, absent for the lifecycle points that carry
 /// nothing: a record ending in an empty field reads as a missing value.
 fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'_>) -> fmt::Result {
@@ -350,6 +380,53 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " onboard-accepted={accepted} onboard-forgotten={forgotten} \
              onboard-overflowed={overflowed} onboard-refused={refused}"
         ),
+        // The seven a handshake on that port produces, all under one
+        // `onboard-tls=` key so a boot's whole onboarding story is one grep —
+        // the `dial-` group's reason on the other port. The code points are
+        // written as the registries number them, four hexadecimal digits with
+        // the prefix, exactly as `tls-version=` and `tls-suite=` are above:
+        // three renderings of one kind of value must not be three formats.
+        DomainDetail::OnboardingHandshake {
+            outcome,
+            version,
+            suite,
+            group,
+        } => write!(
+            cursor,
+            " onboard-tls={outcome} onboard-tls-version=0x{version:04x} \
+             onboard-tls-suite=0x{suite:04x} onboard-tls-group=0x{group:04x}"
+        ),
+        DomainDetail::OnboardingEnded { outcome } => write!(cursor, " onboard-tls={outcome}"),
+        DomainDetail::OnboardingIncompatible {
+            outcome,
+            incompatible,
+        } => write!(
+            cursor,
+            " onboard-tls={outcome} onboard-tls-incompatible={incompatible}"
+        ),
+        DomainDetail::OnboardingRefused { outcome, refusal } => {
+            write!(cursor, " onboard-tls={outcome} onboard-tls-error={refusal}")
+        }
+        DomainDetail::OnboardingAlert { outcome, alert } => write!(
+            cursor,
+            " onboard-tls={outcome} onboard-tls-alert=0x{alert:04x}"
+        ),
+        DomainDetail::OnboardingBacklogged { outcome, held } => {
+            write!(cursor, " onboard-tls={outcome} onboard-tls-held={held}")
+        }
+        // The two offer records. The list is comma-separated inside one field,
+        // which the grammar already carries for a refusal's number pair, and it
+        // is spelled `none` rather than left empty where the client listed
+        // nothing — a value-less key is the one shape a reader looking keys up
+        // cannot read.
+        DomainDetail::OnboardingSuites { points, offered } => {
+            write_offer(cursor, " onboard-tls-suites=", points, *offered)?;
+            write!(cursor, " onboard-tls-suites-offered={offered}")
+        }
+        DomainDetail::OnboardingGroups { points, offered } => {
+            write_offer(cursor, " onboard-tls-groups=", points, *offered)?;
+            write!(cursor, " onboard-tls-groups-offered={offered}")
+        }
         // Decimal, unlike a refusal's hexadecimal numbers below: these are
         // sequence numbers, and a peer's own capture and this appliance's
         // console are compared digit for digit.
@@ -415,7 +492,7 @@ mod tests {
     use crate::event::Primitive;
     use crate::event::{
         ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, NextHopVia,
-        ObjectKind, RejectReason, Value,
+        ObjectKind, OnboardEnd, OnboardOutcome, RejectReason, TlsIncompatible, TlsRefusal, Value,
     };
     use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
     use net_headers::{Ipv4Address, MacAddress};
@@ -1418,6 +1495,51 @@ mod tests {
                 claimed: u32::MAX,
                 expected: u32::MAX,
             },
+            DomainDetail::Onboarded {
+                relayed: u64::MAX,
+                received: u64::MAX,
+                sent: u64::MAX,
+                ended: OnboardEnd::Forgotten,
+            },
+            DomainDetail::OnboardingPort {
+                accepted: u64::MAX,
+                forgotten: u64::MAX,
+                overflowed: u64::MAX,
+                refused: u64::MAX,
+            },
+            DomainDetail::OnboardingHandshake {
+                outcome: OnboardOutcome::NothingInCommon,
+                version: u16::MAX,
+                suite: u16::MAX,
+                group: u16::MAX,
+            },
+            DomainDetail::OnboardingEnded {
+                outcome: OnboardOutcome::NothingInCommon,
+            },
+            DomainDetail::OnboardingIncompatible {
+                outcome: OnboardOutcome::NothingInCommon,
+                incompatible: TlsIncompatible::ServerSentHelloRetryRequestWithUnknownExtension,
+            },
+            DomainDetail::OnboardingRefused {
+                outcome: OnboardOutcome::NothingInCommon,
+                refusal: TlsRefusal::InappropriateHandshakeMessage,
+            },
+            DomainDetail::OnboardingAlert {
+                outcome: OnboardOutcome::NothingInCommon,
+                alert: u16::MAX,
+            },
+            DomainDetail::OnboardingBacklogged {
+                outcome: OnboardOutcome::NothingInCommon,
+                held: u64::MAX,
+            },
+            DomainDetail::OnboardingSuites {
+                points: [u16::MAX; crate::MAX_OFFERED_POINTS],
+                offered: u16::MAX,
+            },
+            DomainDetail::OnboardingGroups {
+                points: [u16::MAX; crate::MAX_OFFERED_POINTS],
+                offered: u16::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -1543,6 +1665,69 @@ mod tests {
             ),
             any::<(u32, u32)>()
                 .prop_map(|(claimed, expected)| DomainDetail::DialSequence { claimed, expected }),
+            (any::<(u64, u64, u64)>(), (0..OnboardEnd::ALL.len())).prop_map(
+                |((relayed, received, sent), ended)| DomainDetail::Onboarded {
+                    relayed,
+                    received,
+                    sent,
+                    ended: OnboardEnd::ALL[ended],
+                }
+            ),
+            any::<(u64, u64, u64, u64)>().prop_map(|(accepted, forgotten, overflowed, refused)| {
+                DomainDetail::OnboardingPort {
+                    accepted,
+                    forgotten,
+                    overflowed,
+                    refused,
+                }
+            }),
+            ((0..OnboardOutcome::ALL.len()), any::<(u16, u16, u16)>(),).prop_map(
+                |(outcome, (version, suite, group))| {
+                    DomainDetail::OnboardingHandshake {
+                        outcome: OnboardOutcome::ALL[outcome],
+                        version,
+                        suite,
+                        group,
+                    }
+                }
+            ),
+            (0..OnboardOutcome::ALL.len()).prop_map(|outcome| DomainDetail::OnboardingEnded {
+                outcome: OnboardOutcome::ALL[outcome],
+            }),
+            (
+                (0..OnboardOutcome::ALL.len()),
+                (0..TlsIncompatible::ALL.len()),
+            )
+                .prop_map(|(outcome, incompatible)| {
+                    DomainDetail::OnboardingIncompatible {
+                        outcome: OnboardOutcome::ALL[outcome],
+                        incompatible: TlsIncompatible::ALL[incompatible],
+                    }
+                }),
+            ((0..OnboardOutcome::ALL.len()), (0..TlsRefusal::ALL.len()),).prop_map(
+                |(outcome, refusal)| DomainDetail::OnboardingRefused {
+                    outcome: OnboardOutcome::ALL[outcome],
+                    refusal: TlsRefusal::ALL[refusal],
+                }
+            ),
+            ((0..OnboardOutcome::ALL.len()), any::<u16>()).prop_map(|(outcome, alert)| {
+                DomainDetail::OnboardingAlert {
+                    outcome: OnboardOutcome::ALL[outcome],
+                    alert,
+                }
+            }),
+            ((0..OnboardOutcome::ALL.len()), any::<u64>()).prop_map(|(outcome, held)| {
+                DomainDetail::OnboardingBacklogged {
+                    outcome: OnboardOutcome::ALL[outcome],
+                    held,
+                }
+            }),
+            any::<([u16; crate::MAX_OFFERED_POINTS], u16)>().prop_map(|(points, offered)| {
+                DomainDetail::OnboardingSuites { points, offered }
+            }),
+            any::<([u16; crate::MAX_OFFERED_POINTS], u16)>().prop_map(|(points, offered)| {
+                DomainDetail::OnboardingGroups { points, offered }
+            }),
             (
                 (0..causes.len()),
                 prop_oneof![

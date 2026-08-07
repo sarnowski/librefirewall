@@ -93,6 +93,7 @@ use crate::dial_contract;
 use crate::management_contract::{self, ManagementInjection};
 use crate::metrics_contract::{self, Scrape};
 use crate::onboard_contract;
+use crate::onboard_tls_contract;
 use crate::qemu::{GuestNic, every_guest_nic};
 use crate::recording_contract::{self, Download};
 use crate::surface_contract::Injected;
@@ -391,22 +392,48 @@ const ONBOARD_CROWD_ISN: u32 = 0x5e02_c100;
 /// The window the onboarding station advertises.
 ///
 /// Larger than anything it sends, so nothing this station does is ever paced by
-/// its own receive window: what the appliance answers with on this port is
-/// nothing at all today, and a window that could refuse a byte would make that
-/// fact unreadable.
+/// its own receive window: what the appliance answers a *half* record with is
+/// nothing at all, and a window that could refuse a byte would make that fact
+/// unreadable.
 const ONBOARD_WINDOW: u16 = 8192;
 
 /// What one onboarding session carries, in one segment.
 ///
-/// A first-party marker of the harness's own, and deliberately not a fragment of
-/// any protocol: nothing above this port's transport exists yet, so a payload
-/// shaped like a handshake would suggest one was being spoken. What is asserted
-/// about it is its **length**, at both ends of the relay and in both domains'
-/// accounts, so the one property it needs is to be a length no bound of the path
-/// rounds off — it is far inside [`pd_runtime::ONBOARD_INBOUND_CAPACITY`] and
-/// inside one relay item, so a session that carried it carried all of it in one
-/// handover.
-const ONBOARD_PAYLOAD: &[u8] = b"LFW-ONBOARD/1 hello";
+/// **The opening of a TLS record and not the whole of one**, which is the one
+/// shape that lets these three boots go on being about what they are about. A
+/// TLS server now stands behind this port, so a payload that is not a record at
+/// all is refused the moment it lands and the session ends by this appliance's
+/// own decision — which would take the endings these boots exist to prove away
+/// from them. A record whose header declares more than arrives is held instead,
+/// unanswered and undecided, so the station keeps deciding how each session
+/// ends. What each *failure* looks like is proved on a boot of its own
+/// ([`crate::onboard_tls_contract`]), by real clients.
+///
+/// Nineteen bytes: the five-byte record header of a handshake record declaring
+/// 1024 bytes, the four-byte header of a client hello inside it, and the first
+/// ten of that hello. What is asserted about it is its **length**, at both ends
+/// of the relay and in both domains' accounts, so the property it needs beyond
+/// being incomplete is to be a length no bound of the path rounds off — it is
+/// far inside [`pd_runtime::ONBOARD_INBOUND_CAPACITY`] and inside one relay
+/// item, so a session that carried it carried all of it in one handover.
+const ONBOARD_PAYLOAD: &[u8] = &[
+    0x16, 0x03, 0x01, 0x04, 0x00, // handshake record, 1024 bytes declared
+    0x01, 0x00, 0x03, 0xfc, // client hello, 1020 bytes declared
+    0x03, 0x03, // the legacy version every TLS 1.3 hello still carries
+    0x4c, 0x46, 0x57, 0x2d, 0x4f, 0x4e, 0x42, 0x44, // ten bytes of its random
+];
+
+/// Wakeups a boot spends waiting for the appliance to finish reporting the
+/// handshakes real clients drew out of it.
+///
+/// [`ONBOARD_NUDGE_LIMIT`]'s reasoning with a different wakeup: there is no
+/// station on this wire to put a frame on it, so what wakes the domain is a
+/// request on the port's *other* surface, which the appliance answers and which
+/// costs the run a scrape it discards. Far more than a healthy boot needs — the
+/// records are usually there on the first look — because the cost of being
+/// wrong is asymmetric: a few spare requests against a run that reports a
+/// domain as silent when it was one wakeup from speaking.
+const ONBOARD_HANDSHAKE_NUDGES: usize = 256;
 
 /// Frames the onboarding station will spend keeping the port awake while it
 /// waits for the appliance to finish a session and report it.
@@ -3023,10 +3050,14 @@ pub struct BootTest<'a> {
     /// port behaves — the onboarding port, which carries a byte stream rather
     /// than a request.
     ///
-    /// Every boot but the three whose subject it is opens nothing there, and not
+    /// Every boot but the four whose subject it is opens nothing there, and not
     /// out of economy: the port holds one connection at a time, so a session on
     /// every boot would put one beside every other contract this harness states.
-    pub onboard: OnboardBehaviour,
+    ///
+    /// The whole contract rather than the station's behaviour alone, because the
+    /// fourth of those boots has no station: it lets real clients onto the wire
+    /// through a forwarded host port, which is a different thing to be told.
+    pub onboard: crate::qemu::OnboardContract,
     /// Whether QEMU is executing the guest on hardware rather than emulating
     /// it. Carried through to [`Booted`] because one judge needs it and cannot
     /// re-derive it honestly: a cycle count taken under emulation measures the
@@ -3048,14 +3079,20 @@ pub enum ManagementBacking {
     /// A host-controlled socket. The harness composes and decodes every frame,
     /// which is what makes the ARP, ICMP and TCP contracts field comparisons.
     Socket,
-    /// QEMU's user-mode (SLIRP) stack with a host port forward to the
-    /// endpoint's own address and port, so `curl` — a client nothing in this
-    /// repository wrote — can be pointed at it. Nothing at frame level is
-    /// asserted on this wire: the harness never sees one.
+    /// QEMU's user-mode (SLIRP) stack with a host port forward to **each** of
+    /// the two ports the endpoint listens on, so `curl` and `openssl` — clients
+    /// nothing in this repository wrote — can be pointed at them. Nothing at
+    /// frame level is asserted on this wire: the harness never sees one.
     UserNetwork {
-        /// The loopback port on the host side of the forward, reserved by
-        /// [`reserve_host_port`] before QEMU is told about it.
+        /// The loopback port on the host side of the forward to the request
+        /// surface, reserved by [`reserve_host_port`] before QEMU is told about
+        /// it.
         host_port: u16,
+        /// The same, for the onboarding port. Both forwards exist on every
+        /// user-mode boot rather than one per scenario: a forward nothing dials
+        /// costs a line of QEMU's command and carries nothing, and a backing
+        /// whose shape depended on the contract would be two backings.
+        onboard_port: u16,
     },
 }
 
@@ -3118,9 +3155,18 @@ impl NicBackends {
     pub fn apply(&self, command: &mut Command, topology: &Topology) -> Result<(), String> {
         for nic in every_guest_nic() {
             let netdev = match (nic, self.management) {
-                (GuestNic::Management, ManagementBacking::UserNetwork { host_port }) => {
-                    user_netdev(&nic.netdev_id(), &topology.management(), host_port)
-                }
+                (
+                    GuestNic::Management,
+                    ManagementBacking::UserNetwork {
+                        host_port,
+                        onboard_port,
+                    },
+                ) => user_netdev(
+                    &nic.netdev_id(),
+                    &topology.management(),
+                    host_port,
+                    onboard_port,
+                ),
                 _ => {
                     let listener = self
                         .listeners
@@ -3151,13 +3197,15 @@ impl NicBackends {
 /// from it, and the endpoint refuses an off-link sender), and the endpoint's own
 /// address as the forward's target. A literal here would be a bench stated
 /// against an address the appliance might not have.
-fn user_netdev(id: &str, management: &ManagementPort, host_port: u16) -> String {
+fn user_netdev(id: &str, management: &ManagementPort, host_port: u16, onboard_port: u16) -> String {
+    let endpoint = ipv4(management.address);
     format!(
-        "user,id={id},net={}/{},host={},hostfwd=tcp:127.0.0.1:{host_port}-{}:{MANAGEMENT_TCP_PORT}",
+        "user,id={id},net={}/{},host={},hostfwd=tcp:127.0.0.1:{host_port}-{endpoint}:\
+         {MANAGEMENT_TCP_PORT},hostfwd=tcp:127.0.0.1:{onboard_port}-{endpoint}:{}",
         ipv4(management.network()),
         management.prefix_length,
         ipv4(management.station),
-        ipv4(management.address),
+        pd_runtime::ONBOARDING_PORT,
     )
 }
 
@@ -5959,6 +6007,10 @@ pub struct Booted {
     /// What the re-decision that commit armed did to the conversations already
     /// running, on the one scenario that states it. `None` everywhere else.
     pub revoked: Option<crate::config_submission_contract::Revoked>,
+    /// What every real client this boot ran against the onboarding port made of
+    /// it, in the order it ran them. Empty on every boot whose subject is
+    /// something else.
+    pub handshakes: Vec<onboard_tls_contract::Attempt>,
     /// What the station this harness played on the onboarding port observed, on
     /// the three scenarios that open a session there. `None` everywhere else.
     ///
@@ -6073,6 +6125,7 @@ fn run_boot(
     let mut dataplane_frames: u64 = 0;
     let mut scrapes: Vec<Scrape> = Vec::new();
     let mut recordings: Vec<Download> = Vec::new();
+    let mut handshakes: Vec<onboard_tls_contract::Attempt> = Vec::new();
     // What the configuration submission proved, on the one scenario that makes one.
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
@@ -6163,7 +6216,7 @@ fn run_boot(
                     wire: stream,
                     injection_failure: None,
                     station: DialStation::new(test.dial.misbehaviour()),
-                    onboard: OnboardStation::new(test.onboard),
+                    onboard: OnboardStation::new(test.onboard.behaviour()),
                     arp_reply: false,
                     echo_reply: false,
                     client: TcpClient::new(),
@@ -6652,7 +6705,7 @@ fn run_boot(
                             && wave == Wave::Shipped
                             && probes.iter().any(|probe| probe.wave == Wave::Submitted) =>
                     {
-                        let ManagementBacking::UserNetwork { host_port } = backends.management
+                        let ManagementBacking::UserNetwork { host_port, .. } = backends.management
                         else {
                             break 'run Err(String::from(
                                 "a reconfiguration scenario must be on the user-mode backing: the \
@@ -6748,7 +6801,10 @@ fn run_boot(
                             && management.is_none()
                             && scrapes.is_empty() =>
                     {
-                        let ManagementBacking::UserNetwork { host_port } = backends.management
+                        let ManagementBacking::UserNetwork {
+                            host_port,
+                            onboard_port,
+                        } = backends.management
                         else {
                             break 'run Err(String::from(
                                 "a boot with no management socket must be on the user-mode \
@@ -6811,6 +6867,62 @@ fn run_boot(
                                         log_path.display()
                                     ));
                                 }
+                            }
+                        }
+                        // And, where the scenario's subject is the *other*
+                        // port, the clients that reach it. After the three
+                        // surfaces above, so a boot that failed one of them
+                        // fails for that rather than for a handshake, and
+                        // through the same forward: what an administrator runs
+                        // is a TLS client, and a handshake this harness composed
+                        // itself would prove only that the appliance agrees with
+                        // the appliance.
+                        if test.onboard.handshakes() {
+                            let driven = onboard_tls_contract::drive(onboard_port, || {
+                                onboard_tls_contract::nudge(host_port)
+                            });
+                            match driven {
+                                Ok(made) => handshakes = made,
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                            // And then wait for the appliance to have said its
+                            // piece. The last session's account is written on a
+                            // pass that runs after its client's connection is
+                            // gone, so a run that stopped when the last client
+                            // exited would kill the guest mid-record and report
+                            // a domain that was about to speak as one that never
+                            // did. Bounded by a number of wakeups rather than by
+                            // a length of time, so an emulated boot and an
+                            // accelerated one spend the same budget.
+                            let mut reported = false;
+                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                                drain(&serial_receiver, &mut output);
+                                if onboard_tls_contract::reported(&output) {
+                                    reported = true;
+                                    break;
+                                }
+                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                            drain(&serial_receiver, &mut output);
+                            if !reported && !onboard_tls_contract::reported(&output) {
+                                break 'run Err(format!(
+                                    "the appliance had not finished reporting the handshakes this \
+                                     boot drove after {ONBOARD_HANDSHAKE_NUDGES} wakeups. A \
+                                     session's account is written on the pass that ends it, so \
+                                     this is a domain that stopped answering the relay rather \
+                                     than one that had nothing to say; see {}",
+                                    log_path.display()
+                                ));
                             }
                         }
                         scrapes = fetched;
@@ -7181,6 +7293,7 @@ fn run_boot(
         dataplane_frames,
         policy,
         recordings,
+        handshakes,
         applied,
         revoked,
         onboard: onboarded,
@@ -7468,7 +7581,7 @@ mod tests {
     fn routed_test<'a>(log: &'a Path, topology: &'a Topology) -> BootTest<'a> {
         BootTest {
             dial: crate::qemu::DialContract::Answered,
-            onboard: OnboardBehaviour::Untouched,
+            onboard: crate::qemu::OnboardContract::Untouched,
             contract: BootContract::Routed,
             log_path: log,
             log_header: HEADER,

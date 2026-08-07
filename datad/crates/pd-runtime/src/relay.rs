@@ -653,6 +653,16 @@ pub const DEMANDS_PER_WAKEUP: usize = 2;
 /// inside this can still meet a stream that has unsent bytes in it, and that is
 /// [`RelayFailure::AnswerTooLong`]: one session ended, the peer whose own
 /// session stopped being read being the party that caused it.
+///
+/// **That stands**, now that a protocol really answers here and the case is
+/// reachable rather than hypothetical. What a peer can provoke by not reading
+/// is bounded — one answer's worth past a stream it stopped draining — typed,
+/// and confined to the session it opened; no other session, no other port and
+/// no other domain is touched, and the peer that caused it is the one that
+/// loses. Widening the ABI with a free-space word would put a number the
+/// network end writes and this end acts on into a path that has none today, to
+/// convert a self-inflicted refusal into a slower one. The refusal is the
+/// better answer.
 const ANSWER_ROOM: usize = lfw_ip_endpoint::onboard::OUTBOUND_CAPACITY;
 
 const _: () = assert!(ANSWER_ROOM <= MAX_RELAY_PAYLOAD);
@@ -798,6 +808,17 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             records: [0; MAX_RELAY_PAYLOAD],
             answer: [0; ANSWER_ROOM],
         }
+    }
+
+    /// The protocol behind this end.
+    ///
+    /// A protocol has things to say that the relay's own account cannot — how a
+    /// handshake ended, and why — and it says them to a console this crate
+    /// cannot reach: a sink belongs to the protection domain, and handing one
+    /// to every relay would make this module a logger. So the protocol keeps
+    /// what it has to say and the domain takes it, which is what this is for.
+    pub const fn terminator(&mut self) -> &mut T {
+        &mut self.terminator
     }
 
     /// The outstanding item, if the network end has written one this end has not

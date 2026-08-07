@@ -260,17 +260,23 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
         ));
     }
 
+    // The bring-up's own `ready`, which is the one with nothing after the state:
+    // this domain finishes bring-up once and says so once. It no longer parks
+    // there — it goes on to answer the relay, and every onboarding session it
+    // carries leaves `ready` records of its own — so what is counted is the
+    // bare one rather than every record in the state, and several of *those*
+    // would still mean something else is writing its ring.
     let ready = field("state", DomainState::Ready.name());
     let complete: Vec<&&str> = ours
         .iter()
-        .filter(|record| record.contains(&ready))
+        .filter(|record| record.trim_end().ends_with(ready.trim_end()))
         .collect();
     if complete.len() != 1 {
         return Err(format!(
-            "the console carried {} `{}` record(s) for the cryptography domain in the `ready` \
-             state, and a boot produces exactly one: this domain runs once in `init` and then \
-             parks, so none means it never finished — or faulted before it could — and several \
-             mean something else is writing its ring\n  records observed: {ours:#?}\n  full run \
+            "the console carried {} `{}` record(s) for the cryptography domain reporting `ready` \
+             and nothing else, and a boot produces exactly one: bring-up runs once in `init`, so \
+             none means it never finished — or faulted before it could — and several mean \
+             something else is writing its ring\n  records observed: {ours:#?}\n  full run \
              log: {}",
             complete.len(),
             LIFECYCLE_PREFIX.trim_end(),

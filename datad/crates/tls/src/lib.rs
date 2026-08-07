@@ -80,7 +80,8 @@ pub use lfw_x509::CertificateKind;
 pub use provider::{Clock, provider};
 pub use rustls::crypto::CryptoProvider;
 pub use server::{
-    Established, HELD_MAX, OFFER_KEPT, Offered, OnboardingServer, PeerOffer, ServerOutcome, Turn,
+    Established, HELD_MAX, OFFER_KEPT, OUTCOME_RECORDS, Offered, OnboardingServer, PeerOffer,
+    ServerOutcome, Turn,
 };
 pub use session::{Negotiated, STEP_RESERVE, ServerKey, SessionError, prove_session};
 pub use sign::{EcdsaP256SigningKey, LocalKey, SignOperation, SignRefused};

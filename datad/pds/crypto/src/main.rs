@@ -4,8 +4,9 @@
 //! Cryptography protection domain: it proves, on the booted image, that every
 //! primitive the appliance owns answers its published test vectors, measures
 //! what each costs on this part, seeds the node's random bit generator from
-//! hardware, proves it can authenticate under a key it does not hold, and then
-//! parks.
+//! hardware, and proves it can authenticate under a key it does not hold — and
+//! then terminates TLS for the onboarding port, one session at a time, for as
+//! long as the node runs.
 //!
 //! This is one of three binaries compiled with the SIMD target specification, and
 //! the reason that specification exists: with AES-NI and carry-less multiply
@@ -52,7 +53,15 @@
 //!
 //! # Adversary
 //!
-//! The **byzantine neighbour protection domain**, in two places now. The clock
+//! An **unauthenticated management-plane attacker**, and it is the one that
+//! decides how often this domain runs: every byte the relay hands over came off
+//! the onboarding port, and so did the pacing. Nothing in this file reads one.
+//! They go to the adopted TLS library through `lfw_tls`, which is where the
+//! parsing is; what comes back is a bounded answer and a value out of a closed
+//! vocabulary, and what a peer can spend by connecting is one session's worth of
+//! a fixed region however many times it connects.
+//!
+//! And the **byzantine neighbour protection domain**, in two places. The clock
 //! calibration region this domain maps read-only to stamp its records, whose
 //! triple is peer-written and ranged by `pd_runtime::PdClock` before a stamp is
 //! derived from it. And the **delegation's reply region**, every word of which is
@@ -61,9 +70,11 @@
 //! library, both of which judge it against a public key rather than believing it.
 //! A holder that never answers is bounded rather than trusted — see `delegate`.
 //!
-//! No device, no network byte and no frame reaches this domain, and no input to
-//! any primitive comes from outside it: every one is a compile-time constant, a
-//! hardware draw, or a value this domain produced itself.
+//! No device and no frame reaches this domain, and no input to any primitive
+//! this domain *proves* comes from outside it: every one is a compile-time
+//! constant, a hardware draw, or a value this domain produced itself. Network
+//! bytes reach it over the relay alone, where they are a peer's ciphertext
+//! handed to a TLS session and never an operand of anything here.
 //!
 //! **No surface here carries key material, and this domain now holds none at
 //! all for the identity it authenticates under.** The seed is drawn, folded and
@@ -117,7 +128,7 @@ use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
-use lfw_tls::{Negotiated, ServerKey, SessionError, prove_session};
+use lfw_tls::{Bump, CryptoProvider, Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{
     Answered, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating, TerminatingPass,
     Terminator, attach_region, log_sample, read_timestamp_counter,
@@ -368,6 +379,10 @@ struct Outcome {
     vectors: [u64; CRYPTO_PRIMITIVES.len()],
     milli_cycles_per_byte: [u64; CRYPTO_PRIMITIVES.len()],
     cycles_per_operation: [u64; CRYPTO_PRIMITIVES.len()],
+    /// What the bring-up leaves behind for the sessions after it, where it got
+    /// that far. Absent on every refusal, which is a domain that holds no
+    /// certificate to present and cannot terminate anything.
+    established: Option<Established>,
 }
 
 #[protection_domain]
@@ -408,7 +423,17 @@ fn init() -> Crypto {
     // taken, so it sits outside every session's reset.
     let delegated: Arc<Delegated> =
         Arc::new(Delegated::attach(sign_request, sign_reply, KEY_HOLDER));
-    let outcome = bring_up(&sink, wall_seconds(&clock), &delegated);
+    let mut outcome = bring_up(&sink, wall_seconds(&clock), &delegated);
+    // After the bring-up and before the first session: every allocation the
+    // boot made — the requester, the generator, the provider's two leaks — sits
+    // below this, where no session's reset reaches it.
+    let arena = ARENA.bump();
+    let onboarding = Onboarding::new(
+        arena,
+        arena.mark(),
+        PdClock::new(calibration),
+        outcome.established.take(),
+    );
     match &outcome.verdict {
         Ok(()) => announce(&sink, DomainState::Ready, DomainDetail::None),
         Err(CryptoError(cause)) => {
@@ -430,7 +455,7 @@ fn init() -> Crypto {
     };
     stats.publish(&sample.values());
     Crypto {
-        relay: Terminating::attach(relay_request, relay_reply, Unwired),
+        relay: Terminating::attach(relay_request, relay_reply, onboarding),
         sink,
         shard: stats,
         sample,
@@ -446,6 +471,7 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
         vectors: [0; CRYPTO_PRIMITIVES.len()],
         milli_cycles_per_byte: [0; CRYPTO_PRIMITIVES.len()],
         cycles_per_operation: [0; CRYPTO_PRIMITIVES.len()],
+        established: None,
     };
     match feature_gate() {
         Ok(features) => announce(
@@ -511,11 +537,18 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
         }
     };
     // Leaked deliberately and once: every key exchange the TLS provider holds
-    // reaches the node's randomness through a `'static` borrow, and this
-    // domain runs to completion and parks, so there is nothing to give back
-    // to. The allocation happens before the arena's mark is taken.
+    // reaches the node's randomness through a `'static` borrow, and the
+    // generator outlives every session this domain will carry, so there is
+    // nothing to give it back to. The allocation happens before the arena's
+    // mark is taken, which is what keeps a session's reset from reclaiming it
+    // underneath a provider still standing on it.
     let entropy: &'static dyn Entropy =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(NodeEntropy::new(generator)));
+    // Assembled once, here, and shared by every session afterwards. It leaks
+    // two allocations that never come back, so it is taken before any mark a
+    // session is wound back to — and a session that assembled its own would
+    // cost the region two more every time a peer connected.
+    let provider = Arc::new(lfw_tls::provider(entropy));
 
     for primitive in PER_OPERATION {
         let cost = measure_operation(primitive, entropy);
@@ -543,7 +576,17 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
 
     if let Err(error) = prove_tls(sink, entropy, now, delegated, &delegation) {
         outcome.verdict = Err(error);
+        return outcome;
     }
+    // Only on a boot that proved all of it. A domain that terminates sessions
+    // under a primitive it could not answer a vector for, or a delegation it
+    // could not verify, would be answering an administrator with a channel this
+    // appliance has no grounds to stand behind.
+    outcome.established = Some(Established {
+        provider,
+        certificate: delegation.certificate,
+        operation: Arc::clone(delegated) as Arc<dyn lfw_tls::SignOperation>,
+    });
     outcome
 }
 
@@ -1085,23 +1128,161 @@ const fn relay_refusal(reason: RelayRefusal, detail: RefusalDetail) -> Refusal {
     refusal(cause, detail)
 }
 
-/// What this domain terminates an onboarding session with, which is nothing.
+/// What a boot has to have established before this domain can terminate a
+/// session: the provider the library runs over, the certificate this appliance
+/// presents, and the way to sign under the key it does not hold.
 ///
-/// The TLS server this domain will run is built and host-tested in `lfw_tls`
-/// and is not reached from here: giving it the arena, the delegated key and the
-/// certificate — and giving its outcome a console record — is a step of its
-/// own. Until then the answer is genuinely empty, and this is where that is
-/// said rather than a zero buried in the relay.
-struct Unwired;
+/// The provider is assembled **once** and shared, because assembling one leaks
+/// two allocations that never come back — and a session is exactly the thing a
+/// peer decides how often there is, so a per-session assembly would let a peer
+/// drain a bounded region by connecting.
+struct Established {
+    provider: Arc<CryptoProvider>,
+    certificate: HeldCertificate,
+    operation: Arc<dyn lfw_tls::SignOperation>,
+}
 
-impl Terminator for Unwired {
-    fn opened(&mut self) {}
+/// What this domain terminates an onboarding session with: one TLS 1.3 server,
+/// opened when the relay opens a session and driven a delivery at a time.
+///
+/// # Adversary
+///
+/// An **unauthenticated management-plane attacker**, at one remove. Every byte
+/// that reaches [`Terminator::advance`] came off the onboarding port, and so
+/// did the pacing. Nothing here reads one: they are handed to `lfw_tls`, which
+/// hands them to the adopted library, and what comes back is a bounded answer
+/// and a value out of a closed vocabulary.
+///
+/// # What a peer costs the region
+///
+/// One session's allocations and no more. The mark is taken once, after the
+/// bring-up has finished allocating, and the arena is wound back to it at both
+/// ends of every session — so a peer that opens a thousand connections costs
+/// the same as one that opens one, and the boot's own leaked allocations sit
+/// below the mark where no reset reaches them.
+///
+/// # There is no protocol above it yet
+///
+/// This terminates the record layer. Plaintext a peer sends is taken and
+/// dropped, deliberately and not as a placeholder: the onboarding protocol is a
+/// step of its own, and leaving the plaintext unread would let a peer grow a
+/// buffer until the session refused itself for a bound of this appliance's
+/// rather than for anything the peer did.
+struct Onboarding {
+    /// The one arena, and where a session's allocations begin in it.
+    arena: &'static Bump,
+    mark: usize,
+    clock: PdClock<'static>,
+    /// Absent on a boot whose cryptography did not establish, which is a
+    /// session that cannot be terminated and says so.
+    established: Option<Established>,
+    server: Option<lfw_tls::OnboardingServer<'static>>,
+    /// What the last session left for the console, taken by the domain after
+    /// the pass that produced it. Plain data with no allocation behind it,
+    /// which is what lets the arena be wound back under it.
+    staged: [Option<DomainDetail>; lfw_tls::OUTCOME_RECORDS],
+}
 
-    fn advance(&mut self, _: &[u8], _: &mut [u8]) -> Answered {
-        Answered::default()
+impl Onboarding {
+    fn new(
+        arena: &'static Bump,
+        mark: usize,
+        clock: PdClock<'static>,
+        established: Option<Established>,
+    ) -> Self {
+        Self {
+            arena,
+            mark,
+            clock,
+            established,
+            server: None,
+            staged: [None; lfw_tls::OUTCOME_RECORDS],
+        }
     }
 
-    fn closed(&mut self) {}
+    /// What the last pass left for the console, cleared as it is taken.
+    fn take_records(&mut self) -> [Option<DomainDetail>; lfw_tls::OUTCOME_RECORDS] {
+        core::mem::replace(&mut self.staged, [None; lfw_tls::OUTCOME_RECORDS])
+    }
+}
+
+impl Terminator for Onboarding {
+    /// Wind the arena back and begin a session.
+    ///
+    /// Back **before** the session and not only after it: a session that ended
+    /// by faulting its way out of this domain would otherwise leave the region
+    /// short for the next peer, and the peer that follows an attacker must not
+    /// inherit what the attacker spent.
+    fn opened(&mut self) {
+        self.server = None;
+        self.arena.reset_to(self.mark);
+        self.staged = [None; lfw_tls::OUTCOME_RECORDS];
+        let Some(established) = self.established.as_ref() else {
+            // A boot that refused its own cryptography holds no certificate to
+            // present and no key to sign with. Its own token rather than a
+            // silent empty answer: the `state=refused` record above says why
+            // this domain did not come up, and this says that a peer met the
+            // consequence.
+            self.staged = [
+                Some(DomainDetail::Refusal(refusal(
+                    "onboarding-cryptography-unproven",
+                    RefusalDetail::None,
+                ))),
+                None,
+                None,
+            ];
+            return;
+        };
+        let opened = lfw_tls::OnboardingServer::open(
+            Arc::clone(&established.provider),
+            self.arena,
+            wall_seconds(&self.clock),
+            established.certificate.as_bytes(),
+            Arc::clone(&established.operation),
+        );
+        match opened {
+            Ok(server) => self.server = Some(server),
+            Err(outcome) => self.staged = outcome.records(),
+        }
+    }
+
+    fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
+        let Some(server) = self.server.as_mut() else {
+            // Nothing opened, so there is nothing to say and nothing to wait
+            // for. Finished rather than silent: a session this domain cannot
+            // terminate is one the peer should stop holding a connection for.
+            return Answered {
+                sent: 0,
+                finished: true,
+            };
+        };
+        let lfw_tls::Turn { sent, finished } = server.advance(received, answer);
+        // Taken and dropped. See this type's header: the protocol above is a
+        // step of its own, and plaintext left unread is a bound of this
+        // appliance's that a peer would trip instead of its own behaviour.
+        let plaintext = server.received().len();
+        server.consumed(plaintext);
+        Answered { sent, finished }
+    }
+
+    /// End the session, take what it came to, and give the region back.
+    fn closed(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            if server.outcome().is_none() {
+                // The transport went away before the handshake settled
+                // anything, so the session's own account of itself is that.
+                server.ended();
+            }
+            if let Some(outcome) = server.outcome() {
+                // Turned into records **here**, while the session's allocations
+                // are still live: an outcome may hold the library's own error,
+                // which may hold an allocation out of this arena, and the reset
+                // below is what would take it away underneath a record.
+                self.staged = outcome.records();
+            }
+        }
+        self.arena.reset_to(self.mark);
+    }
 }
 
 /// Returned by `init` in every case. The bring-up runs once; what the domain
@@ -1111,7 +1292,7 @@ struct Crypto {
     /// — what to answer, when one ends, and how — is `pd_runtime::relay`'s and
     /// host-tested there; what is here is the console record each answer owes
     /// and the shard republished beside it.
-    relay: Terminating<'static, Unwired>,
+    relay: Terminating<'static, Onboarding>,
     sink: RingSink<'static, PdClock<'static>>,
     /// The shard this domain publishes, kept so a session's end can republish
     /// it: the sample's own numbers are the bring-up's and do not move, but the
@@ -1134,6 +1315,13 @@ impl Crypto {
                 DomainState::Ready,
                 DomainDetail::Refusal(relay_refusal(reason, detail)),
             );
+        }
+        // Taken before anything is written, because the sink and the relay are
+        // both this domain's and a record cannot be emitted while the protocol
+        // behind the relay is still borrowed.
+        let handshake = self.relay.terminator().take_records();
+        for detail in handshake.into_iter().flatten() {
+            announce(&self.sink, DomainState::Ready, detail);
         }
         if let Some(session) = pass.report {
             self.report(session);
@@ -1167,8 +1355,16 @@ impl Handler for Crypto {
     /// Bounded by [`RELAY_DEMANDS_PER_WAKEUP`] and by the channel's own window,
     /// which is one item: a wakeup storm from the other end costs a constant
     /// number of reads of a word this domain already maps and never an
-    /// unbounded loop. Nothing here blocks, nothing here allocates, and nothing
-    /// here reads a byte it was not handed.
+    /// unbounded loop. Nothing here blocks and nothing here reads a byte it was
+    /// not handed.
+    ///
+    /// **It allocates**, which nothing on this path did until a protocol stood
+    /// behind the relay, and the bound on that is the arena's rather than this
+    /// loop's: a session's allocations come out of a fixed region, the region is
+    /// wound back to one mark at both ends of every session, and a step that
+    /// finds itself short of a phase's reserve refuses and closes rather than
+    /// faulting. So what a peer can spend by connecting is one session's worth,
+    /// however many times it connects.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         let mut answered = false;
         for _ in 0..RELAY_DEMANDS_PER_WAKEUP {

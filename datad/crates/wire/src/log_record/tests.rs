@@ -758,7 +758,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 17] = [
+    let cases: [(LogRecord, LogRecordError); 21] = [
         (
             LogRecord {
                 kind: 4,
@@ -775,10 +775,55 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 27,
+                detail: 35,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 27 },
+            LogRecordError::DetailKindUnknown { detail: 35 },
+        ),
+        // The handshake details' own token words, on the session end's terms:
+        // an outcome, an incompatibility or a refusal past its set names
+        // nothing a console line can spell.
+        (
+            LogRecord {
+                detail: LogDetailKind::OnboardingEnded.to_bits(),
+                operands: [u64::from(LOG_ONBOARD_OUTCOME_COUNT), 0, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::OnboardOutcomeUnknown {
+                outcome: u64::from(LOG_ONBOARD_OUTCOME_COUNT),
+            },
+        ),
+        (
+            LogRecord {
+                detail: LogDetailKind::OnboardingIncompatible.to_bits(),
+                operands: [0, u64::from(LOG_TLS_INCOMPATIBLE_COUNT), 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::TlsIncompatibleUnknown {
+                incompatible: u64::from(LOG_TLS_INCOMPATIBLE_COUNT),
+            },
+        ),
+        (
+            LogRecord {
+                detail: LogDetailKind::OnboardingRefused.to_bits(),
+                operands: [0, u64::from(LOG_TLS_REFUSAL_COUNT), 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::TlsRefusalUnknown {
+                refusal: u64::from(LOG_TLS_REFUSAL_COUNT),
+            },
+        ),
+        // And the code points beside them, which are refused for being wider
+        // than any registry numbers one.
+        (
+            LogRecord {
+                detail: LogDetailKind::OnboardingHandshake.to_bits(),
+                operands: [0, u64::from(u16::MAX) + 1, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::CodePointTooWide {
+                value: u64::from(u16::MAX) + 1,
+            },
         ),
         // The onboarding session's own token word, on the dial's terms: an end
         // past the set names nothing a console line can spell.
@@ -1127,6 +1172,9 @@ fn every_refusal_names_the_field_and_the_value() {
         LogRecordError::DetailKindUnknown { detail: 7 },
         LogRecordError::DialOutcomeUnknown { outcome: 99 },
         LogRecordError::NextHopViaUnknown { via: 9 },
+        LogRecordError::OnboardOutcomeUnknown { outcome: 99 },
+        LogRecordError::TlsIncompatibleUnknown { incompatible: 99 },
+        LogRecordError::TlsRefusalUnknown { refusal: 99 },
         LogRecordError::SequenceTooWide { value: u64::MAX },
         LogRecordError::AddressTooWide { value: u64::MAX },
         LogRecordError::ClockFrequencyZero,
@@ -1172,6 +1220,9 @@ fn every_refusal_names_the_field_and_the_value() {
             "detail kind 7 names no payload",
             "dial outcome token 99 is not below 13",
             "next hop choice token 9 is not below 3",
+            "onboarding handshake outcome token 99 is not below 10",
+            "TLS incompatibility token 99 is not below 23",
+            "TLS refusal token 99 is not below 23",
             "sequence word 18446744073709551615 does not fit thirty-two bits",
             "address word 18446744073709551615 does not fit thirty-two bits",
             "the established counter frequency is zero, which scales no reading",
@@ -1234,10 +1285,18 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::DialSequence,
         LogDetailKind::Onboarded,
         LogDetailKind::OnboardingPort,
+        LogDetailKind::OnboardingHandshake,
+        LogDetailKind::OnboardingEnded,
+        LogDetailKind::OnboardingIncompatible,
+        LogDetailKind::OnboardingRefused,
+        LogDetailKind::OnboardingAlert,
+        LogDetailKind::OnboardingBacklogged,
+        LogDetailKind::OnboardingSuites,
+        LogDetailKind::OnboardingGroups,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(27), None);
+    assert_eq!(LogDetailKind::from_bits(35), None);
 
     for value in [
         LogValueKind::Absent,

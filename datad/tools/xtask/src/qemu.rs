@@ -62,7 +62,7 @@ use crate::{
     },
     image, management_contract, metrics_contract,
     onboard_contract::{self, OnboardVerdict},
-    probe_contract,
+    onboard_tls_contract, probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -504,15 +504,31 @@ pub(crate) enum OnboardContract {
     /// one set of records that behaviour produces — while the node itself goes
     /// on forwarding and its management port goes on counting to the byte.
     Session(OnboardBehaviour),
+    /// **Real clients**, one after another through a forwarded host port, and
+    /// no station at all. What is judged is the handshake each of them drew: one
+    /// that must complete and three that must fail, each under its own token.
+    ///
+    /// Mutually exclusive with [`Self::Session`] by construction, on
+    /// [`ManagementRole`]'s terms: a boot either plays the station on that wire
+    /// or lets a client onto it, and a boot that did both would be two things on
+    /// one wire.
+    Handshakes,
 }
 
 impl OnboardContract {
     /// How the station this harness plays on that port behaves.
     pub(crate) const fn behaviour(self) -> OnboardBehaviour {
         match self {
-            Self::Untouched => OnboardBehaviour::Untouched,
+            // A boot that lets real clients in plays no station, so the station
+            // this harness would otherwise put on the wire does nothing.
+            Self::Untouched | Self::Handshakes => OnboardBehaviour::Untouched,
             Self::Session(behaviour) => behaviour,
         }
+    }
+
+    /// Whether this boot runs real clients against the port.
+    pub(crate) const fn handshakes(self) -> bool {
+        matches!(self, Self::Handshakes)
     }
 
     /// What the appliance must say about the session, given how the station
@@ -526,8 +542,9 @@ impl OnboardContract {
     /// put on the wire.
     pub(crate) const fn verdict(self) -> Option<OnboardVerdict> {
         let (ended, forgotten) = match self {
-            // Nothing is read: the boot opens no session.
-            Self::Untouched => return None,
+            // Nothing is read: the boot opens no session, or it opens several
+            // and they are judged as handshakes rather than as one session.
+            Self::Untouched | Self::Handshakes => return None,
             // A station that opens nothing is not a session, so this pairing
             // names no records. A `None` rather than a panic: the caller refuses
             // it by name, which turns a table entry that cannot mean anything
@@ -768,6 +785,24 @@ pub(crate) enum Console {
     /// carrying a session cannot satisfy it. Beside it the boot's own routed
     /// contract says the dataplane went on forwarding throughout.
     JudgedOnTheOnboardingSessionAndThePortsCount,
+    /// **The handshakes real clients drew out of the onboarding port, and
+    /// nothing else on the console.**
+    ///
+    /// The narrow shape once more, on the boot that lets clients onto that wire
+    /// instead of playing a station on it. The transcript, the clock, the
+    /// hardware probe and the cryptography domain's bring-up are facts about the
+    /// image that other boots state; what only this boot can settle is whether
+    /// the server behind that port interoperates with a client this project did
+    /// not write, and says how each attempt ended in a vocabulary an
+    /// administrator can act on.
+    ///
+    /// The port's own frame count is deliberately **not** here, unlike on the
+    /// two narrow shapes above it. There is no station on this wire, so the
+    /// harness sees no frame and has no number to hold the console to; what
+    /// stands in its place is the request surface, pulled and judged in the same
+    /// boot, which is the same statement — the node stayed healthy while an
+    /// unauthenticated peer drove a second protection domain four times over.
+    JudgedOnTheOnboardingHandshakes,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -1567,6 +1602,41 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
+    // And the boot whose subject is the TLS server behind that port, driven by
+    // clients nothing in this repository wrote.
+    //
+    // The three above are stations: they decide how a session *ends* and prove
+    // that both domains account for it. None of them speaks the protocol, and
+    // until this one no booted image had ever completed a handshake with
+    // anybody. What the host suite proves is that this appliance's server and
+    // this appliance's client agree, which is two halves of one stack agreeing;
+    // what only a real client can settle is interoperation.
+    //
+    // FOUR CLIENTS OVER ONE BOOT, and the order is part of the claim: the
+    // handshake that completes goes first, so the three failures after it are
+    // sessions on a port that has already carried one. Each failure is a
+    // different cause, and each must reach the console under its own token —
+    // which is the whole reason the outcome vocabulary has ten members rather
+    // than one. A boot that answered every failure with one token would satisfy
+    // a contract that only asked whether the handshake failed.
+    //
+    // It is a client-backed boot like the metrics ones and takes their
+    // contracts with it rather than opting out: the request surface is pulled
+    // and judged in the same boot, which is what says the node stayed healthy
+    // while an unauthenticated peer drove a second protection domain four times
+    // over.
+    Scenario {
+        name: "onboarding-tls",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingHandshakes,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Handshakes,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -1867,13 +1937,16 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         Console::Ignored
         | Console::Judged
         | Console::JudgedOnTheDialledChannelAndThePortsCount
-        | Console::JudgedOnTheOnboardingSessionAndThePortsCount => {}
+        | Console::JudgedOnTheOnboardingSessionAndThePortsCount
+        | Console::JudgedOnTheOnboardingHandshakes => {}
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
     let backing = if scenario.management.user_network() {
         ManagementBacking::UserNetwork {
             host_port: forward_harness::reserve_host_port()
+                .map_err(|error| format!("scenario {name}: {error}"))?,
+            onboard_port: forward_harness::reserve_host_port()
                 .map_err(|error| format!("scenario {name}: {error}"))?,
         }
     } else {
@@ -2028,6 +2101,29 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             let management = management_contract::judge(&booted.serial, &log, booted.management)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!("; {onboarded}; {management}")
+        }
+        Console::JudgedOnTheOnboardingHandshakes => {
+            if booted.handshakes.is_empty() {
+                return Err(format!(
+                    "scenario {name}: the boot met its routed contract and ran no client against \
+                     the onboarding port, so nothing was proved about the server behind it\n  \
+                     full run log: {}",
+                    log.display()
+                ));
+            }
+            // The clients' own transcripts first, for the reason every other
+            // transcript here goes first: what a reader wants is what was said.
+            let evidence = onboard_tls_contract::evidence(&booted.handshakes);
+            println!("{evidence}");
+            append_evidence(
+                &log,
+                "the clients this boot ran against the onboarding port, and what came back",
+                &evidence,
+            )
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+            let handshakes = onboard_tls_contract::judge(&booted.handshakes, &booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {handshakes}")
         }
         Console::Judged => {
             let contract = ConfigContract::from_document(&document)
@@ -2690,7 +2786,7 @@ fn boot(
             topology,
             traffic,
             dial,
-            onboard: onboard.behaviour(),
+            onboard,
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;
