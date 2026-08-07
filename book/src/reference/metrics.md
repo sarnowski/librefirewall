@@ -521,7 +521,7 @@ has advanced. Which appliance it is, and which key it authenticates with, is on 
 | `librefirewall_store_minted` | gauge | `store` | — | 1 where this boot minted a fresh identity because the medium carried none, 0 where it reloaded the one already there. A node whose value flips to 1 after a boot at 0 has lost its identity, which is the fleet's own alert rather than a fault of the boot. |
 | `librefirewall_store_onboarded` | gauge | `store` | — | 1 once a management plane has adopted this appliance, 0 while it is unowned. |
 | `librefirewall_store_reset` | gauge | `store` | — | 1 where this boot found a factory-reset request on the store medium and honoured it, 0 otherwise. It is what tells an intentional reset from a lost medium: both mint, and only this says which one was asked for. |
-| `librefirewall_store_sign_refusals_total` | counter | `store` | — | Signing requests this domain answered with a refusal rather than a signature — an appliance with no established identity, an operation it has none of, or a message longer than a request may carry. A non-zero value beside a zero `librefirewall_store_signatures_total` is a peer asking for something this node cannot give. |
+| `librefirewall_store_sign_refusals_total` | counter | `store` | — | Delegation requests this domain answered with a refusal rather than an answer — an appliance with no established identity, an operation it has none of, or a message longer than a request may carry. Every request over that channel is counted here, the certificate over the device key being asked for on it as well as a signature. A non-zero value beside a zero `librefirewall_store_signatures_total` is a peer asking for something this node cannot give. |
 | `librefirewall_store_signatures_total` | counter | `store` | — | Signatures this domain has produced under the device key on behalf of a domain that holds no key. It is the only operator-visible sign that the delegation is working, and it is a count rather than anything about a signature: no message, no signature and no key is exposed here or anywhere else on this surface. |
 
 **`librefirewall_store_minted` is the one to alert on, and
@@ -535,10 +535,11 @@ corroborating reading either way: a fresh mint is generation 1.
 
 **The two signing counters are how the delegation is watched, and they are counts on purpose.** The
 appliance's private key lives in this one domain, and the domain that authenticates to the network
-asks it for a signature rather than holding one. What that exchange can be seen from the outside is
-exactly these two numbers: `librefirewall_store_signatures_total` climbing means handshakes are being
-authenticated, and `librefirewall_store_sign_refusals_total` climbing instead means a peer is asking
-for something this node will not give — most often an appliance whose identity never established, in
+asks it for a signature — and for the certificate over that key — rather than holding either. What
+that exchange can be seen from the outside is exactly these two numbers:
+`librefirewall_store_signatures_total` climbing means handshakes are being authenticated, and
+`librefirewall_store_sign_refusals_total` climbing instead means a peer is asking for something this
+node will not give — most often an appliance whose identity never established, in
 which case `librefirewall_store_identity` reads 0 and the console says why. Neither carries a message,
 a signature or a key, because there is nothing about a signature an operator needs and much that must
 never be exposed. The refusals reach this surface and **not the console** deliberately: this domain's

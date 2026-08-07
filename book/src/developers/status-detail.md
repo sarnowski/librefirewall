@@ -2284,9 +2284,13 @@ delivers, the management endpoint beside them, and the configuration slot array 
 place in the record and nothing writes them.
 
 **The signing delegation is done, and it is what ended the domain's parking.** The domain keeps the
-keypair after establishing it and answers `wire::signing`'s two regions: the cryptography domain
-writes a request and reads an answer, this domain does the reverse, and there is no field a private
-scalar fits in either direction. It parks in the Microkit event loop and is woken by the asking
+keypair *and the certificate over it* after establishing them and answers `wire::signing`'s two
+regions: the cryptography domain writes a request and reads an answer, this domain does the reverse,
+and there is no field a private scalar fits in either direction. Three questions cross it — sign these
+bytes, which key do you hold, and hand me the certificate over it — and the third is answered here
+rather than reissued in the asking domain because the certificate is half of the identity this domain
+minted and persisted. It is a public artifact, so handing it over reveals nothing a peer is not shown
+anyway. It parks in the Microkit event loop and is woken by the asking
 domain, serving at most four demands per wakeup — `SignResponder::take` already yields one demand per
 change of the requester's sequence, so a peer that storms the channel costs one reply each and never
 a loop — and republishing its shard afterwards, which is why that shard now moves after `init` where
@@ -2430,8 +2434,12 @@ provider's `KeyProvider` refusing to load a key from an encoding is what kept th
 nothing above the seam could have been holding one.
 
 The boot proves it twice over. Directly: ask which key the holder has, have it sign a fixed
-challenge, and verify that signature against that key — which settles the delegation rather than
-ECDSA, the vector run having settled that already. And where it will actually be used: the session's
+challenge, verify that signature against that key, and then take the certificate the holder keeps and
+find the very same public point inside it — which settles the delegation rather than ECDSA, the vector
+run having settled that already, and settles the certificate without parsing it, since the point
+appears in a certificate exactly once, inside the `SubjectPublicKeyInfo`. The record carries the
+certificate's *size*: a certificate is public, but 768 bytes of DER on a bounded ring would push out
+the records an operator reads. And where it will actually be used: the session's
 **server half runs under the delegated key**, so `sign` is reached synchronously deep inside the
 handshake at the `CertificateVerify`. The gate holds the identifier this domain reports to the store
 domain's own, and requires the holder's tally to have moved across the session — a number that

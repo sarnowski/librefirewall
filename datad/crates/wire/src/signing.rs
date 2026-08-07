@@ -12,12 +12,27 @@
 //! written on, because only one domain can own a virtio-blk device and a key that
 //! left that domain would be a key in two places. The domain that terminates a
 //! mutually-authenticated session needs a signature under that key on every
-//! handshake, and needs the public half and the identifier to present a
-//! certificate at all. So the private operation is delegated: the request carries
-//! a message, the reply carries a signature, and **no region either side maps
-//! carries the scalar**. That is a property of what this ABI can express rather
-//! than a rule somebody keeps — there is no field for a key here, in either
-//! direction.
+//! handshake, and needs the public half, the identifier and the appliance's own
+//! certificate to present an identity at all. So the private operation is
+//! delegated: the request carries a message, the reply carries a signature, and
+//! **no region either side maps carries the scalar**. That is a property of what
+//! this ABI can express rather than a rule somebody keeps — there is no field for
+//! a key here, in either direction.
+//!
+//! # What the reply *can* carry, and why none of it is a secret
+//!
+//! Four things, and each is public by construction. A **signature**, which is
+//! what a private key produces and not what it is. A **public point** and a
+//! **device identifier**, which are the two values a peer is told. And a
+//! **certificate**, which is the artifact a peer validates that point out of —
+//! it is published to every party the appliance ever talks to, so a channel that
+//! moves it moves nothing an adversary could not have asked the appliance for.
+//!
+//! The scalar is absent from all four, and the certificate does not weaken that:
+//! a certificate is a signed statement *about* a public key, and its encoding has
+//! no place a private one goes. The claim this ABI makes is unchanged and is
+//! still structural — every field is one of those four shapes, and none of them
+//! is 32 bytes of private scalar under any interpretation.
 //!
 //! # Two regions, because a region is the unit of grant
 //!
@@ -40,11 +55,17 @@
 //!
 //! # The reply carries the operation it answers
 //!
-//! A signature and a public key are different shapes, and a channel whose reply
-//! said only "here are some bytes" would leave the caller to remember which
-//! question was outstanding. So the operation travels back with the answer and a
-//! mismatch is a fault: answering the wrong question is the responder's error and
-//! not the requester's obligation.
+//! A signature, a public key and a certificate are different shapes — and two of
+//! them are variable-length byte strings with different bounds — so a channel
+//! whose reply said only "here are some bytes" would leave the caller to remember
+//! which question was outstanding *and* which bound to hold the length to. So the
+//! operation travels back with the answer and a mismatch is a fault: answering the
+//! wrong question is the responder's error and not the requester's obligation.
+//!
+//! The stated length is then ranged **against the operation that was answered**,
+//! which is why [`SignAnswerBuffer`] carries one destination per shape rather than
+//! one buffer for all of them: a length is bounded by the same slice it is about
+//! to be used to copy into, so the check cannot drift from what it protects.
 //!
 //! # One request in flight, which is what makes a single fence enough
 //!
@@ -85,6 +106,17 @@ pub const PUBLIC_KEY_LEN: usize = 65;
 /// anything renders it.
 pub const DEVICE_ID_LEN: usize = 16;
 
+/// Bytes of certificate a [`SignOperation::Certificate`] answer may carry, and so
+/// the widest thing this channel moves.
+///
+/// Seven hundred and sixty-eight, which is what the certificate profile bounds one
+/// at and what the state record reserves for one: `lfw_x509::MAX_CERTIFICATE_LEN`
+/// and `lfw_store`'s `MAX_STORED_CERTIFICATE` are the same number. This crate
+/// declines to depend on either for one integer on [`MAX_SIGNATURE_LEN`]'s terms —
+/// the two protection domains that see this constant beside one of those are where
+/// they are held equal.
+pub const MAX_CERTIFICATE_LEN: usize = 768;
+
 /// Bytes the system description reserves for the request region, derived rather
 /// than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
 pub const SIGN_REQUEST_REGION_SIZE: usize =
@@ -104,6 +136,17 @@ pub enum SignOperation {
     /// this channel rather than a second one because it is the same authority —
     /// "tell me about the key you hold" — asked in the other tense.
     PublicKey,
+    /// Answer the appliance's own certificate over the key this holder signs
+    /// under.
+    ///
+    /// A **public** artifact: it is the statement every peer is handed and
+    /// validates the public point out of, so moving it here reveals nothing an
+    /// adversary could not obtain by connecting. It travels this channel for
+    /// [`Self::PublicKey`]'s reason and one more: the certificate is part of the
+    /// identity the holder established and persisted, and a caller that issued an
+    /// equivalent one for itself would leave the appliance with two certificates
+    /// over one key and no domain able to say which one a peer saw.
+    Certificate,
 }
 
 impl SignOperation {
@@ -112,6 +155,7 @@ impl SignOperation {
         match self {
             Self::Sign => 0,
             Self::PublicKey => 1,
+            Self::Certificate => 2,
         }
     }
 
@@ -125,6 +169,7 @@ impl SignOperation {
         match bits {
             0 => Some(Self::Sign),
             1 => Some(Self::PublicKey),
+            2 => Some(Self::Certificate),
             _ => None,
         }
     }
@@ -279,6 +324,11 @@ pub struct SignReply {
     signature: [AtomicU8; MAX_SIGNATURE_LEN],
     public_key: [AtomicU8; PUBLIC_KEY_LEN],
     device_id: [AtomicU8; DEVICE_ID_LEN],
+    /// Last, and widest: the appliance's certificate. Appended rather than
+    /// inserted, so every offset above it is the one it was, and placed here
+    /// because it is the only field whose length is stated rather than fixed by
+    /// its type.
+    certificate: [AtomicU8; MAX_CERTIFICATE_LEN],
 }
 
 impl SignReply {
@@ -295,6 +345,7 @@ impl SignReply {
             signature: [const { AtomicU8::new(0) }; MAX_SIGNATURE_LEN],
             public_key: [const { AtomicU8::new(0) }; PUBLIC_KEY_LEN],
             device_id: [const { AtomicU8::new(0) }; DEVICE_ID_LEN],
+            certificate: [const { AtomicU8::new(0) }; MAX_CERTIFICATE_LEN],
         }
     }
 
@@ -378,6 +429,14 @@ mod peer {
                 *byte = cell.load(Ordering::Relaxed);
             }
         }
+
+        /// Bounded by `into` on [`Self::copy_signature`]'s terms, against the
+        /// certificate's own field rather than the signature's.
+        pub(super) fn copy_certificate(&self, into: &mut [u8]) {
+            for (byte, cell) in into.iter_mut().zip(&self.0.certificate) {
+                *byte = cell.load(Ordering::Relaxed);
+            }
+        }
     }
 
     /// The request region as the key holder holds it, on [`PeerReply`]'s terms.
@@ -451,13 +510,59 @@ pub enum SignFault {
         asked: SignOperation,
         answered: SignOperation,
     },
-    /// More signature bytes claimed than the region holds. The one fault that
-    /// would be a read past the region if it were believed.
+    /// More signature bytes claimed than the region holds. One of the two faults
+    /// that would be a read past a field if it were believed.
     LenPastSignature { len: u32 },
+    /// More certificate bytes claimed than the region holds, which is the other.
+    /// Its own variant rather than [`Self::LenPastSignature`] with a wider bound,
+    /// because the two fields have different lengths and a single fault would
+    /// leave a reader unable to tell which bound was exceeded.
+    LenPastCertificate { len: u32 },
     /// A refusal carrying bytes, which no answer means.
     BytesOnRefusal { status: SignStatus, len: u32 },
     /// A signature of zero length under a success, which is not a signature.
     EmptySignature,
+    /// A certificate of zero length under a success, which is not a certificate.
+    /// A holder with no certificate to give refuses by name instead.
+    EmptyCertificate,
+    /// An identity answer stating a length. The public point and the identifier
+    /// are fixed-width fields, so a length there is a claim about nothing — and a
+    /// responder making one is not this protocol's, which is worth saying rather
+    /// than ignoring.
+    BytesOnIdentity { len: u32 },
+}
+
+/// Where one poll copies an answer's bytes.
+///
+/// One field per answer that carries a variable-length byte string, each exactly
+/// its operation's bound. That is the whole point of the type rather than an
+/// arrangement of it: [`SignRequester::poll`] ranges the stated length by slicing
+/// the very buffer it is about to copy into, so the bound and its destination are
+/// one operation and cannot drift apart. A single buffer sized to the larger of
+/// the two would make the signature's bound a number written twice.
+///
+/// Nothing here is shared memory. A caller holds one, hands it to a poll, and the
+/// slice that comes back borrows it — which is what keeps the region itself out of
+/// every caller above.
+pub struct SignAnswerBuffer {
+    signature: [u8; MAX_SIGNATURE_LEN],
+    certificate: [u8; MAX_CERTIFICATE_LEN],
+}
+
+impl SignAnswerBuffer {
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            signature: [0; MAX_SIGNATURE_LEN],
+            certificate: [0; MAX_CERTIFICATE_LEN],
+        }
+    }
+}
+
+impl Default for SignAnswerBuffer {
+    fn default() -> Self {
+        Self::zero()
+    }
 }
 
 /// What a [`SignOperation::PublicKey`] request was answered with.
@@ -484,6 +589,9 @@ pub enum SignPoll<'buf> {
     },
     /// The holder answered which key it holds.
     Identity(DeviceIdentity),
+    /// The holder answered with the appliance's certificate over that key.
+    /// `certificate` is the DER encoding, bounded by the region.
+    Certificate { certificate: &'buf [u8] },
     /// The holder answered and produced nothing, saying why.
     Refused(SignRefusal),
     /// The reply carried this request's sequence and could not be believed.
@@ -536,7 +644,8 @@ impl SignRequester<'_> {
         }
     }
 
-    /// Look once for the answer to `pending`, copying any signature into `into`.
+    /// Look once for the answer to `pending`, copying any byte string it carries
+    /// into `into`.
     ///
     /// The sequence is read **before** anything else and with `Acquire`, which is
     /// what makes the responder's bytes visible before they are copied; a mismatch
@@ -544,7 +653,7 @@ impl SignRequester<'_> {
     pub fn poll<'buf>(
         &mut self,
         pending: PendingSignature,
-        into: &'buf mut [u8; MAX_SIGNATURE_LEN],
+        into: &'buf mut SignAnswerBuffer,
     ) -> SignPoll<'buf> {
         if self.reply.sequence() != pending.sequence {
             return SignPoll::Outstanding(pending);
@@ -567,19 +676,20 @@ impl SignRequester<'_> {
                 answered,
             });
         }
-        // The region bound and the copy's destination are one operation, so the
-        // check cannot drift from the slice it protects.
-        let Some(target) = into.get_mut(..len as usize) else {
-            return self.fault(SignFault::LenPastSignature { len });
-        };
         if let Some(reason) = SignRefusal::from_status(status) {
             if len != 0 {
                 return self.fault(SignFault::BytesOnRefusal { status, len });
             }
             return SignPoll::Refused(reason);
         }
+        // The length is ranged per operation, and in every arm the bound and the
+        // copy's destination are one operation — so the check cannot drift from the
+        // slice it protects, and no arm holds the other's bound.
         match answered {
             SignOperation::Sign => {
+                let Some(target) = into.signature.get_mut(..len as usize) else {
+                    return self.fault(SignFault::LenPastSignature { len });
+                };
                 if len == 0 {
                     return self.fault(SignFault::EmptySignature);
                 }
@@ -590,6 +700,9 @@ impl SignRequester<'_> {
                 }
             }
             SignOperation::PublicKey => {
+                if len != 0 {
+                    return self.fault(SignFault::BytesOnIdentity { len });
+                }
                 let mut public_key = [0_u8; PUBLIC_KEY_LEN];
                 let mut device_id = [0_u8; DEVICE_ID_LEN];
                 self.reply.public_key(&mut public_key);
@@ -598,6 +711,18 @@ impl SignRequester<'_> {
                     public_key,
                     device_id,
                 })
+            }
+            SignOperation::Certificate => {
+                let Some(target) = into.certificate.get_mut(..len as usize) else {
+                    return self.fault(SignFault::LenPastCertificate { len });
+                };
+                if len == 0 {
+                    return self.fault(SignFault::EmptyCertificate);
+                }
+                self.reply.copy_certificate(target);
+                SignPoll::Certificate {
+                    certificate: target,
+                }
             }
         }
     }
@@ -735,6 +860,28 @@ impl SignResponder<'_> {
         self.publish(demand, SignOperation::PublicKey, SignStatus::Ok, 0);
     }
 
+    /// Answer `demand` with the appliance's certificate over the key this holder
+    /// signs under, on [`Self::signed`]'s terms: truncated to what the region
+    /// holds, and the published length is what was actually stored.
+    ///
+    /// An empty `certificate` publishes a zero length, which the requester reads as
+    /// [`SignFault::EmptyCertificate`] — so a holder with none to give must refuse
+    /// by name rather than answer with nothing.
+    pub fn certificate(&mut self, demand: SignDemand, certificate: &[u8]) -> usize {
+        let mut published = 0_u32;
+        for (cell, byte) in self.reply.certificate.iter().zip(certificate) {
+            cell.store(*byte, Ordering::Relaxed);
+            published += 1;
+        }
+        self.publish(
+            demand,
+            SignOperation::Certificate,
+            SignStatus::Ok,
+            published,
+        );
+        published as usize
+    }
+
     /// Answer `demand` with nothing, saying why. Publishes a zero length, which is
     /// what makes [`SignFault::BytesOnRefusal`] a fault the requester can raise
     /// against a peer that does otherwise.
@@ -799,6 +946,7 @@ const _: () = {
     assert!(size_of::<usize>() >= size_of::<u32>());
     assert!(MAX_SIGN_MESSAGE > 0 && MAX_SIGN_MESSAGE <= u32::MAX as usize);
     assert!(MAX_SIGNATURE_LEN > 0 && MAX_SIGNATURE_LEN <= u32::MAX as usize);
+    assert!(MAX_CERTIFICATE_LEN > 0 && MAX_CERTIFICATE_LEN <= u32::MAX as usize);
     // A zeroed pair of regions is the valid idle state: sequence zero is no
     // request and answers none, so neither side acts on what the kernel handed
     // it.
@@ -806,7 +954,7 @@ const _: () = {
     assert!(SignOperation::Sign.to_bits() == 0);
     assert!(SignRefusal::from_status(SignStatus::Ok).is_none());
     assert!(SignStatus::from_bits(5).is_none());
-    assert!(SignOperation::from_bits(2).is_none());
+    assert!(SignOperation::from_bits(3).is_none());
 
     assert!(offset_of!(SignRequest, sequence) == 0);
     assert!(offset_of!(SignRequest, operation) == 4);
@@ -822,7 +970,22 @@ const _: () = {
     assert!(offset_of!(SignReply, len) == 12);
     assert!(offset_of!(SignReply, signed) == 16);
     assert!(offset_of!(SignReply, signature) == 24);
+    // Every field after the signature is pinned too, the certificate having been
+    // appended after them: an offset that moved would be a mapping both domains
+    // read differently, and the four bounds below are the only thing that makes
+    // "appended, never inserted" a compile-time claim.
+    assert!(offset_of!(SignReply, public_key) == 24 + MAX_SIGNATURE_LEN);
+    assert!(offset_of!(SignReply, device_id) == 24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN);
+    assert!(
+        offset_of!(SignReply, certificate)
+            == 24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN
+    );
     assert!(align_of::<SignReply>() == 8);
+    assert!(
+        size_of::<SignReply>()
+            == (24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN)
+                .next_multiple_of(align_of::<SignReply>())
+    );
     // Naturally aligned, which is what makes the counter a single access rather
     // than two a reader could tear across.
     assert!(offset_of!(SignReply, signed).is_multiple_of(align_of::<u64>()));
@@ -832,6 +995,15 @@ const _: () = {
     assert!(SIGN_REQUEST_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
     assert!(SIGN_REPLY_REGION_SIZE >= size_of::<SignReply>());
     assert!(SIGN_REPLY_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));
+
+    // And each is still exactly ONE mapping page, which is the size the system
+    // description grants. Pinned rather than left derived, because a field that
+    // pushed a region onto a second page would widen a capability without anything
+    // saying so: the grant would follow the constant and the topology would change
+    // in a diff nobody was reading. A type that outgrows a page is a change to
+    // argue for, so it fails here first.
+    assert!(SIGN_REQUEST_REGION_SIZE == MAPPING_ALIGN);
+    assert!(SIGN_REPLY_REGION_SIZE == MAPPING_ALIGN);
 };
 
 #[cfg(test)]

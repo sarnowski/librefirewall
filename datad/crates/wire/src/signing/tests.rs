@@ -65,7 +65,7 @@ fn a_signature_crosses_the_channel_and_the_key_does_not() {
     assert_eq!(channel.responder.signed(demand, &[0xDE; 70]), 70);
     assert_eq!(channel.responder.signatures(), 1);
 
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     match channel.requester.poll(pending, &mut into) {
         SignPoll::Signed { signature, signed } => {
             assert_eq!(signature, &[0xDE; 70][..]);
@@ -81,13 +81,142 @@ fn the_identity_request_answers_a_public_key_and_an_identifier() {
     let pending = channel.requester.request(SignOperation::PublicKey, &[]);
     let demand = channel.responder.take().expect("outstanding");
     channel.responder.identity(demand, &identity());
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     assert_eq!(
         channel.requester.poll(pending, &mut into),
         SignPoll::Identity(identity())
     );
     // Answering an identity is not signing, so the counter has not moved.
     assert_eq!(channel.responder.signatures(), 0);
+}
+
+#[test]
+fn the_certificate_request_answers_the_appliances_own_certificate() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Certificate, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    assert_eq!(demand.operation(), Some(SignOperation::Certificate));
+    let der = vec![0x30_u8; 512];
+    assert_eq!(channel.responder.certificate(demand, &der), der.len());
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Certificate { certificate } => assert_eq!(certificate, &der[..]),
+        other => panic!("expected a certificate: {other:?}"),
+    }
+    // Handing over a certificate is not signing, so the tally has not moved: the
+    // one counter on this channel counts private-key operations and nothing else.
+    assert_eq!(channel.responder.signatures(), 0);
+}
+
+#[test]
+fn a_certificate_exactly_the_bound_crosses_whole() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Certificate, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    let widest = vec![0xC5_u8; MAX_CERTIFICATE_LEN];
+    assert_eq!(
+        channel.responder.certificate(demand, &widest),
+        MAX_CERTIFICATE_LEN
+    );
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Certificate { certificate } => assert_eq!(certificate, &widest[..]),
+        other => panic!("a certificate at the bound was not handed over whole: {other:?}"),
+    }
+}
+
+#[test]
+fn a_certificate_longer_than_the_region_publishes_only_what_it_wrote() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Certificate, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    let published = channel
+        .responder
+        .certificate(demand, &[0x44; MAX_CERTIFICATE_LEN + 96]);
+    assert_eq!(published, MAX_CERTIFICATE_LEN);
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Certificate { certificate } => {
+            assert_eq!(certificate.len(), MAX_CERTIFICATE_LEN);
+        }
+        other => panic!("expected a certificate: {other:?}"),
+    }
+}
+
+#[test]
+fn a_certificate_length_past_the_region_is_refused_before_the_copy() {
+    let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+    let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+    let mut requester = request.requester(reply);
+    let pending = requester.request(SignOperation::Certificate, &[]);
+    let len = (MAX_CERTIFICATE_LEN + 1) as u32;
+    publish_raw(
+        reply,
+        pending.sequence(),
+        SignStatus::Ok.to_bits(),
+        SignOperation::Certificate.to_bits(),
+        len,
+    );
+    let mut into = SignAnswerBuffer::zero();
+    // The certificate's own bound and not the signature's: a fault naming the
+    // wrong field would leave a reader looking at the wrong number.
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        SignPoll::Faulted(SignFault::LenPastCertificate { len })
+    );
+}
+
+#[test]
+fn a_signature_length_inside_the_certificate_bound_is_still_past_the_signature() {
+    let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+    let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+    let mut requester = request.requester(reply);
+    let pending = requester.request(SignOperation::Sign, b"m");
+    // A length the wider field would admit, on an answer whose field is the
+    // narrow one: the bound each arm holds is its own.
+    let len = (MAX_SIGNATURE_LEN + 1) as u32;
+    publish_raw(
+        reply,
+        pending.sequence(),
+        SignStatus::Ok.to_bits(),
+        SignOperation::Sign.to_bits(),
+        len,
+    );
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        SignPoll::Faulted(SignFault::LenPastSignature { len })
+    );
+}
+
+#[test]
+fn an_empty_certificate_and_a_measured_identity_are_both_faults() {
+    let cases: [(SignOperation, u32, SignFault); 2] = [
+        (SignOperation::Certificate, 0, SignFault::EmptyCertificate),
+        (
+            SignOperation::PublicKey,
+            9,
+            SignFault::BytesOnIdentity { len: 9 },
+        ),
+    ];
+    for (operation, len, expected) in cases {
+        let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+        let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+        let mut requester = request.requester(reply);
+        let pending = requester.request(operation, &[]);
+        publish_raw(
+            reply,
+            pending.sequence(),
+            SignStatus::Ok.to_bits(),
+            operation.to_bits(),
+            len,
+        );
+        let mut into = SignAnswerBuffer::zero();
+        assert_eq!(
+            requester.poll(pending, &mut into),
+            SignPoll::Faulted(expected)
+        );
+    }
 }
 
 #[test]
@@ -105,19 +234,26 @@ fn a_reply_carrying_another_sequence_is_ignored_entirely() {
         SignOperation::Sign.to_bits(),
         8,
     );
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     match requester.poll(pending, &mut into) {
         SignPoll::Outstanding(_) => {}
         other => panic!("a reply to another request was believed: {other:?}"),
     }
     assert_eq!(requester.faults(), 0, "ignoring is not faulting");
-    assert_eq!(into, [0; MAX_SIGNATURE_LEN], "nothing was copied out");
+    assert_eq!(
+        into.signature, [0; MAX_SIGNATURE_LEN],
+        "nothing was copied out"
+    );
+    assert_eq!(
+        into.certificate, [0; MAX_CERTIFICATE_LEN],
+        "nothing was copied out"
+    );
 }
 
 #[test]
 fn two_requests_in_a_row_are_each_answered_under_their_own_sequence() {
     let mut channel = Channel::new();
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     for filler in [1_u8, 2] {
         let pending = channel.requester.request(SignOperation::Sign, &[filler]);
         let demand = channel.responder.take().expect("outstanding");
@@ -146,7 +282,7 @@ fn one_demand_is_taken_per_change_of_the_sequence() {
         channel.responder.take().is_none(),
         "an answered request produced another demand"
     );
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     assert!(matches!(
         channel.requester.poll(pending, &mut into),
         SignPoll::Signed { .. }
@@ -164,7 +300,7 @@ fn every_refusal_reaches_the_requester_as_itself_and_carries_no_bytes() {
         let pending = channel.requester.request(SignOperation::Sign, b"m");
         let demand = channel.responder.take().expect("outstanding");
         channel.responder.refuse(demand, reason);
-        let mut into = [0_u8; MAX_SIGNATURE_LEN];
+        let mut into = SignAnswerBuffer::zero();
         assert_eq!(
             channel.requester.poll(pending, &mut into),
             SignPoll::Refused(reason)
@@ -185,7 +321,7 @@ fn an_operation_word_the_holder_does_not_know_is_refused_rather_than_ignored() {
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.operation(), None);
     responder.refuse(demand, SignRefusal::NoSuchOperation);
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     assert_eq!(
         requester.poll(pending, &mut into),
         SignPoll::Refused(SignRefusal::NoSuchOperation)
@@ -229,7 +365,7 @@ fn a_reply_answering_the_wrong_question_is_a_fault() {
     let pending = channel.requester.request(SignOperation::Sign, b"m");
     let demand = channel.responder.take().expect("outstanding");
     channel.responder.identity(demand, &identity());
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     assert_eq!(
         channel.requester.poll(pending, &mut into),
         SignPoll::Faulted(SignFault::WrongOperation {
@@ -259,7 +395,7 @@ fn a_status_or_operation_word_outside_its_vocabulary_is_a_fault() {
         let mut requester = request.requester(reply);
         let pending = requester.request(SignOperation::Sign, b"m");
         publish_raw(reply, pending.sequence(), status, operation, 0);
-        let mut into = [0_u8; MAX_SIGNATURE_LEN];
+        let mut into = SignAnswerBuffer::zero();
         assert_eq!(
             requester.poll(pending, &mut into),
             SignPoll::Faulted(expected)
@@ -281,7 +417,7 @@ fn a_length_past_the_signature_region_is_refused_before_the_copy() {
         SignOperation::Sign.to_bits(),
         len,
     );
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     assert_eq!(
         requester.poll(pending, &mut into),
         SignPoll::Faulted(SignFault::LenPastSignature { len })
@@ -313,7 +449,7 @@ fn a_refusal_carrying_bytes_and_a_success_carrying_none_are_both_faults() {
             SignOperation::Sign.to_bits(),
             len,
         );
-        let mut into = [0_u8; MAX_SIGNATURE_LEN];
+        let mut into = SignAnswerBuffer::zero();
         assert_eq!(
             requester.poll(pending, &mut into),
             SignPoll::Faulted(expected)
@@ -330,7 +466,7 @@ fn a_signature_longer_than_the_region_publishes_only_what_it_wrote() {
         .responder
         .signed(demand, &[0xEE; MAX_SIGNATURE_LEN + 16]);
     assert_eq!(published, MAX_SIGNATURE_LEN);
-    let mut into = [0_u8; MAX_SIGNATURE_LEN];
+    let mut into = SignAnswerBuffer::zero();
     match channel.requester.poll(pending, &mut into) {
         SignPoll::Signed { signature, .. } => assert_eq!(signature.len(), MAX_SIGNATURE_LEN),
         other => panic!("expected a signature: {other:?}"),
@@ -363,7 +499,7 @@ fn every_status_and_operation_bit_pattern_round_trips_or_is_refused() {
         }
         match SignOperation::from_bits(bits) {
             Some(operation) => assert_eq!(operation.to_bits(), bits),
-            None => assert!(bits >= 2),
+            None => assert!(bits >= 3),
         }
     }
     for status in [
@@ -398,11 +534,28 @@ fn set_requester_sequence(requester: &mut SignRequester<'_>, sequence: u32) {
     requester.sequence = sequence;
 }
 
+/// The operations a request may name, as a strategy.
+///
+/// Enumerated out of the vocabulary rather than listed here: the encoding is
+/// contiguous from zero, so `from_bits` answering `None` is one past the last
+/// operation. An operation appended to the ABI therefore joins this strategy — and
+/// every property below — without either being edited.
+fn any_operation() -> impl Strategy<Value = SignOperation> {
+    let all: Vec<SignOperation> = (0_u32..).map_while(SignOperation::from_bits).collect();
+    proptest::sample::select(all)
+}
+
 proptest! {
     /// Whatever a hostile responder publishes, one poll is total: it answers,
     /// refuses, faults or stays outstanding, and never reads past the region.
+    ///
+    /// The *asked* operation is drawn too, which is what puts the wrong-operation
+    /// fault under the property rather than in one hand-written case: every pair
+    /// of asked and answered operations is reachable here, and the poll must fault
+    /// on each of the six that disagree.
     #[test]
     fn polling_an_arbitrary_reply_is_total(
+        asked in any_operation(),
         status in any::<u32>(),
         operation in any::<u32>(),
         len in any::<u32>(),
@@ -411,23 +564,86 @@ proptest! {
         let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
         let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
         let mut requester = request.requester(reply);
-        let pending = requester.request(SignOperation::Sign, b"message");
+        let pending = requester.request(asked, b"message");
         // Sometimes the right sequence, sometimes another one.
         let sequence = pending.sequence().wrapping_add(offset);
         publish_raw(reply, sequence, status, operation, len);
-        let mut into = [0_u8; MAX_SIGNATURE_LEN];
+        let answered = SignOperation::from_bits(operation);
+        let mut into = SignAnswerBuffer::zero();
+        let poll = requester.poll(pending, &mut into);
+        // A reply this request's own that answers some other question is a fault
+        // by name, whatever else it carries: the status and the length are never
+        // consulted, because a reply to another question has nothing to say about
+        // this one.
+        let disagreed = answered.filter(|answered| *answered != asked);
+        if let (0, Some(answered)) = (offset, disagreed) {
+            prop_assert_eq!(
+                poll,
+                SignPoll::Faulted(SignFault::WrongOperation { asked, answered })
+            );
+            prop_assert_eq!(requester.faults(), 1);
+        } else {
+            match poll {
+                SignPoll::Outstanding(_) => prop_assert_ne!(offset, 0),
+                SignPoll::Signed { signature, .. } => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::Sign);
+                    prop_assert!(!signature.is_empty());
+                    prop_assert!(signature.len() <= MAX_SIGNATURE_LEN);
+                }
+                SignPoll::Certificate { certificate } => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::Certificate);
+                    prop_assert!(!certificate.is_empty());
+                    prop_assert!(certificate.len() <= MAX_CERTIFICATE_LEN);
+                }
+                SignPoll::Identity(_) => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::PublicKey);
+                }
+                SignPoll::Refused(_) => prop_assert_eq!(offset, 0),
+                SignPoll::Faulted(_) => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(requester.faults(), 1);
+                }
+            }
+        }
+    }
+
+    /// A certificate answer of any stated length either arrives at that length or
+    /// is refused for it, and the bound it is held to is the certificate's own.
+    ///
+    /// The lengths either side of [`MAX_CERTIFICATE_LEN`] are what this is for: a
+    /// bound written with `>=` instead of `>` would refuse the widest certificate
+    /// the profile can produce, and one written against the signature's field
+    /// would refuse almost every certificate there is.
+    #[test]
+    fn a_stated_certificate_length_either_arrives_or_is_refused_for_itself(
+        len in 0_u32..(MAX_CERTIFICATE_LEN as u32 + 64),
+    ) {
+        let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+        let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+        let mut requester = request.requester(reply);
+        let pending = requester.request(SignOperation::Certificate, &[]);
+        publish_raw(
+            reply,
+            pending.sequence(),
+            SignStatus::Ok.to_bits(),
+            SignOperation::Certificate.to_bits(),
+            len,
+        );
+        let mut into = SignAnswerBuffer::zero();
         match requester.poll(pending, &mut into) {
-            SignPoll::Outstanding(_) => prop_assert_ne!(offset, 0),
-            SignPoll::Signed { signature, .. } => {
-                prop_assert_eq!(offset, 0);
-                prop_assert!(!signature.is_empty());
-                prop_assert!(signature.len() <= MAX_SIGNATURE_LEN);
+            SignPoll::Certificate { certificate } => {
+                prop_assert_eq!(certificate.len(), len as usize);
+                prop_assert!(len != 0 && (len as usize) <= MAX_CERTIFICATE_LEN);
             }
-            SignPoll::Identity(_) | SignPoll::Refused(_) => prop_assert_eq!(offset, 0),
-            SignPoll::Faulted(_) => {
-                prop_assert_eq!(offset, 0);
-                prop_assert_eq!(requester.faults(), 1);
+            SignPoll::Faulted(SignFault::EmptyCertificate) => prop_assert_eq!(len, 0),
+            SignPoll::Faulted(SignFault::LenPastCertificate { len: refused }) => {
+                prop_assert_eq!(refused, len);
+                prop_assert!((len as usize) > MAX_CERTIFICATE_LEN);
             }
+            other => prop_assert!(false, "neither arrived nor refused for itself: {other:?}"),
         }
     }
 

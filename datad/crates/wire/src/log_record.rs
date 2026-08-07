@@ -775,14 +775,18 @@ impl LogRecord {
                 documents: self.operands[1],
                 was_owned: flag(self.operands[3])?,
             },
-            // An identifier in its two halves and a count, on `Identity`'s terms
-            // for the halves and with nothing to refuse: a count of signatures a
-            // peer produced is unranged, and the fourth word is not a flag here,
-            // so this detail names three words and leaves the last unclaimed.
+            // An identifier in its two halves and two counts, on `Identity`'s
+            // terms for the halves and with nothing to refuse: a count of
+            // signatures a peer produced and a count of certificate bytes it
+            // handed over are both unranged, so every bit pattern of the four
+            // words is one a delegating domain could have read. This detail is
+            // the one in this ABI whose fourth word is a number rather than a
+            // flag, which is why the flag rule below does not reach it.
             Some(LogDetailKind::Delegated) => CheckedDetail::Delegated {
                 high: self.operands[0],
                 low: self.operands[1],
                 signatures: self.operands[2],
+                certificate: self.operands[3],
             },
             // A token, an address, a port and a count. The token names a closed
             // set and is refused outside it on `Proved`'s terms, which is why it
@@ -1350,6 +1354,7 @@ pub enum CheckedDetail {
         high: u64,
         low: u64,
         signatures: u64,
+        certificate: u64,
     },
     /// Where a connection this appliance originated went, and what became of
     /// it: the outcome token, the destination address and port, and how many

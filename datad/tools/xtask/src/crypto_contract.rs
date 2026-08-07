@@ -26,14 +26,18 @@
 //!
 //! This domain authenticates under a key it does not hold, so two of its records
 //! are about the domain that does. Both carry `delegated-device=` — the appliance
-//! the key holder named — and `delegated-signatures=`, that holder's own tally.
-//! [`delegation_records`] holds them to three things no single record can say:
-//! that the identifier is the *same* on both, that it is the same one the
-//! `domain=store` records report on the same boot, and that the tally **moved**
-//! between them. The last is what proves the session's server half really ran on
-//! the delegated key: its `CertificateVerify` was computed in the other domain, so
-//! a number that stayed put would mean the handshake signed some other way and
-//! the seam was never on the path.
+//! the key holder named — `delegated-signatures=`, that holder's own tally, and
+//! `delegated-certificate=`, the size of the certificate the holder handed over.
+//! [`delegation_records`] holds them to five things no single record can say: that
+//! the identifier is the *same* on both, that it is the same one the `domain=store`
+//! records report on the same boot, that the tally **moved** between them, that a
+//! certificate arrived at all, and that its size is the same on both. The tally is
+//! what proves the session's server half really ran on the delegated key: its
+//! `CertificateVerify` was computed in the other domain, so a number that stayed
+//! put would mean the handshake signed some other way and the seam was never on
+//! the path. The certificate's size is the one field here that must **not** move —
+//! one appliance has one certificate, so two sizes on one boot would be two
+//! answers to one question.
 //!
 //! # Why the verdict is only asserted on an accelerated run
 //!
@@ -301,23 +305,31 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
 /// through [`crate::store_contract`]: what is being compared is two domains'
 /// renderings of one value, so both sides have to come off the wire.
 fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String, String> {
-    let observed: Vec<(&str, &str)> = steps
+    let observed: Vec<(&str, &str, &str)> = steps
         .iter()
         .filter_map(|record| {
             Some((
                 field_value(record, "delegated-device")?,
                 field_value(record, "delegated-signatures")?,
+                field_value(record, "delegated-certificate")?,
             ))
         })
         .collect();
-    let [(first_device, first_count), (second_device, second_count)] = observed[..] else {
+    let [
+        (first_device, first_count, first_certificate),
+        (second_device, second_count, second_certificate),
+    ] = observed[..]
+    else {
         return Err(format!(
-            "the cryptography domain published {} `delegated-device=` record(s) and a boot \
-             produces exactly two: the direct proof that a signature made in the key holder's \
-             domain verifies under the key that domain named, and the same tally read again after \
-             a TLS session whose server half ran under that key. One means the session never ran \
-             on the delegated key; none means the delegation never answered at all\n  records \
-             observed: {steps:#?}\n  full run log: {}",
+            "the cryptography domain published {} complete `delegated-device=` record(s) and a \
+             boot produces exactly two: the direct proof that a signature made in the key \
+             holder's domain verifies under the key that domain named — with the certificate over \
+             that key held to it — and the same tally read again after a TLS session whose server \
+             half ran under that key. One means the session never ran on the delegated key; none \
+             means the delegation never answered at all. A record carrying the identifier without \
+             `delegated-signatures=` or `delegated-certificate=` is not counted here, because a \
+             partial record is a rendering that lost a field\n  records observed: {steps:#?}\n  \
+             full run log: {}",
             observed.len(),
             log.display()
         ));
@@ -365,6 +377,34 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
     };
     let before = number(first_count, "first")?;
     let after = number(second_count, "second")?;
+    // The certificate is the identity's other half, and the two records must agree
+    // about it exactly: a size that moved would mean the holder answered with two
+    // different certificates on one boot.
+    if first_certificate != second_certificate {
+        return Err(format!(
+            "the key holder handed over a certificate of {first_certificate:?} bytes before the \
+             session and {second_certificate:?} after it, and one appliance has one certificate. \
+             Two sizes mean the holder answered with two different certificates\n  full run log: \
+             {}",
+            log.display()
+        ));
+    }
+    let certificate = first_certificate.parse::<u64>().map_err(|error| {
+        format!(
+            "the `delegated-certificate={first_certificate}` is no number: {error}\n  full run \
+             log: {}",
+            log.display()
+        )
+    })?;
+    if certificate == 0 {
+        return Err(format!(
+            "the key holder handed over 0 bytes of certificate, which is no certificate: the \
+             cryptography domain refuses a certificate that does not carry the very public key \
+             the same channel named, so a zero here is a boot that reported having one without \
+             having asked\n  full run log: {}",
+            log.display()
+        ));
+    }
     if before == 0 {
         return Err(format!(
             "the key holder reported having produced 0 signatures after the direct proof, and the \
@@ -385,7 +425,8 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
     }
     Ok(format!(
         "signed for appliance {first_device} under a key it does not hold, the holder's tally \
-         moving {before} -> {after} across a session whose server half ran on that key"
+         moving {before} -> {after} across a session whose server half ran on that key, holding \
+         a {certificate}-byte certificate over that very key"
     ))
 }
 

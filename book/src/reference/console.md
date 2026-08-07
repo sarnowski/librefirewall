@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -58,7 +58,7 @@ written waits forever:
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` with `delegated-signatures=` records, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, one further `ready` per **onboarding session** this domain terminated, carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=` — and, where it refused one, a `ready` carrying the refusal group beside it. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` records carrying `delegated-signatures=` and `delegated-certificate=`, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain and whose certificate size must not have, one appliance having one certificate; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, one further `ready` per **onboarding session** this domain terminated, carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=` — and, where it refused one, a `ready` carrying the refusal group beside it. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -219,25 +219,33 @@ node: an operator holding a silent appliance still has only the external act.
   were lost and not the sectors that were written — the whole slot array is overwritten either way,
   because deciding which sectors held a secret from the record being destroyed would be trusting it
   one last time.
-- `delegated-device=<32 hex> delegated-signatures=<n>` — **a domain that holds no private key
-  reporting the one that does.** This appliance's device key belongs to the domain that owns the
-  medium it is written on, and the domain that authenticates to the network is not that one: it asks
-  for a signature over a channel whose two regions have no field a private key fits in, and this is
-  what it learned by asking.
+- `delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>` — **a domain that
+  holds no private key reporting the one that does.** This appliance's device key belongs to the
+  domain that owns the medium it is written on, and the domain that authenticates to the network is
+  not that one: it asks for a signature over a channel whose two regions have no field a private key
+  fits in, and this is what it learned by asking.
 
   `delegated-device=` is the appliance the key holder named, rendered exactly as the `device=` field
   of that holder's own record — **compare the two character for character**, because two different
   values on one boot mean the asking domain is authenticating as an appliance this one is not.
   `delegated-signatures=` is the *holder's* count of signatures it has produced since it started, not
   a count of requests this domain made: a number this domain incremented itself would say only that
-  it asked.
+  it asked. `delegated-certificate=` is the size in bytes of the certificate that holder handed over
+  — the appliance's own certificate over the very key it signs under, which the asking domain needs
+  in order to present an identity to a peer at all.
+
+  **The certificate is a size and never the certificate itself.** A certificate is public, so there
+  would be nothing unsafe about printing one; what makes it a number here is that 768 bytes of DER on
+  a bounded ring would push out every record an operator can actually read. What the size is worth is
+  a comparison: it is the same on both records of a boot, because one appliance has one certificate.
 
   **The record appears twice on a boot and the pair is the claim.** The first is the direct proof —
-  the holder answered which key it holds, signed a fixed challenge, and the signature verified under
-  that key. The second follows a completed TLS session whose server half ran under the delegated key,
-  and its count must be higher: the handshake's own signature was computed in the other domain, so a
-  number that did not move would mean the session signed some other way. Neither record carries a
-  signature, a message or a key — a public name and a tally are all the channel can carry.
+  the holder answered which key it holds, signed a fixed challenge, the signature verified under that
+  key, and the certificate it then handed over was found to carry that same key. The second follows a
+  completed TLS session whose server half ran under the delegated key, and its count must be higher:
+  the handshake's own signature was computed in the other domain, so a number that did not move would
+  mean the session signed some other way. Neither record carries a signature, a message, a key or a
+  certificate — a public name and three tallies are all that reaches this surface.
 - `dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>` — **the
   channel this appliance reached *out* with, and what became of it.** Every other record on this
   channel is about traffic the appliance answered; this one is about a connection it originated, so
@@ -341,7 +349,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 19 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 43 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 47 the `crypto` domain
 raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -507,7 +515,7 @@ of a vector's contents.
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
 | the session the domain establishes against itself (none carries a `detail=`) | `tls-handshake-refused`, `tls-session-stalled`, `tls-peer-unauthenticated`, `tls-peer-certificate-wrong`, `tls-application-data-lost`, `tls-session-not-closed`, `tls-identity-unbuildable`, `tls-arena-exhausted` |
 | the bounded allocator's own proof (`detail=` is the refusal count for the first and the headroom that was left for the last; the middle carries none) | `arena-allocation-refused`, `arena-starvation-unreachable`, `starved-session-established` |
-| the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid` |
+| the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid` and the certificate's length on `delegated-certificate-not-the-key`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid`, `delegated-certificate-unanswered`, `delegated-certificate-refused`, `delegated-certificate-faulted`, `delegated-certificate-not-the-key` |
 | the onboarding session this domain terminates, refused at the relay carrying it (`detail=` is the operation that named a session there was none of, or the length that was past what one item may carry; the rest carry none) | `relay-no-connection`, `relay-payload-too-long`, `relay-no-such-operation`, `relay-session-failed` |
 
 **The `delegated-*` group is about the other domain**, and it is the one group here whose subject is
@@ -524,6 +532,17 @@ channel reads as; `delegated-signature-refused` is a holder that would not sign;
 the holder named, which means the two halves of that appliance's identity disagree. Read every one of
 them beside the `domain=store` records on the same boot: this domain reports what it was given, and
 that domain reports what it has.
+
+**The four `delegated-certificate-*` tokens are the same exchange asked for the other half of the
+identity**, and they are separate from the three above them on purpose: by the time one of them can
+appear, the key holder has already answered which key it holds and already signed a challenge under
+it. So `delegated-certificate-unanswered`, `delegated-certificate-refused` and
+`delegated-certificate-faulted` all mean something narrower than their `delegated-key-*` counterparts
+— the channel is wired, the key is usable, and the holder stopped or refused only when asked for the
+certificate over it. `delegated-certificate-not-the-key` is the grave one of the four: a certificate
+arrived and does not contain the public key the very same channel named, which means the domain that
+holds this appliance's identity is holding two halves that do not belong to each other. Its `detail=`
+is the size of what arrived.
 
 **The two groups before it are what a boot's TLS proof says when it does not hold**, and they divide
 the same way the proof does. A `tls-*` token means the session itself did not establish or did not stay

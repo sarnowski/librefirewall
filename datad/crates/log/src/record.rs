@@ -546,12 +546,23 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::OnboardingPort.to_bits();
                     record.operands = [*accepted, *forgotten, *overflowed, *refused];
                 }
-                DomainDetail::Delegated { device, signatures } => {
+                DomainDetail::Delegated {
+                    device,
+                    signatures,
+                    certificate,
+                } => {
                     record.detail = LogDetailKind::Delegated.to_bits();
                     // The identifier in its two halves, most significant first,
                     // exactly as `Identity` and `Peer` carry one: three
-                    // renderings of one value must not be three orders.
-                    record.operands = [(*device >> 64) as u64, *device as u64, *signatures, 0];
+                    // renderings of one value must not be three orders. The
+                    // certificate's length takes the fourth word, which this
+                    // detail is the one in the ABI not to carry a flag in.
+                    record.operands = [
+                        (*device >> 64) as u64,
+                        *device as u64,
+                        *signatures,
+                        *certificate,
+                    ];
                 }
                 DomainDetail::Refusal(Refusal {
                     cause,
@@ -834,15 +845,17 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             refused: *refused,
         },
         // Total for the same reason with nothing ranged at all: an identifier is
-        // 128 bits of randomness and a signature count is a tally, so every bit
-        // pattern of the three words is one a delegating domain could have read.
+        // 128 bits of randomness and both counts are tallies, so every bit pattern
+        // of the four words is one a delegating domain could have read.
         CheckedDetail::Delegated {
             high,
             low,
             signatures,
+            certificate,
         } => DomainDetail::Delegated {
             device: (u128::from(*high) << 64) | u128::from(*low),
             signatures: *signatures,
+            certificate: *certificate,
         },
         CheckedDetail::Refusal {
             cause,
@@ -939,9 +952,15 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         documents,
                         was_owned,
                     },
-                    DomainDetail::Delegated { device, signatures } => {
-                        DomainDetail::Delegated { device, signatures }
-                    }
+                    DomainDetail::Delegated {
+                        device,
+                        signatures,
+                        certificate,
+                    } => DomainDetail::Delegated {
+                        device,
+                        signatures,
+                        certificate,
+                    },
                     DomainDetail::DialRoute {
                         next_hop,
                         via,

@@ -47,15 +47,18 @@ fn capture() -> String {
 /// The appliance the key holder names, as both domains render it.
 const DEVICE: &str = "3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c";
 
-/// The direct proof's record: the holder answered, signed, and the signature
-/// verified under the key it named.
+/// The direct proof's record: the holder answered, signed, the signature verified
+/// under the key it named, and the certificate it handed over carried that key.
 const DELEGATION_BEFORE: &str = "LFW-PD domain=crypto state=negotiated \
-     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=1\r\n";
+     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=1 \
+     delegated-certificate=452\r\n";
 
 /// The same tally after a session whose server half ran on the delegated key. It
-/// has moved by the handshake's own `CertificateVerify`.
+/// has moved by the handshake's own `CertificateVerify`; the certificate has not,
+/// one appliance having one of those.
 const DELEGATION_AFTER: &str = "LFW-PD domain=crypto state=negotiated \
-     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=2\r\n";
+     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=2 \
+     delegated-certificate=452\r\n";
 
 /// The key holder's own record, on the same boot.
 const STORE_IDENTITY: &str = "LFW-PD domain=store state=ready \
@@ -205,6 +208,29 @@ fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused()
     );
     let verdict = judge(stranger.as_bytes(), log(), true).expect_err("two identities");
     assert!(verdict.contains("is not this appliance's"), "{verdict}");
+
+    // A holder that answered with no certificate at all, on a boot that still
+    // claimed the delegation worked.
+    let bare = capture().replace("delegated-certificate=452", "delegated-certificate=0");
+    let verdict = judge(bare.as_bytes(), log(), true).expect_err("no certificate");
+    assert!(verdict.contains("0 bytes of certificate"), "{verdict}");
+
+    // Two certificates on one boot, which is one appliance answering as two.
+    let two = capture().replace(
+        "delegated-signatures=2 delegated-certificate=452",
+        "delegated-signatures=2 delegated-certificate=451",
+    );
+    let verdict = judge(two.as_bytes(), log(), true).expect_err("two certificates");
+    assert!(
+        verdict.contains("one appliance has one certificate"),
+        "{verdict}"
+    );
+
+    // A record that lost the certificate field entirely is not a delegation record
+    // at all: a partial rendering must not pass for a whole one.
+    let partial = capture().replace(" delegated-certificate=452\r\n", "\r\n");
+    let verdict = judge(partial.as_bytes(), log(), true).expect_err("partial records");
+    assert!(verdict.contains("exactly two"), "{verdict}");
 
     // And the two records themselves disagreeing.
     let drifted = capture().replace(

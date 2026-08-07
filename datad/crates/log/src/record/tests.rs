@@ -310,6 +310,7 @@ fn every_domain_detail_shape_survives_the_crossing() {
         DomainDetail::Delegated {
             device: 1,
             signatures: u64::MAX,
+            certificate: 452,
         },
         // The channel's own five, each at a value that would survive a field
         // read out of the wrong operand word only if the words were symmetric —

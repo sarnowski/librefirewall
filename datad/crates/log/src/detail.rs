@@ -270,23 +270,30 @@ pub enum DomainDetail<C = &'static str> {
         was_owned: bool,
     },
     /// What a domain that holds no private key learned by asking the domain that
-    /// does: which appliance it signs for, and how many signatures that holder
-    /// has produced since it started.
+    /// does: which appliance it signs for, how many signatures that holder has
+    /// produced since it started, and how large the certificate it handed over is.
     ///
-    /// Appended, never inserted, on the three details above's terms. The pair is
-    /// what makes either number worth reading. The identifier alone would say
-    /// only that a channel answered; the count alone would say that something
-    /// signed and not what for. Together they are the delegation working: a
-    /// domain naming an appliance it cannot have generated, under a count that
-    /// moves when it asks again.
+    /// Appended, never inserted, on the three details above's terms. The three
+    /// together are what makes any of them worth reading. The identifier alone
+    /// would say only that a channel answered; the signature count alone would say
+    /// that something signed and not what for; the certificate's length alone would
+    /// say that bytes arrived and not whose. Together they are the delegation
+    /// working: a domain naming an appliance it cannot have generated, under a count
+    /// that moves when it asks again, holding a certificate over the very key that
+    /// appliance named.
     ///
     /// **No key material has a representation here**, and that is the whole
-    /// point of the record: what a delegating domain can report is a public name
-    /// and a tally, because a public name and a tally are all the channel it
-    /// asked over is able to carry.
+    /// point of the record: what a delegating domain can report is a public name,
+    /// two tallies and nothing else, because a public name and tallies are all the
+    /// channel it asked over lets it say. The certificate is public too and is
+    /// still not printed — a length is what an operator can read.
     Delegated {
         device: u128,
         signatures: u64,
+        /// Bytes of the certificate the holder handed over, which is a count and
+        /// never the certificate: a public artifact is still 768 bytes of DER
+        /// nobody reads off a serial line, and a length is what says one arrived.
+        certificate: u64,
     },
     /// What became of the connection this appliance reached *out* of its
     /// management port with: where it dialled, how many attempts it spent, and

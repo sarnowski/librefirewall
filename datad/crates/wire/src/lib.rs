@@ -131,10 +131,10 @@ pub use relay::{
     RelayRequest, RelayRequester, RelayResponder, RelayStatus,
 };
 pub use signing::{
-    DEVICE_ID_LEN, DeviceIdentity, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, PUBLIC_KEY_LEN,
-    PendingSignature, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE, SignDemand, SignFault,
-    SignOperation, SignPoll, SignRefusal, SignReply, SignRequest, SignRequester, SignResponder,
-    SignStatus,
+    DEVICE_ID_LEN, DeviceIdentity, MAX_CERTIFICATE_LEN, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,
+    PUBLIC_KEY_LEN, PendingSignature, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE,
+    SignAnswerBuffer, SignDemand, SignFault, SignOperation, SignPoll, SignRefusal, SignReply,
+    SignRequest, SignRequester, SignResponder, SignStatus,
 };
 pub use submission::{
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, ConfigAnswer, ConfigDemand, ConfigFault,

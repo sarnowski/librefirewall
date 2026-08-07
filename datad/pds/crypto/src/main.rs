@@ -30,15 +30,17 @@
 //!    every measured primitive reports thousandths of a cycle per byte, and
 //!    the gate holds AES-256-GCM's below a figure no portable implementation
 //!    reaches. This is the claim that would otherwise go quietly untrue.
-//! 4. **The appliance can authenticate under a key it does not hold.** The
-//!    device key belongs to the domain that owns the medium it is written on,
-//!    and this domain is not that one. So it asks: which key do you hold, and
-//!    sign these bytes — and then verifies the signature against the key it was
-//!    given, which is a claim about the delegation and not about ECDSA. The
-//!    session below then runs its **server half under that same delegated key**,
-//!    because that is the only thing that proves the seam where it will actually
-//!    be used: `sign` is called synchronously, deep inside a rustls handshake,
-//!    at the point a server produces its `CertificateVerify`.
+//! 4. **The appliance can authenticate under a key it does not hold, and can
+//!    present the certificate over it.** The device key belongs to the domain
+//!    that owns the medium it is written on, and this domain is not that one. So
+//!    it asks three things: which key do you hold, sign these bytes, and hand me
+//!    the certificate over that key — then verifies the signature against the key
+//!    it was given, which is a claim about the delegation and not about ECDSA, and
+//!    holds the certificate to that same key, which is a claim this domain can
+//!    settle on its own. The session below then runs its **server half under that
+//!    same delegated key**, because that is the only thing that proves the seam
+//!    where it will actually be used: `sign` is called synchronously, deep inside
+//!    a rustls handshake, at the point a server produces its `CertificateVerify`.
 //!
 //! # Why the measurement takes the minimum of several rounds
 //!
@@ -68,8 +70,10 @@
 //! consumed inside this file; the generator holds it, no record names it, and the
 //! raw draws are cleared before the buffer holding them goes out of scope. The
 //! device key is never here in any form: what crosses the delegation is a public
-//! point, a public name, and signatures, because those are the only shapes the
-//! ABI has fields for. The only numbers that leave are counts and costs.
+//! point, a public name, a certificate and signatures, because those are the only
+//! shapes the ABI has fields for and every one of them is something a peer of this
+//! appliance is shown. The certificate is not printed either — its length is what
+//! reaches a record. The only numbers that leave are counts and costs.
 //!
 //! # Two keys, and only one of them is this domain's
 //!
@@ -125,7 +129,7 @@ use wire::{
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
-use delegate::{Delegated, DelegationError, HeldKey};
+use delegate::{Delegated, DelegationError, HeldCertificate, HeldKey};
 
 /// The appliance's only allocator, and the one exception to the rule that a
 /// protection domain has none. It is here because a proven TLS implementation
@@ -529,35 +533,48 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
     // Before the session, because the session's server half runs under the key
     // this establishes: a handshake that failed on an unanswered delegation would
     // report a TLS refusal and say nothing about which half was at fault.
-    let held = match prove_delegation(sink, delegated) {
-        Ok(held) => held,
+    let delegation = match prove_delegation(sink, delegated) {
+        Ok(delegation) => delegation,
         Err(error) => {
             outcome.verdict = Err(error);
             return outcome;
         }
     };
 
-    if let Err(error) = prove_tls(sink, entropy, now, delegated, &held) {
+    if let Err(error) = prove_tls(sink, entropy, now, delegated, &delegation) {
         outcome.verdict = Err(error);
     }
     outcome
 }
 
-/// Ask the key holder which key it holds, have it sign a fixed challenge, and
-/// verify that signature against that key.
+/// The appliance's identity as the key holder gave it up: which key it holds, and
+/// the certificate over that key.
+///
+/// One value because they are one answer and are only worth anything held to each
+/// other. A certificate that does not carry the point the same channel named is not
+/// this appliance's identity however well either half reads alone, and a point with
+/// no certificate is nothing a peer can be shown.
+struct Delegation {
+    held: HeldKey,
+    certificate: HeldCertificate,
+}
+
+/// Ask the key holder which key it holds, have it sign a fixed challenge, verify
+/// that signature against that key, and take the certificate over it.
 ///
 /// **This proves the delegation and not ECDSA**, which the vector run above has
 /// already settled. What it establishes is that the two regions carry a request
-/// and an answer, that the answer is this request's, and that the bytes coming
-/// back are a signature under the point the holder named — so a channel wired to
-/// the wrong region, a holder answering the wrong question, and a public key
-/// paired with somebody else's scalar are each a refusal here rather than a
-/// handshake failure three steps later.
+/// and an answer, that the answer is this request's, that the bytes coming back
+/// are a signature under the point the holder named, and that the certificate the
+/// holder keeps is over that same point — so a channel wired to the wrong region,
+/// a holder answering the wrong question, a public key paired with somebody else's
+/// scalar, and a certificate belonging to some other appliance are each a refusal
+/// here rather than a handshake failure three steps later.
 ///
-/// The record it leaves names the appliance and the holder's own tally. Reported
-/// before the session, so a boot whose session then fails still shows the
-/// delegation having worked.
-fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<HeldKey, CryptoError> {
+/// The record it leaves names the appliance, the holder's own tally and the size of
+/// the certificate. Reported before the session, so a boot whose session then fails
+/// still shows the delegation having worked.
+fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<Delegation, CryptoError> {
     let held = delegated.held_key().map_err(delegation_refusal)?;
     // An all-zero point is what a zeroed region reads as, so it is the one shape
     // that would let a channel nobody wired pass this proof.
@@ -584,23 +601,70 @@ fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<HeldKey, C
             RefusalDetail::One(len as u64),
         ))
     })?;
-    report_delegation(sink, delegated, &held);
-    Ok(held)
+    let certificate = held_certificate(delegated, &held)?;
+    let delegation = Delegation { held, certificate };
+    report_delegation(sink, delegated, &delegation);
+    Ok(delegation)
 }
 
-/// What the delegation has come to: the appliance this domain signs for, and the
-/// holder's own signature tally.
+/// Take the appliance's certificate from the holder and hold it to the key the
+/// same channel named.
+///
+/// **The check is one this domain can settle by itself**, which is why it is worth
+/// making: the uncompressed point the holder published appears in a certificate
+/// exactly once, inside the `SubjectPublicKeyInfo`, so finding those bytes in the
+/// encoding establishes that the certificate's subject public key is the key that
+/// will sign. A certificate for some other appliance, a stale one from before a
+/// factory reset, and a region nobody wired all fail it.
+///
+/// Nothing is parsed. A second X.509 reader in the domain that faces the network
+/// is what this appliance declines to have, and none is needed: containment is the
+/// whole claim, and the algorithm the point is wrapped in is fixed by the profile
+/// the holder wrote it under.
+fn held_certificate(delegated: &Delegated, held: &HeldKey) -> Result<HeldCertificate, CryptoError> {
+    let certificate = delegated.held_certificate().map_err(certificate_refusal)?;
+    if !contains(certificate.as_bytes(), &held.public_key) {
+        // The length and not the bytes: a certificate is public, and a console
+        // that printed 768 bytes of DER would push every record an operator needs
+        // out of a bounded ring to say something they cannot read anyway.
+        return Err(CryptoError(refusal(
+            "delegated-certificate-not-the-key",
+            RefusalDetail::One(certificate.as_bytes().len() as u64),
+        )));
+    }
+    Ok(certificate)
+}
+
+/// Whether `needle` appears in `haystack`.
+///
+/// Written out rather than reached for, because `core` has no such method, and
+/// total: an empty needle is answered `false` rather than handed to `windows`,
+/// which has no zero width, and an over-long one yields no window at all.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// What the delegation has come to: the appliance this domain signs for, the
+/// holder's own signature tally, and the size of the certificate it handed over.
 ///
 /// The tally is the holder's number rather than a count of calls made here, which
 /// is what makes a second record after the handshake meaningful: the number
-/// moving is the holder having signed again.
-fn report_delegation(sink: &dyn Sink, delegated: &Delegated, held: &HeldKey) {
+/// moving is the holder having signed again. The certificate's length is on both
+/// records and does not move, which is the point of it being there twice — one
+/// appliance has one certificate, and a length that changed across a boot would be
+/// two answers to one question.
+fn report_delegation(sink: &dyn Sink, delegated: &Delegated, delegation: &Delegation) {
     announce(
         sink,
         DomainState::Negotiated,
         DomainDetail::Delegated {
-            device: held.device,
+            device: delegation.held.device,
             signatures: delegated.signatures(),
+            certificate: delegation.certificate.as_bytes().len() as u64,
         },
     );
 }
@@ -608,6 +672,23 @@ fn report_delegation(sink: &dyn Sink, delegated: &Delegated, held: &HeldKey) {
 /// Why the delegation refused, as a cause token an operator can act on.
 fn delegation_refusal(error: DelegationError) -> CryptoError {
     CryptoError(refusal(error.cause(), RefusalDetail::None))
+}
+
+/// Why the certificate could not be had, as a cause token of its own.
+///
+/// Its own three rather than [`delegation_refusal`]'s, because by the time this is
+/// reached the public-key exchange has already worked and the challenge has already
+/// been signed: a holder that stops answering *here* is a different fault from one
+/// that never answered, and an operator reading
+/// `delegated-certificate-unanswered` knows the channel is wired and the key is
+/// usable. A shared token would throw that away.
+fn certificate_refusal(error: DelegationError) -> CryptoError {
+    let cause = match error {
+        DelegationError::Unanswered => "delegated-certificate-unanswered",
+        DelegationError::Refused => "delegated-certificate-refused",
+        DelegationError::Faulted => "delegated-certificate-faulted",
+    };
+    CryptoError(refusal(cause, RefusalDetail::None))
 }
 
 /// Establish one session **under the delegated key**, report what it negotiated,
@@ -635,7 +716,7 @@ fn prove_tls(
     entropy: &'static dyn Entropy,
     now: u64,
     delegated: &Arc<Delegated>,
-    held: &HeldKey,
+    delegation: &Delegation,
 ) -> Result<(), CryptoError> {
     let arena = ARENA.bump();
     let mark = arena.mark();
@@ -649,7 +730,7 @@ fn prove_tls(
         SESSION_PAYLOAD,
         &ServerKey::Delegated {
             operation: Arc::clone(delegated) as Arc<dyn lfw_tls::SignOperation>,
-            public_key: held.public_key,
+            public_key: delegation.held.public_key,
         },
     )
     .map_err(session_refusal)?;
@@ -666,7 +747,7 @@ fn prove_tls(
     // The holder's tally again, after the handshake. It must have moved: the
     // server's `CertificateVerify` was computed in the holder's domain, and a
     // number that stayed put would mean the handshake signed some other way.
-    report_delegation(sink, delegated, held);
+    report_delegation(sink, delegated, delegation);
 
     // The same session with the arena all but full. It must refuse, and the
     // refusal must be the arena's rather than any other — a session that

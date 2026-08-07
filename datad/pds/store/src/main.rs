@@ -19,9 +19,17 @@
 //! under this key on every handshake, and must never hold the key: a key in two
 //! domains is a key whose custody nobody can state. So this domain keeps the
 //! keypair after establishing it and answers a **signing delegation** — sign
-//! these bytes, or tell me which key you hold — over the two shared regions
-//! `wire::signing` defines. It parks in the Microkit event loop rather than
-//! beyond reach, and a notification from the asking domain wakes it.
+//! these bytes, tell me which key you hold, or hand me the certificate over it —
+//! over the two shared regions `wire::signing` defines. It parks in the Microkit
+//! event loop rather than beyond reach, and a notification from the asking domain
+//! wakes it.
+//!
+//! The certificate is answered here rather than reissued there because **this is
+//! the identity domain**: the certificate is half of the identity this domain
+//! minted and made durable, and a domain that wrote an equivalent one for itself
+//! would leave the appliance with two certificates over one key and nobody able to
+//! say which one a peer saw. It is a public artifact, so handing it over gives away
+//! nothing — the statement it carries is the one every peer is shown.
 //!
 //! **The key still cannot cross, and that is a property of two things at once.**
 //! The ABI has no field for a scalar in either direction, so there is nothing to
@@ -154,7 +162,8 @@
 //! it goes. No console record, no metric, no `Debug` in this file and **no field
 //! of the delegation ABI** names it; the two records this domain emits carry a
 //! public name and a public-key digest, and what it publishes to the asking
-//! domain is a public point, a public name, and signatures. The medium's copy is
+//! domain is a public point, a public name, a certificate and signatures — four
+//! things a peer of this appliance is shown anyway. The medium's copy is
 //! plaintext there deliberately and for want of anywhere to keep a wrapping key,
 //! which is why physical possession of the store *is* identity theft and why that
 //! boundary is the one the ownership model rests on.
@@ -185,8 +194,9 @@ use sel4_microkit::{
 };
 use virtio::pci::PciConfig;
 use wire::{
-    ClockCalibration, DeviceIdentity, LogConsume, LogRecords, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,
-    SignDemand, SignOperation, SignRefusal, SignReply, SignRequest, SignResponder,
+    ClockCalibration, DeviceIdentity, LogConsume, LogRecords, MAX_CERTIFICATE_LEN,
+    MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, SignDemand, SignOperation, SignRefusal, SignReply,
+    SignRequest, SignResponder,
 };
 
 /// Bytes both copies of the state record occupy, and so the one transfer this
@@ -251,6 +261,13 @@ const _: () = assert!(
 // would publish a truncated key a peer would then fail every handshake under.
 const _: () = assert!(wire::PUBLIC_KEY_LEN == lfw_crypto::P256_PUBLIC_LEN);
 const _: () = assert!(wire::DEVICE_ID_LEN == lfw_store::DEVICE_ID_BYTES);
+
+// And for the certificate, which is the widest thing the channel carries: a reply
+// region narrower than the record would hand over a truncated certificate, and
+// every peer would then reject the appliance for an encoding error rather than for
+// anything true about it. `wire::signing` declines to depend on the store for an
+// integer and names the domain that sees both; this is it.
+const _: () = assert!(MAX_CERTIFICATE_LEN == lfw_store::MAX_STORED_CERTIFICATE);
 
 /// Why this domain could not establish the appliance's identity.
 enum StartupError {
@@ -540,30 +557,55 @@ struct DeviceKey {
     key: P256SecretKey,
     public_key: [u8; wire::PUBLIC_KEY_LEN],
     device_id: [u8; wire::DEVICE_ID_LEN],
+    /// The appliance's own certificate over that point, and the bytes of it that
+    /// are certificate rather than padding. Held here rather than reread from the
+    /// medium on every request: the record is this domain's already, and a second
+    /// read would put a device transfer on a path that must not wait.
+    certificate: [u8; MAX_CERTIFICATE_LEN],
+    certificate_len: usize,
 }
 
 impl DeviceKey {
-    /// Read the keypair out of a state record this domain has already held to
+    /// Read the identity out of a state record this domain has already held to
     /// itself.
     ///
     /// The scalar is read into this frame, turned into a key, and cleared before
     /// the frame ends — through `lfw_crypto`, the one place in the appliance that
     /// clears key material. What survives is the key, which is what this domain
-    /// signs with.
+    /// signs with, and the certificate, which is what a peer validates that key
+    /// out of.
     ///
-    /// `None` where the scalar is not a private key. Unreachable on the reload
-    /// path, `verify` having answered exactly that question, and answered rather
-    /// than asserted because nothing about establishing an identity may fault
-    /// this domain.
+    /// `None` where the scalar is not a private key **or the record carries no
+    /// certificate**, because an identity is not a keypair: it is a keypair with a
+    /// certificate binding it, and half of one is nothing this domain can let
+    /// another authenticate under. Both are unreachable on the reload path,
+    /// `verify` having answered exactly those questions, and answered rather than
+    /// asserted because nothing about establishing an identity may fault this
+    /// domain.
     fn of(state: &State) -> Option<Self> {
         let mut scalar = state.secret_scalar();
         let key = P256SecretKey::from_scalar(&scalar);
         zeroize(&mut scalar);
         let key = key.ok()?;
+        let stored = state.device_certificate();
+        if stored.is_empty() {
+            return None;
+        }
+        let mut certificate = [0_u8; MAX_CERTIFICATE_LEN];
+        let mut certificate_len = 0_usize;
+        // `zip` walks the shorter of the two, so no index is taken. The two lengths
+        // are held equal at build time below, which is what makes the truncation
+        // this would otherwise admit unreachable.
+        for (slot, byte) in certificate.iter_mut().zip(stored.as_bytes()) {
+            *slot = *byte;
+            certificate_len += 1;
+        }
         Some(Self {
             public_key: key.public_key(),
             key,
             device_id: state.device_id(),
+            certificate,
+            certificate_len,
         })
     }
 
@@ -575,6 +617,12 @@ impl DeviceKey {
             public_key: self.public_key,
             device_id: self.device_id,
         }
+    }
+
+    /// The certificate a `SignOperation::Certificate` request is answered with,
+    /// bounded by what was actually stored rather than by the array.
+    fn certificate(&self) -> &[u8] {
+        self.certificate.get(..self.certificate_len).unwrap_or(&[])
     }
 }
 
@@ -1293,8 +1341,37 @@ impl Store {
                 Some(identity) => self.responder.identity(demand, &identity),
                 None => self.refuse(demand, SignRefusal::NoIdentity),
             },
+            Some(SignOperation::Certificate) => self.certificate(demand),
             Some(SignOperation::Sign) => self.sign(demand),
         }
+    }
+
+    /// Hand over the certificate this domain wrote and made durable, or say why
+    /// not.
+    ///
+    /// **A public artifact leaving a domain that holds a private one.** The
+    /// certificate is the statement every peer of this appliance is given, so what
+    /// crosses here is nothing an adversary could not obtain by connecting — and it
+    /// is emitted only into the reply region, never to a console record or a
+    /// metric. The refusal is `NoIdentity` for the reason it is on the public point:
+    /// an identity is a keypair *with* a certificate binding it, so a node with
+    /// neither half to give has none.
+    fn certificate(&mut self, demand: SignDemand) {
+        if self.key.is_none() {
+            self.refuse(demand, SignRefusal::NoIdentity);
+            return;
+        }
+        // Read out of one field and published through another. Destructured so that
+        // is visible rather than argued: the two borrows are disjoint, so the bytes
+        // go from this domain's own memory straight into the reply region with no
+        // copy of the certificate in between.
+        let Self { key, responder, .. } = self;
+        // `None` is the state ruled out above. An empty answer would be read by the
+        // requester as no certificate at all — a typed fault on its side rather
+        // than anything that could fault this domain — which is the correct reading
+        // of a holder that has none and is why this answers rather than asserts.
+        let certificate = key.as_ref().map_or(&[][..], DeviceKey::certificate);
+        responder.certificate(demand, certificate);
     }
 
     /// Sign what the request carries, or say why not.

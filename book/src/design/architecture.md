@@ -339,6 +339,13 @@ and never emits it. TLS **delegates the private-key operation** to that domain �
 caller-supplied signing key for exactly this — so the domain that faces the network authenticates
 with a key it can use and never read.
 
+**The certificate over that key is fetched from the same domain, not reissued.** An identity is a
+keypair *with* a certificate binding it, and the store domain is the one that minted that certificate
+and made it durable — so the domain terminating a session asks for it over the same channel rather
+than writing an equivalent one for itself, which would leave the appliance with two certificates over
+one key and nobody able to say which one a peer was shown. A certificate is public, so moving it
+gives nothing away; the channel still has no field a private key fits in.
+
 **The key is plaintext on the medium**: no TPM, no secure element, nowhere to keep a wrapping key.
 Physical access to the store device is identity theft, recorded as such in the
 [threat model](threat-model.md), and [factory reset](updates.md#factory-reset) overwrites the key

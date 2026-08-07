@@ -138,7 +138,8 @@ migration is re-issuance, not redesign.
 - **Device identity key custody.** The [store domain](architecture.md#key-custody) owns the store
   device, generates the device keypair, holds it, signs with it, and never emits it. The TLS layer
   delegates its private-key operation to that domain, so the domain that faces the network never
-  holds the key it authenticates with.
+  holds the key it authenticates with — and takes the certificate over that key from the same domain
+  rather than issuing one, a certificate being public and the identity being that domain's to state.
 - **Management-plane isolation.** The domain that terminates the channel — and, while unboarded, the
   onboarding server — runs isolated on a dedicated management interface. A full compromise of it
   must not be able to reach dataplane packet buffers, the interception CA key, or the device

@@ -83,8 +83,8 @@ use lfw_log::{Cause, Event, MAX_LINE_LEN, Stamp, render};
 use wire::{
     CauseImage, CheckedBody, CheckedDetail, CheckedText, CheckedValue, IdentifierImage,
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
-    LOG_ONBOARD_END_COUNT,
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
+    LOG_ONBOARD_END_COUNT,
     LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
     LogRecord, LogRecordError, LogText, TextImage, ValueImage,
 };
@@ -727,9 +727,11 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // The channel's refused-reply counts join them: four unranged tallies of
         // what a link answered, and no shape a rule can turn away.
         | DETAIL_DIAL_UNLEARNED
-        // The delegation detail reads three unranged words — an identifier's two
-        // halves and a signature count — and deliberately not the fourth, so the
-        // flag rule below does not reach it and there is nothing here to refuse.
+        // The delegation detail reads four unranged words — an identifier's two
+        // halves, a signature count and a certificate's length — and it is the one
+        // detail in this ABI whose fourth word is a number rather than a flag, so
+        // the flag rule below must not reach it and there is nothing here to
+        // refuse.
         | DETAIL_DELEGATED => None,
         // The two details whose fourth operand word is a flag rather than a
         // number: every other word they carry is unranged, and a flag that is
@@ -1408,11 +1410,11 @@ mod tests {
                     ..domain_record()
                 }),
             ),
-            // The delegation detail, which reads the first three words and leaves
-            // the fourth unclaimed. Committed because it is the one detail whose
-            // *fourth* word is deliberately not a flag: a seed here is what keeps
-            // the flag rule from creeping onto it, and a uniform draw over a
-            // discriminant plus four words does not reach the shape.
+            // The delegation detail, which reads all four words as numbers.
+            // Committed because it is the one detail whose *fourth* word is
+            // deliberately not a flag: a seed here is what keeps the flag rule
+            // from creeping onto it, and a uniform draw over a discriminant plus
+            // four words does not reach the shape.
             (
                 "valid_domain_delegated",
                 region_from_record(&LogRecord {
@@ -1422,8 +1424,9 @@ mod tests {
                         0xfedc_ba98_7654_3210,
                         2,
                         // Neither 0 nor 1, which is what makes this seed prove
-                        // the fourth word is unread here: a rule that treated it
-                        // as a flag would refuse this record.
+                        // the fourth word is a number here: a rule that treated it
+                        // as a flag would refuse this record, and the certificate
+                        // length it carries is a tally with no range to hold it to.
                         u64::MAX,
                     ],
                     ..domain_record()

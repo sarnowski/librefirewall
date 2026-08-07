@@ -10,6 +10,15 @@
 //! `KeyProvider` already refuses to load one from an encoding, which is what
 //! keeps this a substitution rather than a rewrite.
 //!
+//! Three things are asked over that channel and only one of them is the trait's:
+//! a signature, the public point and name the holder signs under, and **the
+//! appliance's own certificate over that point**. The certificate is fetched
+//! rather than issued here because the holder is the identity domain — it minted
+//! that certificate and made it durable — and a certificate written in this domain
+//! would be a second statement over one key, with no domain able to say which one
+//! a peer was shown. It is a public artifact either way: what crosses is what
+//! every peer of this appliance is handed.
+//!
 //! It lives in this protection domain and not in `wire` for one reason: this is
 //! the only place that sees both the TLS trait and the channel ABI, and `wire`
 //! carries zero `unsafe` — a count worth keeping.
@@ -52,8 +61,9 @@ use core::{
 use lfw_tls::{SignOperation as TlsSignOperation, SignRefused};
 use sel4_microkit::Channel;
 use wire::{
-    DEVICE_ID_LEN, DeviceIdentity, MAX_SIGNATURE_LEN, PUBLIC_KEY_LEN, PendingSignature,
-    SignOperation, SignPoll, SignReply, SignRequest, SignRequester,
+    DEVICE_ID_LEN, DeviceIdentity, MAX_CERTIFICATE_LEN, MAX_SIGNATURE_LEN, PUBLIC_KEY_LEN,
+    PendingSignature, SignAnswerBuffer, SignOperation, SignPoll, SignReply, SignRequest,
+    SignRequester,
 };
 
 /// Reads of the reply region one request is given before it is refused.
@@ -74,6 +84,31 @@ const POLL_BUDGET: u32 = 1024;
 // this is that domain, on the store side and on this one.
 const _: () = assert!(MAX_SIGNATURE_LEN == lfw_crypto::P256_MAX_SIGNATURE_LEN);
 const _: () = assert!(PUBLIC_KEY_LEN == lfw_crypto::P256_PUBLIC_LEN);
+
+/// What the holder answered a `Certificate` request with: the appliance's own
+/// certificate over the key it signs under, and how many bytes of the array are
+/// certificate.
+///
+/// Owned rather than a borrow of the region, on [`Answer`]'s terms — what a caller
+/// holds must not be a view into memory a peer may still be writing. **Public
+/// throughout**: this is the artifact the appliance shows every party it talks to,
+/// so nothing about holding it is a secret to keep, and there is no `Debug`ging of
+/// it only because 768 bytes of DER on a record is noise and not because it is
+/// sensitive.
+#[derive(Clone, Copy)]
+pub struct HeldCertificate {
+    bytes: [u8; MAX_CERTIFICATE_LEN],
+    len: usize,
+}
+
+impl HeldCertificate {
+    /// The certificate, bounded by what the holder published rather than by the
+    /// array behind it.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
 
 /// What the holder answered a `PublicKey` request with, and what it has done
 /// since it started.
@@ -168,7 +203,7 @@ impl Delegated {
     /// # Errors
     /// [`DelegationError`], naming which way the exchange failed.
     pub fn held_key(&self) -> Result<HeldKey, DelegationError> {
-        match self.exchange(SignOperation::PublicKey, &[])? {
+        match self.exchange(SignOperation::PublicKey, &[], None)? {
             Answer::Identity(DeviceIdentity {
                 public_key,
                 device_id,
@@ -177,10 +212,34 @@ impl Delegated {
                 device: device_word(device_id),
             }),
             // The channel refuses a reply answering a different operation before
-            // it reaches here, so this arm is unreachable. Answered as a fault
+            // it reaches here, so these arms are unreachable. Answered as a fault
             // rather than asserted: nothing on a path the TLS library calls into
             // may panic.
-            Answer::Signature { .. } => Err(DelegationError::Faulted),
+            Answer::Signature { .. } | Answer::Certificate { .. } => Err(DelegationError::Faulted),
+        }
+    }
+
+    /// Ask the holder for the appliance's certificate over the key it holds.
+    ///
+    /// The certificate is fetched rather than written here because the holder is
+    /// the identity domain: it minted this certificate, made it durable, and is
+    /// the only domain that can say what a later boot will present. A certificate
+    /// this domain issued for itself would be a second statement over one key.
+    ///
+    /// Nothing here judges the bytes. What comes back is a byte string the holder
+    /// chose, bounded by the region; whether it is a certificate over the key the
+    /// same channel named is a question for the caller, which has that key.
+    ///
+    /// # Errors
+    /// [`DelegationError`], naming which way the exchange failed.
+    pub fn held_certificate(&self) -> Result<HeldCertificate, DelegationError> {
+        // The destination is this frame's, handed down rather than returned up:
+        // [`Answer`] says why.
+        let mut bytes = [0_u8; MAX_CERTIFICATE_LEN];
+        match self.exchange(SignOperation::Certificate, &[], Some(&mut bytes))? {
+            Answer::Certificate { len } => Ok(HeldCertificate { bytes, len }),
+            // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
+            Answer::Signature { .. } | Answer::Identity(_) => Err(DelegationError::Faulted),
         }
     }
 
@@ -203,6 +262,7 @@ impl Delegated {
         &self,
         operation: SignOperation,
         message: &[u8],
+        certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
     ) -> Result<Answer, DelegationError> {
         while self
             .taken
@@ -211,13 +271,18 @@ impl Delegated {
         {
             core::hint::spin_loop();
         }
-        let outcome = self.issue(operation, message);
+        let outcome = self.issue(operation, message, certificate);
         self.taken.store(false, Ordering::Release);
         outcome
     }
 
     /// The exchange itself, with the flag held.
-    fn issue(&self, operation: SignOperation, message: &[u8]) -> Result<Answer, DelegationError> {
+    fn issue(
+        &self,
+        operation: SignOperation,
+        message: &[u8],
+        mut certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
+    ) -> Result<Answer, DelegationError> {
         // SAFETY: the flag is held by the caller, so this is the only live
         // reference to the requester for the duration of the call, and the
         // reference does not escape this function.
@@ -227,12 +292,15 @@ impl Delegated {
         // makes the holder look, and a signal ahead of the sequence would be a
         // wakeup for a request that is not there yet.
         self.holder.notify();
+        // Zeroed once and reborrowed per read rather than built per read: the
+        // reply's borrow of it still ends with the iteration that took it, and the
+        // widest answer this channel carries is a certificate — so a buffer rebuilt
+        // inside the loop would zero it again on every read of the budget, in
+        // exactly the byzantine case the budget exists for. What leaves this
+        // function is a copy either way, which is what keeps the shared region out
+        // of every caller above.
+        let mut window = SignAnswerBuffer::zero();
         for _ in 0..POLL_BUDGET {
-            // Declared inside the loop, so the reply's borrow of it ends with the
-            // iteration rather than outliving the poll that took it. What leaves
-            // this function is a copy, which is also what keeps the shared region
-            // out of every caller above.
-            let mut window = [0_u8; MAX_SIGNATURE_LEN];
             match requester.poll(pending, &mut window) {
                 SignPoll::Outstanding(outstanding) => {
                     pending = outstanding;
@@ -249,6 +317,22 @@ impl Delegated {
                     return Ok(Answer::Signature { bytes, len });
                 }
                 SignPoll::Identity(identity) => return Ok(Answer::Identity(identity)),
+                SignPoll::Certificate {
+                    certificate: published,
+                } => {
+                    // Into the caller's destination where there is one. `zip` walks
+                    // the shorter of the two and the ABI has already bounded the
+                    // slice by the region, so the two lengths agree and no index is
+                    // taken.
+                    if let Some(into) = certificate.as_mut() {
+                        for (slot, byte) in into.iter_mut().zip(published) {
+                            *slot = *byte;
+                        }
+                    }
+                    return Ok(Answer::Certificate {
+                        len: published.len(),
+                    });
+                }
                 SignPoll::Refused(_) => return Err(DelegationError::Refused),
                 SignPoll::Faulted(_) => return Err(DelegationError::Faulted),
             }
@@ -269,18 +353,28 @@ impl Delegated {
 // their own.
 unsafe impl Sync for Delegated {}
 
-/// What one exchange came back with: the two shapes a reply can be, already held
+/// What one exchange came back with: the three shapes a reply can be, already held
 /// to the operation that was asked for by `wire::signing`.
 ///
 /// Owned rather than a borrow of the region, which is what lets the poll loop
 /// above declare its window per iteration — and what means no caller here holds a
 /// view into a region a peer may still be writing.
+///
+/// **The certificate is the exception and carries only its length.** It is ten
+/// times the size of everything else this channel moves, so a variant holding it
+/// would make every exchange return a certificate's worth of stack — including the
+/// signature exchange that runs inside a handshake, which is the one path here that
+/// is not a once-per-boot call. The caller that asks for a certificate says where it
+/// goes instead, and only that caller carries the buffer.
 enum Answer {
     Signature {
         bytes: [u8; MAX_SIGNATURE_LEN],
         len: usize,
     },
     Identity(DeviceIdentity),
+    Certificate {
+        len: usize,
+    },
 }
 
 impl TlsSignOperation for Delegated {
@@ -293,7 +387,8 @@ impl TlsSignOperation for Delegated {
     /// on a path that faces the network. What an operator gets instead is the
     /// tally and the fault count this type exposes, on this domain's own records.
     fn sign(&self, message: &[u8], out: &mut [u8]) -> Result<usize, SignRefused> {
-        let Ok(Answer::Signature { bytes, len }) = self.exchange(SignOperation::Sign, message)
+        let Ok(Answer::Signature { bytes, len }) =
+            self.exchange(SignOperation::Sign, message, None)
         else {
             return Err(SignRefused);
         };

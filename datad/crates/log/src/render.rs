@@ -264,9 +264,14 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
         // `peer-device=` are, so an operator comparing this line against the
         // holder's own is comparing one string against another rather than two
         // formats.
-        DomainDetail::Delegated { device, signatures } => write!(
+        DomainDetail::Delegated {
+            device,
+            signatures,
+            certificate,
+        } => write!(
             cursor,
-            " delegated-device={device:032x} delegated-signatures={signatures}"
+            " delegated-device={device:032x} delegated-signatures={signatures} \
+             delegated-certificate={certificate}"
         ),
         // Where this appliance reached out to and how it got on, as four fields
         // an operator reads in one direction: the place, the port, how many
@@ -753,35 +758,43 @@ mod tests {
     }
 
     /// The record a domain that holds no key leaves about the one that does: the
-    /// appliance it signs for, and how many signatures that holder has produced.
-    /// The identifier's rendering is the identity record's, character for
-    /// character, which is what makes the two lines comparable at all.
+    /// appliance it signs for, how many signatures that holder has produced, and
+    /// how many bytes of certificate it handed over. The identifier's rendering is
+    /// the identity record's, character for character, which is what makes the two
+    /// lines comparable at all.
     #[test]
     fn a_delegating_domain_renders_the_appliance_it_signs_for_and_the_holders_tally() {
-        let delegated = |device, signatures| {
+        let delegated = |device, signatures, certificate| {
             rendered(&Event::Domain {
                 domain: Domain::Crypto,
                 state: DomainState::Negotiated,
-                detail: DomainDetail::Delegated { device, signatures },
+                detail: DomainDetail::Delegated {
+                    device,
+                    signatures,
+                    certificate,
+                },
             })
         };
         assert_eq!(
-            delegated(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef, 1),
+            delegated(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef, 1, 452),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
-             delegated-device=0123456789abcdef0123456789abcdef delegated-signatures=1"
+             delegated-device=0123456789abcdef0123456789abcdef delegated-signatures=1 \
+             delegated-certificate=452"
         );
         // A leading zero nibble survives, which is the whole reason the width is
         // fixed: an identifier rendered short is not this appliance's.
         assert_eq!(
-            delegated(1, 0),
+            delegated(1, 0, 0),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
-             delegated-device=00000000000000000000000000000001 delegated-signatures=0"
+             delegated-device=00000000000000000000000000000001 delegated-signatures=0 \
+             delegated-certificate=0"
         );
         assert_eq!(
-            delegated(u128::MAX, u64::MAX),
+            delegated(u128::MAX, u64::MAX, u64::MAX),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
              delegated-device=ffffffffffffffffffffffffffffffff \
-             delegated-signatures=18446744073709551615"
+             delegated-signatures=18446744073709551615 \
+             delegated-certificate=18446744073709551615"
         );
     }
 
@@ -1375,6 +1388,7 @@ mod tests {
             DomainDetail::Delegated {
                 device: u128::MAX,
                 signatures: u64::MAX,
+                certificate: u64::MAX,
             },
             DomainDetail::DialRoute {
                 next_hop: Ipv4Address::from_octets([255, 255, 255, 255]),
@@ -1494,8 +1508,13 @@ mod tests {
                     outcome: DialOutcome::ALL[outcome],
                 }
             ),
-            any::<(u128, u64)>()
-                .prop_map(|(device, signatures)| DomainDetail::Delegated { device, signatures }),
+            any::<(u128, u64, u64)>().prop_map(|(device, signatures, certificate)| {
+                DomainDetail::Delegated {
+                    device,
+                    signatures,
+                    certificate,
+                }
+            }),
             (any::<([u8; 4], u64, u64)>(), (0..NextHopVia::ALL.len()),).prop_map(
                 |((octets, requests, learned), via)| DomainDetail::DialRoute {
                     next_hop: Ipv4Address::from_octets(octets),
