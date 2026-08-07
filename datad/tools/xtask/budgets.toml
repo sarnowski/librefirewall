@@ -65,7 +65,7 @@
 "crates/http/src/request.rs" = 0.2944
 "crates/http/src/response.rs" = 0.3135
 "crates/ip-endpoint/src/http.rs" = 0.3402
-"crates/ip-endpoint/src/lib.rs" = 0.3203
+"crates/ip-endpoint/src/lib.rs" = 0.3214
 "crates/ip-endpoint/src/neighbour.rs" = 0.4247
 "crates/ip-endpoint/src/onboard.rs" = 0.3955
 "crates/ip-endpoint/src/outbound.rs" = 0.4012
@@ -84,7 +84,7 @@
 "crates/metrics/src/lib.rs" = 0.5714
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
-"crates/metrics/src/sample.rs" = 0.0989
+"crates/metrics/src/sample.rs" = 0.0883
 "crates/net-headers/src/lib.rs" = 0.2154
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -98,7 +98,7 @@
 "crates/pd-runtime/src/handover.rs" = 0.3569
 "crates/pd-runtime/src/lib.rs" = 0.5020
 "crates/pd-runtime/src/relay.rs" = 0.3957
-"crates/pd-runtime/src/stats.rs" = 0.2138
+"crates/pd-runtime/src/stats.rs" = 0.2198
 "crates/pd-runtime/src/tap.rs" = 0.3727
 "crates/pipeline/src/lib.rs" = 0.4136
 "crates/queue/src/lib.rs" = 0.4260

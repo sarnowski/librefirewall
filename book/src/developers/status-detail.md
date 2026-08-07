@@ -2534,12 +2534,24 @@ pass that finds nothing waiting spends one saying so, and how many such passes t
 accelerator's decision, so an equality there would be a gate that passes on one machine and fails on
 the next.
 
+The **transport** under that port is published too, and separately from the HTTP server's. They are
+two stacks with two connection tables, and every `librefirewall_tcp_` family now carries a `service`
+label naming which — one family set rather than two, because a refused segment means the same thing
+whichever port it arrived on. Until that label existed the port's whole transport was invisible: the
+shard was built from the HTTP stack's counters alone, so a second administrator's handshake refused
+for want of a slot moved nothing an operator could see, and the reference chapter said it appeared
+under a series it did not.
+
 **Missing.** The rustls server on the far end of that relay, which is what would make the onboarding
 port an onboarding *server*: the cryptography end today accepts the handover, counts what crosses and
 closes, and answers with nothing. What no scenario reaches is the port's behaviour **under a peer
 that overruns it**: the overflow and answer-refusal counts stay zero on all three boots, because a
 station that keeps to the window it is given cannot move them and one that does not is a peer this
-harness has no way to play through a lossless host socket. The management domain's own dial is
+harness has no way to play through a lossless host socket. Nor does any scenario yet *assert* the
+crowding refusal as a counter, though the counter now exists: the boot that crowds the port needs a
+station of the harness's own on the management wire, and a scrape needs QEMU's user-mode stack on
+that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
+states, and the counter is read by hand. The management domain's own dial is
 a separate thing and still carries ten bytes of first-party probe and no protocol at all. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,

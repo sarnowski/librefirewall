@@ -169,10 +169,23 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
     for (name, help) in [
         ("librefirewall_endpoint_frames_total", "Frames."),
         ("librefirewall_endpoint_replies_total", "Replies."),
-        ("librefirewall_tcp_refused_total", "Refused."),
     ] {
         family(&mut text, name, "counter", help);
         text.push_str(&format!("{name}{{domain=\"management\"}} 1\n"));
+    }
+    // The two transports the management port carries, both of them, because the
+    // judgement names one and a fixture holding only that one would not notice a
+    // selection that had stopped naming it.
+    family(
+        &mut text,
+        "librefirewall_tcp_refused_total",
+        "counter",
+        "Refused.",
+    );
+    for service in ["http", "onboarding"] {
+        text.push_str(&format!(
+            "librefirewall_tcp_refused_total{{domain=\"management\",service=\"{service}\"}} 1\n"
+        ));
     }
     family(
         &mut text,
@@ -180,10 +193,13 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
         "counter",
         "Segments.",
     );
-    for direction in ["received", "sent"] {
-        text.push_str(&format!(
-            "librefirewall_tcp_segments_total{{domain=\"management\",direction=\"{direction}\"}} 1\n"
-        ));
+    for service in ["http", "onboarding"] {
+        for direction in ["received", "sent"] {
+            text.push_str(&format!(
+                "librefirewall_tcp_segments_total{{domain=\"management\",service=\"{service}\",\
+                 direction=\"{direction}\"}} 1\n"
+            ));
+        }
     }
     family(
         &mut text,
@@ -679,8 +695,10 @@ fn a_run_that_did_not_take_two_scrapes_is_refused() {
 #[test]
 fn a_transport_that_reports_no_segment_it_just_carried_is_refused() {
     let text = body((5, 4), (4, 5)).replace(
-        "librefirewall_tcp_segments_total{domain=\"management\",direction=\"received\"} 1",
-        "librefirewall_tcp_segments_total{domain=\"management\",direction=\"received\"} 0",
+        "librefirewall_tcp_segments_total{domain=\"management\",service=\"http\",\
+         direction=\"received\"} 1",
+        "librefirewall_tcp_segments_total{domain=\"management\",service=\"http\",\
+         direction=\"received\"} 0",
     );
     let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no segment counted");
     assert!(verdict.contains("no segment received"), "{verdict}");

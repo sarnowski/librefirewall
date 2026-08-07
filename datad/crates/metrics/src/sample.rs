@@ -1166,7 +1166,7 @@ pub struct OnboardSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 111;
+pub const MANAGEMENT_SLOTS: usize = 140;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1184,7 +1184,12 @@ pub struct ManagementSample {
     pub endpoint: EndpointSample,
     pub neighbours: NeighbourSample,
     pub outbound: OutboundSample,
+    /// The transport under the HTTP server.
     pub tcp: TcpSample,
+    /// And the one under the onboarding port, which is its own table with its
+    /// own numbers: a second peer's handshake is refused by *this* stack, and
+    /// counting it in the other one's would attribute it to the wrong port.
+    pub onboarding: TcpSample,
     pub http: HttpSample,
     /// The second listening port's own account of itself.
     pub onboard: OnboardSample,
@@ -1316,36 +1321,355 @@ impl ManagementSample {
         s(&ONBOARD_SESSIONS_CLOSED, &[Label::new("by", "consumer")]),
         plain(&ONBOARD_OVERFLOWED),
         plain(&ONBOARD_ANSWERS_REFUSED),
-        // The transport.
-        s(&TCP_SEGMENTS, &[Label::new("direction", "received")]),
-        s(&TCP_SEGMENTS, &[Label::new("direction", "sent")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "accepted")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "dialled")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "established")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "closed")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "evicted")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "reaped")]),
-        s(&TCP_CONNECTIONS, &[Label::new("event", "abandoned")]),
-        s(&TCP_BYTES, &[Label::new("direction", "received")]),
-        s(&TCP_BYTES, &[Label::new("direction", "sent")]),
-        s(&TCP_BYTES, &[Label::new("direction", "retransmitted")]),
-        plain(&TCP_RETRANSMITS),
-        s(&TCP_REFUSED, &[Label::new("reason", "malformed")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "bad_checksum")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "out_of_window")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "table_full")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "not_listening")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "no_connection")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "unacceptable_ack")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "no_acknowledgement")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "not_a_handshake")]),
-        s(&TCP_REFUSED, &[Label::new("reason", "out_of_order")]),
-        plain(&TCP_URGENT_IGNORED),
-        plain(&TCP_CHALLENGE_ACKS),
-        plain(&TCP_CHALLENGES_SUPPRESSED),
-        s(&TCP_RESETS, &[Label::new("direction", "received")]),
-        s(&TCP_RESETS, &[Label::new("direction", "sent")]),
-        plain(&TCP_WRITE_REFUSED),
+        // The transport, twice: the two listening ports carry their own stacks
+        // with their own tables, and `service` is what tells the two apart. One
+        // family set rather than two, because the meaning of a segment refused or
+        // a connection accepted is the same whichever port it happened on.
+        // The HTTP port's.
+        s(
+            &TCP_SEGMENTS,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_SEGMENTS,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "http"),
+                Label::new("event", "accepted"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "http"),
+                Label::new("event", "dialled"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "http"),
+                Label::new("event", "established"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[Label::new("service", "http"), Label::new("event", "closed")],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "http"),
+                Label::new("event", "evicted"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[Label::new("service", "http"), Label::new("event", "reaped")],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "http"),
+                Label::new("event", "abandoned"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "retransmitted"),
+            ],
+        ),
+        s(&TCP_RETRANSMITS, &[Label::new("service", "http")]),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "malformed"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "bad_checksum"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "out_of_window"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "table_full"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "not_listening"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "no_connection"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "unacceptable_ack"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "no_acknowledgement"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "not_a_handshake"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "http"),
+                Label::new("reason", "out_of_order"),
+            ],
+        ),
+        s(&TCP_URGENT_IGNORED, &[Label::new("service", "http")]),
+        s(&TCP_CHALLENGE_ACKS, &[Label::new("service", "http")]),
+        s(&TCP_CHALLENGES_SUPPRESSED, &[Label::new("service", "http")]),
+        s(
+            &TCP_RESETS,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_RESETS,
+            &[
+                Label::new("service", "http"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(&TCP_WRITE_REFUSED, &[Label::new("service", "http")]),
+        // And the onboarding port's.
+        s(
+            &TCP_SEGMENTS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_SEGMENTS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "accepted"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "dialled"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "established"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "closed"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "evicted"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "reaped"),
+            ],
+        ),
+        s(
+            &TCP_CONNECTIONS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("event", "abandoned"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(
+            &TCP_BYTES,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "retransmitted"),
+            ],
+        ),
+        s(&TCP_RETRANSMITS, &[Label::new("service", "onboarding")]),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "malformed"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "bad_checksum"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "out_of_window"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "table_full"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "not_listening"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "no_connection"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "unacceptable_ack"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "no_acknowledgement"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "not_a_handshake"),
+            ],
+        ),
+        s(
+            &TCP_REFUSED,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("reason", "out_of_order"),
+            ],
+        ),
+        s(&TCP_URGENT_IGNORED, &[Label::new("service", "onboarding")]),
+        s(&TCP_CHALLENGE_ACKS, &[Label::new("service", "onboarding")]),
+        s(
+            &TCP_CHALLENGES_SUPPRESSED,
+            &[Label::new("service", "onboarding")],
+        ),
+        s(
+            &TCP_RESETS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "received"),
+            ],
+        ),
+        s(
+            &TCP_RESETS,
+            &[
+                Label::new("service", "onboarding"),
+                Label::new("direction", "sent"),
+            ],
+        ),
+        s(&TCP_WRITE_REFUSED, &[Label::new("service", "onboarding")]),
         // The server above it.
         plain(&HTTP_REQUESTS),
         s(&HTTP_RESPONSES, &[Label::new("status", "200")]),
@@ -1454,6 +1778,37 @@ impl ManagementSample {
         put(&mut values, &mut at, tcp.resets_received);
         put(&mut values, &mut at, tcp.resets_sent);
         put(&mut values, &mut at, tcp.write_refused);
+
+        let onboarding = &self.onboarding;
+        put(&mut values, &mut at, onboarding.segments_received);
+        put(&mut values, &mut at, onboarding.segments_sent);
+        put(&mut values, &mut at, onboarding.connections_accepted);
+        put(&mut values, &mut at, onboarding.connections_dialled);
+        put(&mut values, &mut at, onboarding.connections_established);
+        put(&mut values, &mut at, onboarding.connections_closed);
+        put(&mut values, &mut at, onboarding.connections_evicted);
+        put(&mut values, &mut at, onboarding.connections_reaped);
+        put(&mut values, &mut at, onboarding.connections_abandoned);
+        put(&mut values, &mut at, onboarding.bytes_received);
+        put(&mut values, &mut at, onboarding.bytes_sent);
+        put(&mut values, &mut at, onboarding.bytes_retransmitted);
+        put(&mut values, &mut at, onboarding.retransmits);
+        put(&mut values, &mut at, onboarding.refused_malformed);
+        put(&mut values, &mut at, onboarding.refused_bad_checksum);
+        put(&mut values, &mut at, onboarding.refused_out_of_window);
+        put(&mut values, &mut at, onboarding.refused_table_full);
+        put(&mut values, &mut at, onboarding.refused_not_listening);
+        put(&mut values, &mut at, onboarding.refused_no_connection);
+        put(&mut values, &mut at, onboarding.refused_unacceptable_ack);
+        put(&mut values, &mut at, onboarding.refused_no_acknowledgement);
+        put(&mut values, &mut at, onboarding.refused_not_a_handshake);
+        put(&mut values, &mut at, onboarding.refused_out_of_order);
+        put(&mut values, &mut at, onboarding.urgent_ignored);
+        put(&mut values, &mut at, onboarding.challenge_acks);
+        put(&mut values, &mut at, onboarding.challenges_suppressed);
+        put(&mut values, &mut at, onboarding.resets_received);
+        put(&mut values, &mut at, onboarding.resets_sent);
+        put(&mut values, &mut at, onboarding.write_refused);
 
         let http = &self.http;
         put(&mut values, &mut at, http.requests);

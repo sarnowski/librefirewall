@@ -19,7 +19,7 @@
 
 use lfw_blk::request::{Operation, RequestFaults};
 use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
-use lfw_ip_endpoint::{Endpoint, Unhandled};
+use lfw_ip_endpoint::{Endpoint, TcpCounters, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
     ManagementSample, NeighbourSample, OnboardSample, OutboundSample, PipelineSample, PolicySample,
@@ -27,6 +27,7 @@ use lfw_metrics::{
     SinkSample, Snapshot, StatsShard, StoreSample, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
+
 use net_headers::ParseFailure;
 use pipeline::{DropReason, PolicyCounters, PolicySweep, PolicySweepCounters};
 
@@ -222,6 +223,47 @@ pub fn forwarder_sample(counters: &ForwarderCounters<'_>) -> ForwarderSample {
     }
 }
 
+/// One transport's counters as the shard's fields.
+///
+/// A function because the management port carries two stacks — the HTTP
+/// server's and the onboarding port's — and they are the same numbers about
+/// two different tables. Written twice, the two could drift into disagreeing
+/// about which counter is which, and the exposition keys its series by
+/// position.
+fn tcp_sample(counters: TcpCounters) -> TcpSample {
+    TcpSample {
+        segments_received: counters.segments_received,
+        segments_sent: counters.segments_sent,
+        connections_accepted: counters.connections_accepted,
+        connections_dialled: counters.connections_dialled,
+        connections_established: counters.connections_established,
+        connections_closed: counters.connections_closed,
+        connections_evicted: counters.connections_evicted,
+        connections_reaped: counters.connections_reaped,
+        connections_abandoned: counters.connections_abandoned,
+        bytes_received: counters.bytes_received,
+        bytes_sent: counters.bytes_sent,
+        bytes_retransmitted: counters.bytes_retransmitted,
+        retransmits: counters.retransmits,
+        refused_malformed: counters.refused_malformed,
+        refused_bad_checksum: counters.refused_bad_checksum,
+        refused_out_of_window: counters.refused_out_of_window,
+        refused_table_full: counters.refused_table_full,
+        refused_not_listening: counters.refused_not_listening,
+        refused_no_connection: counters.refused_no_connection,
+        refused_unacceptable_ack: counters.refused_unacceptable_ack,
+        refused_no_acknowledgement: counters.refused_no_acknowledgement,
+        refused_not_a_handshake: counters.refused_not_a_handshake,
+        refused_out_of_order: counters.refused_out_of_order,
+        urgent_ignored: counters.urgent_ignored,
+        challenge_acks: counters.challenge_acks,
+        challenges_suppressed: counters.challenges_suppressed,
+        resets_received: counters.resets_received,
+        resets_sent: counters.resets_sent,
+        write_refused: counters.write_refused,
+    }
+}
+
 /// The management domain's whole shard, assembled from the stage, the endpoint
 /// it holds and the transport under it.
 #[must_use]
@@ -231,7 +273,7 @@ pub fn management_sample(
     endpoint: Option<&Endpoint>,
     log: LogSample,
 ) -> ManagementSample {
-    let (endpoint_sample, neighbours, outbound, tcp, http, onboard) = match endpoint {
+    let (endpoint_sample, neighbours, outbound, tcp, onboarding, http, onboard) = match endpoint {
         Some(endpoint) => {
             let counters = endpoint.counters();
             let mut unhandled = [0u64; Unhandled::ALL.len()];
@@ -241,6 +283,7 @@ pub fn management_sample(
                 }
             }
             let tcp = endpoint.tcp_counters();
+            let onboarding = endpoint.onboarding_counters();
             let served = endpoint.http_counters();
             let neighbours = endpoint.neighbour_counters();
             let dials = endpoint.outbound_counters();
@@ -279,37 +322,8 @@ pub fn management_sample(
                     bytes: [dials.request_bytes, dials.answer_bytes],
                     answer_overflowed: dials.answer_overflowed,
                 },
-                TcpSample {
-                    segments_received: tcp.segments_received,
-                    segments_sent: tcp.segments_sent,
-                    connections_accepted: tcp.connections_accepted,
-                    connections_dialled: tcp.connections_dialled,
-                    connections_established: tcp.connections_established,
-                    connections_closed: tcp.connections_closed,
-                    connections_evicted: tcp.connections_evicted,
-                    connections_reaped: tcp.connections_reaped,
-                    connections_abandoned: tcp.connections_abandoned,
-                    bytes_received: tcp.bytes_received,
-                    bytes_sent: tcp.bytes_sent,
-                    bytes_retransmitted: tcp.bytes_retransmitted,
-                    retransmits: tcp.retransmits,
-                    refused_malformed: tcp.refused_malformed,
-                    refused_bad_checksum: tcp.refused_bad_checksum,
-                    refused_out_of_window: tcp.refused_out_of_window,
-                    refused_table_full: tcp.refused_table_full,
-                    refused_not_listening: tcp.refused_not_listening,
-                    refused_no_connection: tcp.refused_no_connection,
-                    refused_unacceptable_ack: tcp.refused_unacceptable_ack,
-                    refused_no_acknowledgement: tcp.refused_no_acknowledgement,
-                    refused_not_a_handshake: tcp.refused_not_a_handshake,
-                    refused_out_of_order: tcp.refused_out_of_order,
-                    urgent_ignored: tcp.urgent_ignored,
-                    challenge_acks: tcp.challenge_acks,
-                    challenges_suppressed: tcp.challenges_suppressed,
-                    resets_received: tcp.resets_received,
-                    resets_sent: tcp.resets_sent,
-                    write_refused: tcp.write_refused,
-                },
+                tcp_sample(tcp),
+                tcp_sample(onboarding),
                 HttpSample {
                     requests: served.requests,
                     responses: served.responses,
@@ -343,6 +357,7 @@ pub fn management_sample(
             NeighbourSample::default(),
             OutboundSample::default(),
             TcpSample::default(),
+            TcpSample::default(),
             HttpSample::default(),
             OnboardSample::default(),
         ),
@@ -375,6 +390,7 @@ pub fn management_sample(
         neighbours,
         outbound,
         tcp,
+        onboarding,
         http,
         onboard,
         streams: [

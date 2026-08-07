@@ -59,9 +59,9 @@ in the *next* one.
 ## Metric inventory
 
 122 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 428 counter and gauge series from the 12 shards,
+domains publishing that family. A scrape is 457 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 96 046 bytes — a worst case computed from
+declares, and the document they render into is bounded at 99 784 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -216,23 +216,38 @@ Read them when the console is silent and something is nevertheless wrong.
 | `librefirewall_endpoint_onboard_sessions_closed_total` | counter | `management` | `by`&nbsp;(`consumer`, `peer`) | Sessions each end finished, by which end said so first. Neither moving while `connections_total{event="forgotten"}` does is a link that keeps dropping connections mid-session. |
 
 The port holds **one** connection at a time, and structurally: a second peer's `SYN` while a session
-is live finds no slot and nothing evictable, so it is dropped by the transport itself and appears in
-the TCP families below as `refused{reason="table_full"}` rather than here.
+is live finds no slot and nothing evictable, so it is dropped by the transport itself rather than
+appearing here. It is counted by the transport under this port —
+`librefirewall_tcp_refused_total{service="onboarding",reason="table_full"}` in the families below.
 
-### The management port: the TCP transport
+### The management port: the two TCP transports
+
+The management port carries **two** transports with two connection tables, and every family here is
+published once for each: the stack under the HTTP server, and the stack under the onboarding port.
+`service` is what tells them apart, and it is a label rather than a second set of families because a
+refused segment or an accepted connection means the same thing whichever port it happened on —
+`sum by (service)` separates them and a query that omits the label gets the whole port, which is
+usually what a first look wants.
+
+Read the two differently. The HTTP stack both listens and dials, so its `connections_total` moves on
+`accepted` and on `dialled`. The onboarding stack only ever listens: `dialled` and `abandoned` stay
+at zero there, and a number in either is a defect rather than a peer. Its table holds one
+connection, so `refused{reason="table_full"}` is the ordinary answer to a second administrator
+connecting while a session runs — on the HTTP stack the same series means eight connections were
+already live, which is a very different thing.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_tcp_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
-| `librefirewall_tcp_challenge_acks_total` | counter | `management` | — | Segments challenged rather than acted on under RFC 5961 — a blind in-window `RST` (§3.2) or a `SYN` on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's answer. |
-| `librefirewall_tcp_challenges_suppressed_total` | counter | `management` | — | Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge acknowledgement, or the reset a segment naming no connection would have drawn. The budget is shared across the whole connection table, so this rising is the node declining to be an amplifier and not a connection in trouble. |
-| `librefirewall_tcp_connections_total` | counter | `management` | `event`&nbsp;(`abandoned`, `accepted`, `closed`, `dialled`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. `accepted` is a handshake a peer began and `dialled` one this node began, and the two are never merged: dials rising while `established` stays flat is a node that cannot reach where it is trying to go. |
-| `librefirewall_tcp_refused_total` | counter | `management` | `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_a_handshake`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. `not_a_handshake` is a segment answering a connection this node dialled that carried neither `SYN` nor `RST`, which such a connection has no window to refuse under. |
-| `librefirewall_tcp_resets_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
-| `librefirewall_tcp_retransmits_total` | counter | `management` | — | Segments re-sent, data and control alike. |
-| `librefirewall_tcp_segments_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |
-| `librefirewall_tcp_urgent_ignored_total` | counter | `management` | — | Segments carrying URG, whose urgent pointer is ignored and data delivered in band. |
-| `librefirewall_tcp_write_refused_total` | counter | `management` | — | Segments the stack decided to send that did not fit its caller's storage; ours. |
+| `librefirewall_tcp_bytes_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
+| `librefirewall_tcp_challenge_acks_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments challenged rather than acted on under RFC 5961 — a blind in-window `RST` (§3.2) or a `SYN` on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's answer. |
+| `librefirewall_tcp_challenges_suppressed_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge acknowledgement, or the reset a segment naming no connection would have drawn. The budget is per transport and shared across that transport's whole connection table, so this rising is the node declining to be an amplifier and not a connection in trouble. |
+| `librefirewall_tcp_connections_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `event`&nbsp;(`abandoned`, `accepted`, `closed`, `dialled`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. `accepted` is a handshake a peer began and `dialled` one this node began, and the two are never merged: dials rising while `established` stays flat is a node that cannot reach where it is trying to go. Only the HTTP stack dials, so `dialled` and `abandoned` are zero under `service="onboarding"`. |
+| `librefirewall_tcp_refused_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_a_handshake`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. `not_a_handshake` is a segment answering a connection this node dialled that carried neither `SYN` nor `RST`, which such a connection has no window to refuse under. |
+| `librefirewall_tcp_resets_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
+| `librefirewall_tcp_retransmits_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments re-sent, data and control alike. |
+| `librefirewall_tcp_segments_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |
+| `librefirewall_tcp_urgent_ignored_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments carrying URG, whose urgent pointer is ignored and data delivered in band. |
+| `librefirewall_tcp_write_refused_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments the stack decided to send that did not fit its caller's storage; ours. |
 
 ### The management port: the HTTP server
 

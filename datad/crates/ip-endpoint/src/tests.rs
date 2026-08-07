@@ -5048,6 +5048,12 @@ fn a_second_connection_while_one_is_running_is_dropped_in_silence() {
         Some(lfw_tcp::Outcome::Rejected(lfw_tcp::Rejection::TableFull))
     );
     assert_eq!(endpoint.stream_counters().accepted, 1);
+    // Silent on the wire and not silent on the surfaces, which is the whole
+    // reason the two transports are counted apart: the refusal is this port's,
+    // and the HTTP server's own table — eight connections, none of them this —
+    // must not have been charged for it.
+    assert_eq!(endpoint.onboarding_counters().refused_table_full, 1);
+    assert_eq!(endpoint.tcp_counters().refused_table_full, 0);
 }
 
 #[test]

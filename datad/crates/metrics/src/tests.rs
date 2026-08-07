@@ -3,7 +3,9 @@ use proptest::prelude::*;
 use super::*;
 use crate::catalog::{
     ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES, ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED,
-    ONBOARD_SESSIONS_CLOSED,
+    ONBOARD_SESSIONS_CLOSED, TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED,
+    TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED,
+    TCP_WRITE_REFUSED,
 };
 
 /// One declared series, flattened out of the shard tables: the family it
@@ -1179,7 +1181,7 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 96_046);
+    assert_eq!(MAX_EXPOSITION_LEN, 99_784);
 }
 
 /// A sample's fields land on the series that declare them, positionally.
@@ -1198,7 +1200,7 @@ fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
 /// up a slot whose series is some other family's.
 #[test]
 fn a_filled_block_lands_only_on_the_series_that_declare_it() {
-    let sample = ManagementSample {
+    let onboard = ManagementSample {
         onboard: OnboardSample {
             accepted: 1,
             forgotten: 2,
@@ -1211,16 +1213,108 @@ fn a_filled_block_lands_only_on_the_series_that_declare_it() {
         },
         ..ManagementSample::default()
     };
-    let onboard = [
-        (&ONBOARD_CONNECTIONS, "accepted", 1),
-        (&ONBOARD_CONNECTIONS, "forgotten", 2),
-        (&ONBOARD_BYTES, "received", 3),
-        (&ONBOARD_BYTES, "sent", 4),
-        (&ONBOARD_SESSIONS_CLOSED, "peer", 5),
-        (&ONBOARD_SESSIONS_CLOSED, "consumer", 6),
-        (&ONBOARD_OVERFLOWED, "", 7),
-        (&ONBOARD_ANSWERS_REFUSED, "", 8),
+    lands_on_its_own_series(
+        &onboard,
+        &[
+            (&ONBOARD_CONNECTIONS, "accepted", 1),
+            (&ONBOARD_CONNECTIONS, "forgotten", 2),
+            (&ONBOARD_BYTES, "received", 3),
+            (&ONBOARD_BYTES, "sent", 4),
+            (&ONBOARD_SESSIONS_CLOSED, "peer", 5),
+            (&ONBOARD_SESSIONS_CLOSED, "consumer", 6),
+            (&ONBOARD_OVERFLOWED, "", 7),
+            (&ONBOARD_ANSWERS_REFUSED, "", 8),
+        ],
+    );
+
+    // The two transports, each filled alone. They are the same twenty-nine
+    // families twice over, told apart by one label, so a block written to the
+    // other one's slots would otherwise land on series that look right in every
+    // way but the port they are about.
+    let transport = TcpSample {
+        segments_received: 1,
+        segments_sent: 2,
+        connections_accepted: 3,
+        connections_dialled: 4,
+        connections_established: 5,
+        connections_closed: 6,
+        connections_evicted: 7,
+        connections_reaped: 8,
+        connections_abandoned: 9,
+        bytes_received: 10,
+        bytes_sent: 11,
+        bytes_retransmitted: 12,
+        retransmits: 13,
+        refused_malformed: 14,
+        refused_bad_checksum: 15,
+        refused_out_of_window: 16,
+        refused_table_full: 17,
+        refused_not_listening: 18,
+        refused_no_connection: 19,
+        refused_unacceptable_ack: 20,
+        refused_no_acknowledgement: 21,
+        refused_not_a_handshake: 22,
+        refused_out_of_order: 23,
+        urgent_ignored: 24,
+        challenge_acks: 25,
+        challenges_suppressed: 26,
+        resets_received: 27,
+        resets_sent: 28,
+        write_refused: 29,
+    };
+    let owed: [(&Metric, &str, u64); 29] = [
+        (&TCP_SEGMENTS, "received", 1),
+        (&TCP_SEGMENTS, "sent", 2),
+        (&TCP_CONNECTIONS, "accepted", 3),
+        (&TCP_CONNECTIONS, "dialled", 4),
+        (&TCP_CONNECTIONS, "established", 5),
+        (&TCP_CONNECTIONS, "closed", 6),
+        (&TCP_CONNECTIONS, "evicted", 7),
+        (&TCP_CONNECTIONS, "reaped", 8),
+        (&TCP_CONNECTIONS, "abandoned", 9),
+        (&TCP_BYTES, "received", 10),
+        (&TCP_BYTES, "sent", 11),
+        (&TCP_BYTES, "retransmitted", 12),
+        (&TCP_RETRANSMITS, "", 13),
+        (&TCP_REFUSED, "malformed", 14),
+        (&TCP_REFUSED, "bad_checksum", 15),
+        (&TCP_REFUSED, "out_of_window", 16),
+        (&TCP_REFUSED, "table_full", 17),
+        (&TCP_REFUSED, "not_listening", 18),
+        (&TCP_REFUSED, "no_connection", 19),
+        (&TCP_REFUSED, "unacceptable_ack", 20),
+        (&TCP_REFUSED, "no_acknowledgement", 21),
+        (&TCP_REFUSED, "not_a_handshake", 22),
+        (&TCP_REFUSED, "out_of_order", 23),
+        (&TCP_URGENT_IGNORED, "", 24),
+        (&TCP_CHALLENGE_ACKS, "", 25),
+        (&TCP_CHALLENGES_SUPPRESSED, "", 26),
+        (&TCP_RESETS, "received", 27),
+        (&TCP_RESETS, "sent", 28),
+        (&TCP_WRITE_REFUSED, "", 29),
     ];
+    lands_on_its_own_series(
+        &ManagementSample {
+            tcp: transport,
+            ..ManagementSample::default()
+        },
+        &owed,
+    );
+    lands_on_its_own_series(
+        &ManagementSample {
+            onboarding: transport,
+            ..ManagementSample::default()
+        },
+        &owed,
+    );
+}
+
+/// Every non-zero slot of `sample` belongs to `owed`, in order and by value.
+///
+/// The discriminating label rather than the first one: the transport families
+/// carry `service` in front of the label that separates their series, so a first
+/// label would read `http` twenty-nine times and separate nothing.
+fn lands_on_its_own_series(sample: &ManagementSample, owed: &[(&Metric, &str, u64)]) {
     let values = sample.values();
     let mut seen = Vec::new();
     for (slot, value) in values.iter().enumerate() {
@@ -1230,15 +1324,19 @@ fn a_filled_block_lands_only_on_the_series_that_declare_it() {
         let series = ManagementSample::SERIES
             .get(slot)
             .expect("a slot the series table declares");
-        let label = series.labels.first().map_or("", |label| label.value);
+        let label = series
+            .labels
+            .iter()
+            .find(|label| label.name != "service")
+            .map_or("", |label| label.value);
         seen.push((series.metric.name, label, *value));
     }
-    let owed: Vec<(&str, &str, u64)> = onboard
+    let owed: Vec<(&str, &str, u64)> = owed
         .iter()
         .map(|(metric, label, value)| (metric.name, *label, *value))
         .collect();
     assert_eq!(
         seen, owed,
-        "the onboarding block's values landed on other families' series"
+        "a filled block's values landed on other families' series"
     );
 }

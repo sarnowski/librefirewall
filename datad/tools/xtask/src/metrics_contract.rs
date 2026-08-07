@@ -1224,14 +1224,20 @@ fn judge_one(
             "the endpoint reports no HTTP request, having just answered one",
         ));
     }
+    // Named down to the transport, because the management port carries two and
+    // only one of them is under the server that answered this scrape. The
+    // onboarding port's stack is quiet on a boot with no administrator on it, so
+    // a selection that matched both would find two series and — if it took the
+    // sum — would let a silent HTTP stack pass on the other's numbers.
     let segments = one(
         &exposition,
         "librefirewall_tcp_segments_total",
-        &[("direction", "received")],
+        &[("service", "http"), ("direction", "received")],
     )?;
     if segments.value == 0 {
         return Err(String::from(
-            "the transport reports no segment received, having just carried a connection",
+            "the transport under the HTTP server reports no segment received, having just carried \
+             a connection",
         ));
     }
     asserted.push(requests);

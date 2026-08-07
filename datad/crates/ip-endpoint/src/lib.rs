@@ -124,14 +124,17 @@
 use core::fmt;
 
 use lfw_clock::Monotonic;
-use lfw_tcp::{
-    Connection, Outcome as TcpOutcome, Refusal, Rejection, Released, TcpCounters, TcpStack, Timeout,
-};
+use lfw_tcp::{Connection, Outcome as TcpOutcome, Refusal, Rejection, Released, TcpStack, Timeout};
 
 /// Re-exported rather than restated: the per-boot secret is obtained by the
 /// protection domain and the segment types are what a *test* composes one out
 /// of, and all reach this crate rather than the transport under it.
-pub use lfw_tcp::{ConnectionId, Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber, State};
+/// `TcpCounters` is here for a second reason — it is what this crate's own
+/// `tcp_counters` and `onboarding_counters` answer with, and a return type a
+/// caller cannot name is one it cannot hold.
+pub use lfw_tcp::{
+    ConnectionId, Flags, IsnSecret, MAX_UNACKED, Outgoing, SeqNumber, State, TcpCounters,
+};
 use net_headers::{
     ArpError, ArpOperation, ArpPacket, ArpReply, ArpRequest, EchoReply, EtherType, Ethernet,
     IcmpEcho, IcmpError, Ipv4Address, Ipv4Frame, Ipv4Packet, MAX_PREFIX_LENGTH, MacAddress,
