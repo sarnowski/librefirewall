@@ -123,6 +123,10 @@ const POLICY_SWEEP: &str = "librefirewall_policy_sweep_total";
 /// 1 while a commit's pass is still owed.
 const POLICY_SWEEP_RUNNING: &str = "librefirewall_policy_sweep_running";
 
+/// What a port's driver says its device delivered, which is the independent
+/// account of the wakeups the harness manufactures for the pass below.
+const RECEIVE_FRAMES: &str = "librefirewall_receive_frames_total";
+
 /// What the submission surface answered, and what the node said about itself
 /// around it. Returned so the scenario can print it as evidence.
 #[derive(Clone, Debug)]
@@ -422,6 +426,13 @@ pub struct Revoked {
     pub passes: u64,
     /// Wakeups the harness had to manufacture to get there.
     pub wakeups: usize,
+    /// What the driven port's own driver had received when the harness first read
+    /// progress back. The harness counts what it *wrote*; this and the reading
+    /// below are the appliance's count of what arrived, so the two together say
+    /// whether the budget was spent on frames anybody saw.
+    pub received_first: u64,
+    /// And what it had received once the pass finished.
+    pub received_last: u64,
 }
 
 impl Revoked {
@@ -432,8 +443,15 @@ impl Revoked {
             "  the commit re-decided the connection table:\n\
              \x20   two-way conversations before -> {}, after -> {}\n\
              \x20   {} flow(s) taken back, {} pass(es) over the table completed\n\
-             \x20   {} wakeup(s) manufactured to work the pass off, a pass advancing per wakeup",
-            self.assured_before, self.assured_after, self.revoked, self.passes, self.wakeups,
+             \x20   {} wakeup(s) manufactured to work the pass off, a pass advancing per wakeup\n\
+             \x20   the driven port's own receive count over that: {} -> {}",
+            self.assured_before,
+            self.assured_after,
+            self.revoked,
+            self.passes,
+            self.wakeups,
+            self.received_first,
+            self.received_last,
         )
     }
 }
@@ -484,6 +502,23 @@ pub fn assured_flows(host_port: u16) -> Result<u64, String> {
 /// keeps the occupancy, the lifecycle counts and the two recordings the scenario
 /// judges free of the harness's own pacing.
 ///
+/// # Why the frames are spaced out, and why nothing is timed
+///
+/// A manufactured wakeup is only worth a wakeup if the domain was quiet when it
+/// arrived. `Pipeline::windows_for` sizes a pass's share of a wakeup against what
+/// that wakeup's drain left of its frame budget: a quiet one works off four
+/// windows and a saturated one exactly one. Frames written back to back do not
+/// arrive back to back — they arrive coalesced into far fewer wakeups, some twenty
+/// of them to a wakeup on an emulated guest — so a burst buys one wakeup's windows
+/// between all of them and the budget below is spent at a fraction of its stated
+/// rate. Spacing them leaves the domain quiet when each one lands, which is what
+/// makes the count mean what it says.
+///
+/// That spacing is a **pace and never a bound**: nothing is asserted against it and
+/// a machine on which it is too short costs more wakeups, not a failure. The bound
+/// is the count, and the count comes from the appliance's arithmetic — so a pass
+/// that is not advancing is a finding at any speed, and a slow machine is not one.
+///
 /// # Errors
 /// The verdict, naming what the node reported: a pass that never finished, a
 /// re-decision that took back nothing, or one that took back more than the single
@@ -491,29 +526,59 @@ pub fn assured_flows(host_port: u16) -> Result<u64, String> {
 pub fn await_revocation(
     host_port: u16,
     assured_before: u64,
+    driven_port: usize,
     mut drive: impl FnMut(),
 ) -> Result<Revoked, String> {
     /// How many wakeups the harness will manufacture before calling the pass
-    /// stalled. A pass takes at most `FLOW_CAPACITY / REVISIT_BUCKETS` wakeups at
-    /// any occupancy, a commit mid-pass queues at most one more pass behind the one
-    /// running, and a quiet wakeup works off several windows — so this is generous
-    /// by a wide margin, and bounded, so a pass that is not advancing is a finding
-    /// rather than a hang.
+    /// stalled.
+    ///
+    /// The appliance's own arithmetic, and the reason nothing here is timed. A
+    /// pass crosses `FLOW_CAPACITY / REVISIT_BUCKETS` windows of index, a commit
+    /// arriving mid-pass queues at most one more pass behind the one running, and
+    /// a wakeup works off at least one window however saturated it is — so two
+    /// passes are owed at worst and cost at most twice that many wakeups. This is
+    /// eight times that figure, and a quiet wakeup works off four windows rather
+    /// than one, so the margin over what a paced run actually spends is wider
+    /// still.
     const WAKEUPS: usize = 4_096;
     /// How often the pass's own progress is read back. Every wakeup would spend
-    /// the whole budget on HTTP round trips.
+    /// the whole budget on HTTP round trips — and this endpoint's connection table
+    /// holds eight, each left in `TIME_WAIT`, so scrapes in quick succession are
+    /// the expensive read here rather than the frames.
     const POLL_EVERY: usize = 64;
+    /// How long the harness waits between the wakeups it manufactures, so each
+    /// lands on a domain that has finished with the one before it.
+    const DRIVE_PACE: Duration = Duration::from_millis(5);
 
-    let deadline = Instant::now();
+    let Some(domain) = u8::try_from(driven_port)
+        .ok()
+        .and_then(lfw_metrics::port_domain)
+    else {
+        return Err(format!(
+            "the re-decision is driven through port {driven_port}, which this build has no driver \
+             domain for, so nothing can say whether the frames arrived"
+        ));
+    };
+
+    let driving = Instant::now();
     let mut wakeups = 0usize;
-    while wakeups < WAKEUPS && deadline.elapsed() < SWITCH_GRACE {
+    let mut received_first = None;
+    let mut received_last = 0u64;
+    while wakeups < WAKEUPS {
         for _ in 0..POLL_EVERY {
             drive();
             wakeups += 1;
+            std::thread::sleep(DRIVE_PACE);
         }
         let exposition = crate::metrics_contract::fetch(host_port)
             .map_err(|error| format!("scraping the re-decision's progress: {error}"))?
             .body;
+        // The appliance's own count of what reached the driven port, beside the
+        // harness's count of what it wrote. Nothing is asserted against it: it is
+        // what tells a pass that is not advancing apart from frames that are not
+        // arriving, at the point where somebody reads the failure.
+        received_last = in_domain(&exposition, RECEIVE_FRAMES, domain).unwrap_or(received_last);
+        received_first.get_or_insert(received_last);
         let passes =
             labelled(&exposition, POLICY_SWEEP, "outcome", "completed").ok_or_else(|| {
                 format!(
@@ -574,14 +639,20 @@ pub fn await_revocation(
             revoked,
             passes,
             wakeups,
+            received_first: received_first.unwrap_or(received_last),
+            received_last,
         });
     }
+    let first = received_first.unwrap_or(received_last);
     Err(format!(
         "the forwarding domain committed the submitted generation and no pass over its connection \
-         table finished after {wakeups} manufactured wakeup(s) in {}s. A pass advances one bounded \
-         window per wakeup, so this is a re-decision that is not progressing rather than one that \
-         is slow",
-        SWITCH_GRACE.as_secs()
+         table finished after {wakeups} manufactured wakeup(s), spent in {:.1}s. A wakeup works \
+         off at least one bounded window and two passes are owed at worst, so this is a \
+         re-decision that is not progressing rather than one that is slow. Over those wakeups the \
+         driven port's own driver counted {first} received frame(s) rising to {received_last}: a \
+         count that barely moved is frames that never arrived, and one that tracked them is a \
+         pass that had them and did not advance",
+        driving.elapsed().as_secs_f64()
     ))
 }
 
@@ -593,6 +664,18 @@ fn labelled(exposition: &str, family: &str, label: &str, value: &str) -> Option<
         (labels.contains(&format!("{label}=\"{value}\""))
             && labels.contains("domain=\"forwarder\""))
         .then(|| reading.trim().parse().ok())?
+    })
+}
+
+/// One series carrying no label but the domain, read for a domain the caller
+/// names — the driver's, where every other read here is the forwarder's.
+fn in_domain(exposition: &str, family: &str, domain: &str) -> Option<u64> {
+    exposition.lines().find_map(|line| {
+        let rest = line.strip_prefix(family)?;
+        let (labels, reading) = rest.rsplit_once(' ')?;
+        labels
+            .contains(&format!("domain=\"{domain}\""))
+            .then(|| reading.trim().parse().ok())?
     })
 }
 

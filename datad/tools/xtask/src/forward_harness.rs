@@ -6697,9 +6697,23 @@ fn run_boot(
                             // the router's parser refuses, which reach no flow, no
                             // policy counter and neither recording.
                             let driver = legacy_broadcast_frame(b"LFW-SWEEP/wakeup");
+                            // Which port they go to is named rather than implied:
+                            // the wait reads that port's own driver back for its
+                            // account of what arrived, and a domain it was handed
+                            // could be the wrong one where a port it derives cannot
+                            // be.
+                            let Some(driven) =
+                                endpoints.first().map(|attached| attached.endpoint.port)
+                            else {
+                                break 'run Err(String::from(
+                                    "a re-deciding scenario needs a dataplane port to drive the \
+                                     pass through and this boot attached none",
+                                ));
+                            };
                             let outcome = crate::config_submission_contract::await_revocation(
                                 host_port,
                                 assured_before,
+                                driven,
                                 || {
                                     if let Some(attached) = endpoints.first_mut() {
                                         attached.inject(&driver);
