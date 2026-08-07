@@ -332,6 +332,19 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " onboard-relayed={relayed} onboard-received={received} onboard-sent={sent} \
              onboard-ended={ended}"
         ),
+        // The port's own totals, under keys naming the port rather than a
+        // session: a reader who mistook one for the other would read a boot's
+        // refusals as one session's.
+        DomainDetail::OnboardingPort {
+            accepted,
+            forgotten,
+            overflowed,
+            refused,
+        } => write!(
+            cursor,
+            " onboard-accepted={accepted} onboard-forgotten={forgotten} \
+             onboard-overflowed={overflowed} onboard-refused={refused}"
+        ),
         // Decimal, unlike a refusal's hexadecimal numbers below: these are
         // sequence numbers, and a peer's own capture and this appliance's
         // console are compared digit for digit.

@@ -381,14 +381,31 @@ impl Stream {
         kept
     }
 
-    /// The consumer has finished with the session. The close goes out once
-    /// everything it answered with has.
-    pub fn end_session(&mut self) {
+    /// The consumer has finished with the session **on `connection`**. The close
+    /// goes out once everything it answered with has.
+    ///
+    /// A close names the session it belongs to, and a name this stream no longer
+    /// holds ends nothing: the consumer decides on one wakeup and this end may
+    /// have taken a different connection by the next, so a close that named no
+    /// session would end whichever one happened to be running. That is a peer's
+    /// lever rather than a race — resetting and reconnecting between two passes
+    /// is one segment and a handshake — and the identity is the transport's own
+    /// handle, whose generation makes a fresh connection unequal to the one it
+    /// replaced.
+    ///
+    /// Answers whether it ended the session named. `false` is a consumer whose
+    /// close arrived after the session it was about was gone, which the caller
+    /// reads as nothing left to do rather than as a failure.
+    pub fn end_session(&mut self, connection: ConnectionId) -> bool {
+        if self.connection != Some(connection) {
+            return false;
+        }
         if !self.consumer_closed {
             self.consumer_closed = true;
             StreamCounters::bump(&mut self.counters.closed_by_consumer);
         }
         self.ended.get_or_insert(Ended::ByConsumer);
+        true
     }
 
     /// Send whatever this session owes, or close it.

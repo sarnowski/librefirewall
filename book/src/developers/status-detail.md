@@ -2452,13 +2452,27 @@ the session is over). It is asynchronous rather than a call, because the two dom
 priority and neither is scheduled while the other runs: each writes its direction, signals, and
 returns to its event loop.
 
-Three things the ABI has no way to say, which is why they are properties rather than rules. There is
+Four things the ABI has no way to say, which is why they are properties rather than rules. There is
 **no connection identifier anywhere in it**, so a second concurrent connection would need a second
 name and there is nowhere to put one — the onboarding server serves an administrator, not a fleet,
 and that bound is in the type rather than in the caller that must not exceed it. There is **no
 operation that asks for a plaintext**: the vocabulary has four values and none of them means "give
-me what the peer said". And there is **no field a private key fits in**, in either direction. The
-module is host-tested against a peer that keeps to none of the protocol — every bound is a typed
+me what the peer said". There is **no field a private key fits in**, in either direction. And there
+is **no way for the two ends to disagree about which session is running**: an open *is* the beginning
+of a session and ends whatever the terminating end still believed in, so there is no status that
+means "an open arrived and one was already open" and nothing for a reconciliation exchange to settle.
+What that buys is the property that an answer the network end gave up on costs the session it was
+about and no session after it — the failure that would otherwise poison every later session on the
+boot. Giving up on an item is itself an operation of the channel rather than a handle dropped, so the
+one-item window is freed when it happens.
+
+The one thing a close carries is **how the session ended**, because the terminating end cannot see
+the wire: a session the transport forgot and one the peer hung up on are indistinguishable from
+there, and they are different things to go and look at. The ending travels with the close, in a
+vocabulary mirroring the console's own, so the two domains' records of one session name the same
+party.
+
+The module is host-tested against a peer that keeps to none of the protocol — every bound is a typed
 refusal or a typed fault and nothing in it can panic.
 
 **Both ends of that channel now exist, and the port they serve is open.** The management endpoint
@@ -2476,14 +2490,24 @@ what is delivered, counts it, refuses what it must, and closes. **It runs no TLS
 it reports for bytes sent back is the fact rather than a placeholder — what the protocol will add is
 what it answers with, and the handover, its bounds and its refusals are settled around it.
 
-*Every distinct failure of that path is diagnosable from the console alone.* Fourteen tokens on the
-management domain and five on the cryptography one, each naming one cause: the terminating domain's
-five refusals quoted whole, the six answers the network end could not believe, and this appliance's
+*Every distinct failure of that path is diagnosable from the console alone.* Thirteen tokens on the
+management domain and four on the cryptography one, each naming one cause: the terminating domain's
+four refusals quoted whole, the six answers the network end could not believe, and this appliance's
 own three bounds — a far end that said nothing inside the answer timeout, a window found taken, and
 an answer that outgrew the room the port keeps for one. Beside each, both domains report the
 session itself — how many items crossed, how many bytes each way, and which end finished it — so
 two accounts of one session are comparable and a relay that lost something cannot read as one that
 carried nothing.
+
+*And the port's own account reaches both surfaces.* A session's record set carries a second record
+from the domain that owns the port: connections it has accepted, connections the transport stopped
+holding mid-session, bytes a peer sent past the window it was given, and bytes the terminating
+domain's answer had no room for. Those are the facts the session's account can state a fault about
+and not place — a session that ended forgotten beside a non-zero overflow is a peer that overran the
+window, and one accepted connection more than there are session records is a connection that never
+became a session. The same four, and the four beside them, are `/metrics` families too, and that is
+not redundancy: a console record exists only once a session has *ended*, so a peer that connects,
+floods the port and disappears leaves no record at all and moves three counters.
 
 **Missing.** The rustls server on the far end of that relay, which is what would make the onboarding
 port an onboarding *server*: the cryptography end today accepts the handover, counts what crosses and

@@ -151,7 +151,7 @@ fn a_refusal_frees_the_window_so_the_connection_can_be_closed() {
     assert!(
         channel
             .requester
-            .request(RelayOperation::Close, &[])
+            .request(RelayOperation::Close(RelayEnding::Refused), &[])
             .is_ok(),
         "a refused item left the window taken"
     );
@@ -179,9 +179,41 @@ fn a_fault_frees_the_window_too() {
         RelayPoll::Faulted(RelayFault::StatusUnknown { status: 99 })
     );
     assert!(
-        requester.request(RelayOperation::Close, &[]).is_ok(),
+        requester
+            .request(RelayOperation::Close(RelayEnding::Refused), &[])
+            .is_ok(),
         "a faulted item left the window taken"
     );
+}
+
+#[test]
+fn an_abandoned_item_frees_the_window_and_its_late_answer_is_ignored() {
+    let mut channel = Channel::new();
+    let pending = ask(&mut channel, RelayOperation::Open, &[]);
+    let given_up = pending.sequence();
+    channel.requester.abandon(pending);
+    assert!(
+        !channel.requester.outstanding(),
+        "an item given up on left the one slot taken, which is a dead channel"
+    );
+
+    // The far end answers it late, into a region nothing is polling.
+    let demand = channel.responder.take().expect("the abandoned item");
+    channel.responder.answered(demand, b"late", false);
+
+    // And the next item is issued and answered on its own number. The late reply
+    // carries a sequence no item is held against, so nothing about it is read.
+    let next = channel
+        .requester
+        .request(RelayOperation::Open, &[])
+        .expect("the window was freed");
+    assert_ne!(next.sequence(), given_up);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    match channel.requester.poll(next, &mut into) {
+        RelayPoll::Outstanding(_) => {}
+        other => panic!("the abandoned item's answer was read as this one's: {other:?}"),
+    }
+    assert_eq!(channel.requester.faults(), 0);
 }
 
 #[test]
@@ -237,7 +269,6 @@ fn one_demand_is_taken_per_change_of_the_sequence() {
 fn every_refusal_reaches_the_requester_as_itself_carrying_no_bytes_and_closing() {
     for reason in [
         RelayRefusal::NoConnection,
-        RelayRefusal::AlreadyOpen,
         RelayRefusal::PayloadTooLong,
         RelayRefusal::NoSuchOperation,
         RelayRefusal::SessionFailed,
@@ -482,16 +513,19 @@ fn every_status_and_operation_bit_pattern_round_trips_or_is_refused() {
     for bits in 0_u32..9 {
         match RelayStatus::from_bits(bits) {
             Some(status) => assert_eq!(status.to_bits(), bits),
-            None => assert!(bits >= 6),
+            None => assert!(bits >= 5),
         }
         match RelayOperation::from_bits(bits) {
             Some(operation) => assert_eq!(operation.to_bits(), bits),
+            None => assert!(bits >= 7),
+        }
+        match RelayEnding::from_bits(bits) {
+            Some(ending) => assert_eq!(ending.to_bits(), bits),
             None => assert!(bits >= 4),
         }
     }
     for status in [
         RelayStatus::NoConnection,
-        RelayStatus::AlreadyOpen,
         RelayStatus::PayloadTooLong,
         RelayStatus::NoSuchOperation,
         RelayStatus::SessionFailed,
@@ -499,6 +533,60 @@ fn every_status_and_operation_bit_pattern_round_trips_or_is_refused() {
         let refusal = RelayRefusal::from_status(status).expect("not the success");
         assert_eq!(refusal.to_status(), status);
     }
+}
+
+#[test]
+fn every_close_ending_crosses_as_itself_and_is_echoed_as_itself() {
+    for ending in [
+        RelayEnding::Peer,
+        RelayEnding::Consumer,
+        RelayEnding::Forgotten,
+        RelayEnding::Refused,
+    ] {
+        let mut channel = Channel::new();
+        let pending = ask(&mut channel, RelayOperation::Close(ending), &[]);
+        let demand = channel.responder.take().expect("outstanding");
+        assert_eq!(
+            demand.operation(),
+            Some(RelayOperation::Close(ending)),
+            "the far end read a close and lost how the session ended"
+        );
+        channel.responder.answered(demand, &[], true);
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        // The echo is compared whole, ending included, so a responder that
+        // answered a close with some other ending is a mismatched echo rather
+        // than an accepted answer.
+        match channel.requester.poll(pending, &mut into) {
+            RelayPoll::Answered { closed, .. } => assert!(closed),
+            other => panic!("expected a closing answer for {ending:?}: {other:?}"),
+        }
+        assert_eq!(channel.requester.faults(), 0);
+    }
+}
+
+#[test]
+fn a_close_answered_with_another_ending_is_a_mismatched_echo() {
+    let mut channel = Channel::new();
+    let pending = ask(&mut channel, RelayOperation::Close(RelayEnding::Peer), &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    // A far end that answers the close it was handed as though the session had
+    // ended some other way. It is a fault and not a detail: the ending is the
+    // whole of what this operation adds, so an echo that changed it is an answer
+    // to a different question.
+    let mistaken = RelayDemand {
+        sequence: demand.sequence(),
+        operation: Some(RelayOperation::Close(RelayEnding::Forgotten)),
+        len: demand.stated_len(),
+    };
+    channel.responder.answered(mistaken, &[], true);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    assert_eq!(
+        channel.requester.poll(pending, &mut into),
+        RelayPoll::Faulted(RelayFault::WrongOperation {
+            asked: RelayOperation::Close(RelayEnding::Peer),
+            answered: RelayOperation::Close(RelayEnding::Forgotten),
+        })
+    );
 }
 
 /// Store an operation word directly, modelling a peer that writes one this side
@@ -590,6 +678,13 @@ proptest! {
         let demand = responder.take().expect("a non-zero sequence is a request");
         prop_assert_eq!(demand.stated_len(), len);
         prop_assert_eq!(demand.operation(), RelayOperation::from_bits(operation));
+        // A close arrives with an ending or does not arrive at all: the word is
+        // decoded whole, so no close reaches the terminating end carrying an
+        // ending this side invented.
+        if let Some(RelayOperation::Close(ending)) = demand.operation() {
+            prop_assert_eq!(RelayOperation::Close(ending).to_bits(), operation);
+            prop_assert!(ending.to_bits() < RelayEnding::COUNT as u32);
+        }
         let mut scratch = std::boxed::Box::new([0_u8; MAX_RELAY_PAYLOAD]);
         let payload = demand.payload(&responder, &mut scratch);
         prop_assert_eq!(payload.is_some(), (len as usize) <= MAX_RELAY_PAYLOAD);

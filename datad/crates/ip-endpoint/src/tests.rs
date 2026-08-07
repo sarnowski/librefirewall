@@ -4989,7 +4989,8 @@ fn what_the_consumer_answers_with_goes_out_and_the_close_follows_it() {
     let mut endpoint = endpoint();
     let mut station = onboarding_station(&mut endpoint);
     endpoint.stream_mut().push(b"server hello");
-    endpoint.stream_mut().end_session();
+    let session = endpoint.stream().connection().expect("an accepted session");
+    assert!(endpoint.stream_mut().end_session(session));
     let frames = drain_onboarding(&mut endpoint, at(2));
     assert_eq!(frames.len(), 2, "the bytes, and then the close behind them");
     let (flags, _, payload) = station.read(&frames[0]);
@@ -5012,7 +5013,8 @@ fn a_peer_that_closes_is_reported_as_the_end_that_finished_the_session() {
     assert_eq!(endpoint.stream().ending(), OnboardEnded::ByPeer);
     // The consumer answers the close, and the order the two happened in is what
     // the ending keeps: the peer hung up first.
-    endpoint.stream_mut().end_session();
+    let session = endpoint.stream().connection().expect("an accepted session");
+    assert!(endpoint.stream_mut().end_session(session));
     assert_eq!(endpoint.stream().ending(), OnboardEnded::ByPeer);
     let frames = drain_onboarding(&mut endpoint, at(3));
     let (flags, _, _) = station.read(frames.last().expect("this end's own close"));

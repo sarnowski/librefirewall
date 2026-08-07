@@ -36,10 +36,11 @@ use crate::catalog::{
     HTTP_RESPONSE_BYTES, HTTP_RESPONSES, HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED,
     INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label,
     NEIGHBOUR_ENTRIES_EXPIRED, NEIGHBOUR_REPLIES, NEIGHBOUR_REQUESTS, NEIGHBOUR_RESOLUTIONS_FAILED,
-    OUTBOUND_ANSWER_OVERFLOWED, OUTBOUND_BYTES, OUTBOUND_DIALS, OUTBOUND_SEGMENTS_DROPPED,
-    OUTBOUND_SESSIONS, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS,
-    POLICY_SWEEP_RUNNING, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
-    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
+    ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES, ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED,
+    ONBOARD_SESSIONS_CLOSED, OUTBOUND_ANSWER_OVERFLOWED, OUTBOUND_BYTES, OUTBOUND_DIALS,
+    OUTBOUND_SEGMENTS_DROPPED, OUTBOUND_SESSIONS, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP,
+    POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES,
+    RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
     RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
     RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
@@ -1145,9 +1146,27 @@ pub struct OutboundSample {
     pub answer_overflowed: u64,
 }
 
+/// What the onboarding port has done with the byte stream it carries, one field
+/// per decision.
+///
+/// Named fields rather than the arrays [`OutboundSample`] uses for its label
+/// pairs: three of these eight are their own family, so an array would be a
+/// grouping the exposition does not have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OnboardSample {
+    pub accepted: u64,
+    pub forgotten: u64,
+    pub received: u64,
+    pub sent: u64,
+    pub closed_by_peer: u64,
+    pub closed_by_consumer: u64,
+    pub overflowed: u64,
+    pub refused: u64,
+}
+
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 103;
+pub const MANAGEMENT_SLOTS: usize = 111;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1167,6 +1186,8 @@ pub struct ManagementSample {
     pub outbound: OutboundSample,
     pub tcp: TcpSample,
     pub http: HttpSample,
+    /// The second listening port's own account of itself.
+    pub onboard: OnboardSample,
     /// Streams begun, given up on, windows handed over, and their bytes.
     pub streams: [u64; 4],
     pub log: LogSample,
@@ -1283,6 +1304,18 @@ impl ManagementSample {
         s(&OUTBOUND_BYTES, &[Label::new("direction", "request")]),
         s(&OUTBOUND_BYTES, &[Label::new("direction", "answer")]),
         plain(&OUTBOUND_ANSWER_OVERFLOWED),
+        // And the byte stream the second listening port carries, whose counts a
+        // scrape reads whether or not a session ever finished: a peer that
+        // floods the port and vanishes leaves no session record at all, and
+        // these are where it shows.
+        s(&ONBOARD_CONNECTIONS, &[Label::new("event", "accepted")]),
+        s(&ONBOARD_CONNECTIONS, &[Label::new("event", "forgotten")]),
+        s(&ONBOARD_BYTES, &[Label::new("direction", "received")]),
+        s(&ONBOARD_BYTES, &[Label::new("direction", "sent")]),
+        s(&ONBOARD_SESSIONS_CLOSED, &[Label::new("by", "peer")]),
+        s(&ONBOARD_SESSIONS_CLOSED, &[Label::new("by", "consumer")]),
+        plain(&ONBOARD_OVERFLOWED),
+        plain(&ONBOARD_ANSWERS_REFUSED),
         // The transport.
         s(&TCP_SEGMENTS, &[Label::new("direction", "received")]),
         s(&TCP_SEGMENTS, &[Label::new("direction", "sent")]),
@@ -1380,6 +1413,16 @@ impl ManagementSample {
         put(&mut values, &mut at, outbound.dropped_unresolved);
         put_all(&mut values, &mut at, &outbound.bytes);
         put(&mut values, &mut at, outbound.answer_overflowed);
+
+        let onboard = &self.onboard;
+        put(&mut values, &mut at, onboard.accepted);
+        put(&mut values, &mut at, onboard.forgotten);
+        put(&mut values, &mut at, onboard.received);
+        put(&mut values, &mut at, onboard.sent);
+        put(&mut values, &mut at, onboard.closed_by_peer);
+        put(&mut values, &mut at, onboard.closed_by_consumer);
+        put(&mut values, &mut at, onboard.overflowed);
+        put(&mut values, &mut at, onboard.refused);
 
         let tcp = &self.tcp;
         put(&mut values, &mut at, tcp.segments_received);

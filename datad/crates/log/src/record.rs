@@ -537,6 +537,15 @@ impl Event<Cause> {
                     // names a vocabulary carries it — `Dialled`'s own order.
                     record.operands = [*ended as u64, *relayed, *received, *sent];
                 }
+                DomainDetail::OnboardingPort {
+                    accepted,
+                    forgotten,
+                    overflowed,
+                    refused,
+                } => {
+                    record.detail = LogDetailKind::OnboardingPort.to_bits();
+                    record.operands = [*accepted, *forgotten, *overflowed, *refused];
+                }
                 DomainDetail::Delegated { device, signatures } => {
                     record.detail = LogDetailKind::Delegated.to_bits();
                     // The identifier in its two halves, most significant first,
@@ -811,6 +820,19 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             sent: *sent,
             ended: onboard_end_of(*ended)?,
         },
+        // Four tallies and no token, so nothing is ranged: every bit pattern of
+        // each is a count the port could have kept about itself.
+        CheckedDetail::OnboardingPort {
+            accepted,
+            forgotten,
+            overflowed,
+            refused,
+        } => DomainDetail::OnboardingPort {
+            accepted: *accepted,
+            forgotten: *forgotten,
+            overflowed: *overflowed,
+            refused: *refused,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and a signature count is a tally, so every bit
         // pattern of the three words is one a delegating domain could have read.
@@ -966,6 +988,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         received,
                         sent,
                         ended,
+                    },
+                    DomainDetail::OnboardingPort {
+                        accepted,
+                        forgotten,
+                        overflowed,
+                        refused,
+                    } => DomainDetail::OnboardingPort {
+                        accepted,
+                        forgotten,
+                        overflowed,
+                        refused,
                     },
                     DomainDetail::Dialled {
                         destination,

@@ -1,5 +1,6 @@
 use super::*;
 use lfw_tcp::{IsnSecret, TcpStack};
+use proptest::prelude::*;
 use std::boxed::Box;
 use std::{vec, vec::Vec};
 use wire::RelayResponder;
@@ -80,7 +81,15 @@ struct Stream {
     /// How much of an offered run this stream will take. `None` takes all of it.
     room: Option<usize>,
     ended: bool,
+    /// How the session running now would end, as the real stream records it the
+    /// moment one of the two ends says so.
     ending: Option<Ended>,
+    /// How the **last** session ended, waiting to be taken exactly once — the
+    /// real stream's own shape, and what makes an ending left behind readable as
+    /// the next session's.
+    last_ending: Option<Ended>,
+    /// Closes this stream refused for naming a session it no longer held.
+    refused_closes: usize,
 }
 
 impl Stream {
@@ -96,6 +105,17 @@ impl Stream {
     /// goes out, and the pump makes the account then.
     fn forgotten(&mut self) {
         self.session = None;
+        self.last_ending = Some(self.ending.unwrap_or(Ended::Forgotten));
+        self.ending = None;
+    }
+
+    /// The peer reset and reconnected, so the transport holds a **different**
+    /// connection: everything the old session had is gone with it and the handle
+    /// is one the table issued for the new one.
+    fn reconnected(&mut self) {
+        self.forgotten();
+        self.session = Some(handles().1);
+        self.ended = false;
     }
 }
 
@@ -123,13 +143,27 @@ impl Onboarding for Stream {
         kept
     }
 
-    fn end_session(&mut self) {
+    /// The real stream refuses a name it does not hold, and so does this one: it
+    /// is the property under test in
+    /// [`a_close_for_a_session_that_is_gone_leaves_the_new_one_alone`], and a
+    /// fake that ended whatever was running would prove the pump right whatever
+    /// it did.
+    fn end_session(&mut self, connection: ConnectionId) -> bool {
+        if self.session != Some(connection) {
+            self.refused_closes += 1;
+            return false;
+        }
         self.ended = true;
         self.ending.get_or_insert(Ended::ByConsumer);
+        true
     }
 
     fn take_ending(&mut self) -> Option<Ended> {
-        self.ending.take()
+        self.last_ending.take()
+    }
+
+    fn ending(&self) -> Ended {
+        self.ending.unwrap_or(Ended::Forgotten)
     }
 }
 
@@ -183,7 +217,12 @@ fn a_session_opens_delivers_and_closes() {
     stream.ending = Some(Ended::ByPeer);
     let pass = relay.poll(at(5), &mut stream);
     assert!(pass.notify);
-    assert_eq!(serve(&mut far, &[], true), RelayOperation::Close);
+    // The close carries how the session ended, so the far end reports the same
+    // party this end will.
+    assert_eq!(
+        serve(&mut far, &[], true),
+        RelayOperation::Close(RelayEnding::Peer)
+    );
     let pass = relay.poll(at(6), &mut stream);
     assert!(pass.report.is_none(), "the connection is still closing");
     stream.forgotten();
@@ -351,16 +390,132 @@ fn a_connection_replaced_between_passes_closes_the_far_end_first() {
 
     // A different peer, on a handle the transport issued for a fresh
     // connection: the far end still holds the old session and must be told.
-    stream.session = Some(handles().1);
+    stream.reconnected();
     let pass = relay.poll(at(2), &mut stream);
     assert!(pass.notify);
-    assert_eq!(serve(&mut far, &[], true), RelayOperation::Close);
+    // Neither end of the old session said it was over, which is what the close
+    // carries — and the far end reports it as that rather than as a peer close.
+    assert_eq!(
+        serve(&mut far, &[], true),
+        RelayOperation::Close(RelayEnding::Forgotten)
+    );
     let pass = relay.poll(at(3), &mut stream);
     assert!(pass.report.is_some(), "the old session's account");
     // And only then is the new one opened.
     let pass = relay.poll(at(4), &mut stream);
     assert!(pass.notify);
     assert_eq!(serve(&mut far, &[], false), RelayOperation::Open);
+}
+
+/// The defect this exists for: a peer that resets and reconnects between the
+/// pass that decided a close and the pass that acts on it must not have its
+/// **new** session ended by the old one's close.
+#[test]
+fn a_close_for_a_session_that_is_gone_leaves_the_new_one_alone() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream::running();
+
+    relay.poll(at(0), &mut stream);
+    serve(&mut far, &[], false);
+    relay.poll(at(1), &mut stream);
+
+    // The far end says the session is over — and between that answer and the
+    // pass that claims it the peer resets and opens another. One segment and a
+    // handshake, which is a peer's own pacing rather than a race.
+    serve(&mut far, &[], true);
+    stream.reconnected();
+    let pass = relay.poll(at(2), &mut stream);
+    assert!(
+        !stream.ended,
+        "the old session's close ended the connection that replaced it"
+    );
+    assert_eq!(
+        stream.refused_closes, 1,
+        "the close was not named, so nothing could refuse it"
+    );
+    // The old session's account is the old session's: neither of its ends said
+    // it was over, the far end's close having landed after it was gone.
+    let report = pass.report.expect("the old session's account");
+    assert_eq!(report.ended, OnboardEnd::Forgotten);
+    assert!(report.failure.is_none());
+
+    // And the new connection is then opened rather than inheriting anything.
+    let pass = relay.poll(at(3), &mut stream);
+    assert!(pass.notify);
+    assert_eq!(serve(&mut far, &[], false), RelayOperation::Open);
+    let pass = relay.poll(at(4), &mut stream);
+    assert!(
+        pass.report.is_none(),
+        "the new session was reported at once"
+    );
+    assert!(!stream.ended, "the new session was ended before it began");
+}
+
+/// The same rule for the closes this end composes because it gave up: an
+/// `Unanswered` names the session it was decided for, so a connection that
+/// replaced it is untouched.
+#[test]
+fn a_failure_ends_the_session_it_was_about_and_no_other() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut stream = Stream::running();
+
+    relay.poll(at(0), &mut stream);
+    stream.reconnected();
+    let past = ANSWER_TIMEOUT.as_nanos().saturating_add(1);
+    let pass = relay.poll(at(past), &mut stream);
+    assert!(
+        !stream.ended,
+        "a far end that went quiet took down the connection after it"
+    );
+    assert_eq!(stream.refused_closes, 1);
+    let report = pass.report.expect("the abandoned session's account");
+    assert_eq!(report.failure, Some(RelayFailure::Unanswered));
+    assert_eq!(report.ended, OnboardEnd::Refused);
+}
+
+/// An answer this end dropped costs the session it was about **and nothing
+/// after it**: the next connection's `Open` goes out, and this end asks for
+/// nothing else first.
+///
+/// It is the pump's half of the rule the ABI states — an open is the beginning
+/// of a session and ends any the far end still believes in — so there is no
+/// refusal here to recover from and no reconciliation to perform. The far end's
+/// half is [`Terminating`]'s, tested below.
+#[test]
+fn an_open_after_a_dropped_answer_begins_a_new_session() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream::running();
+
+    // The open goes out and is never answered inside the bound, so this end
+    // drops the handle and gives up on the session.
+    relay.poll(at(0), &mut stream);
+    let past = ANSWER_TIMEOUT.as_nanos().saturating_add(1);
+    relay.poll(at(past), &mut stream);
+    assert!(stream.ended);
+    // And the far end answers it late, into a region nothing is polling: it now
+    // holds a session this end has already given up on.
+    serve(&mut far, &[], false);
+
+    // The next connection. Nothing is owed to the far end first — the open is
+    // itself the end of what it still believed in.
+    stream.reconnected();
+    let pass = relay.poll(at(past + 1), &mut stream);
+    assert!(pass.report.is_some(), "the abandoned session's account");
+    let pass = relay.poll(at(past + 2), &mut stream);
+    assert!(pass.notify);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open,
+        "the next session opened with something other than an open"
+    );
+    let pass = relay.poll(at(past + 3), &mut stream);
+    assert!(pass.report.is_none(), "the new session was refused");
+    assert!(!stream.ended, "the new session was ended before it began");
 }
 
 #[test]
@@ -391,4 +546,257 @@ fn a_pass_with_no_clock_arms_no_deadline_and_still_carries_the_session() {
     let pass = relay.poll(None, &mut stream);
     assert!(pass.report.is_none());
     assert!(pass.notify);
+}
+
+// ---------------------------------------------------------------------------
+// The terminating end: the same channel from the side that answers.
+
+/// The far end over one channel, with a requester standing in for the network
+/// end so both halves of a rule are driven by the code that really implements
+/// them.
+struct Ends<'chan> {
+    near: RelayRequester<'chan>,
+    far: Terminating<'chan>,
+}
+
+impl Channel {
+    fn both(&self) -> Ends<'_> {
+        Ends {
+            near: self.request.requester(&self.reply),
+            far: Terminating::attach(&self.request, &self.reply),
+        }
+    }
+}
+
+impl Ends<'_> {
+    /// Ask for one operation and let the far end answer it, giving back what
+    /// that answer left the console owed.
+    fn exchange(&mut self, operation: RelayOperation, payload: &[u8]) -> TerminatingPass {
+        let pending = self
+            .near
+            .request(operation, payload)
+            .expect("the window is free");
+        let demand = self.far.take().expect("an item to answer");
+        let pass = self.far.answer(demand);
+        let mut into = std::boxed::Box::new([0_u8; MAX_RELAY_PAYLOAD]);
+        // Claimed, so the window is free for the next item: an unclaimed answer
+        // would make every exchange after the first a busy window rather than a
+        // statement about the far end.
+        drop(self.near.poll(pending, &mut into));
+        pass
+    }
+}
+
+/// The far end's half of the rule the ABI states: an open **supersedes**. There
+/// is no refusal for it, the superseded session is accounted for, and the new one
+/// runs.
+#[test]
+fn an_open_supersedes_the_session_the_far_end_still_held() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+
+    let pass = ends.exchange(RelayOperation::Open, &[]);
+    assert_eq!(pass, TerminatingPass::default());
+    assert!(ends.far.holds_a_session());
+    let pass = ends.exchange(RelayOperation::Deliver, b"client hello");
+    assert_eq!(pass, TerminatingPass::default());
+
+    // The network end gave up on that session without saying so — an answer it
+    // dropped — and opens the next one. This end is the one that was left
+    // believing, and the open is what ends that belief.
+    let pass = ends.exchange(RelayOperation::Open, &[]);
+    assert!(
+        pass.refused.is_none(),
+        "an open was refused for a session already open: {pass:?}"
+    );
+    let report = pass.report.expect("the superseded session's account");
+    // Neither end of it ever said it was over, which is what the ending says.
+    assert_eq!(report.ended, OnboardEnd::Forgotten);
+    assert_eq!(report.received, b"client hello".len() as u64);
+    assert_eq!(report.relayed, 2, "the open and the delivery");
+    assert!(ends.far.holds_a_session(), "the new session did not begin");
+
+    // And the new session is a new session: nothing of the old one's account is
+    // in it.
+    let pass = ends.exchange(RelayOperation::Close(RelayEnding::Peer), &[]);
+    let report = pass.report.expect("the new session's account");
+    assert_eq!(report.received, 0);
+    assert_eq!(report.relayed, 2, "its own open and its own close");
+    assert!(!ends.far.holds_a_session());
+}
+
+/// Fix D from the side that reports: each ending reaches the console as itself,
+/// so a session the transport forgot is not read as one the peer closed.
+#[test]
+fn each_ending_a_close_carries_is_reported_as_itself() {
+    for (ending, expected) in [
+        (RelayEnding::Peer, OnboardEnd::Peer),
+        (RelayEnding::Consumer, OnboardEnd::Consumer),
+        (RelayEnding::Forgotten, OnboardEnd::Forgotten),
+        (RelayEnding::Refused, OnboardEnd::Refused),
+    ] {
+        let channel = Channel::zero();
+        let mut ends = channel.both();
+        ends.exchange(RelayOperation::Open, &[]);
+        let pass = ends.exchange(RelayOperation::Close(ending), &[]);
+        let report = pass.report.expect("the session's account");
+        assert_eq!(
+            report.ended, expected,
+            "a close carrying {ending:?} was reported as {:?}",
+            report.ended
+        );
+        assert!(pass.refused.is_none());
+        assert!(!ends.far.holds_a_session());
+    }
+}
+
+/// The two ends' `relayed` counts are one number rather than two, which is what
+/// makes a disagreement between the two records mean a relay that lost
+/// something.
+#[test]
+fn both_ends_count_the_same_handovers_for_one_session() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut stream = Stream::running();
+    let mut far = Terminating::attach(&channel.request, &channel.reply);
+
+    let mut far_report = None;
+    // Driven to the end of a session: an open, a delivery, a poll, and the close
+    // the peer's own hang-up provokes.
+    for step in 0..8_u64 {
+        if step == 3 {
+            stream.waiting.extend_from_slice(b"records");
+        }
+        if step == 5 {
+            stream.peer_closed = true;
+            stream.ending = Some(Ended::ByPeer);
+        }
+        let pass = relay.poll(at(step), &mut stream);
+        if pass.notify {
+            let demand = far.take().expect("the item that was written");
+            let answered = far.answer(demand);
+            far_report = far_report.or(answered.report);
+        }
+        if let Some(report) = pass.report {
+            let far_report = far_report.expect("the far end's own account");
+            assert_eq!(
+                (report.relayed, report.received, report.ended),
+                (far_report.relayed, far_report.received, far_report.ended),
+                "the two domains' accounts of one session disagree"
+            );
+            return;
+        }
+        if step == 6 {
+            stream.forgotten();
+        }
+    }
+    panic!("the session never finished");
+}
+
+/// Every refusal ends the session and reports it, and none of them counts as a
+/// handover — the network end does not count a refusal either.
+#[test]
+fn a_refusal_reports_the_session_it_ended_and_is_not_counted() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+    ends.exchange(RelayOperation::Open, &[]);
+    let pass = ends.exchange(RelayOperation::Deliver, b"one");
+    assert_eq!(pass, TerminatingPass::default());
+
+    // A payload longer than one item may carry: the length is refused rather
+    // than the prefix that fitted being fed to a protocol.
+    let long = vec![0x11_u8; MAX_RELAY_PAYLOAD + 1];
+    let pass = ends.exchange(RelayOperation::Deliver, &long);
+    assert_eq!(
+        pass.refused,
+        Some((
+            RelayRefusal::PayloadTooLong,
+            RefusalDetail::One(long.len() as u64)
+        ))
+    );
+    let report = pass.report.expect("the refused session's account");
+    assert_eq!(report.ended, OnboardEnd::Refused);
+    assert_eq!(report.received, 3, "the delivery that did arrive");
+    assert_eq!(report.relayed, 2, "the refused item is not a handover");
+    assert!(!ends.far.holds_a_session());
+}
+
+/// An operation naming a session with none open is refused, and the refusal
+/// names the word that did the naming.
+///
+/// The other refusal this end can raise — a word naming no operation at all,
+/// which includes a close whose ending could not be read — is the ABI's own to
+/// reach: only a region written outside `wire::RelayRequester::request` can carry
+/// one, and `wire::relay` is where that is driven. This end's arm for it is the
+/// delegation to `RelayDemand::operation`.
+#[test]
+fn an_operation_naming_a_session_there_is_none_of_is_refused() {
+    let channel = Channel::zero();
+    let mut ends = channel.both();
+    let pass = ends.exchange(RelayOperation::Poll, &[]);
+    assert_eq!(
+        pass.refused,
+        Some((
+            RelayRefusal::NoConnection,
+            RefusalDetail::One(u64::from(RelayOperation::Poll.to_bits()))
+        ))
+    );
+    assert!(pass.report.is_none(), "there was no session to account for");
+    assert!(!ends.far.holds_a_session());
+
+    // And a close is no different: it names a session too, so one with none open
+    // is refused rather than reported as a session that ended.
+    let pass = ends.exchange(RelayOperation::Close(RelayEnding::Peer), &[]);
+    assert_eq!(
+        pass.refused.map(|(reason, _)| reason),
+        Some(RelayRefusal::NoConnection)
+    );
+    assert!(pass.report.is_none());
+}
+
+proptest! {
+    /// Every operation a requester can write, in whatever order: the far end
+    /// answers each exactly once, never holds more than one session, and never
+    /// reports one it did not hold.
+    ///
+    /// The words are generated as arbitrary `u32` and decoded, so the run covers
+    /// the whole legal vocabulary — all four closes among them — in orders no
+    /// well-behaved network end would produce.
+    #[test]
+    fn answering_an_arbitrary_run_of_operations_is_total(
+        words in proptest::collection::vec(any::<u32>(), 1..24),
+    ) {
+        let channel = Channel::zero();
+        let mut ends = channel.both();
+        let mut reports = 0_usize;
+        let mut opens = 0_usize;
+        for word in words {
+            // Undecodable words are the ABI's own case and are unreachable
+            // through a requester, so a run steps over them rather than
+            // pretending to write one.
+            let Some(operation) = RelayOperation::from_bits(word) else {
+                continue;
+            };
+            let held_before = ends.far.holds_a_session();
+            let pass = ends.exchange(operation, &[]);
+            if operation == RelayOperation::Open {
+                opens += 1;
+                prop_assert!(ends.far.holds_a_session(), "an open left no session");
+                // The rule this run is really about: an open is never refused,
+                // whatever this end still believed in.
+                prop_assert!(pass.refused.is_none());
+                prop_assert_eq!(pass.report.is_some(), held_before);
+            }
+            if pass.report.is_some() {
+                reports += 1;
+                prop_assert!(held_before, "a session was reported that was never held");
+            }
+            if pass.refused.is_some() {
+                prop_assert!(!ends.far.holds_a_session());
+            }
+        }
+        // Never more than one session at a time, so no run can report more
+        // sessions than were begun.
+        prop_assert!(reports <= opens);
+    }
 }

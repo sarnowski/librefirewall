@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-117 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 420 counter and gauge series from the 12 shards,
+122 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 428 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 93 546 bytes — a worst case computed from
+declares, and the document they render into is bounded at 96 046 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -194,6 +194,30 @@ reached over.
 they answer different questions: the record says how the channel ended and is written once, while
 these say how much was spent getting there. A node whose `sessions_total{outcome="failed"}` moves
 without `outbound_dials_total` moving is one refusing its own opens rather than one nothing answers.
+
+### The management port: the onboarding port it listens on
+
+The port's **second** listening port, which carries a byte stream rather than requests: bytes an
+administrator's session sends cross to the domain that terminates TLS, and bytes that domain answers
+with go back on the wire unread. Every count here is a count of bytes or connections; **no byte of a
+session reaches this surface or any other**.
+
+These eight and the console's own `onboard-` records are two readings of one port, and the split
+matters: a console record exists only once a session has *ended*, so a peer that connects, floods the
+port past the window it was given and disappears leaves no record at all — and moves three of these.
+Read them when the console is silent and something is nevertheless wrong.
+
+| Metric | Type | `domain` | Other labels | Meaning |
+|---|---|---|---|---|
+| `librefirewall_endpoint_onboard_answers_refused_total` | counter | `management` | — | Bytes the terminating domain answered with that this port had no room for. Ours rather than a peer's: the answer outgrew the room this end keeps for one, and the session is ended rather than carried on with a hole in the middle of it. |
+| `librefirewall_endpoint_onboard_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Bytes taken off a peer and held for the terminating domain, and bytes that domain answered with and the transport took. **Compare `received` against the console's `onboard-received=` summed over the boot**: a gap is bytes this port took off the wire that never crossed the relay. |
+| `librefirewall_endpoint_onboard_connections_total` | counter | `management` | `event`&nbsp;(`accepted`, `forgotten`) | Connections the port accepted, and those the transport stopped holding while a session ran on one — a reset, an eviction, or a reaping. **`accepted` larger than the number of session records is a peer that connected and produced no session.** |
+| `librefirewall_endpoint_onboard_overflowed_total` | counter | `management` | — | Bytes a peer sent past the room this port had left, refused rather than allowed to displace what came before them. The receive window is kept equal to the room actually left, so this is **unreachable while a peer honours it** — any number here is a peer that did not. |
+| `librefirewall_endpoint_onboard_sessions_closed_total` | counter | `management` | `by`&nbsp;(`consumer`, `peer`) | Sessions each end finished, by which end said so first. Neither moving while `connections_total{event="forgotten"}` does is a link that keeps dropping connections mid-session. |
+
+The port holds **one** connection at a time, and structurally: a second peer's `SYN` while a session
+is live finds no slot and nothing evictable, so it is dropped by the transport itself and appears in
+the TCP families below as `refused{reason="table_full"}` rather than here.
 
 ### The management port: the TCP transport
 

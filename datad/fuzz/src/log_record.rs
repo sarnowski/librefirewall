@@ -138,7 +138,8 @@ const DETAIL_DIAL_UNLEARNED: u8 = 22;
 const DETAIL_DIAL_SEGMENTS: u8 = 23;
 const DETAIL_DIAL_SEQUENCE: u8 = 24;
 const DETAIL_ONBOARDED: u8 = 25;
-const DETAIL_COUNT: u8 = 26;
+const DETAIL_ONBOARDING_PORT: u8 = 26;
+const DETAIL_COUNT: u8 = 27;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -572,7 +573,7 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
                 | DETAIL_DELEGATED | DETAIL_DIALLED | DETAIL_DIAL_ROUTE
                 | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE
-                | DETAIL_ONBOARDED => {
+                | DETAIL_ONBOARDED | DETAIL_ONBOARDING_PORT => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -802,6 +803,14 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
                 end: record.operands[0],
             },
         ),
+        // The onboarding **port**'s detail reads four words and ranges none:
+        // there is no token in it, and every one of the four is a tally the port
+        // could have kept about itself. So no bit pattern of it is refusable,
+        // which is why this arm names the discriminant and produces nothing
+        // rather than being folded into the default — a discriminant this model
+        // does not carry is one the record check reads and this one calls
+        // unknown.
+        DETAIL_ONBOARDING_PORT => None,
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the
@@ -1436,6 +1445,20 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The onboarding **port**'s detail, whose four words are all tallies
+            // and none of them a token. Committed at the widest each can be,
+            // which is the shape a rule that crept a range onto one of them
+            // would refuse: the detail has no vocabulary in it, and a uniform
+            // draw over a discriminant plus four words reaches neither this
+            // discriminant nor these values.
+            (
+                "valid_domain_onboarding_port",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_PORT,
+                    operands: [u64::MAX; 4],
+                    ..domain_record()
+                }),
+            ),
             // Every byte the writer could set, set.
             ("every_byte_set", vec![0xFF; RECORD_BYTES]),
         ];
@@ -1554,6 +1577,20 @@ mod tests {
                     9,
                     0,
                 ],
+                ..domain_record()
+            },
+        );
+        // And the onboarding session's, whose leading word names which end
+        // finished it. The three counts behind it are held at the widest each can
+        // be, so a seed here also fails a rule that crept a range onto one of
+        // them while ranging the token correctly.
+        pair(
+            "onboard_end_at_its_last_token",
+            "onboard_end_one_past_its_last_token",
+            LOG_ONBOARD_END_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDED,
+                operands: [u64::from(token), u64::MAX, u64::MAX, u64::MAX],
                 ..domain_record()
             },
         );

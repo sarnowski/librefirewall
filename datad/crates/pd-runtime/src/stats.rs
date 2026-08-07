@@ -22,7 +22,7 @@ use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, Unhandled};
 use lfw_metrics::{
     ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
-    ManagementSample, NeighbourSample, OutboundSample, PipelineSample, PolicySample,
+    ManagementSample, NeighbourSample, OnboardSample, OutboundSample, PipelineSample, PolicySample,
     PolicySweepSample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS,
     SinkSample, Snapshot, StatsShard, StoreSample, TapSample, TcpSample,
 };
@@ -231,7 +231,7 @@ pub fn management_sample(
     endpoint: Option<&Endpoint>,
     log: LogSample,
 ) -> ManagementSample {
-    let (endpoint_sample, neighbours, outbound, tcp, http) = match endpoint {
+    let (endpoint_sample, neighbours, outbound, tcp, http, onboard) = match endpoint {
         Some(endpoint) => {
             let counters = endpoint.counters();
             let mut unhandled = [0u64; Unhandled::ALL.len()];
@@ -244,6 +244,7 @@ pub fn management_sample(
             let served = endpoint.http_counters();
             let neighbours = endpoint.neighbour_counters();
             let dials = endpoint.outbound_counters();
+            let stream = endpoint.stream_counters();
             (
                 EndpointSample {
                     arp_replies: counters.arp_replies,
@@ -321,6 +322,16 @@ pub fn management_sample(
                     retransmits_unavailable: served.retransmits_unavailable,
                     slots_exhausted: served.slots_exhausted,
                 },
+                OnboardSample {
+                    accepted: stream.accepted,
+                    forgotten: stream.forgotten,
+                    received: stream.received,
+                    sent: stream.sent,
+                    closed_by_peer: stream.closed_by_peer,
+                    closed_by_consumer: stream.closed_by_consumer,
+                    overflowed: stream.overflowed,
+                    refused: stream.refused,
+                },
             )
         }
         // An unaddressed port has no endpoint, so its endpoint, transport and
@@ -333,6 +344,7 @@ pub fn management_sample(
             OutboundSample::default(),
             TcpSample::default(),
             HttpSample::default(),
+            OnboardSample::default(),
         ),
     };
     ManagementSample {
@@ -364,6 +376,7 @@ pub fn management_sample(
         outbound,
         tcp,
         http,
+        onboard,
         streams: [
             stage.downloads.started,
             stage.downloads.abandoned,

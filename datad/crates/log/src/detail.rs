@@ -387,6 +387,38 @@ pub enum DomainDetail<C = &'static str> {
         sent: u64,
         ended: OnboardEnd,
     },
+    /// What the onboarding **port** has done and refused, beside the account of a
+    /// session that ended on it.
+    ///
+    /// Emitted by the domain that owns the network and by no other, the port
+    /// being that domain's. It is what places a fault an
+    /// [`Self::Onboarded`] record can state but not explain: a session that ended
+    /// as forgotten with bytes refused past the window is a peer that overran it,
+    /// and one accepted connection more than there are session records is a
+    /// connection that never became a session at all.
+    ///
+    /// **These are the port's running totals over the boot, not the session's
+    /// share of them.** A session's own account is the record beside this one,
+    /// and a reader combines the two rather than being handed a subtraction it
+    /// cannot check. Every count is the port's own and is bounded by the port's
+    /// own constants, so nothing a peer sends decides how many records there are.
+    ///
+    /// **No byte of a session has a representation here.** What is reported is
+    /// how many bytes there were and which way they went.
+    OnboardingPort {
+        /// Connections accepted on the port, whatever became of them.
+        accepted: u64,
+        /// Connections the transport stopped holding while a session was running
+        /// on them: a reset, an eviction, a reaping.
+        forgotten: u64,
+        /// Bytes a peer sent past the room the port had left. Unreachable while
+        /// the advertised window is honoured, so a number here is a peer that
+        /// ignored it rather than a port that ran out.
+        overflowed: u64,
+        /// Bytes the terminating domain answered with that there was no room for.
+        /// **Ours** rather than the peer's.
+        refused: u64,
+    },
     /// The two sequence numbers behind an unacceptable acknowledgement: what the
     /// peer claimed, and what this end had actually sent.
     ///

@@ -961,17 +961,40 @@ impl<'ring> EndpointStage<'ring> {
             .map_or(0, |endpoint| endpoint.stream_mut().push(bytes))
     }
 
-    /// End the onboarding session: the terminating domain has finished with it.
-    pub fn onboard_end_session(&mut self) {
-        if let Some(endpoint) = self.endpoint.as_mut() {
-            endpoint.stream_mut().end_session();
-        }
+    /// End the onboarding session **on `connection`**: the terminating domain has
+    /// finished with it.
+    ///
+    /// Answers whether that session was still the one running. The connection is
+    /// named rather than implied, because the terminating domain decides on one
+    /// wakeup and the transport may hold a different connection by the next —
+    /// `lfw_ip_endpoint::onboard::Stream::end_session` is where the identity is
+    /// checked, and an unaddressed port holds no session for any name.
+    pub fn onboard_end_session(&mut self, connection: ConnectionId) -> bool {
+        self.endpoint
+            .as_mut()
+            .is_some_and(|endpoint| endpoint.stream_mut().end_session(connection))
     }
 
     /// How the last onboarding session ended, taken once so the domain that
     /// reports it reports each session exactly once.
     pub fn take_onboard_ending(&mut self) -> Option<OnboardEnded> {
         self.endpoint.as_mut()?.stream_mut().take_ending()
+    }
+
+    /// How the onboarding session running now would end if it ended at this
+    /// instant.
+    ///
+    /// Read live rather than taken, and it is what a close composed while the
+    /// connection is still up carries: the taken ending exists only once the
+    /// transport has let the connection go, and a close goes out before that
+    /// wherever the peer is the end that hung up.
+    #[must_use]
+    pub fn onboard_ending(&self) -> OnboardEnded {
+        self.endpoint
+            .as_ref()
+            .map_or(OnboardEnded::Forgotten, |endpoint| {
+                endpoint.stream().ending()
+            })
     }
 
     /// What the onboarding port's own stream has done, one field per decision.

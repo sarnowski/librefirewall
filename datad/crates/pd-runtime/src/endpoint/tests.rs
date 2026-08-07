@@ -62,7 +62,11 @@ struct Fixture {
     receive: &'static ForwardRings,
     /// The calibration region, written by the clock domain.
     clock: &'static ClockCalibration,
-    stage: EndpointStage<'static>,
+    /// On the heap, and not for the appliance's reason: the stage holds the
+    /// response staging array, so building one on a test thread's stack costs
+    /// that array several times over in an unoptimized build. The domain that
+    /// really holds one is compiled release and has a megabyte of stack.
+    stage: Box<EndpointStage<'static>>,
 }
 
 impl EndpointStage<'_> {
@@ -106,7 +110,7 @@ impl Fixture {
             tx_pool: transmit_pool,
             handover,
             receive,
-            stage: EndpointStage::attach(
+            stage: Box::new(EndpointStage::attach(
                 EndpointRegions {
                     receive,
                     receive_returns,
@@ -117,7 +121,7 @@ impl Fixture {
                 },
                 IsnSecret::from_bytes(SECRET),
                 stats_regions(),
-            ),
+            )),
             clock: Box::leak(Box::new(ClockCalibration::zero())),
         }
     }
@@ -1322,6 +1326,26 @@ fn onboarding_syn() -> Vec<u8> {
     frame
 }
 
+/// A connection handle a transport really issued, which is the only way to get
+/// one a stream can compare: the generation is the table's, and a handle invented
+/// here would compare equal to whatever slot it names.
+fn a_connection_elsewhere() -> lfw_tcp::ConnectionId {
+    let mut stack: lfw_tcp::TcpStack<1> = lfw_tcp::TcpStack::new(
+        OUR_ADDRESS,
+        lfw_ip_endpoint::onboard::ONBOARDING_PORT,
+        lfw_ip_endpoint::TCP_MSS,
+        4096,
+        lfw_tcp::IsnSecret::from_bytes([3; 16]),
+    );
+    let mut out = [0_u8; 128];
+    let hz = core::num::NonZeroU64::new(TSC_HZ).expect("a nonzero frequency");
+    let now = lfw_clock::Calibration::new(hz, Ticks(0), 1).monotonic(NOW);
+    stack
+        .connect(now, STATION_ADDRESS, 4443, &mut out)
+        .expect("a dial into an empty table")
+        .connection
+}
+
 /// A port with no addressing has no session, answers nothing about one, and is
 /// not a thing a caller has to check before asking: every accessor is total.
 #[test]
@@ -1336,9 +1360,19 @@ fn an_unaddressed_port_has_no_onboarding_session_to_carry() {
         unaddressed.stage.onboard_counters(),
         crate::OnboardCounters::default()
     );
-    // And driving it composes nothing rather than refusing to be driven.
+    // And driving it composes nothing rather than refusing to be driven. A close
+    // has to name a session, and an unaddressed port holds none for any name, so
+    // the handle of an addressed fixture's own connection ends nothing here.
     unaddressed.stage.onboard_consumed(16);
-    unaddressed.stage.onboard_end_session();
+    assert!(
+        !unaddressed
+            .stage
+            .onboard_end_session(a_connection_elsewhere())
+    );
+    assert_eq!(
+        unaddressed.stage.onboard_ending(),
+        lfw_ip_endpoint::onboard::Ended::Forgotten
+    );
     let hz = core::num::NonZeroU64::new(TSC_HZ).expect("a nonzero frequency");
     unaddressed
         .stage
@@ -1373,7 +1407,7 @@ fn an_onboarding_session_crosses_the_stage_and_leaves_on_the_transmit_pipeline()
     // sent anyway would be putting a session's bytes into a connection the peer
     // has not finished opening.
     assert_eq!(fixture.stage.onboard_push(b"records"), 7);
-    fixture.stage.onboard_end_session();
+    assert!(fixture.stage.onboard_end_session(session));
     let before = fixture.stage.counters().replies_sent;
     let now = fixture.stage.monotonic(NOW).expect("a calibration");
     fixture.stage.drive_onboarding(now);

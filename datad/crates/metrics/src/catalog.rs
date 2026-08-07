@@ -536,6 +536,47 @@ pub const OUTBOUND_ANSWER_OVERFLOWED: Metric = metric(
      displace what came before them.",
 );
 
+// ── The onboarding port: the second listening port, carrying a byte stream ──
+
+pub const ONBOARD_CONNECTIONS: Metric = metric(
+    "librefirewall_endpoint_onboard_connections_total",
+    Kind::Counter,
+    "Connections the onboarding port accepted, and those the transport stopped holding while a \
+     session was running on one. `accepted` counts every connection whatever became of it, so a \
+     count larger than the sessions reported is a peer that connected and produced no session; \
+     `forgotten` is a reset, an eviction or a reaping, which is a different thing to look at from \
+     either end closing.",
+);
+
+pub const ONBOARD_BYTES: Metric = metric(
+    "librefirewall_endpoint_onboard_bytes_total",
+    Kind::Counter,
+    "Bytes the onboarding port took off a peer and held for the terminating domain, and bytes \
+     that domain answered with and the transport took. Opaque record bytes counted and never \
+     read: no byte of a session reaches any surface.",
+);
+
+pub const ONBOARD_SESSIONS_CLOSED: Metric = metric(
+    "librefirewall_endpoint_onboard_sessions_closed_total",
+    Kind::Counter,
+    "Sessions on the onboarding port each end finished, by which end said so first.",
+);
+
+pub const ONBOARD_OVERFLOWED: Metric = metric(
+    "librefirewall_endpoint_onboard_overflowed_total",
+    Kind::Counter,
+    "Bytes a peer sent past the room the onboarding port had left, refused rather than allowed to \
+     displace what came before them. Unreachable while the advertised window is honoured, so a \
+     number here is a peer that ignored it.",
+);
+
+pub const ONBOARD_ANSWERS_REFUSED: Metric = metric(
+    "librefirewall_endpoint_onboard_answers_refused_total",
+    Kind::Counter,
+    "Bytes the terminating domain answered with that the onboarding port had no room for. Ours \
+     rather than a peer's: the answer outgrew the room this end keeps for one.",
+);
+
 // ── The clock, on the domain that measured it and the one that reads it ─────
 
 pub const CLOCK_GENERATION: Metric = metric(
@@ -1011,6 +1052,11 @@ pub const ALL_METRICS: &[&Metric] = &[
     &OUTBOUND_SEGMENTS_DROPPED,
     &OUTBOUND_BYTES,
     &OUTBOUND_ANSWER_OVERFLOWED,
+    &ONBOARD_CONNECTIONS,
+    &ONBOARD_BYTES,
+    &ONBOARD_SESSIONS_CLOSED,
+    &ONBOARD_OVERFLOWED,
+    &ONBOARD_ANSWERS_REFUSED,
     &TCP_SEGMENTS,
     &TCP_BYTES,
     &TCP_RETRANSMITS,

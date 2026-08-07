@@ -1,6 +1,10 @@
 use proptest::prelude::*;
 
 use super::*;
+use crate::catalog::{
+    ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES, ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED,
+    ONBOARD_SESSIONS_CLOSED,
+};
 
 /// One declared series, flattened out of the shard tables: the family it
 /// belongs to, the domain whose shard carries it, and its own labels.
@@ -1175,5 +1179,66 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 93_546);
+    assert_eq!(MAX_EXPOSITION_LEN, 96_046);
+}
+
+/// A sample's fields land on the series that declare them, positionally.
+///
+/// `SERIES` and `values()` are one ABI in two lists, and nothing about the type
+/// system holds them together: a series inserted in the middle of one list and a
+/// field appended to the end of the other compiles, keeps
+/// `SERIES.len() == MANAGEMENT_SLOTS`, and shifts every series after the
+/// insertion point onto its neighbour's value. That has happened, and it was
+/// caught by a booted image reporting no HTTP request having just answered one —
+/// which is a very long way from the two lines that caused it.
+///
+/// The statement is per block rather than per field, and it is the one that
+/// catches the whole defect class: fill exactly one block, and require every
+/// non-zero slot to belong to a family of that block. A shift of any size lights
+/// up a slot whose series is some other family's.
+#[test]
+fn a_filled_block_lands_only_on_the_series_that_declare_it() {
+    let sample = ManagementSample {
+        onboard: OnboardSample {
+            accepted: 1,
+            forgotten: 2,
+            received: 3,
+            sent: 4,
+            closed_by_peer: 5,
+            closed_by_consumer: 6,
+            overflowed: 7,
+            refused: 8,
+        },
+        ..ManagementSample::default()
+    };
+    let onboard = [
+        (&ONBOARD_CONNECTIONS, "accepted", 1),
+        (&ONBOARD_CONNECTIONS, "forgotten", 2),
+        (&ONBOARD_BYTES, "received", 3),
+        (&ONBOARD_BYTES, "sent", 4),
+        (&ONBOARD_SESSIONS_CLOSED, "peer", 5),
+        (&ONBOARD_SESSIONS_CLOSED, "consumer", 6),
+        (&ONBOARD_OVERFLOWED, "", 7),
+        (&ONBOARD_ANSWERS_REFUSED, "", 8),
+    ];
+    let values = sample.values();
+    let mut seen = Vec::new();
+    for (slot, value) in values.iter().enumerate() {
+        if *value == 0 {
+            continue;
+        }
+        let series = ManagementSample::SERIES
+            .get(slot)
+            .expect("a slot the series table declares");
+        let label = series.labels.first().map_or("", |label| label.value);
+        seen.push((series.metric.name, label, *value));
+    }
+    let owed: Vec<(&str, &str, u64)> = onboard
+        .iter()
+        .map(|(metric, label, value)| (metric.name, *label, *value))
+        .collect();
+    assert_eq!(
+        seen, owed,
+        "the onboarding block's values landed on other families' series"
+    );
 }

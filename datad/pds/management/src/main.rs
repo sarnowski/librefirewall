@@ -152,9 +152,10 @@ use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
     Configurations, DIAL_REQUEST_CAPACITY, DialFacts, Downloads, Ended, EndpointRegions,
-    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OpenError,
-    PdClock, Pool, RELAY_ANSWER_TIMEOUT, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
-    StatsRegions, Via, attach_region, log_sample, read_timestamp_counter,
+    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY,
+    OnboardCounters, OpenError, PdClock, Pool, RELAY_ANSWER_TIMEOUT, Relay, RelayFailure,
+    RelayReport, Resolutions, ReturnRing, StatsRegions, Via, attach_region, log_sample,
+    read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -202,9 +203,6 @@ fn relay_refusal(failure: RelayFailure) -> Refusal {
     let (cause, detail) = match failure {
         RelayFailure::Refused(RelayRefusal::NoConnection) => {
             ("relay-refused-no-connection", RefusalDetail::None)
-        }
-        RelayFailure::Refused(RelayRefusal::AlreadyOpen) => {
-            ("relay-refused-already-open", RefusalDetail::None)
         }
         RelayFailure::Refused(RelayRefusal::PayloadTooLong) => {
             ("relay-refused-payload-too-long", RefusalDetail::None)
@@ -515,13 +513,19 @@ impl Dial {
 }
 
 /// What one onboarding session owes the console: the account of what it
-/// carried, and — where this appliance ended it — the cause.
+/// carried, the port's own totals beside it, and — where this appliance ended it
+/// — the cause.
 ///
-/// **Two records rather than one wider one**, on the dialled channel's terms: a
-/// record carries four operand words, the account fills them, and a cause with
-/// its own two numbers is a fifth and sixth fact. A session that simply ended
-/// says so in one line and stops there.
-fn announce_session(sink: &dyn Sink, report: &RelayReport) {
+/// **Records rather than one wider one**, on the dialled channel's terms: a
+/// record carries four operand words, the account fills them, the port's own
+/// totals are a fifth through eighth fact, and a cause with its own two numbers
+/// is a ninth and tenth. So a session that simply ended says so in two lines,
+/// and one this appliance ended adds the cause.
+///
+/// The count is bounded by the shape of the outcome and never by anything that
+/// happened on the wire: a session that carried one byte and one that carried
+/// four thousand report the same lines.
+fn announce_session(sink: &dyn Sink, report: &RelayReport, port: OnboardCounters) {
     announce(
         sink,
         DomainState::Ready,
@@ -530,6 +534,26 @@ fn announce_session(sink: &dyn Sink, report: &RelayReport) {
             received: report.received,
             sent: report.sent,
             ended: report.ended,
+        },
+    );
+    // The port's own totals beside the session's account, because the account
+    // can state a fault and not place it: a session that ended forgotten with
+    // bytes refused past the window is a peer that overran it, and one accepted
+    // connection more than there are session records is a connection that never
+    // became a session at all. Neither fact is derivable from the record above.
+    //
+    // The port's running totals rather than this session's share of them: a
+    // subtraction would be a number a reader cannot check against anything, and
+    // the same four counts reach `/metrics`, where a scrape can see them move
+    // without waiting for a session to end.
+    announce(
+        sink,
+        DomainState::Ready,
+        DomainDetail::OnboardingPort {
+            accepted: port.accepted,
+            forgotten: port.forgotten,
+            overflowed: port.overflowed,
+            refused: port.refused,
         },
     );
     if let Some(failure) = report.failure {
@@ -835,7 +859,7 @@ impl Handler for Management {
                 CRYPTO.notify();
             }
             if let Some(report) = pass.report {
-                announce_session(&running.sink, &report);
+                announce_session(&running.sink, &report, running.stage.onboard_counters());
             }
             running.stage.drive_onboarding(now);
             running.stage.publish(log);

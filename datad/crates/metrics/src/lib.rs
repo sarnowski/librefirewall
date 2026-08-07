@@ -84,11 +84,11 @@ pub use sample::{
     FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_SLOTS, FLOW_STATES,
     FORWARDER_SHARD_SLOTS, FORWARDER_SLOTS, FlowSample, ForwarderSample, GENERATION_OUTCOME_NAMES,
     GENERATION_OUTCOMES, HARDWARE_PROBE_SLOTS, HTTP_STATUSES, HardwareProbeSample, HttpSample,
-    LogSample, MANAGEMENT_SLOTS, ManagementSample, NeighbourSample, OutboundSample, PIPELINES,
-    POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS, PipelineSample,
-    PolicySample, PolicySweepSample, PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS,
-    ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS, STORE_SLOTS, SinkSample,
-    StoreSample, TapSample, TcpSample, UartSample,
+    LogSample, MANAGEMENT_SLOTS, ManagementSample, NeighbourSample, OnboardSample, OutboundSample,
+    PIPELINES, POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS,
+    PipelineSample, PolicySample, PolicySweepSample, PoolSample, RECORDER_SLOTS,
+    ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS,
+    STORE_SLOTS, SinkSample, StoreSample, TapSample, TcpSample, UartSample,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table

@@ -54,6 +54,19 @@
 //!   compromised cannot ask this channel to carry two. The onboarding server
 //!   serves an administrator and not a fleet, and that bound is here rather than
 //!   in the caller that must not exceed it.
+//! * **A disagreement about which session is running.** An
+//!   [`RelayOperation::Open`] **is** the beginning of a new session, and it ends
+//!   whatever session the terminating end still believed in. There is no refusal
+//!   for an open against a session already open, because a channel that cannot
+//!   name two connections cannot have two: the near end is the only end that
+//!   opens one, so its open is the newer fact and the older belief is stale by
+//!   construction. That is what makes the two ends' agreement structural rather
+//!   than something a reconciliation exchange has to re-establish — an answer the
+//!   near end dropped, and every other way it can stop talking about a session
+//!   without saying so, costs the session it was about and nothing after it. What
+//!   the terminating end owes on such an open is the account of the session it
+//!   gave up, which is [`RelayEnding::Forgotten`]'s case exactly: neither end
+//!   said the session was over.
 //! * **A request for plaintext.** [`RelayOperation`] has four values and none of
 //!   them asks for decrypted bytes. The network end can hand records over, ask
 //!   what to send, and say the connection ended; there is no word it can write
@@ -111,7 +124,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::MAPPING_ALIGN;
+use crate::{LOG_ONBOARD_END_COUNT, MAPPING_ALIGN};
 
 /// Bytes of opaque record data one item may carry, in either direction.
 ///
@@ -133,15 +146,83 @@ pub const RELAY_REQUEST_REGION_SIZE: usize =
 /// As [`RELAY_REQUEST_REGION_SIZE`], for the direction carrying the answer.
 pub const RELAY_REPLY_REGION_SIZE: usize = size_of::<RelayReply>().next_multiple_of(MAPPING_ALIGN);
 
+/// How a session ended at the network end, travelling with the
+/// [`RelayOperation::Close`] that says it is over.
+///
+/// **The whole reason a close carries one**: the terminating end reports every
+/// session it held, and a close that said only *that* the session was over would
+/// make a session the transport forgot indistinguishable from one the peer hung
+/// up on. Those are two different things to go and look at — one is a reset, an
+/// eviction or a reaping, the other is an administrator finishing — so the
+/// distinction is carried rather than guessed at by the end that cannot see the
+/// wire.
+///
+/// Four values, mirroring `lfw_log::OnboardEnd`'s parties and in its order, so
+/// the two domains' accounts of one session are read in one vocabulary. The
+/// mirror is checked rather than asserted in prose: the count below is held to
+/// [`LOG_ONBOARD_END_COUNT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayEnding {
+    /// The peer on the network closed its half.
+    Peer,
+    /// The terminating end said the session was over. It is in the vocabulary
+    /// because the vocabulary is *how a session ended* and this is one of the
+    /// ways; a network end whose far end has already closed a session owes it no
+    /// close, so a well-behaved one has no occasion to write this word.
+    Consumer,
+    /// The connection stopped existing while neither end had said anything: a
+    /// reset, an eviction under table pressure, a reaping. Also what an
+    /// [`RelayOperation::Open`] implies about the session it supersedes.
+    Forgotten,
+    /// The network end ended the session itself, because the channel carrying it
+    /// answered something that could not be believed or acted on.
+    Refused,
+}
+
+impl RelayEnding {
+    /// Endings this vocabulary has.
+    pub const COUNT: usize = 4;
+
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::Peer => 0,
+            Self::Consumer => 1,
+            Self::Forgotten => 2,
+            Self::Refused => 3,
+        }
+    }
+
+    /// `None` for every other bit pattern, on [`RelayOperation::from_bits`]'s
+    /// terms — and reached through it, an ending being readable only out of a
+    /// close.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Peer),
+            1 => Some(Self::Consumer),
+            2 => Some(Self::Forgotten),
+            3 => Some(Self::Refused),
+            _ => None,
+        }
+    }
+}
+
 /// What a request asks the terminating end to do with *the* connection.
 ///
-/// Four values, and the set is closed deliberately: it is the whole vocabulary a
-/// network end has, and there is no member of it that asks for a plaintext byte.
+/// Four operations, and the set is closed deliberately: it is the whole
+/// vocabulary a network end has, and there is no member of it that asks for a
+/// plaintext byte. One of them carries a value, and it is the only one that
+/// could: an ending exists exactly where a session ends, so a
+/// [`Self::Deliver`] has nowhere to put one and a close cannot be written
+/// without one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayOperation {
     /// A connection was accepted; begin a session over it. The only thing that
     /// starts one, and the reason this ABI needs no identifier: there is one
-    /// session, and this is where it comes from.
+    /// session, and this is where it comes from. It also **ends** any session the
+    /// terminating end still holds — see this module's header on why that is what
+    /// keeps the two ends from disagreeing about which session is running.
     Open,
     /// Here are the bytes the peer sent. The payload is whatever arrived and is
     /// not required to be a whole record — the terminating end reassembles,
@@ -151,19 +232,23 @@ pub enum RelayOperation {
     /// a handshake forward across wakeups without the network end having to
     /// invent a reason to ask.
     Poll,
-    /// The connection ended at the network end. The session is over whatever the
-    /// reply says.
-    Close,
+    /// The connection ended at the network end, the way the [`RelayEnding`] says.
+    /// The session is over whatever the reply says.
+    Close(RelayEnding),
 }
 
 impl RelayOperation {
+    /// The three operations that carry no ending, which is where a close's own
+    /// encoding starts.
+    const CLOSE_BASE: u32 = 3;
+
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
             Self::Open => 0,
             Self::Deliver => 1,
             Self::Poll => 2,
-            Self::Close => 3,
+            Self::Close(ending) => Self::CLOSE_BASE + ending.to_bits(),
         }
     }
 
@@ -171,15 +256,19 @@ impl RelayOperation {
     /// terms: the field is peer-written, so an undecodable value is input to
     /// reject rather than one to coerce. The responder answers such a request
     /// with [`RelayRefusal::NoSuchOperation`] rather than ignoring it, because a
-    /// requester left waiting cannot tell a refusal from a hang.
+    /// requester left waiting cannot tell a refusal from a hang. A close whose
+    /// ending cannot be read is such a word: it is not a close this end has, and
+    /// coercing one would be inventing the fact the ending exists to carry.
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
             0 => Some(Self::Open),
             1 => Some(Self::Deliver),
             2 => Some(Self::Poll),
-            3 => Some(Self::Close),
-            _ => None,
+            _ => match RelayEnding::from_bits(bits.wrapping_sub(Self::CLOSE_BASE)) {
+                Some(ending) => Some(Self::Close(ending)),
+                None => None,
+            },
         }
     }
 }
@@ -192,11 +281,12 @@ pub enum RelayStatus {
     /// An operation naming a session, with none open. Distinct from every other
     /// refusal because it is the one an operator reads as a protocol mistake at
     /// the *network* end rather than as anything the peer did.
+    ///
+    /// It is **not** reachable through [`RelayOperation::Open`], which opens a
+    /// session rather than naming one — there is deliberately no status for an
+    /// open against a session already running, for the reason this module's
+    /// header gives.
     NoConnection,
-    /// [`RelayOperation::Open`] with a session already running. The one refusal
-    /// that says a network end tried to carry two connections over a channel with
-    /// room for one.
-    AlreadyOpen,
     /// The request's payload length is past what a request may carry, so there is
     /// nothing well-defined to hand to the protocol.
     PayloadTooLong,
@@ -213,10 +303,9 @@ impl RelayStatus {
         match self {
             Self::Ok => 0,
             Self::NoConnection => 1,
-            Self::AlreadyOpen => 2,
-            Self::PayloadTooLong => 3,
-            Self::NoSuchOperation => 4,
-            Self::SessionFailed => 5,
+            Self::PayloadTooLong => 2,
+            Self::NoSuchOperation => 3,
+            Self::SessionFailed => 4,
         }
     }
 
@@ -227,10 +316,9 @@ impl RelayStatus {
         match bits {
             0 => Some(Self::Ok),
             1 => Some(Self::NoConnection),
-            2 => Some(Self::AlreadyOpen),
-            3 => Some(Self::PayloadTooLong),
-            4 => Some(Self::NoSuchOperation),
-            5 => Some(Self::SessionFailed),
+            2 => Some(Self::PayloadTooLong),
+            3 => Some(Self::NoSuchOperation),
+            4 => Some(Self::SessionFailed),
             _ => None,
         }
     }
@@ -245,7 +333,6 @@ impl RelayStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayRefusal {
     NoConnection,
-    AlreadyOpen,
     PayloadTooLong,
     NoSuchOperation,
     SessionFailed,
@@ -256,7 +343,6 @@ impl RelayRefusal {
     pub const fn to_status(self) -> RelayStatus {
         match self {
             Self::NoConnection => RelayStatus::NoConnection,
-            Self::AlreadyOpen => RelayStatus::AlreadyOpen,
             Self::PayloadTooLong => RelayStatus::PayloadTooLong,
             Self::NoSuchOperation => RelayStatus::NoSuchOperation,
             Self::SessionFailed => RelayStatus::SessionFailed,
@@ -269,7 +355,6 @@ impl RelayRefusal {
         match status {
             RelayStatus::Ok => None,
             RelayStatus::NoConnection => Some(Self::NoConnection),
-            RelayStatus::AlreadyOpen => Some(Self::AlreadyOpen),
             RelayStatus::PayloadTooLong => Some(Self::PayloadTooLong),
             RelayStatus::NoSuchOperation => Some(Self::NoSuchOperation),
             RelayStatus::SessionFailed => Some(Self::SessionFailed),
@@ -704,6 +789,27 @@ impl RelayRequester<'_> {
         }
     }
 
+    /// Give up on `pending` without an answer, freeing the window.
+    ///
+    /// The **only** way an item ends unanswered, and it exists because the
+    /// alternative is a dead channel: a caller that dropped the handle instead
+    /// would leave this channel's one slot taken for the life of the domain, and
+    /// every later session refused for a window nothing will ever free. That is
+    /// why [`PendingRelay`] is `#[must_use]` and why this takes it by value —
+    /// an item given up on must not be pollable afterwards.
+    ///
+    /// What it does **not** do is move the sequence. A reply that lands later
+    /// carries a number no future item will be issued under, so
+    /// [`Self::poll`] reads it as no answer at all rather than as the next
+    /// item's — which is what makes abandoning safe rather than a way to have an
+    /// old answer believed.
+    pub fn abandon(&mut self, pending: PendingRelay) {
+        // Consumed rather than read: the handle's value is that it cannot be
+        // used again, and there is nothing in it this side has to look at.
+        let PendingRelay { .. } = pending;
+        self.outstanding = false;
+    }
+
     /// Whether the one slot this channel has is taken.
     #[must_use]
     pub const fn outstanding(&self) -> bool {
@@ -916,8 +1022,14 @@ const _: () = {
     assert!(RelayStatus::Ok.to_bits() == 0);
     assert!(RelayOperation::Open.to_bits() == 0);
     assert!(RelayRefusal::from_status(RelayStatus::Ok).is_none());
-    assert!(RelayStatus::from_bits(6).is_none());
-    assert!(RelayOperation::from_bits(4).is_none());
+    assert!(RelayStatus::from_bits(5).is_none());
+    // A close's four endings occupy the words after the three operations that
+    // carry none, so the vocabulary ends exactly there.
+    assert!(RelayEnding::COUNT == LOG_ONBOARD_END_COUNT as usize);
+    assert!(RelayOperation::CLOSE_BASE as usize + RelayEnding::COUNT == 7);
+    assert!(RelayOperation::from_bits(6).is_some());
+    assert!(RelayOperation::from_bits(7).is_none());
+    assert!(RelayEnding::from_bits(RelayEnding::COUNT as u32).is_none());
 
     assert!(offset_of!(RelayRequest, sequence) == 0);
     assert!(offset_of!(RelayRequest, operation) == 4);

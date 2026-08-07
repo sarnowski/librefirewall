@@ -127,8 +127,8 @@ pub use log_ring::{
 };
 pub use relay::{
     MAX_RELAY_PAYLOAD, PendingRelay, RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, RelayBusy,
-    RelayDemand, RelayFault, RelayOperation, RelayPoll, RelayRefusal, RelayReply, RelayRequest,
-    RelayRequester, RelayResponder, RelayStatus,
+    RelayDemand, RelayEnding, RelayFault, RelayOperation, RelayPoll, RelayRefusal, RelayReply,
+    RelayRequest, RelayRequester, RelayResponder, RelayStatus,
 };
 pub use signing::{
     DEVICE_ID_LEN, DeviceIdentity, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, PUBLIC_KEY_LEN,

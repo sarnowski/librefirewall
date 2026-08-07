@@ -209,6 +209,10 @@ pub enum LogDetailKind {
     /// What one onboarding session carried, as **both** the domain that owns
     /// the network and the domain that terminates the session report it.
     Onboarded,
+    /// What the onboarding *port* has done and refused, as the domain that owns
+    /// it reports beside a session's account. Its own discriminant rather than a
+    /// wider operand array, on [`Self::DialRoute`]'s terms.
+    OnboardingPort,
 }
 
 impl LogDetailKind {
@@ -241,6 +245,7 @@ impl LogDetailKind {
             Self::DialSegments => 23,
             Self::DialSequence => 24,
             Self::Onboarded => 25,
+            Self::OnboardingPort => 26,
         }
     }
 
@@ -273,6 +278,7 @@ impl LogDetailKind {
             23 => Some(Self::DialSegments),
             24 => Some(Self::DialSequence),
             25 => Some(Self::Onboarded),
+            26 => Some(Self::OnboardingPort),
             _ => None,
         }
     }
@@ -834,6 +840,16 @@ impl LogRecord {
                 received: self.operands[2],
                 sent: self.operands[3],
             },
+            // Four counts and nothing ranged: each is a tally the port kept
+            // about itself, so every bit pattern of each is one it could have
+            // written. There is no token here — the detail names one surface and
+            // not a member of a vocabulary.
+            Some(LogDetailKind::OnboardingPort) => CheckedDetail::OnboardingPort {
+                accepted: self.operands[0],
+                forgotten: self.operands[1],
+                overflowed: self.operands[2],
+                refused: self.operands[3],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -1381,6 +1397,16 @@ pub enum CheckedDetail {
         relayed: u64,
         received: u64,
         sent: u64,
+    },
+    /// What the onboarding port has done and refused over the boot: connections
+    /// it accepted, connections it stopped holding while a session ran on them,
+    /// bytes a peer sent past the window it was given, and bytes the terminating
+    /// domain answered with that there was no room for.
+    OnboardingPort {
+        accepted: u64,
+        forgotten: u64,
+        overflowed: u64,
+        refused: u64,
     },
 }
 

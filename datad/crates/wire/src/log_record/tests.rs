@@ -775,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 26,
+                detail: 27,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 26 },
+            LogRecordError::DetailKindUnknown { detail: 27 },
         ),
         // The onboarding session's own token word, on the dial's terms: an end
         // past the set names nothing a console line can spell.
@@ -1233,10 +1233,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::DialSegments,
         LogDetailKind::DialSequence,
         LogDetailKind::Onboarded,
+        LogDetailKind::OnboardingPort,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(26), None);
+    assert_eq!(LogDetailKind::from_bits(27), None);
 
     for value in [
         LogValueKind::Absent,
