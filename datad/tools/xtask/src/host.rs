@@ -727,7 +727,8 @@ fn tail(stderr: &[u8], count: usize) -> String {
 pub(crate) fn clean(root: &Path) -> Result<(), String> {
     for path in [
         root.join("build/image"),
-        root.join("build/dev-keys"),
+        root.join(crate::artifacts::BUILD_DEV_KEY_DIR),
+        root.join(crate::artifacts::BUILD_DEV_CA_DIR),
         root.join("dist"),
         root.join("target"),
     ] {

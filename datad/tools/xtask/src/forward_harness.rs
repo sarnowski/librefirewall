@@ -93,6 +93,7 @@ use crate::dial_contract;
 use crate::management_contract::{self, ManagementInjection};
 use crate::metrics_contract::{self, Scrape};
 use crate::onboard_contract;
+use crate::onboard_install_contract;
 use crate::onboard_request_contract;
 use crate::onboard_tls_contract;
 use crate::qemu::{GuestNic, every_guest_nic};
@@ -3028,6 +3029,11 @@ pub enum BootContract<'a> {
 pub struct BootTest<'a> {
     /// The contract the boot is judged against.
     pub contract: BootContract<'a>,
+    /// The workspace this run builds in. Reached for by the one client that
+    /// composes rather than only reads: the management server this harness
+    /// plays keeps its certification authority under the build tree and carries
+    /// the committed package fixture out of the source tree.
+    pub root: &'a Path,
     /// Path of the run log, whose parent directories are created.
     pub log_path: &'a Path,
     /// Harness-generated header written ahead of the captured serial output,
@@ -6044,6 +6050,11 @@ pub struct Booted {
     /// The requests real clients made on the surface above those handshakes,
     /// where the boot ran any.
     pub requests: Vec<onboard_request_contract::Attempt>,
+    /// What this run's **management server** did to the appliance, on the two
+    /// boots that play one: the package it issued and uploaded, or the closed
+    /// surface it met on an appliance somebody already owns. `None` everywhere
+    /// else.
+    pub installs: Option<onboard_install_contract::Onboarded>,
     /// What the station this harness played on the onboarding port observed, on
     /// the three scenarios that open a session there. `None` everywhere else.
     ///
@@ -6160,6 +6171,7 @@ fn run_boot(
     let mut recordings: Vec<Download> = Vec::new();
     let mut handshakes: Vec<onboard_tls_contract::Attempt> = Vec::new();
     let mut requests: Vec<onboard_request_contract::Attempt> = Vec::new();
+    let mut installs: Option<onboard_install_contract::Onboarded> = None;
     // What the configuration submission proved, on the one scenario that makes one.
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
@@ -7026,6 +7038,93 @@ fn run_boot(
                                 ));
                             }
                         }
+                        // And, on the two boots whose subject is onboarding
+                        // *whole*, the management server this harness plays.
+                        // Last of all, because it is the one client that
+                        // changes the appliance: an install shuts the surface
+                        // for good, so a boot that ran anything else after it
+                        // would be asking an owned appliance for a resource
+                        // that no longer exists and calling the answer a
+                        // failure.
+                        if test.onboard.onboards() || test.onboard.revisits() {
+                            drain(&serial_receiver, &mut output);
+                            // The identity this appliance printed: the
+                            // fingerprint every client pins to, and the name a
+                            // certification authority is about to certify.
+                            // Both read off the appliance's own output, so what
+                            // is issued is issued to what an administrator
+                            // would have read.
+                            let (device, fingerprint) =
+                                match onboard_request_contract::identity(&output) {
+                                    Ok(identity) => identity,
+                                    Err(verdict) => {
+                                        break 'run Err(format!(
+                                            "{verdict}; see {}",
+                                            log_path.display()
+                                        ));
+                                    }
+                                };
+                            let into = log_path.parent().unwrap_or(Path::new("."));
+                            let driven = if test.onboard.onboards() {
+                                onboard_install_contract::onboard(
+                                    test.root,
+                                    onboard_port,
+                                    &fingerprint,
+                                    &device,
+                                    into,
+                                    || onboard_tls_contract::nudge(host_port),
+                                )
+                            } else {
+                                onboard_install_contract::revisit(
+                                    onboard_port,
+                                    &fingerprint,
+                                    into,
+                                    || onboard_tls_contract::nudge(host_port),
+                                )
+                            };
+                            let driven = match driven {
+                                Ok(made) => made,
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            };
+                            // The same bounded wait the requests take, and for
+                            // one reason more: an install's own account is
+                            // written by the domain that made it durable, which
+                            // is a second ring behind the one answering the
+                            // client.
+                            let mut reported = false;
+                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                                drain(&serial_receiver, &mut output);
+                                if driven.reported(&output) {
+                                    reported = true;
+                                    break;
+                                }
+                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                            drain(&serial_receiver, &mut output);
+                            if !reported && !driven.reported(&output) {
+                                break 'run Err(format!(
+                                    "the appliance had not finished accounting for what this \
+                                     run's management server did after \
+                                     {ONBOARD_HANDSHAKE_NUDGES} wakeups. A request's record is \
+                                     written on the pass that decided it and an install's on the \
+                                     domain that made it durable, so this is a domain that \
+                                     stopped answering rather than one that had nothing to say; \
+                                     see {}",
+                                    log_path.display()
+                                ));
+                            }
+                            installs = Some(driven);
+                        }
                         scrapes = fetched;
                         break 'run Ok(());
                     }
@@ -7396,6 +7495,7 @@ fn run_boot(
         recordings,
         handshakes,
         requests,
+        installs,
         applied,
         revoked,
         onboard: onboarded,
@@ -7685,6 +7785,9 @@ mod tests {
             dial: crate::qemu::DialContract::Answered,
             onboard: crate::qemu::OnboardContract::Untouched,
             contract: BootContract::Routed,
+            // No client of this harness's own reaches for it: these boots run
+            // no management server, so the workspace is named and never opened.
+            root: Path::new("."),
             log_path: log,
             log_header: HEADER,
             topology,

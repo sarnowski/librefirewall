@@ -93,6 +93,13 @@ lfw-x509 = { path = "../../crates/x509" }
 # The superblock the recorder writes at the head of each extent, decoded off
 # the disk image with the appliance's own decoder rather than a copy of it.
 lfw-capture-ring = { path = "../../crates/capture-ring" }
+# The onboarding package's own format and vocabulary, for the harness that
+# plays the management server: the four member names, the block size, and the
+# token each refusal is named by. Composing a package here against a second
+# copy of that format — or asserting a token written out beside the code that
+# raises it — is the drift every dependency above exists to close, and it would
+# hide in exactly the place a passing gate looks like proof.
+lfw-package = { path = "../../crates/package" }
 
 [lints]
 workspace = true

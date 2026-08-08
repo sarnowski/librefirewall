@@ -62,7 +62,7 @@ use crate::{
     },
     image, management_contract, metrics_contract,
     onboard_contract::{self, OnboardVerdict},
-    onboard_request_contract, onboard_tls_contract, probe_contract,
+    onboard_install_contract, onboard_request_contract, onboard_tls_contract, probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -523,6 +523,25 @@ pub(crate) enum OnboardContract {
     /// record per attempt. A boot doing both would owe a count neither contract
     /// states.
     Requests,
+    /// **The management server**, played by this harness against an appliance
+    /// that has never met one ([`crate::onboard_install_contract`]): it reads
+    /// the request the appliance serves, issues a device certificate against a
+    /// certification authority of this checkout's own, composes a package to
+    /// the package contract, has two packages refused by name, uploads the one
+    /// this appliance can take, and then finds the surface shut behind it.
+    ///
+    /// Its own variant for the reason [`Self::Requests`] is one: this boot's
+    /// contract is that an appliance *changed hands*, which is a claim the two
+    /// read-only ones cannot make and which the appliance can satisfy exactly
+    /// once.
+    Onboards,
+    /// The same clients against the appliance a **previous boot of this run**
+    /// took ownership of, over the medium it left behind.
+    ///
+    /// What is judged here is an absence, and it is the half the boot above
+    /// cannot prove: a close that a restart undid would satisfy every assertion
+    /// that boot makes.
+    Owned,
 }
 
 impl OnboardContract {
@@ -531,7 +550,9 @@ impl OnboardContract {
         match self {
             // A boot that lets real clients in plays no station, so the station
             // this harness would otherwise put on the wire does nothing.
-            Self::Untouched | Self::Handshakes | Self::Requests => OnboardBehaviour::Untouched,
+            Self::Untouched | Self::Handshakes | Self::Requests | Self::Onboards | Self::Owned => {
+                OnboardBehaviour::Untouched
+            }
             Self::Session(behaviour) => behaviour,
         }
     }
@@ -546,6 +567,17 @@ impl OnboardContract {
         matches!(self, Self::Requests)
     }
 
+    /// Whether this boot plays the management server and gives the appliance an
+    /// owner.
+    pub(crate) const fn onboards(self) -> bool {
+        matches!(self, Self::Onboards)
+    }
+
+    /// Whether this boot returns to an appliance a previous one adopted.
+    pub(crate) const fn revisits(self) -> bool {
+        matches!(self, Self::Owned)
+    }
+
     /// What the appliance must say about the session, given how the station
     /// ended it.
     ///
@@ -558,8 +590,11 @@ impl OnboardContract {
     pub(crate) const fn verdict(self) -> Option<OnboardVerdict> {
         let (ended, forgotten) = match self {
             // Nothing is read: the boot opens no session, or it opens several
-            // and they are judged as handshakes rather than as one session.
-            Self::Untouched | Self::Handshakes | Self::Requests => return None,
+            // and they are judged as handshakes, as requests, or as what one
+            // management server did, rather than as one session.
+            Self::Untouched | Self::Handshakes | Self::Requests | Self::Onboards | Self::Owned => {
+                return None;
+            }
             // A station that opens nothing is not a session, so this pairing
             // names no records. A `None` rather than a panic: the caller refuses
             // it by name, which turns a table entry that cannot mean anything
@@ -823,6 +858,25 @@ pub(crate) enum Console {
     /// the page carried, what `openssl` made of the request it links to, and
     /// the token each refused request reached the console under.
     JudgedOnTheOnboardingRequests,
+    /// **What a management server did to an appliance that had never met one**,
+    /// and the store domain's own account of having changed hands.
+    ///
+    /// The narrow shape once more, and the widest claim any single boot in this
+    /// table makes: the three boots above read what an unprovisioned appliance
+    /// *serves*, and this one drives it all the way through the one transition
+    /// it has. So both domains are read — the one that answered the requests,
+    /// for the token each of them drew, and the one that made the ownership
+    /// durable, for the anchor's fingerprint and the endpoint it will answer to
+    /// — and held to what this run's own certification authority issued.
+    JudgedOnTheOnboardingInstall,
+    /// **An appliance that came back owned, and serves nothing.**
+    ///
+    /// The other half of the claim above, and the half no single boot can make:
+    /// a surface a restart reopened would satisfy every assertion the boot that
+    /// installed makes. So the store domain's record is read for the identity
+    /// that returned — the same appliance, now with an owner — and every
+    /// address the surface once had is asked for and found gone.
+    JudgedOnTheOwnedApplianceServingNothing,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -1692,6 +1746,66 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
+    // And the pair that puts the whole of onboarding on a booted image: the
+    // harness stops reading what the appliance serves and starts being the
+    // thing an administrator carries it to.
+    //
+    // The first boot is the management server. It fetches the request, reads it
+    // back with `openssl`, issues a device certificate against a certification
+    // authority generated for this checkout alone, composes a package to the
+    // package contract, and uploads it as the body of `POST /configuration.tar`
+    // over the same pinned TLS every other client on this port uses. What it
+    // holds the appliance to is not that the upload succeeded: it is that the
+    // appliance printed **this authority's own fingerprint**, computed here by
+    // the profile's definition before the appliance said it, and the endpoint
+    // the package named — so a node that installed some other anchor, or none,
+    // fails on a number rather than on a status line.
+    //
+    // TWO PACKAGES ARE REFUSED FIRST, each under a token of its own, because
+    // an install shuts the surface and so is the last thing this boot can do.
+    // One is well formed and certified to a **different appliance's key** — the
+    // fixture the management server itself produced, which needs nothing
+    // composed — and one is this appliance's own package in an archive that is
+    // not ustar. They are two different things for an administrator to go and
+    // fix, and an appliance that answered both the same way would satisfy a
+    // contract that only asked whether a bad package was refused.
+    //
+    // The second boot is what makes the close *permanent* rather than
+    // per-boot. It carries the same medium into a second boot and finds the
+    // appliance owned: the same identifier and the same key, at a generation
+    // the install advanced, with every address the surface once had — the page,
+    // the request, and the route that took the package, offered the very
+    // package that was accepted — answering that this appliance already has an
+    // owner. A close that a restart undid satisfies everything the first boot
+    // asserts and nothing here.
+    Scenario {
+        name: "onboarding-adopted",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingInstall,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Onboards,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // Fresh, necessarily: the whole subject is an appliance that has never
+        // had an owner being given one.
+        store: StoreMedium::Fresh,
+    },
+    Scenario {
+        name: "onboarding-owned",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOwnedApplianceServingNothing,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Owned,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // The medium the boot above was adopted on. It must precede this one in
+        // this table, and `StoreDisk::carried` says so by name when it does not.
+        store: StoreMedium::CarriedFrom("onboarding-adopted"),
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -1994,7 +2108,9 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         | Console::JudgedOnTheDialledChannelAndThePortsCount
         | Console::JudgedOnTheOnboardingSessionAndThePortsCount
         | Console::JudgedOnTheOnboardingHandshakes
-        | Console::JudgedOnTheOnboardingRequests => {}
+        | Console::JudgedOnTheOnboardingRequests
+        | Console::JudgedOnTheOnboardingInstall
+        | Console::JudgedOnTheOwnedApplianceServingNothing => {}
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -2124,6 +2240,10 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             }
         }
     };
+    // What the store domain said about itself, on the two boots whose subject
+    // is an appliance changing hands. Held out here because the claim the pair
+    // makes is between two boots and only the run has seen both.
+    let mut identity = None;
     let judged = match scenario.console {
         // Unreachable for the two narrow ones: `run_scenario` hands a refusal
         // scenario to `run_fail_closed_scenario` and a cryptography-only one to
@@ -2181,6 +2301,36 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             let served = onboard_request_contract::judge(&booted.requests, &booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!("; {served}")
+        }
+        Console::JudgedOnTheOnboardingInstall
+        | Console::JudgedOnTheOwnedApplianceServingNothing => {
+            let Some(installs) = &booted.installs else {
+                return Err(format!(
+                    "scenario {name}: the boot met its routed contract and this run's management \
+                     server never reached the onboarding surface, so nothing was proved about \
+                     what an appliance does when one arrives\n  full run log: {}",
+                    log.display()
+                ));
+            };
+            let evidence = onboard_install_contract::evidence(installs);
+            println!("{evidence}");
+            append_evidence(
+                &log,
+                "what this run's management server did to the appliance, and what came back",
+                &evidence,
+            )
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+            // The store domain's own account first: it is what an install
+            // changes, so the contract is between the two records and reading
+            // one of them twice would be this harness agreeing with itself.
+            let reported = store_contract::judge(&booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            let install =
+                onboard_install_contract::judge(installs, &reported, &booted.serial, &log)
+                    .map_err(|error| format!("scenario {name}: {error}"))?;
+            let summary = reported.summary();
+            identity = Some(reported);
+            format!("; {install}; the store domain reports {summary}")
         }
         Console::JudgedOnTheOnboardingHandshakes => {
             if booted.handshakes.is_empty() {
@@ -2266,7 +2416,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
     );
     Ok(Observed {
         management_tcp_isn: booted.management_tcp_isn,
-        store_identity: None,
+        store_identity: identity,
         accelerated: booted.hardware_accelerated,
     })
 }
@@ -2861,6 +3011,7 @@ fn boot(
         backends,
         BootTest {
             contract,
+            root,
             log_path: &log,
             log_header: &header,
             topology,

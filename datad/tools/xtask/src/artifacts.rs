@@ -56,3 +56,10 @@ pub(crate) const BUILD_DEV_KEY_DIR: &str = "build/dev-keys";
 /// it and it is embedded into the GRUB core image, so the same file is the
 /// single trust anchor on both sides.
 pub(crate) const DEV_PUBLIC_KEY: &str = "librefirewall-dev-pub.gpg";
+
+/// The throwaway development certification authority the QEMU harness onboards
+/// an appliance with, on the same terms as the keyring above: generated once
+/// per checkout, never committed, removed by `clean`. It owns one appliance
+/// that exists for the length of a gate run, and looking like a key worth
+/// keeping is exactly what it must not do.
+pub(crate) const BUILD_DEV_CA_DIR: &str = "build/dev-ca";

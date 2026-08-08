@@ -68,7 +68,7 @@ const FINGERPRINT: &str = "fingerprint";
 
 /// How long one client is given before the run gives up on it, on
 /// [`crate::onboard_tls_contract`]'s terms.
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What one attempt asks for and what the appliance owes for it.
 struct Ask {
@@ -161,7 +161,7 @@ pub struct Attempt {
 /// # Errors
 /// A rendering that is not 64 hexadecimal characters, which is the store
 /// domain's contract and so is a finding rather than something to work around.
-fn pinned(fingerprint: &str) -> Result<String, String> {
+pub(crate) fn pinned(fingerprint: &str) -> Result<String, String> {
     let bytes: Vec<u8> = fingerprint
         .as_bytes()
         .chunks(2)
@@ -265,16 +265,20 @@ pub(crate) fn drive(
     Ok(attempts)
 }
 
-/// One `curl` run against the port.
-fn fetch(ask: &Ask, index: usize, port: u16, pin: &str, into: &Path) -> Result<Attempt, String> {
-    let url = format!("https://127.0.0.1:{port}{}", ask.target);
-    let body = into.join(format!("onboarding-request-{index}.body"));
-    // `--insecure` and a pin together, which is not a contradiction: the
-    // appliance has no chain to validate — that is the whole point of the phase
-    // — and the pin is what authenticates it. `--http1.1` because that is the
-    // only version this surface speaks and a client that negotiated another
-    // would be testing a different protocol.
-    let arguments: Vec<String> = [
+/// How every client on this port reaches it: the arguments, and the pin that
+/// authenticates the appliance to them.
+///
+/// One place rather than one per contract, because it is one statement about
+/// what an administrator does — and the whole value of pinning is lost the
+/// moment a second contract reaches the same port without it.
+///
+/// `--insecure` and a pin together is not a contradiction: the appliance has no
+/// chain to validate — that is the whole point of the phase — and the pin is
+/// what authenticates it. `--http1.1` because that is the only version this
+/// surface speaks and a client that negotiated another would be testing a
+/// different protocol.
+pub(crate) fn client(pin: &str) -> Vec<String> {
+    [
         "--silent",
         "--show-error",
         "--include",
@@ -285,10 +289,19 @@ fn fetch(ask: &Ask, index: usize, port: u16, pin: &str, into: &Path) -> Result<A
     .iter()
     .map(|argument| (*argument).to_owned())
     .chain([format!("sha256//{pin}")])
-    .chain(ask.arguments.iter().map(|argument| (*argument).to_owned()))
-    .chain(["--output".to_owned(), body.display().to_string()])
-    .chain([url.clone()])
-    .collect();
+    .collect()
+}
+
+/// One `curl` run against the port.
+fn fetch(ask: &Ask, index: usize, port: u16, pin: &str, into: &Path) -> Result<Attempt, String> {
+    let url = format!("https://127.0.0.1:{port}{}", ask.target);
+    let body = into.join(format!("onboarding-request-{index}.body"));
+    let arguments: Vec<String> = client(pin)
+        .into_iter()
+        .chain(ask.arguments.iter().map(|argument| (*argument).to_owned()))
+        .chain(["--output".to_owned(), body.display().to_string()])
+        .chain([url.clone()])
+        .collect();
     let command = format!("curl {}", arguments.join(" "));
     let output = Command::new("curl")
         .args(&arguments)

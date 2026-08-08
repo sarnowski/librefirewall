@@ -88,6 +88,7 @@ mod image;
 mod management_contract;
 mod metrics_contract;
 mod onboard_contract;
+mod onboard_install_contract;
 mod onboard_request_contract;
 mod onboard_tls_contract;
 mod pins;

@@ -360,7 +360,12 @@ authority topology, so it stays under `datad/build/image/<config>/`.
 
 Image builds generate a throwaway development signing key under `datad/build/dev-keys/` (never
 committed; removed by `make clean`); the manifest records `trust_profile: development` so a
-development-signed image can never be mistaken for a production one.
+development-signed image can never be mistaken for a production one. The end-to-end gate mints a
+second throwaway key on the same terms and for the same reason: the scenario that onboards a booted
+appliance needs a certification authority to issue its device certificate, so one is generated under
+`datad/build/dev-ca/` the first time a run needs it, is never committed, and goes with `make clean`.
+It owns one appliance that exists for the length of a gate run, and looking like a key worth keeping
+is exactly what it must not do.
 
 All commands force Podman's `cgroupfs` manager. Override `PODMAN` only to select a compatible
 Podman executable; Docker is not a supported build interface.
