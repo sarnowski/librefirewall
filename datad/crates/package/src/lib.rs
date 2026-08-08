@@ -52,6 +52,7 @@
 mod archive;
 mod certificate;
 mod endpoint;
+mod refusal;
 
 #[cfg(test)]
 mod tests;

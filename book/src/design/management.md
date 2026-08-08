@@ -70,8 +70,13 @@ The flow:
 2. The administrator reaches the onboarding server over HTTPS and verifies the presented
    certificate's fingerprint against the console output. This authenticates the appliance to the
    administrator.
-3. `GET /` serves a deliberately plain, unstyled HTML page: a link to the CSR, and a form to upload
-   a configuration package.
+3. `GET /` serves a deliberately plain, unstyled HTML page: the appliance's identity and
+   fingerprint to compare against the console, a link to the CSR, and the exact command that
+   uploads a configuration package. **Not a form** — the package travels as the whole body of the
+   request, and a browser form can only send a body it has wrapped in an encoding of its own, which
+   would put a second parser for that wrapping on the one path an unauthenticated peer reaches. The
+   page therefore tells an administrator what to run rather than offering a control that would have
+   to be unwrapped.
 4. `GET /certificate.csr` downloads the certificate signing request (its exact profile is the
    [certificate contract](../contracts/certificate-profile.md)).
 5. The administrator uploads the CSR to the management application, which shows the fingerprint

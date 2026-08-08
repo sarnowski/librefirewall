@@ -234,9 +234,7 @@ use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Ipv4Address, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::StatsShard;
-use lfw_package::{
-    ArchiveError, CertificateError, EmptyField, EndpointError, Member, NumericField, PackageError,
-};
+use lfw_package::{ArchiveError, CertificateError, EndpointError, PackageError};
 use lfw_store::{
     ChainFault, CheckedState, Cleared, Copies, IdentityError, InstallError, Onboarding,
     RESET_REQUEST_BYTES, RESET_REQUEST_SECTOR, ResetRequest, STATE_A_SECTOR, STATE_COPY_BYTES,
@@ -597,11 +595,13 @@ const fn record_detail(error: StateError) -> RefusalDetail {
 
 /// The token an install refusal is named by, and the numbers that place it.
 ///
-/// One per distinct rule, all the way down: an administrator holding a refused
-/// package has four files to go and look at, and a token covering three rules
-/// names none of them. The residual arms exist because these vocabularies belong
-/// to other crates — a variant added upstream reaches the console as a token
-/// saying so rather than as another rule's name.
+/// The rules of the package name themselves: `PackageError::cause` is the one
+/// catalogue for them, so every domain that reads a package reads the same
+/// tokens out of it and none of them can drift. What is added here is what only
+/// this domain can refuse — it owns the medium, the staging region and the
+/// appliance's key. The residual arms cover the two vocabularies this domain
+/// matches from outside the crate that declares them: a variant added upstream
+/// reaches the console as a token saying so rather than as another rule's name.
 fn install_refusal(error: InstallError) -> Refusal {
     let (cause, detail) = match error {
         InstallError::AlreadyOwned => ("install-already-owned", RefusalDetail::None),
@@ -618,7 +618,7 @@ fn install_refusal(error: InstallError) -> Refusal {
             record_detail(error),
         ),
         InstallError::Chain(fault) => (chain_cause(fault), RefusalDetail::None),
-        InstallError::Package(error) => (package_cause(error), package_detail(error)),
+        InstallError::Package(error) => (error.cause(), package_detail(error)),
         _ => ("install-unusable", RefusalDetail::None),
     };
     Refusal {
@@ -644,23 +644,6 @@ const fn chain_cause(fault: ChainFault) -> &'static str {
     }
 }
 
-/// Which rule of the package contract refused, at the contract's own grain.
-const fn package_cause(error: PackageError) -> &'static str {
-    match error {
-        PackageError::Archive(error) => archive_cause(error),
-        PackageError::DeviceCertificate(error) => device_certificate_cause(error),
-        PackageError::TrustAnchor(error) => anchor_certificate_cause(error),
-        PackageError::DeviceKeyIsNotThisAppliance => "install-device-key-is-not-this-appliance",
-        PackageError::Endpoint(error) => endpoint_cause(error),
-        PackageError::Configuration(_) => "install-configuration-refused",
-        // Unreachable: this domain injects its own verifier, and every path that
-        // refuses a chain records why first. Named rather than merged into the
-        // residual, so a reader who ever sees it knows exactly which claim broke.
-        PackageError::ChainNotVerified => "install-chain-not-verified",
-        _ => "install-package-unusable",
-    }
-}
-
 /// The numbers a package refusal turns on, where its variant carries them.
 const fn package_detail(error: PackageError) -> RefusalDetail {
     match error {
@@ -670,63 +653,6 @@ const fn package_detail(error: PackageError) -> RefusalDetail {
         }
         PackageError::Endpoint(error) => endpoint_detail(error),
         _ => RefusalDetail::None,
-    }
-}
-
-/// The archive's own rules. Every one that names a position carries it, because
-/// a tar an administrator did not compose by hand is one whose fault is found by
-/// offset.
-const fn archive_cause(error: ArchiveError) -> &'static str {
-    match error {
-        ArchiveError::ArchiveOverBound { .. } => "install-archive-over-bound",
-        ArchiveError::NotAWholeNumberOfBlocks { .. } => "install-archive-partial-block",
-        ArchiveError::TruncatedHeader { .. } => "install-archive-truncated-header",
-        ArchiveError::EndsWithoutTerminator => "install-archive-no-terminator",
-        ArchiveError::BytesAfterEndOfArchive { .. } => "install-archive-trailing-bytes",
-        ArchiveError::NotUstar { .. } => "install-archive-not-ustar",
-        ArchiveError::ChecksumMismatch { .. } => "install-archive-checksum-mismatch",
-        ArchiveError::NotARegularFile { .. } => "install-archive-not-a-regular-file",
-        ArchiveError::FieldIsNotEmpty { field, .. } => match field {
-            EmptyField::LinkName => "install-archive-link-name-not-empty",
-            EmptyField::Prefix => "install-archive-prefix-not-empty",
-        },
-        ArchiveError::UnknownMember { .. } => "install-archive-unknown-member",
-        ArchiveError::DuplicateMember { member } => match member {
-            Member::DeviceCertificate => "install-duplicate-device-certificate",
-            Member::TrustAnchor => "install-duplicate-trust-anchor",
-            Member::ManagementEndpoint => "install-duplicate-management-endpoint",
-            Member::Configuration => "install-duplicate-configuration",
-        },
-        ArchiveError::MissingMember { member } => match member {
-            Member::DeviceCertificate => "install-missing-device-certificate",
-            Member::TrustAnchor => "install-missing-trust-anchor",
-            Member::ManagementEndpoint => "install-missing-management-endpoint",
-            Member::Configuration => "install-missing-configuration",
-        },
-        ArchiveError::EmptyNumericField { field, .. } => match field {
-            NumericField::Size => "install-archive-size-empty",
-            NumericField::Checksum => "install-archive-checksum-empty",
-        },
-        ArchiveError::NotOctal { field, .. } => match field {
-            NumericField::Size => "install-archive-size-not-octal",
-            NumericField::Checksum => "install-archive-checksum-not-octal",
-        },
-        ArchiveError::NumericFieldOverBound { field, .. } => match field {
-            NumericField::Size => "install-archive-size-over-bound",
-            NumericField::Checksum => "install-archive-checksum-over-bound",
-        },
-        // The member is named where it is what an administrator would act on —
-        // a file that is too large is a file to shrink — and not where the fault
-        // is the archive writer's whatever member it landed on.
-        ArchiveError::MemberOverBound { member, .. } => match member {
-            Member::DeviceCertificate => "install-device-certificate-over-bound",
-            Member::TrustAnchor => "install-trust-anchor-over-bound",
-            Member::ManagementEndpoint => "install-management-endpoint-over-bound",
-            Member::Configuration => "install-configuration-over-bound",
-        },
-        ArchiveError::MemberBodyTruncated { .. } => "install-archive-member-truncated",
-        ArchiveError::MemberPaddingIsNotZero { .. } => "install-archive-member-padding",
-        _ => "install-archive-unusable",
     }
 }
 
@@ -754,56 +680,6 @@ const fn archive_detail(error: ArchiveError) -> RefusalDetail {
     }
 }
 
-/// The device certificate's own rules, and the anchor's below it.
-///
-/// Two functions rather than one taking which, because the token is what tells
-/// an administrator which of two files to open: a certificate is malformed in
-/// exactly the same ways whichever of them it is, and being told only that is
-/// being told to check both.
-const fn device_certificate_cause(error: CertificateError) -> &'static str {
-    match error {
-        CertificateError::MissingBeginBoundary => "install-device-no-begin-boundary",
-        CertificateError::MissingEndBoundary => "install-device-no-end-boundary",
-        CertificateError::LineTooLong { .. } => "install-device-line-too-long",
-        CertificateError::NotBase64 => "install-device-not-base64",
-        CertificateError::PaddingMisplaced => "install-device-padding-misplaced",
-        CertificateError::NotAWholeGroup => "install-device-not-a-whole-group",
-        CertificateError::NonCanonicalPadding => "install-device-non-canonical-padding",
-        CertificateError::TrailingContent => "install-device-trailing-content",
-        CertificateError::CertificateIsEmpty => "install-device-empty",
-        CertificateError::CertificateTooLong { .. } => "install-device-too-long",
-        CertificateError::TruncatedDer { .. } => "install-device-truncated-der",
-        CertificateError::UnexpectedTag { .. } => "install-device-unexpected-tag",
-        CertificateError::IndefiniteLength { .. } => "install-device-indefinite-length",
-        CertificateError::NonMinimalLength { .. } => "install-device-non-minimal-length",
-        CertificateError::LengthOutOfRange { .. } => "install-device-length-out-of-range",
-        CertificateError::TrailingDer => "install-device-trailing-der",
-        _ => "install-device-unusable",
-    }
-}
-
-const fn anchor_certificate_cause(error: CertificateError) -> &'static str {
-    match error {
-        CertificateError::MissingBeginBoundary => "install-anchor-no-begin-boundary",
-        CertificateError::MissingEndBoundary => "install-anchor-no-end-boundary",
-        CertificateError::LineTooLong { .. } => "install-anchor-line-too-long",
-        CertificateError::NotBase64 => "install-anchor-not-base64",
-        CertificateError::PaddingMisplaced => "install-anchor-padding-misplaced",
-        CertificateError::NotAWholeGroup => "install-anchor-not-a-whole-group",
-        CertificateError::NonCanonicalPadding => "install-anchor-non-canonical-padding",
-        CertificateError::TrailingContent => "install-anchor-trailing-content",
-        CertificateError::CertificateIsEmpty => "install-anchor-empty",
-        CertificateError::CertificateTooLong { .. } => "install-anchor-too-long",
-        CertificateError::TruncatedDer { .. } => "install-anchor-truncated-der",
-        CertificateError::UnexpectedTag { .. } => "install-anchor-unexpected-tag",
-        CertificateError::IndefiniteLength { .. } => "install-anchor-indefinite-length",
-        CertificateError::NonMinimalLength { .. } => "install-anchor-non-minimal-length",
-        CertificateError::LengthOutOfRange { .. } => "install-anchor-length-out-of-range",
-        CertificateError::TrailingDer => "install-anchor-trailing-der",
-        _ => "install-anchor-unusable",
-    }
-}
-
 /// The two lengths a certificate refusal turns on. The DER faults name an
 /// element of a certificate and it is deliberately not carried: all nine send an
 /// administrator to the same place, which is the tool that wrote the file.
@@ -814,35 +690,6 @@ const fn certificate_detail(error: CertificateError) -> RefusalDetail {
             RefusalDetail::Two(len as u64, bound as u64)
         }
         _ => RefusalDetail::None,
-    }
-}
-
-/// The endpoint line's own rules. An administrator typed this member, so every
-/// one of them is a thing to go and correct.
-const fn endpoint_cause(error: EndpointError) -> &'static str {
-    match error {
-        EndpointError::Empty => "install-endpoint-empty",
-        EndpointError::NotAscii => "install-endpoint-not-ascii",
-        EndpointError::OverBound { .. } => "install-endpoint-over-bound",
-        EndpointError::MissingColon => "install-endpoint-no-colon",
-        EndpointError::TooManyColons => "install-endpoint-too-many-colons",
-        EndpointError::TrailingBytes => "install-endpoint-trailing-bytes",
-        EndpointError::AddressHasTooFewOctets { .. } => "install-endpoint-too-few-octets",
-        EndpointError::AddressHasTooManyOctets => "install-endpoint-too-many-octets",
-        EndpointError::OctetIsEmpty => "install-endpoint-octet-empty",
-        EndpointError::OctetIsNotDecimal => "install-endpoint-octet-not-decimal",
-        EndpointError::OctetHasLeadingZero => "install-endpoint-octet-leading-zero",
-        EndpointError::OctetOutOfRange => "install-endpoint-octet-out-of-range",
-        EndpointError::AddressIsUnspecified => "install-endpoint-unspecified",
-        EndpointError::AddressIsLoopback => "install-endpoint-loopback",
-        EndpointError::AddressIsMulticast => "install-endpoint-multicast",
-        EndpointError::AddressIsBroadcast => "install-endpoint-broadcast",
-        EndpointError::AddressIsReserved => "install-endpoint-reserved",
-        EndpointError::PortIsEmpty => "install-endpoint-port-empty",
-        EndpointError::PortIsNotDecimal => "install-endpoint-port-not-decimal",
-        EndpointError::PortHasLeadingZero => "install-endpoint-port-leading-zero",
-        EndpointError::PortOutOfRange => "install-endpoint-port-out-of-range",
-        _ => "install-endpoint-unusable",
     }
 }
 

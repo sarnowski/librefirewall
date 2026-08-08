@@ -2788,7 +2788,7 @@ Taking ownership is the A/B record's own transaction: the record is read back of
 to itself as an identity again, the ownership written into it, and the whole state composed into the
 copy the generation's parity selects and flushed. Only then are the two console records emitted —
 the anchor's SPKI fingerprint, then the endpoint with the generation the record now stands at — so a
-line here is a statement about durable state rather than about an intention. **One hundred and nine
+line here is a statement about durable state rather than about an intention. **One hundred and four
 console tokens** carry the refusals, one per distinct rule of the package contract at the grain an
 administrator acts on: which of the four files to open and what about it was wrong. An install costs
 a copy, a whole archive walk and a signature verification that a peer paces, so **one boot serves

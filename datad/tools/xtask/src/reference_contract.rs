@@ -148,6 +148,11 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // domain alone would leave half this group uncompared.
     ("pds/crypto/src/delegate.rs", Vocabulary::Causes("crypto")),
     ("pds/store/src/main.rs", Vocabulary::Causes("store")),
+    // The onboarding package's own refusals, named where the variants are:
+    // `lfw_package`'s error types are the only place a match over them can be
+    // held exhaustive by the compiler, so the catalogue lives there and the
+    // domain that installs a package reads it rather than restating it.
+    ("crates/package/src/refusal.rs", Vocabulary::Causes("store")),
     // The identity's own refusals, raised by the store domain and named where
     // the variants are: `lfw_store::IdentityError::cause` is the one place that
     // knows what each disagreement means, so scanning the domain alone would

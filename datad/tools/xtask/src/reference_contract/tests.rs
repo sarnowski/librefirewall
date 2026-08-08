@@ -92,6 +92,10 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
         ("pds/crypto/src/delegate.rs", &["delegated-key-refused"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
+        (
+            "crates/package/src/refusal.rs",
+            &["install-endpoint-loopback"],
+        ),
         ("crates/store/src/identity.rs", &["stored-scalar-unusable"]),
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/wire/src/lib.rs", &["source-port"]),
@@ -120,7 +124,11 @@ fn sound_console() -> String {
         ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
         (
             "store",
-            &["store-medium-too-small", "stored-scalar-unusable"],
+            &[
+                "store-medium-too-small",
+                "install-endpoint-loopback",
+                "stored-scalar-unusable",
+            ],
         ),
     ])
 }
@@ -222,7 +230,11 @@ fn a_token_two_domains_share_is_not_a_finding() {
         ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
         (
             "store",
-            &["store-medium-too-small", "stored-scalar-unusable"],
+            &[
+                "store-medium-too-small",
+                "install-endpoint-loopback",
+                "stored-scalar-unusable",
+            ],
         ),
     ]);
     let findings = cause_findings(&sites, &console);
