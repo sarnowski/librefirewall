@@ -67,6 +67,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-x509",
     "lfw-tls",
     "lfw-onboarding",
+    "lfw-package",
     "lfw-store",
     "xtask",
 ];
@@ -109,6 +110,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-x509",
     "lfw-tls",
     "lfw-onboarding",
+    "lfw-package",
     "lfw-store",
 ];
 
@@ -197,6 +199,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "nic_driver_paths",
     "find_virtio_caps",
     "store_state",
+    "onboarding_package",
 ];
 
 pub(crate) fn test_host(root: &Path) -> Result<(), String> {

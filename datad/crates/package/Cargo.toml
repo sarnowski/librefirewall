@@ -1,0 +1,26 @@
+[package]
+# The onboarding package an administrator uploads: the archive, its four
+# members, and the rules each one must satisfy. Named for the artifact rather
+# than for tar, because tar is how the artifact is spelled and not what it is.
+name = "lfw-package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The configuration member is an ordinary configuration document and is held to
+# the same reader and the same rules as one submitted any other way. Reached for
+# rather than reimplemented: a second document reader would be a second set of
+# rules to keep in step with the one the configuration domain runs at boot.
+config = { path = "../config" }
+# The `SubjectPublicKeyInfo` the device certificate must carry, in the one
+# encoding this appliance renders its own key in. Taking its width from the
+# writer that produces it is what keeps "the same key" one definition, and the
+# certificate bound is the profile's own.
+lfw-x509 = { path = "../x509" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

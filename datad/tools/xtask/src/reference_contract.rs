@@ -195,6 +195,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
              derivation and appear on no surface at all",
         ),
     ),
+    (
+        "crates/package/src/archive.rs",
+        Vocabulary::Other(
+            "the onboarding package's four member names, which are the archive's own wire \
+             syntax: a member is one of four values by the time anything downstream sees it, \
+             and a refusal names that value rather than the bytes the header spelled",
+        ),
+    ),
 ];
 
 /// The seven domains whose refusal tokens the console chapter tabulates, in the

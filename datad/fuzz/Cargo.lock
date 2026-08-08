@@ -459,6 +459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-package"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "lfw-x509",
+]
+
+[[package]]
 name = "lfw-pcapng"
 version = "0.1.0"
 
@@ -536,6 +544,7 @@ dependencies = [
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
+ "lfw-package",
  "lfw-pcapng",
  "lfw-recorder",
  "lfw-store",

@@ -99,6 +99,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("crates/http/src/request.rs", &["content-length"]),
         ("crates/crypto/src/vectors.rs", &["cavp-shavs-0"]),
         ("crates/crypto/src/drbg.rs", &["librefirewall-drbg-seed-v1"]),
+        ("crates/package/src/archive.rs", &["management-endpoint"]),
     ]
 }
 

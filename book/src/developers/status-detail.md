@@ -2690,8 +2690,63 @@ identifier the store domain printed, and its own signature must verify. Three of
 refused under three different tokens — an address that does not exist, the configuration upload this
 build does not serve, and the page under a method it is not served with.
 
-**Missing.** `POST /configuration.tar`: the package upload, its tar reader, and everything that
-installs what a package carries. The unboarded/onboarded state machine has nowhere to be stored, so
+**The package an administrator carries back is read, whole or not at all.** `lfw_package` takes an
+uploaded archive and this appliance's own `SubjectPublicKeyInfo`, and answers with a package or with
+one typed refusal. The archive rules are the narrowest tar that can carry four small files: the
+`ustar` magic and version in every header, a type flag denoting a regular file — so every PAX and
+GNU extension, every link, directory and device node is refused by name — an empty link-name and an
+empty `prefix`, a name compared byte for byte against the four constants with no path and no `./`,
+every numeric field read as bounded octal and every header checksum verified, each member inside its
+own bound and the whole archive inside the outer one, and exactly four members each exactly once
+with order not significant. The content rules are the contract's: the device certificate must bind
+the appliance's own key, the endpoint must be a dotted quad and a port from 1 to 65535, and the
+document must pass `config::load` — the same reader and the same rules as a document submitted any
+other way.
+
+**The key check is a walk, not a search.** A certificate can carry the bytes of a key in an
+extension, a name or a serial without binding them to anything, so searching for them would answer a
+different question. The `SubjectPublicKeyInfo` is taken from the one place that binds it — the
+seventh element of the signed body — by descending through named elements, refusing an indefinite or
+non-minimally encoded length on the way, and the descent is eight reads deep with no loop in it. The
+appliance's key is an argument rather than something read out of the archive, so a package carrying
+somebody else's identity has nothing to be compared against.
+
+**The chain check is injected, and a package cannot exist without it having passed.** Whether the
+device certificate chains to the anchor is a cryptographic question answered by the adopted
+validator, which lives with the adopted cryptography and not in a parser; the reader takes a
+verifier from its caller. That is not an ordering convention: the verifier's acceptance produces a
+private token, the package's only constructor takes that token, and the constructor and the type's
+fields are private — so an edit that dropped the verification would not compile rather than shipping
+a package nobody checked. Whether the anchor is a certification authority at all is part of the same
+answer, an anchor lacking the constraint being one the validator refuses.
+
+**It is proved against a package the management server produced.** The fixture under
+`datad/crates/package/fixtures/` came out of `Ctrld.Package`, over certificates that server's own
+authority issued, and the appliance's public point beside it is the point that package's device
+certificate binds; no private key was committed, and the keys behind it were generated for the
+fixture and discarded. The suite reads it whole, holds the yielded endpoint, document and
+certificates to what went in, and — the part that earns the fixture — recomposes the archive with a
+writer of its own and asserts the bytes are the fixture's, so an adversarial archive is a mutation
+of the real framing rather than of an invented one. On the other side, `Ctrld.PackageFixtureTest`
+asserts the server's writer still reproduces those exact bytes. Two implementations of one format in
+two languages drift silently; these two gates are what stops it.
+
+**The fuzz target drives it as the uploader.** `onboarding_package` takes the archive unshaped and
+asserts invariants rather than the absence of a panic: reading is total and deterministic; nothing
+is yielded unless every rule passed, checked by taking a yielded package apart again from the
+outside; the same input read with a verifier that refuses yields a package never, whatever else was
+right about it; the verifier is only ever asked about a certificate that already binds the
+appliance's key, so the domain holding the cryptography is not made to spend a signature on an
+archive the structural rules would have refused; and an archive past the outer bound is refused by
+that bound and nothing else. Its seeds are the real package and a mutation of it per rule — each
+member missing, each duplicated, an unknown name, a `./` prefix, a truncated header and a truncated
+body, a size field lying in both directions, a checksum that does not verify, a PAX extended header,
+a GNU long name, a symlink, a directory, a member over its bound, an archive over its own, and the
+anchor put in the device certificate's place, which is a well-formed certificate over the wrong key.
+
+**Missing.** `POST /configuration.tar` itself: nothing routes an upload to that reader, nothing
+persists what a package carries, and no protection domain holds the reader — it is host-side only,
+so no console record, metric or QEMU scenario reaches it and none is claimed. The unboarded/onboarded state machine has nowhere to be stored, so
 nothing closes the onboarding server permanently after onboarding. The rate limiter is proved on the
 host and not on the image — tripping it needs more sessions than a boot spends handshakes on, and
 what the image proves instead is that two other refusals reach two different tokens. What no scenario
@@ -2736,9 +2791,11 @@ delivered anchor and matches the profile in every field.
   ustar headers directly rather than through a tar library, and the suite decodes what comes out
   against every rule the contract states — the magic and version, the regular-file type flag, the
   four exact names with no path and an empty prefix field, each size field against the bytes
-  present, every header checksum, the bounds, and the two closing zero blocks. That decoder is the
-  mechanism holding this writer and the appliance's reader — two implementations of one format, in
-  two languages — from drifting apart.
+  present, every header checksum, the bounds, and the two closing zero blocks. A second test holds
+  the writer to a committed fixture — the very archive the appliance's suite reads — byte for byte,
+  so a framing change both this writer and its own decoder would admit still fails here unless the
+  appliance's side changes with it. Those two tests are the mechanism holding this writer and the
+  appliance's reader — two implementations of one format, in two languages — from drifting apart.
 - **Postgres holds accounts and sessions, the authority and the endpoint certificate, the appliance
   inventory, configuration versions, and the audit trail.** Passwords are PBKDF2-HMAC-SHA512 with
   the work factor stored on each hash. Sessions are server-side tokens: the cookie carries the
@@ -2784,7 +2841,7 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 29 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 30 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (29 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 14 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Three scenarios share ONE store medium: the second is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/tools/xtask/src/host.rs` holds the authoritative target list. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |

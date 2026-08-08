@@ -38,6 +38,10 @@ cargo-fuzz = true
 #                   bytes deciding which flow a packet is related to
 #   lfw-http        the request head a management-plane attacker composes, cut
 #                   into whatever segments it chooses
+#   lfw-package     the onboarding package an administrator uploads: the tar
+#                   framing, the armour around the two certificates, the DER
+#                   walk that finds the key one binds, and the endpoint line —
+#                   every byte of which is the management-plane attacker's
 #   lfw-tls         the onboarding TLS server: every record an unauthenticated
 #                   peer sends, the buffering either side of the adopted
 #                   library, and the outcome the handshake settles on — and
@@ -107,6 +111,10 @@ lfw-pcapng = { path = "../crates/pcapng" }
 # of them is what the appliance signs with.
 lfw-store = { path = "../crates/store" }
 lfw-tls = { path = "../crates/tls" }
+# The onboarding package reader. Its whole surface is a byte string an
+# unauthenticated peer uploaded, and it reaches `config` underneath, so the
+# target here drives one parser through another.
+lfw-package = { path = "../crates/package" }
 lfw-crypto = { path = "../crates/crypto" }
 # The `SubjectPublicKeyInfo` a fingerprint is taken over, so the harness can hold
 # a verified identity's fingerprint to the digest over its own stored key rather
@@ -307,6 +315,13 @@ bench = false
 [[bin]]
 name = "onboarding_tls"
 path = "fuzz_targets/onboarding_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onboarding_package"
+path = "fuzz_targets/onboarding_package.rs"
 test = false
 doc = false
 bench = false

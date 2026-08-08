@@ -22,6 +22,7 @@ members = [
     "crates/metrics",
     "crates/http",
     "crates/onboarding",
+    "crates/package",
     "crates/pcapng",
     "crates/blk",
     "crates/capture-ring",
