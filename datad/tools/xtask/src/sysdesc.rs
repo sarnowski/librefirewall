@@ -65,6 +65,28 @@
 //! module does not model. A cross-check that passes on a file it did not
 //! understand is worse than no cross-check, because it reports the agreement it
 //! never established.
+//!
+//! # Reading it is not enough: it must be a document Microkit can read
+//!
+//! Understanding the file and the file being well-formed XML are two different
+//! properties, and only the first was ever established here. The Microkit tool
+//! reads this description with a conformant XML parser, so a rule XML imposes
+//! that this scanner waved through produced a description that satisfied every
+//! table above and then could not be assembled into an image at all — and
+//! because this check is what the fast gate runs, that is a commit qualified on
+//! the way in and unbootable from the moment it lands. A horizontal rule typed
+//! into one of the comment blocks did exactly that.
+//!
+//! So the scanner is deliberately no more permissive than XML on any rule an
+//! edit to this file can trip: the bytes are UTF-8; a comment body carries no
+//! `--`; the XML declaration sits at the first byte or nowhere; the document
+//! has exactly one root element; attributes are separated by whitespace; and an
+//! attribute value carries no raw `<`, no `&` that does not open a character
+//! reference or one of the five predefined entities, and no control character
+//! beyond tab, newline and carriage return. Where the two could differ the
+//! scanner takes the narrower reading — being stricter than XML costs a
+//! description nobody would write, while being looser costs the property this
+//! module exists for.
 
 use std::{fs, path::Path};
 
@@ -2543,8 +2565,17 @@ struct StartTag {
 /// is in, which is exactly what separates an attribute from a sentence about
 /// one. Everything it cannot classify is an error.
 fn scan(text: &[u8]) -> Result<Vec<Element>, String> {
+    if let Err(error) = std::str::from_utf8(text) {
+        return Err(format!(
+            "line {}: the description is not valid UTF-8 ({error}). It declares that encoding and \
+             is read under it, so a byte outside it is a document no conformant parser accepts",
+            line_of(text, error.valid_up_to())
+        ));
+    }
+
     let mut elements = Vec::new();
     let mut open: Vec<Open> = Vec::new();
+    let mut roots: Vec<usize> = Vec::new();
     let mut at = 0;
 
     while at < text.len() {
@@ -2556,22 +2587,9 @@ fn scan(text: &[u8]) -> Result<Vec<Element>, String> {
         at = start;
 
         if starts_with(text, at, b"<!--") {
-            let end = find(text, at + 4, b"-->").ok_or_else(|| {
-                format!(
-                    "line {}: an XML comment opens here and is never closed with `-->`, so \
-                     everything after it was about to be read as markup",
-                    line_of(text, at)
-                )
-            })?;
-            at = end + 3;
+            at = skip_comment(text, at)?;
         } else if starts_with(text, at, b"<?") {
-            let end = find(text, at + 2, b"?>").ok_or_else(|| {
-                format!(
-                    "line {}: a processing instruction opens here and is never closed with `?>`",
-                    line_of(text, at)
-                )
-            })?;
-            at = end + 2;
+            at = skip_processing_instruction(text, at)?;
         } else if starts_with(text, at, b"<!") {
             return Err(format!(
                 "line {}: a `<!` declaration (a DOCTYPE or a CDATA section) is markup this \
@@ -2582,17 +2600,85 @@ fn scan(text: &[u8]) -> Result<Vec<Element>, String> {
         } else if starts_with(text, at, b"</") {
             at = close_element(text, at, &mut open)?;
         } else {
+            if open.is_empty() {
+                roots.push(line_of(text, at));
+            }
             at = open_element(text, at, &mut open, &mut elements)?;
         }
     }
 
-    match open.last() {
-        None => Ok(elements),
-        Some(unclosed) => Err(format!(
+    if let Some(unclosed) = open.last() {
+        return Err(format!(
             "line {}: <{}> is opened here and never closed",
             unclosed.line, unclosed.tag
+        ));
+    }
+
+    match roots.as_slice() {
+        [_] => Ok(elements),
+        [] => Err(
+            "the description declares no root element, so there is no system for Microkit to \
+             assemble and nothing here to hold to the constants"
+                .to_owned(),
+        ),
+        [_, second, ..] => Err(format!(
+            "line {second}: a second top-level element opens here. XML gives a document exactly \
+             one root, so everything from this point on is content a conformant parser refuses \
+             to read rather than a second half of the system"
         )),
     }
+}
+
+/// Skip one `<!-- ... -->`, holding its body to the one rule XML puts on it.
+///
+/// Finding the terminator and skipping to it is what let a `--` through: to a
+/// search that wants only the first `-->`, the two hyphens that close a comment
+/// and the two hyphens someone typed as a horizontal rule are the same bytes.
+/// Walking the body is what tells them apart.
+fn skip_comment(text: &[u8], at: usize) -> Result<usize, String> {
+    let mut cursor = at + 4;
+    loop {
+        if starts_with(text, cursor, b"-->") {
+            return Ok(cursor + 3);
+        }
+        if cursor >= text.len() {
+            return Err(format!(
+                "line {}: an XML comment opens here and is never closed with `-->`, so \
+                 everything after it was about to be read as markup",
+                line_of(text, at)
+            ));
+        }
+        if starts_with(text, cursor, b"--") {
+            return Err(format!(
+                "line {}: this comment's body carries `--`, which XML admits only as the opening \
+                 of the closing `-->`. The Microkit tool refuses the document over it, so a \
+                 description that reads perfectly well here assembles into no image at all",
+                line_of(text, cursor)
+            ));
+        }
+        cursor += 1;
+    }
+}
+
+/// Skip one `<? ... ?>`, refusing an XML declaration anywhere but the first byte.
+fn skip_processing_instruction(text: &[u8], at: usize) -> Result<usize, String> {
+    let end = find(text, at + 2, b"?>").ok_or_else(|| {
+        format!(
+            "line {}: a processing instruction opens here and is never closed with `?>`",
+            line_of(text, at)
+        )
+    })?;
+    if at != 0
+        && read_name(text, at + 2).is_some_and(|(target, _)| target.eq_ignore_ascii_case("xml"))
+    {
+        return Err(format!(
+            "line {}: an XML declaration appears here rather than as the document's very first \
+             byte, which is the only place XML admits one — a comment or even a space in front of \
+             it is enough to make the document one Microkit will not read",
+            line_of(text, at)
+        ));
+    }
+    Ok(end + 2)
 }
 
 /// Read one start tag, emit its element, and push it if it stays open.
@@ -2654,8 +2740,11 @@ fn close_element(text: &[u8], at: usize, open: &mut Vec<Open>) -> Result<usize, 
 /// Read a start tag's attributes up to `>` or `/>`.
 fn read_attributes(text: &[u8], mut at: usize, tag: &str, line: usize) -> Result<StartTag, String> {
     let mut attributes: Vec<(String, String)> = Vec::new();
+    let mut previous: Option<String> = None;
     loop {
+        let before = at;
         at = skip_whitespace(text, at);
+        let separated = at > before;
         match text.get(at) {
             None => {
                 return Err(format!(
@@ -2677,6 +2766,17 @@ fn read_attributes(text: &[u8], mut at: usize, tag: &str, line: usize) -> Result
                 });
             }
             Some(_) => {}
+        }
+
+        if let Some(previous) = &previous
+            && !separated
+        {
+            return Err(format!(
+                "line {}: <{tag}> runs the value of `{previous}` straight into what follows it. \
+                 XML requires whitespace between two attributes, so this is a document the \
+                 Microkit tool refuses rather than a tag with a compact spelling",
+                line_of(text, at)
+            ));
         }
 
         let (name, after_name) = read_name(text, at).ok_or_else(|| {
@@ -2713,6 +2813,7 @@ fn read_attributes(text: &[u8], mut at: usize, tag: &str, line: usize) -> Result
             )
         })?;
         let value = utf8(&text[value_at + 1..end], "an attribute value")?;
+        check_attribute_value(&value, &name, tag, line_of(text, value_at))?;
 
         if attributes.iter().any(|(seen, _)| *seen == name) {
             return Err(format!(
@@ -2720,8 +2821,77 @@ fn read_attributes(text: &[u8], mut at: usize, tag: &str, line: usize) -> Result
                  honours is not something this gate may assume"
             ));
         }
+        previous = Some(name.clone());
         attributes.push((name, value));
         at = end + 1;
+    }
+}
+
+/// Hold an attribute value to the characters XML lets one carry.
+///
+/// The quotes bound the value for this scanner, which is why it read anything
+/// between them; they do not bound it for an XML parser, which still owes the
+/// three refusals below. A `<` here is the one that bites in practice: the file
+/// explains markup by quoting it, and an author who moves such a quotation out
+/// of a comment and into a `name` writes a description that stops being a
+/// document.
+fn check_attribute_value(value: &str, name: &str, tag: &str, line: usize) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "line {line}: the value of `{name}` in <{tag}> {why}, so the Microkit tool refuses to \
+             read the description at all"
+        ))
+    };
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' => return refuse("carries a raw `<`, which XML forbids in an attribute value"),
+            b'&' => {
+                let rest = &value[index + 1..];
+                let Some(body) = rest.split_once(';').map(|(body, _)| body) else {
+                    return refuse(
+                        "carries an `&` that never reaches a `;`, so it opens a \
+                                   reference XML cannot end",
+                    );
+                };
+                if !is_defined_reference(body) {
+                    return refuse(&format!(
+                        "carries `&{body};`, which is neither a character reference nor one of \
+                         the five entities XML defines without a document type"
+                    ));
+                }
+                index += body.len() + 2;
+                continue;
+            }
+            byte if byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r') => {
+                return refuse(&format!(
+                    "carries the control character 0x{byte:02x}, which XML admits nowhere in a \
+                     document"
+                ));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// Whether `&<body>;` names something in a document with no document type: a
+/// decimal or hexadecimal character reference, or one of the five entities XML
+/// itself defines. Everything else is undefined, and an undefined entity is a
+/// refusal rather than a warning.
+fn is_defined_reference(body: &str) -> bool {
+    if matches!(body, "amp" | "lt" | "gt" | "apos" | "quot") {
+        return true;
+    }
+    let Some(number) = body.strip_prefix('#') else {
+        return false;
+    };
+    // XML spells a hexadecimal character reference with a lower-case `x` only.
+    match number.strip_prefix('x') {
+        Some(hex) => !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        None => !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()),
     }
 }
 
@@ -3846,14 +4016,17 @@ mod tests {
 
         // A misplaced quote instead re-pairs them, so `name` reads as
         // `vq0 size=` and the size is gone. It must not be read as a tag that
-        // simply has no size.
+        // simply has no size — and what names it is the separation rule, which
+        // is also what an XML parser objects to first: the re-paired value ends
+        // hard against the digits that were meant to be a value of their own.
         let repaired =
             scan(b"<system>\n  <memory_region name=\"vq0 size=\"0x1000\" />\n</system>\n")
                 .unwrap_err();
         assert!(
-            repaired.contains("neither an attribute name nor the end of the tag"),
+            repaired.contains("straight into what follows"),
             "{repaired}"
         );
+        assert!(repaired.contains("line 2"), "{repaired}");
     }
 
     #[test]
@@ -3907,6 +4080,92 @@ mod tests {
             let error = scan(text.as_bytes()).unwrap_err();
             assert!(error.contains(expected), "{text:?} produced {error:?}");
         }
+    }
+
+    #[test]
+    fn a_comment_body_carrying_a_double_hyphen_fails_loudly() {
+        // The defect that produced this check: a horizontal rule typed into one
+        // of the description's comment blocks. Every table above still agreed,
+        // the gate printed its passing line, and the Microkit tool then refused
+        // the document — so the commit was qualified on the way in and no image
+        // could be assembled from it.
+        let text = committed().replacen(
+            "<!-- ===================================================================",
+            "<!-- -------------------------------------------------------------------",
+            1,
+        );
+        let error = scan(text.as_bytes()).unwrap_err();
+        assert!(error.contains("carries `--`"), "{error}");
+        assert!(error.contains("assembles into no image"), "{error}");
+
+        // A body that merely *ends* in a hyphen is the same rule and is the
+        // shape a `find` for the terminator cannot see at all: the first `-->`
+        // it lands on starts one byte late.
+        let trailing = scan(b"<system><!-- a ---></system>").unwrap_err();
+        assert!(trailing.contains("carries `--`"), "{trailing}");
+
+        // And the rule must not swallow the comments the file actually has.
+        assert!(scan(b"<system><!-- a - b --><!----><!--->--></system>").is_ok());
+    }
+
+    #[test]
+    fn a_description_that_is_not_one_document_is_reported() {
+        let two = scan(b"<system />\n<system />\n").unwrap_err();
+        assert!(two.contains("a second top-level element"), "{two}");
+        assert!(two.contains("line 2"), "{two}");
+
+        let none = scan(b"<?xml version=\"1.0\"?>\n<!-- nothing here -->\n").unwrap_err();
+        assert!(none.contains("no root element"), "{none}");
+    }
+
+    #[test]
+    fn an_xml_declaration_anywhere_but_the_first_byte_is_reported() {
+        // A space in front of it is enough for a conformant parser, which is
+        // exactly the kind of edit a formatter or a paste makes silently.
+        for text in [
+            &b" <?xml version=\"1.0\"?><system />"[..],
+            b"<!-- c --><?xml version=\"1.0\"?><system />",
+            b"<system><?XML v?></system>",
+        ] {
+            let error = scan(text).unwrap_err();
+            assert!(error.contains("very first byte"), "{error}");
+        }
+        assert!(scan(b"<?xml version=\"1.0\"?><system><?php x?></system>").is_ok());
+    }
+
+    #[test]
+    fn attributes_that_are_not_separated_are_reported() {
+        let error = scan(b"<system><map mr=\"cfg\"perms=\"r\" /></system>").unwrap_err();
+        assert!(error.contains("straight into what follows"), "{error}");
+    }
+
+    #[test]
+    fn an_attribute_value_carrying_what_xml_forbids_is_reported() {
+        for (value, expected) in [
+            ("a<b", "raw `<`"),
+            ("a&b", "never reaches a `;`"),
+            ("a&nbsp;b", "&nbsp;"),
+            ("a&#X41;b", "&#X41;"),
+            ("a&#;b", "&#;"),
+            ("a\u{1}b", "0x01"),
+        ] {
+            let text = format!("<system><memory_region name=\"{value}\" /></system>");
+            let error = scan(text.as_bytes()).unwrap_err();
+            assert!(error.contains(expected), "{value:?} produced {error:?}");
+            assert!(error.contains("refuses to read the description"), "{error}");
+        }
+
+        // What XML does admit stays admitted, or the check trades one wrong
+        // verdict for another.
+        assert!(
+            scan(b"<system><memory_region name=\"a&amp;&lt;&#65;&#x41;b>c\" /></system>").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_description_that_is_not_utf8_is_reported() {
+        let error = scan(b"<system><!-- caf\xe9 --></system>").unwrap_err();
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     #[test]

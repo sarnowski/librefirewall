@@ -242,6 +242,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | Coverage floors (94% combined, 90% per library crate) | `cargo llvm-cov` in `xtask test` |
 | Dependency, license and source policy | `cargo deny check bans licenses sources` |
 | The system description agrees with the constants the domains compile against: every region's extent, cacheability and per-grant permissions, the **exact** set of domains that map it, both I/O-port windows against the constants the drivers form addresses from, every channel end's notify direction, the port→driver attribution, and that each of the 151 mappings is named by a `setvar_vaddr` | `xtask test` (`sysdesc::check`) |
+| That the system description is a document Microkit can read at all: UTF-8 bytes, no `--` inside a comment, an XML declaration only at the first byte, exactly one root element, whitespace between attributes, and attribute values free of a raw `<`, an undefined entity reference or a control character | `xtask test` (`sysdesc::check`) |
 | The shipped configuration document is one the appliance would accept: it goes through the same `config::load` the configuration domain runs at boot | `xtask test` (`image::check_configuration`) |
 | The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves — plus the counts the status detail chapter states about the gate: how many system scenarios there are, how many reach the management port, and how many library crates carry the coverage floor | `xtask test` (`reference_contract`) |
 | The fuzz targets the gate runs, and the harnesses the seed corpora replay through, are each exactly the set the fuzz manifest declares — both directions, so a declared target left off either list fails here rather than building under the sanitizer and never running | `xtask test`, `xtask fuzz` (the seed smoke tests) |
@@ -255,6 +256,16 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 region's mapper set exactly, a grant that widens and a grant that vanishes are both findings there
 and nowhere else — including the one shape the rest of it cannot see, a mapping no `setvar_vaddr`
 names, which is authority granted to a domain with no line of code in it able to say where.
+
+It is also the only thing standing between an edit to that file and a push, which is why it holds
+the description to XML itself and not only to the constants. The two are separate properties, and
+for a while only the second was checked: a description could satisfy every rule about extents,
+perms and mapper sets and still not be a document, because the checker read it with a scanner that
+understood the file rather than with the rules a parser applies. A horizontal rule typed into one
+of the comment blocks is enough — XML reserves `--` inside a comment for the closing `-->` — and
+the result was a commit the pre-commit hook passed and from which no image could be assembled at
+all. That is exactly the commit a bisect must not land on, so the scanner is now no more permissive
+than XML on any rule an edit to this file can trip.
 
 `reference_contract` is why the book's *content* is now gated without the book becoming a build
 input: rendering is still a reading convenience, mdbook is still not pinned into the builder, and
