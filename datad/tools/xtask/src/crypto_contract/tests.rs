@@ -36,6 +36,7 @@ fn capture() -> String {
     text.push_str(DELEGATION_BEFORE);
     text.push_str(SESSION);
     text.push_str(DELEGATION_AFTER);
+    text.push_str(DELEGATION_SIGNED);
     text.push_str("LFW-PD domain=crypto state=ready\r\n");
     // The store domain's own rendering of the same appliance, which the
     // delegation's records are held against: the claim is that two domains name
@@ -58,6 +59,12 @@ const DELEGATION_BEFORE: &str = "LFW-PD domain=crypto state=negotiated \
 /// one appliance having one of those.
 const DELEGATION_AFTER: &str = "LFW-PD domain=crypto state=negotiated \
      delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=2 \
+     delegated-certificate=452\r\n";
+
+/// And once more after the certificate signing request the onboarding surface
+/// serves was signed through the same channel, which moves the tally again.
+const DELEGATION_SIGNED: &str = "LFW-PD domain=crypto state=negotiated \
+     delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=3 \
      delegated-certificate=452\r\n";
 
 /// The key holder's own record, on the same boot.
@@ -183,17 +190,25 @@ fn a_boot_that_never_finished_and_one_that_finished_twice_are_both_refused() {
 /// The delegation's own claims, each refused for the reason it exists.
 #[test]
 fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused() {
-    // Only the direct proof, so nothing says the session ran on the delegated
-    // key.
-    let once = capture().replace(DELEGATION_AFTER, "");
-    let verdict = judge(once.as_bytes(), log(), true).expect_err("one delegation record");
-    assert!(verdict.contains("exactly two"), "{verdict}");
+    // Only the direct proof and the session, so nothing says the certificate
+    // signing request was signed through the delegation.
+    let twice = capture().replace(DELEGATION_SIGNED, "");
+    let verdict = judge(twice.as_bytes(), log(), true).expect_err("two delegation records");
+    assert!(verdict.contains("exactly three"), "{verdict}");
 
-    // Two records and a tally that did not move: the handshake signed some other
-    // way, which is exactly what the pair exists to catch.
+    // Three records and a tally that did not move across the session: the
+    // handshake signed some other way, which is exactly what the sequence exists
+    // to catch.
     let still = capture().replace("delegated-signatures=2", "delegated-signatures=1");
     let verdict = judge(still.as_bytes(), log(), true).expect_err("an unmoved tally");
     assert!(verdict.contains("signed some other way"), "{verdict}");
+
+    // And a tally that did not move across the request, which is the request
+    // this appliance serves having been signed somewhere other than the domain
+    // that holds the key.
+    let unsigned = capture().replace("delegated-signatures=3", "delegated-signatures=2");
+    let verdict = judge(unsigned.as_bytes(), log(), true).expect_err("an unsigned request");
+    assert!(verdict.contains("was never signed at all"), "{verdict}");
 
     // A holder that reports no signature at all after the direct proof.
     let zero = capture().replace("delegated-signatures=1", "delegated-signatures=0");
@@ -217,8 +232,8 @@ fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused()
 
     // Two certificates on one boot, which is one appliance answering as two.
     let two = capture().replace(
-        "delegated-signatures=2 delegated-certificate=452",
-        "delegated-signatures=2 delegated-certificate=451",
+        "delegated-signatures=3 delegated-certificate=452",
+        "delegated-signatures=3 delegated-certificate=451",
     );
     let verdict = judge(two.as_bytes(), log(), true).expect_err("two certificates");
     assert!(
@@ -230,12 +245,12 @@ fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused()
     // at all: a partial rendering must not pass for a whole one.
     let partial = capture().replace(" delegated-certificate=452\r\n", "\r\n");
     let verdict = judge(partial.as_bytes(), log(), true).expect_err("partial records");
-    assert!(verdict.contains("exactly two"), "{verdict}");
+    assert!(verdict.contains("exactly three"), "{verdict}");
 
     // And the two records themselves disagreeing.
     let drifted = capture().replace(
-        &format!("delegated-device={DEVICE} delegated-signatures=2"),
-        "delegated-device=00000000000000000000000000000001 delegated-signatures=2",
+        &format!("delegated-device={DEVICE} delegated-signatures=3"),
+        "delegated-device=00000000000000000000000000000001 delegated-signatures=3",
     );
     let verdict = judge(drifted.as_bytes(), log(), true).expect_err("a drifting identifier");
     assert!(verdict.contains("a boot has one identity"), "{verdict}");

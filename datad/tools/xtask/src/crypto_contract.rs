@@ -24,20 +24,24 @@
 //!
 //! # The delegation, which is a claim about two domains and not one
 //!
-//! This domain authenticates under a key it does not hold, so two of its records
-//! are about the domain that does. Both carry `delegated-device=` — the appliance
+//! This domain authenticates under a key it does not hold, so three of its records
+//! are about the domain that does. Each carries `delegated-device=` — the appliance
 //! the key holder named — `delegated-signatures=`, that holder's own tally, and
 //! `delegated-certificate=`, the size of the certificate the holder handed over.
-//! [`delegation_records`] holds them to five things no single record can say: that
-//! the identifier is the *same* on both, that it is the same one the `domain=store`
-//! records report on the same boot, that the tally **moved** between them, that a
-//! certificate arrived at all, and that its size is the same on both. The tally is
-//! what proves the session's server half really ran on the delegated key: its
-//! `CertificateVerify` was computed in the other domain, so a number that stayed
-//! put would mean the handshake signed some other way and the seam was never on
-//! the path. The certificate's size is the one field here that must **not** move —
-//! one appliance has one certificate, so two sizes on one boot would be two
-//! answers to one question.
+//! They are written at the three points the delegation is really used: after the
+//! direct proof, after the TLS session whose server half ran on the delegated key,
+//! and after the certificate signing request the onboarding surface serves was
+//! signed through the same channel. [`delegation_records`] holds them to five
+//! things no single record can say: that the identifier is the *same* on all
+//! three, that it is the same one the `domain=store` records report on the same
+//! boot, that the tally **moved** at every step, that a certificate arrived at all,
+//! and that its size never changed. The tally is what proves each use really went
+//! through the holder's domain — the session's `CertificateVerify` and the
+//! request's own signature were both computed there, so a number that stayed put
+//! would mean that step signed some other way and the seam was never on the path.
+//! The certificate's size is the one field here that must **not** move — one
+//! appliance has one certificate, so two sizes on one boot would be two answers to
+//! one question.
 //!
 //! # Why the verdict is only asserted on an accelerated run
 //!
@@ -298,14 +302,14 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
     ))
 }
 
-/// Judge the two records this domain leaves about the key it does not hold.
+/// Judge the three records this domain leaves about the key it does not hold.
 ///
 /// Three claims, and none of them is available from one record. The identifier
-/// must be the same on both and must be the one the **store domain** reports on
-/// the same boot, because that is what says the channel reached the appliance's
+/// must be the same on all three and must be the one the **store domain** reports
+/// on the same boot, because that is what says the channel reached the appliance's
 /// own key holder rather than answering out of a zeroed region. And the tally must
-/// have moved, because that is what says the handshake between the two records
-/// signed through the delegation rather than beside it.
+/// have moved at every step, because that is what says the work between two
+/// records signed through the delegation rather than beside it.
 ///
 /// The store domain's own `device=` is read out of the same capture rather than
 /// through [`crate::store_contract`]: what is being compared is two domains'
@@ -324,15 +328,18 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
     let [
         (first_device, first_count, first_certificate),
         (second_device, second_count, second_certificate),
+        (third_device, third_count, third_certificate),
     ] = observed[..]
     else {
         return Err(format!(
             "the cryptography domain published {} complete `delegated-device=` record(s) and a \
-             boot produces exactly two: the direct proof that a signature made in the key \
-             holder's domain verifies under the key that domain named — with the certificate over \
-             that key held to it — and the same tally read again after a TLS session whose server \
-             half ran under that key. One means the session never ran on the delegated key; none \
-             means the delegation never answered at all. A record carrying the identifier without \
+             boot produces exactly three, one per point the delegation is really used: the direct \
+             proof that a signature made in the key holder's domain verifies under the key that \
+             domain named — with the certificate over that key held to it — the same tally read \
+             again after a TLS session whose server half ran under that key, and once more after \
+             the certificate signing request the onboarding surface serves was signed through the \
+             same channel. Fewer means one of those steps never reached the holder; none means \
+             the delegation never answered at all. A record carrying the identifier without \
              `delegated-signatures=` or `delegated-certificate=` is not counted here, because a \
              partial record is a rendering that lost a field\n  records observed: {steps:#?}\n  \
              full run log: {}",
@@ -340,11 +347,11 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
             log.display()
         ));
     };
-    if first_device != second_device {
+    if first_device != second_device || second_device != third_device {
         return Err(format!(
-            "the cryptography domain named appliance {first_device:?} before the session and \
-             {second_device:?} after it, and a boot has one identity. Two values mean the key \
-             holder answered as two different appliances\n  full run log: {}",
+            "the cryptography domain named appliance {first_device:?}, then {second_device:?}, \
+             then {third_device:?}, and a boot has one identity. Two values mean the key holder \
+             answered as two different appliances\n  full run log: {}",
             log.display()
         ));
     }
@@ -383,15 +390,16 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
     };
     let before = number(first_count, "first")?;
     let after = number(second_count, "second")?;
+    let signed = number(third_count, "third")?;
     // The certificate is the identity's other half, and the two records must agree
     // about it exactly: a size that moved would mean the holder answered with two
     // different certificates on one boot.
-    if first_certificate != second_certificate {
+    if first_certificate != second_certificate || second_certificate != third_certificate {
         return Err(format!(
             "the key holder handed over a certificate of {first_certificate:?} bytes before the \
-             session and {second_certificate:?} after it, and one appliance has one certificate. \
-             Two sizes mean the holder answered with two different certificates\n  full run log: \
-             {}",
+             session, {second_certificate:?} after it and {third_certificate:?} after the request \
+             was signed, and one appliance has one certificate. Two sizes mean the holder \
+             answered with two different certificates\n  full run log: {}",
             log.display()
         ));
     }
@@ -429,10 +437,21 @@ fn delegation_records(text: &str, steps: &[&&str], log: &Path) -> Result<String,
             log.display()
         ));
     }
+    if signed <= after {
+        return Err(format!(
+            "the key holder's signature tally was {after} after the TLS session and {signed} \
+             after the certificate signing request was composed, and that request is signed \
+             through the same delegation: a tally that did not move means the request this \
+             appliance serves was signed somewhere other than the domain that holds the key — or \
+             was never signed at all\n  full run log: {}",
+            log.display()
+        ));
+    }
     Ok(format!(
         "signed for appliance {first_device} under a key it does not hold, the holder's tally \
-         moving {before} -> {after} across a session whose server half ran on that key, holding \
-         a {certificate}-byte certificate over that very key"
+         moving {before} -> {after} across a session whose server half ran on that key and on to \
+         {signed} for the certificate signing request it serves, holding a {certificate}-byte \
+         certificate over that very key throughout"
     ))
 }
 

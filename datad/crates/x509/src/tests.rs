@@ -4,9 +4,10 @@ use lfw_crypto::{Drbg, Entropy, P256_PUBLIC_LEN, P256SecretKey, SEED_LEN, p256_v
 use proptest::prelude::*;
 
 use crate::{
-    Certificate, CertificateKind, DEVICE_ID_LEN, DerError, DeviceId, FINGERPRINT_LEN,
-    MAX_CERTIFICATE_LEN, MAX_CSR_LEN, Profile, ProfileError, SPKI_LEN, Serial, Validity,
-    fingerprint_hex, spki, spki_fingerprint, write_certificate, write_csr,
+    CSR_LABEL, Certificate, CertificateKind, DEVICE_ID_LEN, DerError, DeviceId, FINGERPRINT_LEN,
+    MAX_CERTIFICATE_LEN, MAX_CSR_LEN, MAX_CSR_PEM_LEN, PemDoesNotFit, Profile, ProfileError,
+    SPKI_LEN, Serial, Validity, fingerprint_hex, spki, spki_fingerprint, write_certificate,
+    write_csr, write_csr_signed, write_pem,
 };
 
 struct TestEntropy(Mutex<Drbg>);
@@ -373,4 +374,117 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+#[test]
+fn a_request_signed_elsewhere_is_the_request_signed_here() {
+    // The two writers are one writer: what the delegated form changes is where
+    // the scalar lives, and a byte of difference between them would mean the
+    // appliance serves something other than what this crate is tested on.
+    let signing = key(0x51);
+    let subject = b"0123456789abcdef0123456789abcdef";
+    let mut here = [0_u8; MAX_CSR_LEN];
+    let here_len = write_csr(subject, &signing, &mut here).expect("a request fits");
+    let mut elsewhere = [0_u8; MAX_CSR_LEN];
+    let elsewhere_len = write_csr_signed(
+        subject,
+        &signing.public_key(),
+        &mut elsewhere,
+        |body, out| signing.sign(body, out).map_err(|_| ()),
+    )
+    .expect("a request fits");
+    assert_eq!(here.get(..here_len), elsewhere.get(..elsewhere_len));
+    let (info, signature) = tbs_and_signature(elsewhere.get(..elsewhere_len).expect("written"));
+    p256_verify(&signing.public_key(), info, signature).expect("the request is signed");
+}
+
+#[test]
+fn a_signer_that_refuses_refuses_the_request_rather_than_writing_one() {
+    let signing = key(0x52);
+    let mut out = [0_u8; MAX_CSR_LEN];
+    assert_eq!(
+        write_csr_signed(b"device", &signing.public_key(), &mut out, |_, _| Err(())),
+        Err(ProfileError::Signature)
+    );
+    // And a signer that claims a length past the buffer it was handed is
+    // refused rather than believed: the length crosses a channel this crate
+    // does not own.
+    assert_eq!(
+        write_csr_signed(b"device", &signing.public_key(), &mut out, |_, out| Ok(out
+            .len()
+            .saturating_add(1))),
+        Err(ProfileError::Signature)
+    );
+}
+
+#[test]
+fn a_request_is_armoured_the_one_way_the_profile_armours_one() {
+    let signing = key(0x53);
+    let subject = b"0123456789abcdef0123456789abcdef";
+    let mut der = [0_u8; MAX_CSR_LEN];
+    let der_len = write_csr(subject, &signing, &mut der).expect("a request fits");
+    let mut pem = [0_u8; MAX_CSR_PEM_LEN];
+    let pem_len = write_pem(CSR_LABEL, der.get(..der_len).expect("written"), &mut pem)
+        .expect("the derived bound holds every request this profile writes");
+    let text = core::str::from_utf8(pem.get(..pem_len).expect("written")).expect("ascii");
+
+    assert!(text.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n"));
+    assert!(text.ends_with("-----END CERTIFICATE REQUEST-----\n"));
+    let body: String = text
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    for line in text.lines().filter(|line| !line.starts_with("-----")) {
+        assert!(line.len() <= 64, "a line of {} characters", line.len());
+    }
+    assert_eq!(body, base64(der.get(..der_len).expect("written")));
+}
+
+#[test]
+fn the_armouring_pads_every_tail_length_and_bounds_every_one() {
+    for len in 0..=48usize {
+        let body: Vec<u8> = (0..len).map(|index| index as u8).collect();
+        let mut out = [0_u8; MAX_CSR_PEM_LEN];
+        let written = write_pem("X", &body, &mut out).expect("a short body fits");
+        let text = core::str::from_utf8(out.get(..written).expect("written")).expect("ascii");
+        let encoded: String = text
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        assert_eq!(encoded, base64(&body), "at {len} bytes");
+        assert_eq!(encoded.len() % 4, 0, "at {len} bytes");
+    }
+}
+
+#[test]
+fn an_armouring_a_buffer_cannot_hold_names_both_sizes_and_writes_nothing_usable() {
+    let mut out = [0_u8; 8];
+    assert!(matches!(
+        write_pem(CSR_LABEL, &[0_u8; 64], &mut out),
+        Err(PemDoesNotFit {
+            capacity: 8,
+            needed
+        }) if needed > 8
+    ));
+}
+
+/// Base64 as a test computes it, independently of the writer under test.
+fn base64(body: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in body.chunks(3) {
+        let mut group = [0u8; 3];
+        group[..chunk.len()].copy_from_slice(chunk);
+        let packed = (u32::from(group[0]) << 16) | (u32::from(group[1]) << 8) | u32::from(group[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[((packed >> (18 - 6 * index)) & 0x3f) as usize],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

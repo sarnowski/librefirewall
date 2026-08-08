@@ -68,7 +68,8 @@ use std::{
 };
 
 use lfw_log::{
-    DialOutcome, MAX_CAUSE_LEN, OnboardOutcome, RejectReason, TlsIncompatible, TlsRefusal,
+    DialOutcome, MAX_CAUSE_LEN, OnboardOutcome, OnboardRefusal, OnboardRoute, RejectReason,
+    TlsIncompatible, TlsRefusal,
 };
 use lfw_metrics::{
     ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, RULE_HITS,
@@ -246,7 +247,7 @@ pub(crate) fn check(root: &Path, repository: &Path) -> Result<(), String> {
         println!(
             "reference: {CONSOLE_PAGE} and {METRICS_PAGE} agree with the code they describe: \
              every refusal cause token, every `rejected=` reason, every `dial-outcome=` token, \
-             every token the onboarding port's three vocabularies carry, and every metric family with its type, labels and publishing domains; and every count \
+             every token the onboarding port's five vocabularies carry, and every metric family with its type, labels and publishing domains; and every count \
              {STATUS_DETAIL_PAGE} states about the gate agrees with the list it is about"
         );
         return Ok(());
@@ -732,6 +733,26 @@ fn check_onboarding_vocabularies(console: &str, findings: &mut Vec<String>) {
             total: "refusals:",
             code: "lfw_log::TlsRefusal",
             tokens: &TlsRefusal::ALL.map(TlsRefusal::name),
+        },
+    );
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["onboarding resource", "what it means"],
+            total: "resources:",
+            code: "lfw_log::OnboardRoute",
+            tokens: &OnboardRoute::ALL.map(OnboardRoute::name),
+        },
+    );
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["request refusal", "what it means"],
+            total: "request refusals:",
+            code: "lfw_log::OnboardRefusal",
+            tokens: &OnboardRefusal::ALL.map(OnboardRefusal::name),
         },
     );
 }

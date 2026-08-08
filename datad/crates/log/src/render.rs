@@ -427,6 +427,28 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             write_offer(cursor, " onboard-tls-groups=", points, *offered)?;
             write!(cursor, " onboard-tls-groups-offered={offered}")
         }
+        // The request surface's three, under a key of their own rather than
+        // `onboard-tls-`'s: they are a protocol above the record layer, and a
+        // reader grepping one boot's handshakes must not also get its requests.
+        DomainDetail::OnboardingServed { route, bytes } => {
+            write!(cursor, " onboard-http={route} onboard-http-bytes={bytes}")
+        }
+        DomainDetail::OnboardingRequest {
+            refusal,
+            status,
+            held,
+        } => write!(
+            cursor,
+            " onboard-http-refused={refusal} onboard-http-status={status} \
+             onboard-http-held={held}"
+        ),
+        DomainDetail::OnboardingThrottled {
+            strikes,
+            wait_millis,
+        } => write!(
+            cursor,
+            " onboard-http-strikes={strikes} onboard-http-wait={wait_millis}"
+        ),
         // Decimal, unlike a refusal's hexadecimal numbers below: these are
         // sequence numbers, and a peer's own capture and this appliance's
         // console are compared digit for digit.
@@ -492,7 +514,8 @@ mod tests {
     use crate::event::Primitive;
     use crate::event::{
         ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, NextHopVia,
-        ObjectKind, OnboardEnd, OnboardOutcome, RejectReason, TlsIncompatible, TlsRefusal, Value,
+        ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, RejectReason,
+        TlsIncompatible, TlsRefusal, Value,
     };
     use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
     use net_headers::{Ipv4Address, MacAddress};
@@ -1540,6 +1563,19 @@ mod tests {
                 points: [u16::MAX; crate::MAX_OFFERED_POINTS],
                 offered: u16::MAX,
             },
+            DomainDetail::OnboardingServed {
+                route: OnboardRoute::CertificateRequest,
+                bytes: u64::MAX,
+            },
+            DomainDetail::OnboardingRequest {
+                refusal: OnboardRefusal::StrayCarriageReturn,
+                status: u16::MAX,
+                held: u64::MAX,
+            },
+            DomainDetail::OnboardingThrottled {
+                strikes: u64::MAX,
+                wait_millis: u64::MAX,
+            },
         ];
         for detail in [
             RefusalDetail::None,
@@ -1727,6 +1763,25 @@ mod tests {
             }),
             any::<([u16; crate::MAX_OFFERED_POINTS], u16)>().prop_map(|(points, offered)| {
                 DomainDetail::OnboardingGroups { points, offered }
+            }),
+            ((0..OnboardRoute::ALL.len()), any::<u64>()).prop_map(|(route, bytes)| {
+                DomainDetail::OnboardingServed {
+                    route: OnboardRoute::ALL[route],
+                    bytes,
+                }
+            }),
+            ((0..OnboardRefusal::ALL.len()), any::<(u16, u64)>()).prop_map(
+                |(refusal, (status, held))| DomainDetail::OnboardingRequest {
+                    refusal: OnboardRefusal::ALL[refusal],
+                    status,
+                    held,
+                }
+            ),
+            any::<(u64, u64)>().prop_map(|(strikes, wait_millis)| {
+                DomainDetail::OnboardingThrottled {
+                    strikes,
+                    wait_millis,
+                }
             }),
             (
                 (0..causes.len()),

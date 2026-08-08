@@ -163,8 +163,8 @@ pub const ROUTE_STAGE_DROP_REASONS: [&str; 9] = [
 /// Status codes the management server can answer with, in the order
 /// [`HttpSample::responses`] holds them; `lfw_http::Status::ALL` is the same set
 /// and a test in `lfw_ip_endpoint` holds the two together.
-pub const HTTP_STATUSES: [&str; 10] = [
-    "200", "400", "404", "405", "408", "413", "414", "431", "503", "505",
+pub const HTTP_STATUSES: [&str; 11] = [
+    "200", "400", "404", "405", "408", "413", "414", "429", "431", "503", "505",
 ];
 
 /// Every writing domain's own account of its log ring.
@@ -1166,7 +1166,7 @@ pub struct OnboardSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 140;
+pub const MANAGEMENT_SLOTS: usize = 141;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1679,6 +1679,7 @@ impl ManagementSample {
         s(&HTTP_RESPONSES, &[Label::new("status", "408")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "413")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "414")]),
+        s(&HTTP_RESPONSES, &[Label::new("status", "429")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "431")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "503")]),
         s(&HTTP_RESPONSES, &[Label::new("status", "505")]),

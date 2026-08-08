@@ -85,7 +85,8 @@ use wire::{
     LOG_CAUSE_BYTES, LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT,
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
     LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_ONBOARD_END_COUNT,
-    LOG_ONBOARD_OUTCOME_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
+    LOG_ONBOARD_OUTCOME_COUNT, LOG_ONBOARD_REFUSAL_COUNT, LOG_ONBOARD_ROUTE_COUNT,
+    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
     LOG_TLS_INCOMPATIBLE_COUNT, LOG_TLS_REFUSAL_COUNT, LogRecord, LogRecordError, LogText,
     TextImage, ValueImage,
 };
@@ -148,7 +149,10 @@ const DETAIL_ONBOARDING_ALERT: u8 = 31;
 const DETAIL_ONBOARDING_BACKLOGGED: u8 = 32;
 const DETAIL_ONBOARDING_SUITES: u8 = 33;
 const DETAIL_ONBOARDING_GROUPS: u8 = 34;
-const DETAIL_COUNT: u8 = 35;
+const DETAIL_ONBOARDING_SERVED: u8 = 35;
+const DETAIL_ONBOARDING_REQUEST: u8 = 36;
+const DETAIL_ONBOARDING_THROTTLED: u8 = 37;
+const DETAIL_COUNT: u8 = 38;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -586,7 +590,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ONBOARDING_ENDED | DETAIL_ONBOARDING_INCOMPATIBLE
                 | DETAIL_ONBOARDING_REFUSED | DETAIL_ONBOARDING_ALERT
                 | DETAIL_ONBOARDING_BACKLOGGED | DETAIL_ONBOARDING_SUITES
-                | DETAIL_ONBOARDING_GROUPS => {
+                | DETAIL_ONBOARDING_GROUPS | DETAIL_ONBOARDING_SERVED
+                | DETAIL_ONBOARDING_REQUEST | DETAIL_ONBOARDING_THROTTLED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -858,6 +863,23 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // carry them, so no bit pattern of those is refusable, and what is left
         // is the count of how many the client really listed.
         DETAIL_ONBOARDING_SUITES | DETAIL_ONBOARDING_GROUPS => wide_code_point(record.operands[2]),
+        // The request surface's three. The served one ranges its resource
+        // token and nothing else; the refused one ranges its cause token and
+        // then the status, which is rendered as a number and so is held to the
+        // sixteen bits one has; the limiter's two words are tallies and no bit
+        // pattern of either is refusable.
+        DETAIL_ONBOARDING_SERVED => (record.operands[0]
+            >= u64::from(LOG_ONBOARD_ROUTE_COUNT))
+        .then_some(LogRecordError::OnboardRouteUnknown {
+            route: record.operands[0],
+        }),
+        DETAIL_ONBOARDING_REQUEST => (record.operands[0]
+            >= u64::from(LOG_ONBOARD_REFUSAL_COUNT))
+        .then_some(LogRecordError::OnboardRefusalUnknown {
+            refusal: record.operands[0],
+        })
+        .or_else(|| wide_code_point(record.operands[1])),
+        DETAIL_ONBOARDING_THROTTLED => None,
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the
@@ -1605,6 +1627,33 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The request surface's three, whose fields are all distinct for the
+            // reason the offer seeds' points are: a field read out of the wrong
+            // word survives a symmetric fixture and nothing else.
+            (
+                "valid_domain_onboarding_served",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_SERVED,
+                    operands: [1, 431, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_request",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_REQUEST,
+                    operands: [3, 404, 2047, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_onboarding_throttled",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ONBOARDING_THROTTLED,
+                    operands: [6, 32_000, 0, 0],
+                    ..domain_record()
+                }),
+            ),
             // Every byte the writer could set, set.
             ("every_byte_set", vec![0xFF; RECORD_BYTES]),
         ];
@@ -1771,6 +1820,27 @@ mod tests {
             &|token| LogRecord {
                 detail: DETAIL_ONBOARDING_REFUSED,
                 operands: [5, u64::from(token), 0, 0],
+                ..domain_record()
+            },
+        );
+        // And the request surface's two, each on the detail that leads with it.
+        pair(
+            "onboard_route_at_its_last_token",
+            "onboard_route_one_past_its_last_token",
+            LOG_ONBOARD_ROUTE_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDING_SERVED,
+                operands: [u64::from(token), 0, 0, 0],
+                ..domain_record()
+            },
+        );
+        pair(
+            "onboard_refusal_at_its_last_token",
+            "onboard_refusal_one_past_its_last_token",
+            LOG_ONBOARD_REFUSAL_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_ONBOARDING_REQUEST,
+                operands: [u64::from(token), 0, 0, 0],
                 ..domain_record()
             },
         );

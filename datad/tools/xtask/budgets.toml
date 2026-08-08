@@ -61,9 +61,9 @@
 "crates/flow/src/tcp.rs" = 0.4104
 "crates/flow/src/timeout.rs" = 0.6667
 "crates/hpet/src/lib.rs" = 0.5630
-"crates/http/src/lib.rs" = 0.5316
+"crates/http/src/lib.rs" = 0.5285
 "crates/http/src/request.rs" = 0.2944
-"crates/http/src/response.rs" = 0.3135
+"crates/http/src/response.rs" = 0.3221
 "crates/ip-endpoint/src/http.rs" = 0.3402
 "crates/ip-endpoint/src/lib.rs" = 0.3214
 "crates/ip-endpoint/src/neighbour.rs" = 0.4247
@@ -71,12 +71,12 @@
 "crates/ip-endpoint/src/outbound.rs" = 0.4012
 "crates/ip-endpoint/src/route.rs" = 0.5247
 "crates/log/src/console.rs" = 0.5084
-"crates/log/src/detail.rs" = 0.5719
-"crates/log/src/event.rs" = 0.4314
+"crates/log/src/detail.rs" = 0.5770
+"crates/log/src/event.rs" = 0.4524
 "crates/log/src/identifier.rs" = 0.2775
 "crates/log/src/lib.rs" = 0.3987
-"crates/log/src/record.rs" = 0.1437
-"crates/log/src/render.rs" = 0.2243
+"crates/log/src/record.rs" = 0.1423
+"crates/log/src/render.rs" = 0.2209
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
 "crates/metrics/src/catalog.rs" = 0.1198
@@ -89,6 +89,10 @@
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
 "crates/nic-driver-core/src/port.rs" = 0.4521
+"crates/onboarding/src/lib.rs" = 0.6981
+"crates/onboarding/src/limiter.rs" = 0.4808
+"crates/onboarding/src/page.rs" = 0.3652
+"crates/onboarding/src/surface.rs" = 0.3182
 "crates/packet-buffer/src/lib.rs" = 0.4529
 "crates/pcapng/src/lib.rs" = 0.2777
 "crates/pd-runtime/src/clock.rs" = 0.6393
@@ -138,8 +142,8 @@
 "crates/wire/src/config_rule.rs" = 0.3961
 "crates/wire/src/download.rs" = 0.3633
 "crates/wire/src/image.rs" = 0.3106
-"crates/wire/src/lib.rs" = 0.2698
-"crates/wire/src/log_record.rs" = 0.2595
+"crates/wire/src/lib.rs" = 0.2697
+"crates/wire/src/log_record.rs" = 0.2586
 "crates/wire/src/log_ring.rs" = 0.4271
 "crates/wire/src/log_slot.rs" = 0.1088
 "crates/wire/src/relay.rs" = 0.4034
@@ -147,8 +151,9 @@
 "crates/wire/src/submission.rs" = 0.3286
 "crates/wire/src/tap.rs" = 0.3151
 "crates/x509/src/der.rs" = 0.2609
-"crates/x509/src/lib.rs" = 0.6512
-"crates/x509/src/profile.rs" = 0.2810
+"crates/x509/src/lib.rs" = 0.6222
+"crates/x509/src/pem.rs" = 0.4051
+"crates/x509/src/profile.rs" = 0.3008
 "crates/x509/src/time.rs" = 0.2625
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
@@ -158,7 +163,7 @@
 "pds/console/src/main.rs" = 0.4926
 "pds/crypto/src/arena.rs" = 0.4566
 "pds/crypto/src/delegate.rs" = 0.5071
-"pds/crypto/src/main.rs" = 0.3857
+"pds/crypto/src/main.rs" = 0.3925
 "pds/forwarder/src/main.rs" = 0.4667
 "pds/hardware-probe/src/main.rs" = 0.4226
 "pds/management/src/entropy.rs" = 0.6489
@@ -181,6 +186,7 @@
 "crates/metrics" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 3
+"crates/onboarding" = 0
 "crates/packet-buffer" = 3
 "crates/pcapng" = 0
 "crates/pd-runtime" = 7
@@ -221,6 +227,7 @@
 "crates/metrics" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 1
+"crates/onboarding" = 0
 "crates/packet-buffer" = 3
 "crates/pcapng" = 0
 "crates/pd-runtime" = 2
@@ -261,6 +268,7 @@
 "crates/metrics" = 0
 "crates/net-headers" = 0
 "crates/nic-driver-core" = 0
+"crates/onboarding" = 0
 "crates/packet-buffer" = 1
 "crates/pcapng" = 0
 "crates/pd-runtime" = 0

@@ -27,7 +27,8 @@ use lfw_clock::UtcNanos;
 use net_headers::Ipv4Address;
 
 use crate::event::{
-    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, Primitive, TlsIncompatible, TlsRefusal,
+    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Primitive,
+    TlsIncompatible, TlsRefusal,
 };
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
@@ -526,6 +527,45 @@ pub enum DomainDetail<C = &'static str> {
     OnboardingGroups {
         points: [u16; MAX_OFFERED_POINTS],
         offered: u16,
+    },
+    /// One request the onboarding surface answered: which of its two resources
+    /// and how many bytes of body went back.
+    ///
+    /// A resource out of a closed vocabulary rather than the target a peer
+    /// wrote, on the same terms every other record here is under: the target is
+    /// adversary-chosen bytes and reaches no surface at all.
+    ///
+    /// It is per request and bounded by that: one response closes the
+    /// connection and one connection carries one request, so the record count
+    /// a peer can provoke is the session count the port already bounds and
+    /// already reports.
+    OnboardingServed {
+        route: OnboardRoute,
+        bytes: u64,
+    },
+    /// One request the onboarding surface refused, the status it was answered
+    /// with, and the head this end was holding when it decided.
+    ///
+    /// The status travels because it is what the peer was told and an
+    /// administrator comparing a client's complaint against this record is
+    /// comparing that number. `held` is this end's own arithmetic over what
+    /// arrived — never a byte of it — and it is what tells a bound that is too
+    /// tight from a peer that is misbehaving.
+    OnboardingRequest {
+        refusal: OnboardRefusal,
+        status: u16,
+        held: u64,
+    },
+    /// What the limiter is doing, written beside the refusal it caused.
+    ///
+    /// Its own record rather than two more fields, because it answers a
+    /// different question: not why this request was refused but **when the next
+    /// one will not be**. `wait` is milliseconds until the next allowance and
+    /// is always finite — the whole design of the limiter is that a lockout
+    /// expires — and `strikes` is how many consecutive refusals lengthened it.
+    OnboardingThrottled {
+        strikes: u64,
+        wait_millis: u64,
     },
     /// The two sequence numbers behind an unacceptable acknowledgement: what the
     /// peer claimed, and what this end had actually sent.

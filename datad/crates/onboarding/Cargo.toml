@@ -1,0 +1,21 @@
+[package]
+# The read-only surface an unprovisioned appliance serves over TLS: the page an
+# administrator lands on and the certificate signing request they carry to the
+# management application. Named for the phase rather than for HTTP, because
+# what it is is one step of onboarding and HTTP is how that step is spelled.
+name = "lfw-onboarding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lfw-clock = { path = "../clock" }
+lfw-http = { path = "../http" }
+lfw-log = { path = "../log" }
+lfw-x509 = { path = "../x509" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

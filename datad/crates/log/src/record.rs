@@ -51,8 +51,8 @@ const DIGEST_BYTES: usize = 32;
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, OnboardOutcome, Primitive, RejectReason, TlsIncompatible, TlsRefusal,
-    Value,
+    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Primitive, RejectReason,
+    TlsIncompatible, TlsRefusal, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -101,6 +101,8 @@ pub enum Vocabulary {
     OnboardOutcome,
     TlsIncompatible,
     TlsRefusal,
+    OnboardRoute,
+    OnboardRefusal,
 }
 
 impl Vocabulary {
@@ -123,6 +125,8 @@ impl Vocabulary {
             Self::OnboardOutcome => OnboardOutcome::ALL.len(),
             Self::TlsIncompatible => TlsIncompatible::ALL.len(),
             Self::TlsRefusal => TlsRefusal::ALL.len(),
+            Self::OnboardRoute => OnboardRoute::ALL.len(),
+            Self::OnboardRefusal => OnboardRefusal::ALL.len(),
         }
     }
 
@@ -145,6 +149,8 @@ impl Vocabulary {
             Self::OnboardOutcome => "onboarding handshake outcome",
             Self::TlsIncompatible => "TLS incompatibility",
             Self::TlsRefusal => "TLS refusal",
+            Self::OnboardRoute => "onboarding resource",
+            Self::OnboardRefusal => "onboarding request refusal",
         }
     }
 }
@@ -216,6 +222,16 @@ fn tls_incompatible_of(token: u8) -> Result<TlsIncompatible, DecodeError> {
 /// A refusal token as the member it selects, on the same terms.
 fn tls_refusal_of(token: u8) -> Result<TlsRefusal, DecodeError> {
     variant(TlsRefusal::ALL, Vocabulary::TlsRefusal, token)
+}
+
+/// A resource token as the member it selects, on the same terms.
+fn onboard_route_of(token: u8) -> Result<OnboardRoute, DecodeError> {
+    variant(OnboardRoute::ALL, Vocabulary::OnboardRoute, token)
+}
+
+/// A request-refusal token as the member it selects, on the same terms.
+fn onboard_refusal_of(token: u8) -> Result<OnboardRefusal, DecodeError> {
+    variant(OnboardRefusal::ALL, Vocabulary::OnboardRefusal, token)
 }
 
 fn identifier(text: &CheckedIdentifier, which: LogText) -> Result<Identifier, DecodeError> {
@@ -623,6 +639,29 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::OnboardingGroups.to_bits();
                     record.operands = offer_words(points, *offered);
                 }
+                // The three the request surface above the record layer
+                // produces. Each leads with its own vocabulary's token, on
+                // `OnboardingHandshake`'s order, and what follows is the fact
+                // that token holds.
+                DomainDetail::OnboardingServed { route, bytes } => {
+                    record.detail = LogDetailKind::OnboardingServed.to_bits();
+                    record.operands = [*route as u64, *bytes, 0, 0];
+                }
+                DomainDetail::OnboardingRequest {
+                    refusal,
+                    status,
+                    held,
+                } => {
+                    record.detail = LogDetailKind::OnboardingRequest.to_bits();
+                    record.operands = [*refusal as u64, u64::from(*status), *held, 0];
+                }
+                DomainDetail::OnboardingThrottled {
+                    strikes,
+                    wait_millis,
+                } => {
+                    record.detail = LogDetailKind::OnboardingThrottled.to_bits();
+                    record.operands = [*strikes, *wait_millis, 0, 0];
+                }
                 DomainDetail::Delegated {
                     device,
                     signatures,
@@ -970,6 +1009,30 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             points: *points,
             offered: *offered,
         },
+        // The request surface's three, on the handshake records' terms: `wire`
+        // ranged the token to the vocabulary's width and this crate maps it, so
+        // the only refusal any of them can earn is a token inside that bound
+        // naming no variant this build has.
+        CheckedDetail::OnboardingServed { route, bytes } => DomainDetail::OnboardingServed {
+            route: onboard_route_of(*route)?,
+            bytes: *bytes,
+        },
+        CheckedDetail::OnboardingRequest {
+            refusal,
+            status,
+            held,
+        } => DomainDetail::OnboardingRequest {
+            refusal: onboard_refusal_of(*refusal)?,
+            status: *status,
+            held: *held,
+        },
+        CheckedDetail::OnboardingThrottled {
+            strikes,
+            wait_millis,
+        } => DomainDetail::OnboardingThrottled {
+            strikes: *strikes,
+            wait_millis: *wait_millis,
+        },
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and both counts are tallies, so every bit pattern
         // of the four words is one a delegating domain could have read.
@@ -1092,6 +1155,25 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::OnboardingGroups { points, offered } => {
                         DomainDetail::OnboardingGroups { points, offered }
                     }
+                    DomainDetail::OnboardingServed { route, bytes } => {
+                        DomainDetail::OnboardingServed { route, bytes }
+                    }
+                    DomainDetail::OnboardingRequest {
+                        refusal,
+                        status,
+                        held,
+                    } => DomainDetail::OnboardingRequest {
+                        refusal,
+                        status,
+                        held,
+                    },
+                    DomainDetail::OnboardingThrottled {
+                        strikes,
+                        wait_millis,
+                    } => DomainDetail::OnboardingThrottled {
+                        strikes,
+                        wait_millis,
+                    },
                     DomainDetail::Operation { primitive, cycles } => {
                         DomainDetail::Operation { primitive, cycles }
                     }
@@ -1345,6 +1427,8 @@ const _: () = {
     assert!(OnboardOutcome::ALL.len() == wire::LOG_ONBOARD_OUTCOME_COUNT as usize);
     assert!(TlsIncompatible::ALL.len() == wire::LOG_TLS_INCOMPATIBLE_COUNT as usize);
     assert!(TlsRefusal::ALL.len() == wire::LOG_TLS_REFUSAL_COUNT as usize);
+    assert!(OnboardRoute::ALL.len() == wire::LOG_ONBOARD_ROUTE_COUNT as usize);
+    assert!(OnboardRefusal::ALL.len() == wire::LOG_ONBOARD_REFUSAL_COUNT as usize);
     assert!(crate::MAX_OFFERED_POINTS == wire::LOG_OFFERED_POINTS);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);

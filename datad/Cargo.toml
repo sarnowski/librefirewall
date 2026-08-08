@@ -21,6 +21,7 @@ members = [
     "crates/flow",
     "crates/metrics",
     "crates/http",
+    "crates/onboarding",
     "crates/pcapng",
     "crates/blk",
     "crates/capture-ring",

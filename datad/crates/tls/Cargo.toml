@@ -27,6 +27,12 @@ rustls = { version = "0.23.43", default-features = false, features = [
 
 [dev-dependencies]
 proptest = { workspace = true }
+# **A test dependency and never a production one.** This crate terminates the
+# record layer and deliberately knows nothing about the protocol above it; what
+# the one test using this proves is that the two compose the way the protection
+# domain wires them, which is a claim neither crate can make alone. The
+# production dependency runs the other way and stays absent.
+lfw-onboarding = { path = "../onboarding" }
 
 [lints]
 workspace = true

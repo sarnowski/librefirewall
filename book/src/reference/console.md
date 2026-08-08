@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -58,7 +58,7 @@ written waits forever:
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **two** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, and the second carries `fingerprint=`. Those two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. `refused` carries the refusal group |
-| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **two** `delegated-device=` records carrying `delegated-signatures=` and `delegated-certificate=`, the first before that session and the second after it, whose count must have moved because the session's own signature was made in the other domain and whose certificate size must not have, one appliance having one certificate; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, per **onboarding session** this domain terminated: a `ready` carrying `onboard-tls=`, which says how the handshake on that session ended and carries whatever that ending holds — up to two more `ready` records with it where the ending is an offer this appliance had nothing in common with, or an arena that ran short — and then a `ready` carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`. Where it refused the session at the relay, a `ready` carrying the refusal group comes first. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
+| `crypto` | `starting`, then a run of `negotiated` records, then `ready` — or `starting` then `refused` | the first `negotiated` carries `features=`, the CPUID words the part was accepted on; then one per primitive carrying `primitive=` and `vectors=`; one per per-byte measured primitive carrying `primitive=` and `milli-cycles-per-byte=`; one per per-operation measured primitive carrying `primitive=` and `cycles-per-operation=`; then the session it established against itself, as `tls-version=` with `tls-suite=`, `tls-group=` with `tls-echoed=`, and `peer-device=`; and **three** `delegated-device=` records carrying `delegated-signatures=` and `delegated-certificate=`, the first before that session, the second after it and the third after the certificate signing request the onboarding surface serves was signed through the same channel, whose count must have moved at every step because those signatures were made in the other domain and whose certificate size must not have, one appliance having one certificate; and two `arena-bytes=` with `arena-bound=` records, the first the peak a session held against what the arena has and the second what a deliberately starved session was left with against what one phase needs. The single `ready` carries no tail: what it means is that every record before it held. After it, per **onboarding session** this domain terminated: a `ready` carrying `onboard-tls=`, which says how the handshake on that session ended and carries whatever that ending holds — up to two more `ready` records with it where the ending is an offer this appliance had nothing in common with, or an arena that ran short — and, per **request** an administrator's client made on the surface above that handshake, a `ready` carrying either `onboard-http=` — which resource went back — or `onboard-http-refused=` with the status the client was told, and a second `ready` beside a refusal the rate limiter caused saying how long the wait is; and then a `ready` carrying `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`. Where it refused the session at the relay, a `ready` carrying the refusal group comes first. It emits no `onboard-accepted=` record: that one is the port's, and this domain owns no port. **Its `onboard-ended=` is the ending the other domain told it**, so the two records of one session name the same party rather than this end guessing at what it cannot see. `refused` carries the refusal group |
 
 `console` is the domain that owns the serial device and renders every other domain's records, which
 makes its two records mean something different from the rest: they are the console reporting that it
@@ -237,15 +237,18 @@ node: an operator holding a silent appliance still has only the external act.
   **The certificate is a size and never the certificate itself.** A certificate is public, so there
   would be nothing unsafe about printing one; what makes it a number here is that 768 bytes of DER on
   a bounded ring would push out every record an operator can actually read. What the size is worth is
-  a comparison: it is the same on both records of a boot, because one appliance has one certificate.
+  a comparison: it is the same on every record of a boot, because one appliance has one certificate.
 
-  **The record appears twice on a boot and the pair is the claim.** The first is the direct proof —
-  the holder answered which key it holds, signed a fixed challenge, the signature verified under that
-  key, and the certificate it then handed over was found to carry that same key. The second follows a
-  completed TLS session whose server half ran under the delegated key, and its count must be higher:
-  the handshake's own signature was computed in the other domain, so a number that did not move would
-  mean the session signed some other way. Neither record carries a signature, a message, a key or a
-  certificate — a public name and three tallies are all that reaches this surface.
+  **The record appears three times on a boot and the sequence is the claim**, one per point the
+  delegation is really used. The first is the direct proof — the holder answered which key it holds,
+  signed a fixed challenge, the signature verified under that key, and the certificate it then handed
+  over was found to carry that same key. The second follows a completed TLS session whose server half
+  ran under the delegated key. The third follows the certificate signing request the onboarding
+  surface serves, which is composed once at bring-up and signed through the same channel. Each count
+  must be higher than the one before it: those two signatures were computed in the other domain, so a
+  number that did not move would mean that step signed some other way. No record carries a signature,
+  a message, a key or a certificate — a public name and three tallies are all that reaches this
+  surface.
 - `dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>` — **the
   channel this appliance reached *out* with, and what became of it.** Every other record on this
   channel is about traffic the appliance answered; this one is about a connection it originated, so
@@ -429,6 +432,68 @@ node: an operator holding a silent appliance still has only the external act.
   long list is reported as the first eight of it and the number it really sent. What to do with them
   is compare them against what this appliance has — one suite and one group — which the
   `crypto-profile` chapter states.
+- `onboard-http=<resource> onboard-http-bytes=<n>` — **one request the onboarding surface
+  answered**, and how many bytes of body went back. One record per request, and one request per
+  connection: every response closes the connection, so the number of these on a boot is the number
+  of things an administrator's client successfully asked for.
+
+  The resource is named out of a closed set and **never as the address the client typed**. A request
+  target is bytes whoever reached the port chose, and no such byte reaches a console line — which is
+  the same rule the handshake records above are written under.
+
+  `onboard-http=` is one of 2 resources:
+
+  | onboarding resource | what it means |
+  |---|---|
+  | `page` | the onboarding page, which carries this appliance's identifier and the fingerprint an administrator compares against the console. |
+  | `certificate-request` | the certificate signing request, as the certificate profile fixes it: PKCS#10, subject common name the device identifier, signed with the device key. |
+- `onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>` — **one request the
+  surface refused**, why, what the client was told, and how many bytes of head this appliance was
+  holding when it decided.
+
+  The status is here because it is what the client saw, so an administrator holding a client's
+  complaint against this line is comparing one number. `onboard-http-held=` is this appliance's own
+  arithmetic over what arrived — never a byte of it — and it is what separates a bound that is too
+  tight from a peer that is misbehaving.
+
+  **One token per cause, and that is the whole design of the list.** An administrator whose client
+  cannot get past this surface has the console and nothing else, so a token standing for "the
+  request was bad" would name none of the twenty ways it can be. The first five are the surface's
+  own decisions; the fifteen after them are the request parser's, one for one.
+
+  `onboard-http-refused=` is one of 20 request refusals:
+
+  | request refusal | what it means |
+  |---|---|
+  | `rate-limited` | the allowance was spent. The `onboard-http-strikes=` record beside it says how long the wait is, and **there is always a wait rather than a lockout** — a refusal that never expired would be a way to make an unonboarded appliance unonboardable from across a network. |
+  | `identity-absent` | the request arrived before this appliance had an identity to answer with, which is a boot whose cryptography never established. **Nothing about the request was wrong**; read the `domain=crypto` records above it. |
+  | `unknown-route` | the address names nothing this appliance serves. `POST /configuration.tar` reaches this today, the configuration upload not being served by this build. |
+  | `method-not-served` | the address names something, under a method it is not served with. Everything here is a `GET`. |
+  | `head-too-long` | the request head outgrew what may be accumulated before it ends. A peer that never stops writing one. |
+  | `bare-line-feed` | a line ended with a bare `LF`. Refused rather than tolerated: two parties disagreeing about where a line ends is how one request becomes two. |
+  | `stray-carriage-return` | a `CR` that no `LF` followed. |
+  | `malformed-request-line` | the request line is not three space-separated parts. |
+  | `malformed-method` | the method is not a token, or is longer than one may be. |
+  | `malformed-target` | the address is empty or carries a byte no address may — a control character among them. |
+  | `target-too-long` | the address is longer than one may be. |
+  | `unsupported-version` | a well-formed HTTP version that is not the one this surface speaks. A client pinned to HTTP/1.0 reaches this. |
+  | `malformed-version` | not an HTTP version at all. |
+  | `too-many-headers` | more header fields than one request may carry. |
+  | `malformed-header-name` | a field name that is not a token, longer than one may be, or a line with no colon in it. |
+  | `malformed-header-value` | a field value longer than one may be, or one carrying a byte a field value may not. |
+  | `obsolete-line-folding` | a continuation line, which a strict recipient refuses. |
+  | `body-not-accepted` | a body framed in a way that is not read — any transfer encoding, a repeated or non-decimal length, or a body on a method that may not carry one. **This surface takes no body at all**, so every body reaches this or the next. |
+  | `body-too-large` | a declared body length past what this surface holds, which is none. |
+  | `not-utf8` | bytes no string can hold, which a request head is never made of. |
+- `onboard-http-strikes=<n> onboard-http-wait=<n>` — **what the rate limiter is doing**, written
+  beside the one refusal it causes. `onboard-http-strikes=` is how many requests in a row have been
+  refused, and `onboard-http-wait=` is milliseconds until the next one will not be.
+
+  The wait is **always finite**, and both numbers stop growing: consecutive refusals lengthen the
+  interval up to a bound and no further, so the longest an administrator ever waits is that bound.
+  A node whose clock domain never published is not limited at all, which is deliberate — a limiter
+  with no clock cannot expire a refusal, and refusing for ever on the only port into an
+  unprovisioned appliance is worse than not limiting it.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -458,7 +523,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 19 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 48 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 51 the `crypto` domain
 raises, and 51 the `store` domain raises. A token outside all seven is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -627,6 +692,16 @@ of a vector's contents.
 | the signing delegation, where the key this domain authenticates under lives in another domain (`detail=` is the signature's length on `delegated-signature-invalid` and the certificate's length on `delegated-certificate-not-the-key`; the rest carry none) | `delegated-key-unanswered`, `delegated-key-refused`, `delegated-reply-faulted`, `delegated-key-absent`, `delegated-signature-refused`, `delegated-signature-invalid`, `delegated-certificate-unanswered`, `delegated-certificate-refused`, `delegated-certificate-faulted`, `delegated-certificate-not-the-key` |
 | the onboarding session this domain terminates, refused at the relay carrying it (`detail=` is the operation that named a session there was none of, or the length that was past what one item may carry; the rest carry none) | `relay-no-connection`, `relay-payload-too-long`, `relay-no-such-operation`, `relay-session-failed` |
 | a session opened on a boot whose cryptography never established (a `ready` record, no `detail=`) | `onboarding-cryptography-unproven` |
+| composing the identity the onboarding surface serves, which happens once at bring-up and never per request (none carries a `detail=`) | `onboarding-key-unencodable`, `onboarding-request-unsignable`, `onboarding-request-unarmourable` |
+
+**The three `onboarding-*` composition tokens are a bring-up failure and never a peer's doing.** The
+certificate signing request this appliance serves is written and signed **once**, before any peer can
+connect, so a domain that could not compose it refuses at boot rather than at a request — and what a
+peer can provoke by asking for the request is a copy of an array rather than a signature in the domain
+that holds this appliance's private key. `onboarding-key-unencodable` is a public key that would not
+encode, `onboarding-request-unsignable` is the key holder refusing the request's own signature, and
+`onboarding-request-unarmourable` is an encoded request that would not fit its armouring. Read all
+three beside the `delegated-*` group above them and the `domain=store` records on the same boot.
 
 **The `delegated-*` group is about the other domain**, and it is the one group here whose subject is
 not this domain's own code. This appliance's private key lives in the domain that owns the medium it

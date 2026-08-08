@@ -93,6 +93,14 @@ pub const LOG_TLS_INCOMPATIBLE_COUNT: u8 = 23;
 /// `lfw_log::TlsRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
 pub const LOG_TLS_REFUSAL_COUNT: u8 = 23;
 
+/// How many resources the onboarding request surface serves —
+/// `lfw_log::OnboardRoute::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_ONBOARD_ROUTE_COUNT: u8 = 2;
+
+/// How many ways a request on that surface may be refused —
+/// `lfw_log::OnboardRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_ONBOARD_REFUSAL_COUNT: u8 = 20;
+
 /// Code points of one kind an offer record carries —
 /// `lfw_log::MAX_OFFERED_POINTS`. Eight, which is [`LOG_OPERANDS`] halved:
 /// four sixteen-bit points ride in each of two words, most significant first,
@@ -248,6 +256,14 @@ pub enum LogDetailKind {
     /// listed, each eight code points and the number really offered.
     OnboardingSuites,
     OnboardingGroups,
+    /// The three the **request surface above the record layer** produces: a
+    /// request it answered, one it refused, and what the limiter is doing.
+    /// Three discriminants for [`Self::DialRoute`]'s reason — a served request
+    /// names a resource and a refused one names a cause out of a different
+    /// vocabulary, and the limiter's two numbers belong to neither.
+    OnboardingServed,
+    OnboardingRequest,
+    OnboardingThrottled,
 }
 
 impl LogDetailKind {
@@ -289,6 +305,9 @@ impl LogDetailKind {
             Self::OnboardingBacklogged => 32,
             Self::OnboardingSuites => 33,
             Self::OnboardingGroups => 34,
+            Self::OnboardingServed => 35,
+            Self::OnboardingRequest => 36,
+            Self::OnboardingThrottled => 37,
         }
     }
 
@@ -330,6 +349,9 @@ impl LogDetailKind {
             32 => Some(Self::OnboardingBacklogged),
             33 => Some(Self::OnboardingSuites),
             34 => Some(Self::OnboardingGroups),
+            35 => Some(Self::OnboardingServed),
+            36 => Some(Self::OnboardingRequest),
+            37 => Some(Self::OnboardingThrottled),
             _ => None,
         }
     }
@@ -952,6 +974,24 @@ impl LogRecord {
                 points: offered_points(self.operands[0], self.operands[1]),
                 offered: code_point(self.operands[2])?,
             },
+            // The request surface's three. The token word is ranged to its own
+            // vocabulary and the status to the sixteen bits a status code has;
+            // every count beside them is unranged on `Received`'s terms, each
+            // being a number of bytes or of refusals the emitting domain could
+            // have arrived at.
+            Some(LogDetailKind::OnboardingServed) => CheckedDetail::OnboardingServed {
+                route: onboard_route_token(self.operands[0])?,
+                bytes: self.operands[1],
+            },
+            Some(LogDetailKind::OnboardingRequest) => CheckedDetail::OnboardingRequest {
+                refusal: onboard_refusal_token(self.operands[0])?,
+                status: code_point(self.operands[1])?,
+                held: self.operands[2],
+            },
+            Some(LogDetailKind::OnboardingThrottled) => CheckedDetail::OnboardingThrottled {
+                strikes: self.operands[0],
+                wait_millis: self.operands[1],
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -1087,6 +1127,22 @@ fn tls_refusal_token(raw: u64) -> Result<u8, LogRecordError> {
     match u8::try_from(raw) {
         Ok(narrow) if narrow < LOG_TLS_REFUSAL_COUNT => Ok(narrow),
         _ => Err(LogRecordError::TlsRefusalUnknown { refusal: raw }),
+    }
+}
+
+/// A resource token carried in an operand word, on the same terms.
+fn onboard_route_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_ONBOARD_ROUTE_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::OnboardRouteUnknown { route: raw }),
+    }
+}
+
+/// A request-refusal token carried in an operand word, on the same terms.
+fn onboard_refusal_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_ONBOARD_REFUSAL_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::OnboardRefusalUnknown { refusal: raw }),
     }
 }
 
@@ -1597,6 +1653,24 @@ pub enum CheckedDetail {
         points: [u16; LOG_OFFERED_POINTS],
         offered: u16,
     },
+    /// One request the onboarding surface answered, and the body it went back
+    /// with.
+    OnboardingServed {
+        route: u8,
+        bytes: u64,
+    },
+    /// One it refused: why, the status the peer was told, and the head this end
+    /// held when it decided.
+    OnboardingRequest {
+        refusal: u8,
+        status: u16,
+        held: u64,
+    },
+    /// What the limiter is doing, beside the refusal it caused.
+    OnboardingThrottled {
+        strikes: u64,
+        wait_millis: u64,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1694,6 +1768,12 @@ pub enum LogRecordError {
         incompatible: u64,
     },
     TlsRefusalUnknown {
+        refusal: u64,
+    },
+    OnboardRouteUnknown {
+        route: u64,
+    },
+    OnboardRefusalUnknown {
         refusal: u64,
     },
     /// An operand carrying a TCP sequence number wider than the thirty-two bits
@@ -1802,6 +1882,15 @@ impl fmt::Display for LogRecordError {
             Self::TlsRefusalUnknown { refusal } => write!(
                 f,
                 "TLS refusal token {refusal} is not below {LOG_TLS_REFUSAL_COUNT}"
+            ),
+            Self::OnboardRouteUnknown { route } => write!(
+                f,
+                "onboarding resource token {route} is not below {LOG_ONBOARD_ROUTE_COUNT}"
+            ),
+            Self::OnboardRefusalUnknown { refusal } => write!(
+                f,
+                "onboarding request refusal token {refusal} is not below \
+                 {LOG_ONBOARD_REFUSAL_COUNT}"
             ),
             Self::DialOutcomeUnknown { outcome } => write!(
                 f,

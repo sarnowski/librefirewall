@@ -402,6 +402,22 @@ fn every_domain_detail_shape_survives_the_crossing() {
             ],
             offered: 8,
         },
+        // And the request surface's three, on the same terms: no two fields of
+        // one shape are equal, so a field read out of the wrong operand word
+        // fails here.
+        DomainDetail::OnboardingServed {
+            route: OnboardRoute::CertificateRequest,
+            bytes: 431,
+        },
+        DomainDetail::OnboardingRequest {
+            refusal: OnboardRefusal::ObsoleteLineFolding,
+            status: 405,
+            held: 2047,
+        },
+        DomainDetail::OnboardingThrottled {
+            strikes: 6,
+            wait_millis: 32_000,
+        },
     ];
     for operands in [
         RefusalDetail::None,
@@ -969,6 +985,19 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
             .prop_map(|(points, offered)| DomainDetail::OnboardingSuites { points, offered }),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()
             .prop_map(|(points, offered)| DomainDetail::OnboardingGroups { points, offered }),
+        (pick(OnboardRoute::ALL), any::<u64>())
+            .prop_map(|(route, bytes)| DomainDetail::OnboardingServed { route, bytes }),
+        (pick(OnboardRefusal::ALL), any::<(u16, u64)>()).prop_map(|(refusal, (status, held))| {
+            DomainDetail::OnboardingRequest {
+                refusal,
+                status,
+                held,
+            }
+        }),
+        any::<(u64, u64)>().prop_map(|(strikes, wait_millis)| DomainDetail::OnboardingThrottled {
+            strikes,
+            wait_millis,
+        }),
         (
             any_cause(),
             prop_oneof![

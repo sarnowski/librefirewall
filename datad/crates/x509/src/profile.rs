@@ -239,13 +239,41 @@ pub fn write_csr(
     key: &P256SecretKey,
     out: &mut [u8; MAX_CSR_LEN],
 ) -> Result<usize, ProfileError> {
-    let public = key.public_key();
+    write_csr_signed(subject, &key.public_key(), out, |body, signature| {
+        key.sign(body, signature).map_err(|_| ())
+    })
+}
+
+/// The same request, signed by something that is not a key this crate holds.
+///
+/// [`write_csr`] above is this with the key beside the caller; this is the
+/// shape the appliance really uses, because the scalar the request must be
+/// signed under lives in the protection domain that owns the medium it is
+/// written on and reaches this one only as a call. The public point is
+/// therefore a parameter rather than derived: the only party that can say
+/// which point the signer will sign under is the signer.
+///
+/// `sign` is handed the `CertificationRequestInfo` and a fixed buffer, and
+/// answers the DER signature's length. Its error carries nothing — a signer
+/// that will not sign gives a caller here nothing to act on, and a richer one
+/// would be a description of another domain's internals travelling on a path
+/// whose product faces the network.
+///
+/// # Errors
+/// [`ProfileError`] where the encoding does not fit or the signature was
+/// refused or did not fit its fixed buffer.
+pub fn write_csr_signed(
+    subject: &[u8],
+    public_key: &[u8; P256_PUBLIC_LEN],
+    out: &mut [u8; MAX_CSR_LEN],
+    sign: impl FnOnce(&[u8], &mut [u8]) -> Result<usize, ()>,
+) -> Result<usize, ProfileError> {
     let mut info = [0_u8; MAX_CSR_LEN];
     let mut writer = Writer::new(&mut info);
     writer.constructed(SEQUENCE, |request| {
         request.unsigned_integer(&[0])?;
         write_name(request, subject)?;
-        write_spki(request, &public)?;
+        write_spki(request, public_key)?;
         // An empty `[0] IMPLICIT SET OF Attribute`, which is where a request's
         // extensions would go and where this profile puts none.
         request.constructed(context(0), |_| Ok(()))
@@ -254,10 +282,10 @@ pub fn write_csr(
     let body = info.get(..info_len).unwrap_or_default();
 
     let mut signature = [0_u8; P256_MAX_SIGNATURE_LEN];
-    let signature_len = key
-        .sign(body, &mut signature)
-        .map_err(|_| ProfileError::Signature)?;
-    let signature = signature.get(..signature_len).unwrap_or_default();
+    let signature_len = sign(body, &mut signature).map_err(|()| ProfileError::Signature)?;
+    let signature = signature
+        .get(..signature_len)
+        .ok_or(ProfileError::Signature)?;
 
     let mut writer = Writer::new(out);
     writer.constructed(SEQUENCE, |request| {

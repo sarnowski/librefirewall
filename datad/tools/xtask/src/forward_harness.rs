@@ -93,6 +93,7 @@ use crate::dial_contract;
 use crate::management_contract::{self, ManagementInjection};
 use crate::metrics_contract::{self, Scrape};
 use crate::onboard_contract;
+use crate::onboard_request_contract;
 use crate::onboard_tls_contract;
 use crate::qemu::{GuestNic, every_guest_nic};
 use crate::recording_contract::{self, Download};
@@ -3085,7 +3086,7 @@ pub enum ManagementBacking {
     /// frame level is asserted on this wire: the harness never sees one.
     UserNetwork {
         /// The loopback port on the host side of the forward to the request
-        /// surface, reserved by [`reserve_host_port`] before QEMU is told about
+        /// surface, reserved by [`reserve_host_ports`] before QEMU is told about
         /// it.
         host_port: u16,
         /// The same, for the onboarding port. Both forwards exist on every
@@ -3209,23 +3210,52 @@ fn user_netdev(id: &str, management: &ManagementPort, host_port: u16, onboard_po
     )
 }
 
-/// Take a loopback port nothing else holds, and let it go again.
+/// Take `N` loopback ports nothing else holds, and let them all go at once.
 ///
 /// The same trick the NIC listeners use, for the same reason: a fixed port would
 /// collide with whatever else is running on a shared runner. There is a window
-/// between releasing it and QEMU binding it, and it is accepted — the
-/// alternative is handing QEMU a listening socket, which its `hostfwd` does not
+/// between releasing them and QEMU binding them, and it is accepted — the
+/// alternative is handing QEMU listening sockets, which its `hostfwd` does not
 /// take.
 ///
+/// **Every listener is held until every port has been taken**, and that is the
+/// whole reason this reserves a set rather than being called once per port. A
+/// function that bound one socket, read its number and dropped it hands the next
+/// caller a port the kernel has just freed — which it readily reuses, so two
+/// consecutive calls can answer the same number. QEMU then refuses the second
+/// forwarding rule and exits before a single frame crosses, which reads as a boot
+/// that failed rather than as two rules for one port.
+///
 /// # Errors
-/// A port that could not be bound.
-pub fn reserve_host_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|error| format!("reserve a host port for the management forward: {error}"))?;
-    listener
-        .local_addr()
-        .map(|address| address.port())
-        .map_err(|error| format!("read the reserved host port: {error}"))
+/// A port that could not be bound, or a set with a repeat in it — which cannot
+/// arise while the listeners are alive and is answered rather than asserted,
+/// because a duplicate reaching QEMU is the failure this exists to prevent.
+pub fn reserve_host_ports<const N: usize>() -> Result<[u16; N], String> {
+    let mut held = Vec::with_capacity(N);
+    let mut ports = [0_u16; N];
+    for port in &mut ports {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("reserve a host port for the management forward: {error}"))?;
+        *port = listener
+            .local_addr()
+            .map(|address| address.port())
+            .map_err(|error| format!("read the reserved host port: {error}"))?;
+        held.push(listener);
+    }
+    for (at, port) in ports.iter().enumerate() {
+        if ports
+            .iter()
+            .skip(at.saturating_add(1))
+            .any(|other| other == port)
+        {
+            return Err(format!(
+                "the host reserved port {port} twice for one boot's forwards, which QEMU refuses \
+                 as a duplicate forwarding rule. The listeners are held until every port is \
+                 taken, so this is the host handing back a port it had not freed"
+            ));
+        }
+    }
+    Ok(ports)
 }
 
 /// One opaque frame for the management port: addressed at L2 to the port's own
@@ -6011,6 +6041,9 @@ pub struct Booted {
     /// it, in the order it ran them. Empty on every boot whose subject is
     /// something else.
     pub handshakes: Vec<onboard_tls_contract::Attempt>,
+    /// The requests real clients made on the surface above those handshakes,
+    /// where the boot ran any.
+    pub requests: Vec<onboard_request_contract::Attempt>,
     /// What the station this harness played on the onboarding port observed, on
     /// the three scenarios that open a session there. `None` everywhere else.
     ///
@@ -6126,6 +6159,7 @@ fn run_boot(
     let mut scrapes: Vec<Scrape> = Vec::new();
     let mut recordings: Vec<Download> = Vec::new();
     let mut handshakes: Vec<onboard_tls_contract::Attempt> = Vec::new();
+    let mut requests: Vec<onboard_request_contract::Attempt> = Vec::new();
     // What the configuration submission proved, on the one scenario that makes one.
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
@@ -6925,6 +6959,73 @@ fn run_boot(
                                 ));
                             }
                         }
+                        // And, where the scenario's subject is the surface
+                        // above that handshake, the requests an administrator
+                        // makes on it. After the handshake block, because a
+                        // boot that runs one runs neither the other.
+                        if test.onboard.requests() {
+                            // The console up to here, which is where the
+                            // fingerprint every one of these clients pins to
+                            // was printed. Read from the appliance's own output
+                            // rather than recomputed, so what is pinned is what
+                            // an administrator would have read.
+                            drain(&serial_receiver, &mut output);
+                            let printed = onboard_request_contract::identity(&output);
+                            let (_, fingerprint) = match printed {
+                                Ok(identity) => identity,
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            };
+                            let into = log_path.parent().unwrap_or(Path::new("."));
+                            let driven = onboard_request_contract::drive(
+                                onboard_port,
+                                &fingerprint,
+                                into,
+                                || onboard_tls_contract::nudge(host_port),
+                            );
+                            match driven {
+                                Ok(made) => requests = made,
+                                Err(verdict) => {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                            // The same bounded wait the handshakes take, and
+                            // for the same reason: a request's record is
+                            // written on the pass that decided it, which runs
+                            // after the client's connection is gone.
+                            let mut reported = false;
+                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                                drain(&serial_receiver, &mut output);
+                                if onboard_request_contract::reported(&output) {
+                                    reported = true;
+                                    break;
+                                }
+                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
+                                    break 'run Err(format!(
+                                        "{verdict}; see {}",
+                                        log_path.display()
+                                    ));
+                                }
+                            }
+                            drain(&serial_receiver, &mut output);
+                            if !reported && !onboard_request_contract::reported(&output) {
+                                break 'run Err(format!(
+                                    "the appliance had not finished reporting the requests this \
+                                     boot made after {ONBOARD_HANDSHAKE_NUDGES} wakeups. A \
+                                     request's record is written on the pass that decided it, so \
+                                     this is a domain that stopped answering the relay rather \
+                                     than one that had nothing to say; see {}",
+                                    log_path.display()
+                                ));
+                            }
+                        }
                         scrapes = fetched;
                         break 'run Ok(());
                     }
@@ -7294,6 +7395,7 @@ fn run_boot(
         policy,
         recordings,
         handshakes,
+        requests,
         applied,
         revoked,
         onboard: onboarded,

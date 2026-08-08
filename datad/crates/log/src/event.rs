@@ -189,6 +189,88 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// Which of the onboarding surface's two resources a request was answered
+    /// with.
+    ///
+    /// Two members, and it is closed because the surface is: an unprovisioned
+    /// appliance serves a page and a certificate signing request, and anything
+    /// else is a refusal with a token of its own. The token names the resource
+    /// and never the target a peer typed — a request target is adversary-chosen
+    /// bytes, and no such byte reaches a console line.
+    ///
+    /// The order is the wire encoding, so a variant is appended and never
+    /// inserted.
+    OnboardRoute {
+        /// The onboarding page, which carries the appliance's name and the
+        /// fingerprint an administrator compares against the console.
+        Page => "page",
+        /// The certificate signing request, as the certificate profile fixes
+        /// it.
+        CertificateRequest => "certificate-request",
+    }
+}
+
+closed_vocabulary! {
+    /// Why a request on the onboarding surface was refused.
+    ///
+    /// **One token per cause, and no token covering two.** An administrator
+    /// whose client cannot get past this surface has the console and nothing
+    /// else, so a token standing for "the request was bad" would name none of
+    /// the fifteen ways it can be. Five of these are the surface's own
+    /// decisions — the limiter, an identity that does not exist yet, a target
+    /// nothing serves, a method nothing serves it under, and a head that
+    /// outgrew what may be accumulated — and the fifteen after them mirror
+    /// `lfw_http::RequestError` member for member.
+    ///
+    /// That mirror is **closed on both sides**, unlike the two that quote the
+    /// adopted TLS library: the parser is first-party, so the one call site
+    /// that maps it names every variant with no residual, and a variant added
+    /// there fails this build rather than landing on a token that says nothing.
+    ///
+    /// The order is the wire encoding, so a variant is appended and never
+    /// inserted.
+    OnboardRefusal {
+        /// The limiter had no allowance left. The record beside this one says
+        /// how many consecutive refusals there have been and how long the next
+        /// allowance is away, and there is always a next one: a lockout that
+        /// did not expire would be a remote bricking primitive against an
+        /// appliance whose port is the only way in.
+        RateLimited => "rate-limited",
+        /// The request arrived before this appliance had an identity to answer
+        /// with — a boot whose cryptography never established. Nothing about
+        /// the request was wrong.
+        IdentityAbsent => "identity-absent",
+        /// The target names no resource this surface serves.
+        UnknownRoute => "unknown-route",
+        /// The target names one, under a method it is not served with.
+        MethodNotServed => "method-not-served",
+        /// The head outgrew what may be accumulated before it ends. This
+        /// appliance's bound rather than the parser's: what it refuses is a
+        /// peer that never stops writing a head.
+        HeadTooLong => "head-too-long",
+        BareLineFeed => "bare-line-feed",
+        StrayCarriageReturn => "stray-carriage-return",
+        MalformedRequestLine => "malformed-request-line",
+        MalformedMethod => "malformed-method",
+        MalformedTarget => "malformed-target",
+        TargetTooLong => "target-too-long",
+        UnsupportedVersion => "unsupported-version",
+        MalformedVersion => "malformed-version",
+        TooManyHeaders => "too-many-headers",
+        MalformedHeaderName => "malformed-header-name",
+        MalformedHeaderValue => "malformed-header-value",
+        ObsoleteLineFolding => "obsolete-line-folding",
+        /// A body framed in a way the parser will not read, which on this
+        /// surface is every body: nothing here takes one.
+        BodyNotAccepted => "body-not-accepted",
+        /// A declared body length past what this surface holds.
+        BodyTooLarge => "body-too-large",
+        /// Bytes no string can hold, which a head is never made of.
+        NotUtf8 => "not-utf8",
+    }
+}
+
+closed_vocabulary! {
     /// How one handshake on the onboarding port ended, as the domain that
     /// terminates it reports.
     ///
@@ -670,6 +752,8 @@ mod tests {
         check_vocabulary!(NextHopVia);
         check_vocabulary!(OnboardEnd);
         check_vocabulary!(OnboardOutcome);
+        check_vocabulary!(OnboardRoute);
+        check_vocabulary!(OnboardRefusal);
         check_vocabulary!(TlsIncompatible);
         check_vocabulary!(TlsRefusal);
     }

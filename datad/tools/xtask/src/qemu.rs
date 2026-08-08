@@ -62,7 +62,7 @@ use crate::{
     },
     image, management_contract, metrics_contract,
     onboard_contract::{self, OnboardVerdict},
-    onboard_tls_contract, probe_contract,
+    onboard_request_contract, onboard_tls_contract, probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -513,6 +513,16 @@ pub(crate) enum OnboardContract {
     /// or lets a client onto it, and a boot that did both would be two things on
     /// one wire.
     Handshakes,
+    /// **Real clients again**, and the surface above the handshake: the page,
+    /// the request it links to, and three requests that must be refused, each
+    /// under its own token.
+    ///
+    /// Its own variant rather than more clients on [`Self::Handshakes`] because
+    /// the two prove different things and each boot's contract is exact: that
+    /// one owes one handshake record per attempt, and this one owes one request
+    /// record per attempt. A boot doing both would owe a count neither contract
+    /// states.
+    Requests,
 }
 
 impl OnboardContract {
@@ -521,7 +531,7 @@ impl OnboardContract {
         match self {
             // A boot that lets real clients in plays no station, so the station
             // this harness would otherwise put on the wire does nothing.
-            Self::Untouched | Self::Handshakes => OnboardBehaviour::Untouched,
+            Self::Untouched | Self::Handshakes | Self::Requests => OnboardBehaviour::Untouched,
             Self::Session(behaviour) => behaviour,
         }
     }
@@ -529,6 +539,11 @@ impl OnboardContract {
     /// Whether this boot runs real clients against the port.
     pub(crate) const fn handshakes(self) -> bool {
         matches!(self, Self::Handshakes)
+    }
+
+    /// Whether this boot runs real clients against the surface above it.
+    pub(crate) const fn requests(self) -> bool {
+        matches!(self, Self::Requests)
     }
 
     /// What the appliance must say about the session, given how the station
@@ -544,7 +559,7 @@ impl OnboardContract {
         let (ended, forgotten) = match self {
             // Nothing is read: the boot opens no session, or it opens several
             // and they are judged as handshakes rather than as one session.
-            Self::Untouched | Self::Handshakes => return None,
+            Self::Untouched | Self::Handshakes | Self::Requests => return None,
             // A station that opens nothing is not a session, so this pairing
             // names no records. A `None` rather than a panic: the caller refuses
             // it by name, which turns a table entry that cannot mean anything
@@ -803,6 +818,11 @@ pub(crate) enum Console {
     /// boot, which is the same statement — the node stayed healthy while an
     /// unauthenticated peer drove a second protection domain four times over.
     JudgedOnTheOnboardingHandshakes,
+    /// **The requests real clients made on the surface above those
+    /// handshakes**, on [`Self::JudgedOnTheOnboardingHandshakes`]'s terms: what
+    /// the page carried, what `openssl` made of the request it links to, and
+    /// the token each refused request reached the console under.
+    JudgedOnTheOnboardingRequests,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -1637,6 +1657,39 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
+    // And the boot whose subject is the SURFACE above that handshake: what an
+    // administrator actually does once their client has connected.
+    //
+    // The one above proves the record layer interoperates. This proves the two
+    // things that layer exists to carry — the page an administrator reads the
+    // fingerprint off, and the certificate signing request they take to the
+    // management application — and it proves them the way an administrator
+    // would: every request is pinned to the digest the STORE domain printed on
+    // this same boot, so a page that carried one fingerprint and a certificate
+    // that carried another would fail before a byte of the body was read.
+    //
+    // The request is then read back by `openssl req`, which shares no code with
+    // this appliance and is the same family of tool the management server
+    // parses with. A request this appliance emits that `openssl` will not read
+    // is a request the management server will not sign.
+    //
+    // THREE OF THE FIVE MUST BE REFUSED, each under a token of its own: an
+    // address that does not exist, the configuration upload the next step will
+    // use and this build does not serve, and the page under a method it is not
+    // served with. A boot that answered all three the same way would satisfy a
+    // contract that only asked whether a bad request was refused.
+    Scenario {
+        name: "onboarding-requests",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingRequests,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Requests,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -1938,16 +1991,20 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
         | Console::Judged
         | Console::JudgedOnTheDialledChannelAndThePortsCount
         | Console::JudgedOnTheOnboardingSessionAndThePortsCount
-        | Console::JudgedOnTheOnboardingHandshakes => {}
+        | Console::JudgedOnTheOnboardingHandshakes
+        | Console::JudgedOnTheOnboardingRequests => {}
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
     let backing = if scenario.management.user_network() {
+        // Both at once, because a reservation that released its socket before the
+        // next one bound would let the host answer with the same port twice — and
+        // QEMU refuses a duplicate forwarding rule by exiting.
+        let [host_port, onboard_port] = forward_harness::reserve_host_ports::<2>()
+            .map_err(|error| format!("scenario {name}: {error}"))?;
         ManagementBacking::UserNetwork {
-            host_port: forward_harness::reserve_host_port()
-                .map_err(|error| format!("scenario {name}: {error}"))?,
-            onboard_port: forward_harness::reserve_host_port()
-                .map_err(|error| format!("scenario {name}: {error}"))?,
+            host_port,
+            onboard_port,
         }
     } else {
         ManagementBacking::Socket
@@ -2101,6 +2158,27 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             let management = management_contract::judge(&booted.serial, &log, booted.management)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             format!("; {onboarded}; {management}")
+        }
+        Console::JudgedOnTheOnboardingRequests => {
+            if booted.requests.is_empty() {
+                return Err(format!(
+                    "scenario {name}: the boot met its routed contract and ran no client against \
+                     the onboarding surface, so nothing was proved about what it serves\n  \
+                     full run log: {}",
+                    log.display()
+                ));
+            }
+            let evidence = onboard_request_contract::evidence(&booted.requests);
+            println!("{evidence}");
+            append_evidence(
+                &log,
+                "the requests this boot made on the onboarding surface, and what came back",
+                &evidence,
+            )
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+            let served = onboard_request_contract::judge(&booted.requests, &booted.serial, &log)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            format!("; {served}")
         }
         Console::JudgedOnTheOnboardingHandshakes => {
             if booted.handshakes.is_empty() {

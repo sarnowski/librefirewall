@@ -117,6 +117,7 @@ mod delegate;
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
 
+use lfw_clock::Monotonic;
 use lfw_crypto::{
     Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, EntropyError, KEY_LEN, MlKem768DecapsulationKey,
     MlKem768EncapsulationKey, NONCE_LEN, NodeEntropy, P256_MAX_SIGNATURE_LEN, P256SecretKey,
@@ -128,6 +129,7 @@ use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Primitive, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
+use lfw_onboarding::{Identity, Onboarding as RequestSurface};
 use lfw_tls::{Bump, CryptoProvider, Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{
     Answered, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating, TerminatingPass,
@@ -578,6 +580,19 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
         outcome.verdict = Err(error);
         return outcome;
     }
+    // The identity the surface above the session serves, composed **once**,
+    // here, before any peer can connect. That is a property and not a
+    // convenience: were the request signed per call, an unauthenticated peer
+    // could make the domain that holds this appliance's private key sign as
+    // often as it could open a connection. Composed here it cannot — what a
+    // peer can ask for is a copy of an array.
+    let identity = match onboarding_identity(sink, delegated, &delegation) {
+        Ok(identity) => identity,
+        Err(error) => {
+            outcome.verdict = Err(error);
+            return outcome;
+        }
+    };
     // Only on a boot that proved all of it. A domain that terminates sessions
     // under a primitive it could not answer a vector for, or a delegation it
     // could not verify, would be answering an administrator with a channel this
@@ -586,8 +601,68 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
         provider,
         certificate: delegation.certificate,
         operation: Arc::clone(delegated) as Arc<dyn lfw_tls::SignOperation>,
+        identity,
     });
     outcome
+}
+
+/// Render the two public strings a peer is shown and sign the certificate
+/// signing request they carry away.
+///
+/// **The private half never comes here.** The request is signed the way the
+/// handshake's own `CertificateVerify` is — by asking the holder — and the
+/// public point it binds is the one that holder named, so a request over some
+/// other key is impossible rather than merely unlikely.
+///
+/// The two renderings are `lfw_x509`'s own, which is what makes the string on
+/// the page and the string the store domain printed on the console two views of
+/// one definition rather than two renderings. A second one anywhere would be
+/// two fingerprints an administrator has to normalise before comparing, which
+/// is the same as not comparing them.
+fn onboarding_identity(
+    sink: &dyn Sink,
+    delegated: &Delegated,
+    delegation: &Delegation,
+) -> Result<Identity, CryptoError> {
+    let device = lfw_x509::DeviceId::from_bytes(delegation.held.device.to_be_bytes()).render();
+    let fingerprint = lfw_x509::spki_fingerprint(&delegation.held.public_key)
+        .map(|digest| lfw_x509::fingerprint_hex(&digest))
+        .map_err(|_| CryptoError(refusal("onboarding-key-unencodable", RefusalDetail::None)))?;
+    let mut der = [0_u8; lfw_x509::MAX_CSR_LEN];
+    let der_len = lfw_x509::write_csr_signed(
+        &device,
+        &delegation.held.public_key,
+        &mut der,
+        |body, signature| lfw_tls::SignOperation::sign(delegated, body, signature).map_err(|_| ()),
+    )
+    .map_err(|_| {
+        CryptoError(refusal(
+            "onboarding-request-unsignable",
+            RefusalDetail::None,
+        ))
+    })?;
+    let mut pem = [0_u8; lfw_x509::MAX_CSR_PEM_LEN];
+    let pem_len = lfw_x509::write_pem(
+        lfw_x509::CSR_LABEL,
+        der.get(..der_len).unwrap_or_default(),
+        &mut pem,
+    )
+    .map_err(|_| {
+        CryptoError(refusal(
+            "onboarding-request-unarmourable",
+            RefusalDetail::None,
+        ))
+    })?;
+    // The holder's tally has moved again — the request's own signature was made
+    // in its domain — and the certificate's size has not, one appliance having
+    // one certificate. Reported here so a boot shows the delegation working a
+    // third time, for a third purpose.
+    report_delegation(sink, delegated, delegation);
+    Ok(Identity::new(
+        device,
+        fingerprint,
+        pem.get(..pem_len).unwrap_or_default(),
+    ))
 }
 
 /// The appliance's identity as the key holder gave it up: which key it holds, and
@@ -1140,6 +1215,10 @@ struct Established {
     provider: Arc<CryptoProvider>,
     certificate: HeldCertificate,
     operation: Arc<dyn lfw_tls::SignOperation>,
+    /// The two public strings and the signed request the surface above the
+    /// session serves. Composed once at bring-up, so what a peer costs by
+    /// asking for it is a copy rather than a signature in another domain.
+    identity: Identity,
 }
 
 /// What this domain terminates an onboarding session with: one TLS 1.3 server,
@@ -1161,13 +1240,18 @@ struct Established {
 /// the same as one that opens one, and the boot's own leaked allocations sit
 /// below the mark where no reset reaches them.
 ///
-/// # There is no protocol above it yet
+/// # The protocol above it is the onboarding surface
 ///
-/// This terminates the record layer. Plaintext a peer sends is taken and
-/// dropped, deliberately and not as a placeholder: the onboarding protocol is a
-/// step of its own, and leaving the plaintext unread would let a peer grow a
-/// buffer until the session refused itself for a bound of this appliance's
-/// rather than for anything the peer did.
+/// This drives two things and joins them: `lfw_tls` terminates the record
+/// layer, and `lfw_onboarding` decides what a request on it is answered with.
+/// Plaintext the session produces goes to the surface, what the surface
+/// composes goes back to the session, and neither of them is read here — what
+/// this file holds is the wiring and the console records the two owe.
+///
+/// **Nothing here signs anything either.** The certificate signing request the
+/// surface serves was composed at bring-up, so what an unauthenticated peer can
+/// provoke by asking for it is a copy of an array rather than a signature in
+/// the domain that holds this appliance's private key.
 struct Onboarding {
     /// The one arena, and where a session's allocations begin in it.
     arena: &'static Bump,
@@ -1177,11 +1261,23 @@ struct Onboarding {
     /// session that cannot be terminated and says so.
     established: Option<Established>,
     server: Option<lfw_tls::OnboardingServer<'static>>,
-    /// What the last session left for the console, taken by the domain after
-    /// the pass that produced it. Plain data with no allocation behind it,
-    /// which is what lets the arena be wound back under it.
-    staged: [Option<DomainDetail>; lfw_tls::OUTCOME_RECORDS],
+    /// The request surface, which outlives a session because its limiter does:
+    /// an allowance a peer spent must not come back by opening a new
+    /// connection, which is the one thing a peer can always do.
+    surface: RequestSurface,
+    /// What the last pass left for the console, taken by the domain after the
+    /// pass that produced it. Plain data with no allocation behind it, which is
+    /// what lets the arena be wound back under it.
+    staged: [Option<DomainDetail>; STAGED_RECORDS],
 }
+
+/// The most console records one pass can leave.
+///
+/// The handshake's own, plus the request surface's. A pass that answered a
+/// request and then finished the session produces both sets and no more: one
+/// item ends at most one session, and one connection carries at most one
+/// answered request.
+const STAGED_RECORDS: usize = lfw_tls::OUTCOME_RECORDS + lfw_onboarding::REQUEST_RECORDS;
 
 impl Onboarding {
     fn new(
@@ -1190,19 +1286,49 @@ impl Onboarding {
         clock: PdClock<'static>,
         established: Option<Established>,
     ) -> Self {
+        let surface = RequestSurface::new(established.as_ref().map(|held| held.identity));
         Self {
             arena,
             mark,
             clock,
             established,
             server: None,
-            staged: [None; lfw_tls::OUTCOME_RECORDS],
+            surface,
+            staged: [None; STAGED_RECORDS],
         }
     }
 
     /// What the last pass left for the console, cleared as it is taken.
-    fn take_records(&mut self) -> [Option<DomainDetail>; lfw_tls::OUTCOME_RECORDS] {
-        core::mem::replace(&mut self.staged, [None; lfw_tls::OUTCOME_RECORDS])
+    fn take_records(&mut self) -> [Option<DomainDetail>; STAGED_RECORDS] {
+        core::mem::replace(&mut self.staged, [None; STAGED_RECORDS])
+    }
+
+    /// Put `records` in the free slots, in order.
+    ///
+    /// Total by construction: [`STAGED_RECORDS`] is the sum of what the two
+    /// sources can produce in one pass, so the iterator runs out before the
+    /// slots do — and a record that found none would be dropped rather than
+    /// panicking, no fault being admissible on a path a peer paces.
+    fn stage(&mut self, records: impl IntoIterator<Item = DomainDetail>) {
+        let mut free = self.staged.iter_mut().filter(|slot| slot.is_none());
+        for record in records {
+            let Some(slot) = free.next() else {
+                return;
+            };
+            *slot = Some(record);
+        }
+    }
+
+    /// The instant the limiter measures against, or nothing where this node has
+    /// no clock.
+    ///
+    /// Nothing, and not the boot instant, because the difference decides
+    /// whether a refusal can expire: a limiter driven by an instant that never
+    /// advances would refuse for ever, and refusing for ever on the only port
+    /// into an unprovisioned appliance is a way to brick it from across a
+    /// network.
+    fn now(&self) -> Option<Monotonic> {
+        self.clock.calibration().map(|_| self.clock.monotonic())
     }
 }
 
@@ -1216,21 +1342,22 @@ impl Terminator for Onboarding {
     fn opened(&mut self) {
         self.server = None;
         self.arena.reset_to(self.mark);
-        self.staged = [None; lfw_tls::OUTCOME_RECORDS];
+        self.staged = [None; STAGED_RECORDS];
+        // The buffers, and not the limiter: a peer must not inherit the last
+        // one's half-written head, and must not escape its own spent allowance
+        // by opening a fresh connection.
+        self.surface.opened();
         let Some(established) = self.established.as_ref() else {
             // A boot that refused its own cryptography holds no certificate to
             // present and no key to sign with. Its own token rather than a
             // silent empty answer: the `state=refused` record above says why
             // this domain did not come up, and this says that a peer met the
             // consequence.
-            self.staged = [
-                Some(DomainDetail::Refusal(refusal(
-                    "onboarding-cryptography-unproven",
-                    RefusalDetail::None,
-                ))),
-                None,
-                None,
-            ];
+            self.staged = [None; STAGED_RECORDS];
+            self.stage([DomainDetail::Refusal(refusal(
+                "onboarding-cryptography-unproven",
+                RefusalDetail::None,
+            ))]);
             return;
         };
         let opened = lfw_tls::OnboardingServer::open(
@@ -1242,11 +1369,23 @@ impl Terminator for Onboarding {
         );
         match opened {
             Ok(server) => self.server = Some(server),
-            Err(outcome) => self.staged = outcome.records(),
+            Err(outcome) => {
+                let records = outcome.records();
+                self.stage(records.into_iter().flatten());
+            }
         }
     }
 
+    /// One turn: give the session what arrived, give the surface what the
+    /// session decrypted, and give the session what the surface composed.
+    ///
+    /// The order matters in one place. The surface's answer is pushed **before**
+    /// the session is driven, so a request that completes on this delivery is
+    /// answered on this turn rather than on the next one — a peer that sent a
+    /// whole request and is waiting to read must not have to send something
+    /// else to make the answer leave.
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
+        let now = self.now();
         let Some(server) = self.server.as_mut() else {
             // Nothing opened, so there is nothing to say and nothing to wait
             // for. Finished rather than silent: a session this domain cannot
@@ -1256,13 +1395,33 @@ impl Terminator for Onboarding {
                 finished: true,
             };
         };
-        let lfw_tls::Turn { sent, finished } = server.advance(received, answer);
-        // Taken and dropped. See this type's header: the protocol above is a
-        // step of its own, and plaintext left unread is a bound of this
-        // appliance's that a peer would trip instead of its own behaviour.
-        let plaintext = server.received().len();
-        server.consumed(plaintext);
-        Answered { sent, finished }
+        // The session first, so the plaintext this delivery produced is
+        // available to the surface on this same turn.
+        let first = server.advance(received, answer);
+        let decision = {
+            let plaintext = server.received();
+            let decision = self.surface.take(now, plaintext);
+            // Consumed whatever the surface made of it: the bytes are the
+            // surface's now, and plaintext left unread is a bound of this
+            // appliance's that a peer would trip instead of its own behaviour.
+            let taken = plaintext.len();
+            server.consumed(taken);
+            decision
+        };
+        let pushed = server.push(self.surface.pending());
+        self.surface.sent(pushed);
+        if self.surface.finished() {
+            // Everything the surface owed has been handed to the session, so
+            // this end says goodbye. The notification is a record like any
+            // other and leaves with whatever is still queued in front of it.
+            server.close();
+        }
+        // A second turn, which is what encrypts the answer just pushed and
+        // takes it toward the wire. The room is what the first turn left.
+        let second = drive_again(server, answer, first.sent);
+        let records = decision.records();
+        self.stage(records.into_iter().flatten());
+        second
     }
 
     /// End the session, take what it came to, and give the region back.
@@ -1278,10 +1437,41 @@ impl Terminator for Onboarding {
                 // are still live: an outcome may hold the library's own error,
                 // which may hold an allocation out of this arena, and the reset
                 // below is what would take it away underneath a record.
-                self.staged = outcome.records();
+                let records = outcome.records();
+                self.stage(records.into_iter().flatten());
             }
         }
         self.arena.reset_to(self.mark);
+    }
+}
+
+/// Drive the session once more into whatever room the first turn left, and
+/// answer for the pair.
+///
+/// A second call rather than a wider one, because the library produces bytes
+/// only when it is asked: plaintext pushed after a turn sits unencrypted until
+/// the next one, and a session that waited for the peer to speak again before
+/// encrypting an answer would answer every request one delivery late.
+///
+/// Nothing is delivered on the second call — the peer's bytes went in on the
+/// first — so what it can do is encrypt and drain. The room is bounded by
+/// what the first turn did not use, and the two `finished` flags are combined
+/// by taking the later one, a session that finished staying finished.
+fn drive_again(
+    server: &mut lfw_tls::OnboardingServer<'static>,
+    answer: &mut [u8],
+    already: usize,
+) -> Answered {
+    let Some(room) = answer.get_mut(already..) else {
+        return Answered {
+            sent: already,
+            finished: false,
+        };
+    };
+    let lfw_tls::Turn { sent, finished } = server.advance(&[], room);
+    Answered {
+        sent: already.saturating_add(sent),
+        finished,
     }
 }
 

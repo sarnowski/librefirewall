@@ -30,6 +30,7 @@
 //! typed, and nothing indexes.
 
 mod der;
+mod pem;
 mod profile;
 mod time;
 
@@ -37,9 +38,10 @@ mod time;
 mod tests;
 
 pub use der::{DerError, Writer};
+pub use pem::{CSR_LABEL, MAX_CSR_PEM_LEN, PemDoesNotFit, write_pem};
 pub use profile::{
     Certificate, CertificateKind, DEVICE_ID_LEN, DeviceId, FINGERPRINT_LEN, MAX_CERTIFICATE_LEN,
     MAX_CSR_LEN, Profile, ProfileError, SPKI_LEN, Serial, Validity, fingerprint_hex, spki,
-    spki_fingerprint, write_certificate, write_csr,
+    spki_fingerprint, write_certificate, write_csr, write_csr_signed,
 };
 pub use time::Utc;

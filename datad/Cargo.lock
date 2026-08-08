@@ -389,10 +389,13 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 name = "crypto"
 version = "0.1.0"
 dependencies = [
+ "lfw-clock",
  "lfw-crypto",
  "lfw-log",
  "lfw-metrics",
+ "lfw-onboarding",
  "lfw-tls",
+ "lfw-x509",
  "pd-runtime",
  "sel4-microkit",
  "wire",
@@ -888,6 +891,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-onboarding"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "lfw-http",
+ "lfw-log",
+ "lfw-x509",
+ "proptest",
+]
+
+[[package]]
 name = "lfw-pcapng"
 version = "0.1.0"
 dependencies = [
@@ -937,6 +951,7 @@ version = "0.1.0"
 dependencies = [
  "lfw-crypto",
  "lfw-log",
+ "lfw-onboarding",
  "lfw-x509",
  "proptest",
  "rustls",

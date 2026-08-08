@@ -91,8 +91,8 @@ mod response;
 
 pub use request::{Header, Parsed, Request, RequestError, parse};
 pub use response::{
-    ContentType, MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE, XML_CONTENT_TYPE,
-    write_head,
+    ContentType, HTML_CONTENT_TYPE, MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE,
+    PKCS10_CONTENT_TYPE, XML_CONTENT_TYPE, write_head,
 };
 
 /// Bytes of request head a caller may accumulate before the head must have
@@ -155,6 +155,11 @@ pub enum Status {
     RequestTimeout,
     ContentTooLarge,
     UriTooLong,
+    /// What a rate limiter answers with. No server here has ever been able to
+    /// say "come back later" before: the metrics port answers whatever it is
+    /// asked as fast as it is asked, and the one surface that must not is the
+    /// one an unprovisioned appliance exposes to whoever reaches it.
+    TooManyRequests,
     HeadersTooLarge,
     ServiceUnavailable,
     VersionNotSupported,
@@ -163,7 +168,7 @@ pub enum Status {
 impl Status {
     /// Every variant, so a counter table and a bound are built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Ok,
         Self::BadRequest,
         Self::NotFound,
@@ -171,6 +176,7 @@ impl Status {
         Self::RequestTimeout,
         Self::ContentTooLarge,
         Self::UriTooLong,
+        Self::TooManyRequests,
         Self::HeadersTooLarge,
         Self::ServiceUnavailable,
         Self::VersionNotSupported,
@@ -186,6 +192,7 @@ impl Status {
             Self::RequestTimeout => 408,
             Self::ContentTooLarge => 413,
             Self::UriTooLong => 414,
+            Self::TooManyRequests => 429,
             Self::HeadersTooLarge => 431,
             Self::ServiceUnavailable => 503,
             Self::VersionNotSupported => 505,
@@ -204,6 +211,7 @@ impl Status {
             Self::RequestTimeout => "Request Timeout",
             Self::ContentTooLarge => "Content Too Large",
             Self::UriTooLong => "URI Too Long",
+            Self::TooManyRequests => "Too Many Requests",
             Self::HeadersTooLarge => "Request Header Fields Too Large",
             Self::ServiceUnavailable => "Service Unavailable",
             Self::VersionNotSupported => "HTTP Version Not Supported",
@@ -221,6 +229,7 @@ impl Status {
             Self::RequestTimeout => "408",
             Self::ContentTooLarge => "413",
             Self::UriTooLong => "414",
+            Self::TooManyRequests => "429",
             Self::HeadersTooLarge => "431",
             Self::ServiceUnavailable => "503",
             Self::VersionNotSupported => "505",

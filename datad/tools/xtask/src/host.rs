@@ -66,6 +66,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-crypto",
     "lfw-x509",
     "lfw-tls",
+    "lfw-onboarding",
     "lfw-store",
     "xtask",
 ];
@@ -107,6 +108,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-crypto",
     "lfw-x509",
     "lfw-tls",
+    "lfw-onboarding",
     "lfw-store",
 ];
 

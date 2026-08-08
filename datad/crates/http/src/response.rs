@@ -28,6 +28,17 @@ pub const OCTET_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 /// document declares UTF-8.
 pub const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
 
+/// The one page an appliance ever serves a person. The charset is stated
+/// because the page carries no markup that could state it a second time — a
+/// document declaring its encoding twice is a document with two answers.
+pub const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+
+/// A PKCS#10 certification request, as RFC 2311 section 3.5 registers it.
+/// `charset` is absent deliberately: the media type is defined over the DER
+/// structure, and the PEM armouring it travels in is US-ASCII by its own
+/// grammar rather than by a parameter.
+pub const PKCS10_CONTENT_TYPE: &str = "application/pkcs10";
+
 /// A content type this crate can promise a head for.
 ///
 /// A closed set rather than a `&str`, and that is the whole point of the type:
@@ -45,12 +56,22 @@ pub enum ContentType {
     OctetStream,
     /// [`XML_CONTENT_TYPE`]: the configuration document a node states.
     Xml,
+    /// [`HTML_CONTENT_TYPE`]: the onboarding page.
+    Html,
+    /// [`PKCS10_CONTENT_TYPE`]: the certificate signing request.
+    Pkcs10,
 }
 
 impl ContentType {
     /// Every variant, so [`MAX_HEAD_LEN`] is derived by iteration rather than
     /// from a list that drifts from the enum.
-    pub const ALL: [Self; 3] = [Self::Metrics, Self::OctetStream, Self::Xml];
+    pub const ALL: [Self; 5] = [
+        Self::Metrics,
+        Self::OctetStream,
+        Self::Xml,
+        Self::Html,
+        Self::Pkcs10,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -58,6 +79,8 @@ impl ContentType {
             Self::Metrics => METRICS_CONTENT_TYPE,
             Self::OctetStream => OCTET_STREAM_CONTENT_TYPE,
             Self::Xml => XML_CONTENT_TYPE,
+            Self::Html => HTML_CONTENT_TYPE,
+            Self::Pkcs10 => PKCS10_CONTENT_TYPE,
         }
     }
 }

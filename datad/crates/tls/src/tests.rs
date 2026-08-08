@@ -1598,3 +1598,80 @@ fn offer_of(suites: &[u16], listed: u16, groups: &[u16], grouped: u16) -> crate:
         groups: kept(groups, grouped),
     }
 }
+
+/// The request surface above the record layer, over the same meeting.
+///
+/// **This is the only place the two halves of the onboarding port are held
+/// together**, and it is a test rather than a design: nothing in this crate
+/// depends on `lfw_onboarding`, which is why the dependency is a development
+/// one. What it proves is the ordering the protection domain wires — the
+/// session is driven, the plaintext it produced goes to the surface, what the
+/// surface composed is pushed back, and the session is driven again so the
+/// answer leaves on the same turn the request arrived on. A push that waited
+/// for the peer to speak again would answer every request one delivery late,
+/// which is invisible in a unit test of either half.
+#[test]
+fn a_real_client_gets_the_page_and_the_request_over_the_session() {
+    use lfw_onboarding::{Decision, Identity as Onboarded, Monotonic, Onboarding as Surface};
+
+    const DEVICE: &[u8; 32] = b"00000000000000000000000000000001";
+    const FINGERPRINT: &[u8; 64] =
+        b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const REQUEST: &[u8] =
+        b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBAA==\n-----END CERTIFICATE REQUEST-----\n";
+
+    let arena = Bump::new(ROOM);
+    let (certificate, signer) = onboarding(0x61);
+    let server = OnboardingServer::open(
+        assembled(0x62),
+        &arena,
+        NOW,
+        &certificate,
+        signer as std::sync::Arc<dyn SignOperation>,
+    )
+    .expect("the server opens");
+    let mut meeting = Meeting {
+        client: Client::new(0x63, &certificate),
+        server,
+        echo: false,
+        answered: Vec::new(),
+    };
+    let mut surface = Surface::new(Some(Onboarded::new(*DEVICE, *FINGERPRINT, REQUEST)));
+    surface.opened();
+    meeting.client.pending = b"GET / HTTP/1.1\r\nHost: appliance\r\n\r\n".to_vec();
+
+    // The handshake, then the request, then the answer — each round driving the
+    // surface exactly as the protection domain's turn does.
+    let mut served = None;
+    for _ in 0..8 {
+        meeting.round();
+        let plaintext = meeting.server.received().to_vec();
+        let decision = surface.take(Some(Monotonic::BOOT), &plaintext);
+        meeting.server.consumed(plaintext.len());
+        if let Decision::Served { route, bytes } = decision {
+            served = Some((route, bytes));
+        }
+        let pushed = meeting.server.push(surface.pending());
+        surface.sent(pushed);
+        if surface.finished() {
+            meeting.server.close();
+        }
+        if !meeting.client.received.is_empty() && surface.finished() {
+            break;
+        }
+    }
+
+    let (route, bytes) = served.expect("the page was served");
+    assert_eq!(route, lfw_log::OnboardRoute::Page);
+    let answered = String::from_utf8_lossy(&meeting.client.received).into_owned();
+    assert!(
+        answered.starts_with("HTTP/1.1 200 OK\r\n"),
+        "the client read: {answered}"
+    );
+    // The two strings an administrator compares, having crossed a real TLS
+    // session rather than a buffer this test composed.
+    assert!(answered.contains(core::str::from_utf8(DEVICE).expect("ascii")));
+    assert!(answered.contains(core::str::from_utf8(FINGERPRINT).expect("ascii")));
+    assert!(answered.contains(&format!("Content-Length: {bytes}\r\n")));
+    assert_eq!(arena.refusals(), 0);
+}
