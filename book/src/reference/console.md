@@ -470,17 +470,19 @@ node: an operator holding a silent appliance still has only the external act.
 
   **One token per cause, and that is the whole design of the list.** An administrator whose client
   cannot get past this surface has the console and nothing else, so a token standing for "the
-  request was bad" would name none of the twenty ways it can be. The first five are the surface's
-  own decisions; the fifteen after them are the request parser's, one for one.
+  request was bad" would name none of the twenty-six ways it can be. Five are the surface's own
+  decisions about a request; the fifteen after them are the request parser's, one for one; and the
+  last six are the appliance's state and the upload route — one for the surface being shut, and five
+  for the ways a package upload does not become an owner.
 
-  `onboard-http-refused=` is one of 20 request refusals:
+  `onboard-http-refused=` is one of 26 request refusals:
 
   | request refusal | what it means |
   |---|---|
   | `rate-limited` | the allowance was spent. The `onboard-http-strikes=` record beside it says how long the wait is, and **there is always a wait rather than a lockout** — a refusal that never expired would be a way to make an unonboarded appliance unonboardable from across a network. |
   | `identity-absent` | the request arrived before this appliance had an identity to answer with, which is a boot whose cryptography never established. **Nothing about the request was wrong**; read the `domain=crypto` records above it. |
-  | `unknown-route` | the address names nothing this appliance serves. `POST /configuration.tar` reaches this today, the configuration upload not being served by this build. |
-  | `method-not-served` | the address names something, under a method it is not served with. Everything here is a `GET`. |
+  | `unknown-route` | the address names nothing this appliance serves. |
+  | `method-not-served` | the address names something, under a method it is not served with. The page and the request are `GET`; the package upload is `POST`, and nothing else is served at all. |
   | `head-too-long` | the request head outgrew what may be accumulated before it ends. A peer that never stops writing one. |
   | `bare-line-feed` | a line ended with a bare `LF`. Refused rather than tolerated: two parties disagreeing about where a line ends is how one request becomes two. |
   | `stray-carriage-return` | a `CR` that no `LF` followed. |
@@ -494,9 +496,15 @@ node: an operator holding a silent appliance still has only the external act.
   | `malformed-header-name` | a field name that is not a token, longer than one may be, or a line with no colon in it. |
   | `malformed-header-value` | a field value longer than one may be, or one carrying a byte a field value may not. |
   | `obsolete-line-folding` | a continuation line, which a strict recipient refuses. |
-  | `body-not-accepted` | a body framed in a way that is not read — any transfer encoding, a repeated or non-decimal length, or a body on a method that may not carry one. **This surface takes no body at all**, so every body reaches this or the next. |
-  | `body-too-large` | a declared body length past what this surface holds, which is none. |
+  | `body-not-accepted` | a body framed in a way that is not read — any transfer encoding, a repeated or non-decimal length, or a body on a method that may not carry one. One framing is read and no other: a single decimal `Content-Length` on a `POST`. |
+  | `body-too-large` | a declared body length past the widest onboarding package this appliance will look at. Refused at the head, so no byte of the body is accumulated on the way to finding out. |
   | `not-utf8` | bytes no string can hold, which a request head is never made of. |
+  | `already-owned` | this appliance has an owner, so the surface is shut and **every** address on it is gone. Its own token and not `unknown-route`: an administrator told "no such resource" would go looking for a typing mistake, and what has happened is that the appliance moved on. A **factory reset** is the way back. |
+  | `upload-empty` | a package upload declaring no body at all. Nothing was staged and nothing was asked of the domain that holds the key, so no other domain's record says anything about this request — which is why it is named here rather than left to be inferred from silence. Most often a `curl` without its `--data-binary`. |
+  | `upload-overran` | the peer sent more body than the length it declared. The peer contradicting itself, rather than any rule about what a package is. |
+  | `upload-unavailable` | this appliance could not begin an upload — the room a package is validated in was not free. **Nothing about the request was wrong**; the `domain=crypto` record beside it says what was needed and what was left. |
+  | `upload-unstaged` | the upload began and the bytes would not all go where they were meant to. Unreachable while a declared length is held to the room reserved for it, and named rather than asserted because nothing on a path a peer paces may fault. |
+  | `package-refused` | the package arrived whole and the domain that holds the device key did not install it. **Which rule refused it is that domain's record**, in the package contract's own vocabulary and beside the numbers that place it; this token says the upload got that far and was judged. |
 - `onboard-http-strikes=<n> onboard-http-wait=<n>` — **what the rate limiter is doing**, written
   beside the one refusal it causes. `onboard-http-strikes=` is how many requests in a row have been
   refused, and `onboard-http-wait=` is milliseconds until the next one will not be.
@@ -533,12 +541,18 @@ node: an operator holding a silent appliance still has only the external act.
 
 ## `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the seven tables together are the complete set: 23 the
+Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
 `nic-driver` domain raises, 25 the `clock` domain raises, 19 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 51 the `crypto` domain
-raises, and 155 the `store` domain raises. A token outside all seven is a defect, not an extension.
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 140 the `crypto` domain
+raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
+
+**One of those eight tables belongs to two domains, and the counts above already include it.** The
+onboarding package's rules are one catalogue that both the cryptography domain and the store domain
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 140 and
+87 of the 155. Listing it twice would make a reader learn one vocabulary twice; attributing it to one
+domain would leave the other's records looking unnamed.
 
 **`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
 are virtio 1.0 PCI device classes and both run the same handshake in the same order, so a
@@ -705,6 +719,17 @@ of a vector's contents.
 | the onboarding session this domain terminates, refused at the relay carrying it (`detail=` is the operation that named a session there was none of, or the length that was past what one item may carry; the rest carry none) | `relay-no-connection`, `relay-payload-too-long`, `relay-no-such-operation`, `relay-session-failed` |
 | a session opened on a boot whose cryptography never established (a `ready` record, no `detail=`) | `onboarding-cryptography-unproven` |
 | composing the identity the onboarding surface serves, which happens once at bring-up and never per request (none carries a `detail=`) | `onboarding-key-unencodable`, `onboarding-request-unsignable`, `onboarding-request-unarmourable` |
+| taking delivery of an onboarding package, before a rule of it is read (`detail=` is the arena an upload needs and the arena that was free, on the first; the second carries none) | `upload-window-unavailable`, `upload-unprepared` |
+
+**The two `upload-*` tokens are this appliance and never the package.** An upload is validated in a
+window taken from this domain's bounded arena, and the window is reserved before a byte of the body
+is placed — so `upload-window-unavailable` is a request refused with nothing begun, and its two
+numbers are what an upload costs and what was free. It reaches a peer as a 503 and the surface's own
+`upload-unavailable`, which is a different vocabulary saying the same thing to a different reader.
+`upload-unprepared` is this domain reaching the judgement with no window or no cryptography to judge
+under, which the surface's own ordering makes unreachable and which is answered by name rather than
+asserted, nothing on a path a peer paces being allowed to fault. Neither says anything about the
+bytes: a package that was read and refused draws a token out of the shared catalogue below.
 
 **The three `onboarding-*` composition tokens are a bring-up failure and never a peer's doing.** The
 certificate signing request this appliance serves is written and signed **once**, before any peer can
@@ -774,29 +799,19 @@ having been told to run.
 | minting one (none carries a `detail=`) | `device-key-ungenerable`, `onboarding-certificate-unwritable`, `public-key-unencodable`, `certificate-too-long-for-record` |
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
 | installing an onboarding package, before a rule of it is read (`detail=` is the stated length and the bytes really staged for `install-archive-past-region`, the number of installs one boot serves for `installs-exhausted`, and absent on the rest) | `install-already-owned`, `install-archive-past-region`, `installs-exhausted`, `install-no-medium`, `install-record-absent`, `install-appliance-key-unencodable`, `install-certificate-too-long`, `install-record-refused-the-package`, `install-unusable` |
-| the archive's own framing (`detail=` is the byte offset the fault was found at, or the two lengths where the token names a pair) | `install-archive-over-bound`, `install-archive-partial-block`, `install-archive-truncated-header`, `install-archive-no-terminator`, `install-archive-trailing-bytes`, `install-archive-not-ustar`, `install-archive-checksum-mismatch`, `install-archive-not-a-regular-file`, `install-archive-link-name-not-empty`, `install-archive-prefix-not-empty`, `install-archive-unknown-member`, `install-archive-size-empty`, `install-archive-checksum-empty`, `install-archive-size-not-octal`, `install-archive-checksum-not-octal`, `install-archive-size-over-bound`, `install-archive-checksum-over-bound`, `install-archive-member-truncated`, `install-archive-member-padding` |
-| a member missing, duplicated, or past its own bound — the three archive faults whose token names **which file** (`detail=` is the size and the bound on the last four) | `install-missing-device-certificate`, `install-missing-trust-anchor`, `install-missing-management-endpoint`, `install-missing-configuration`, `install-duplicate-device-certificate`, `install-duplicate-trust-anchor`, `install-duplicate-management-endpoint`, `install-duplicate-configuration`, `install-device-certificate-over-bound`, `install-trust-anchor-over-bound`, `install-management-endpoint-over-bound`, `install-configuration-over-bound` |
-| the **device certificate**'s armour and the DER inside it (`detail=` is the length and the bound on `install-device-line-too-long` and `install-device-too-long`, and absent on the rest) | `install-device-no-begin-boundary`, `install-device-no-end-boundary`, `install-device-line-too-long`, `install-device-not-base64`, `install-device-padding-misplaced`, `install-device-not-a-whole-group`, `install-device-non-canonical-padding`, `install-device-trailing-content`, `install-device-empty`, `install-device-too-long`, `install-device-truncated-der`, `install-device-unexpected-tag`, `install-device-indefinite-length`, `install-device-non-minimal-length`, `install-device-length-out-of-range`, `install-device-trailing-der` |
-| the **trust anchor**'s, which are the same rules over the other file (same `detail=` rule) | `install-anchor-no-begin-boundary`, `install-anchor-no-end-boundary`, `install-anchor-line-too-long`, `install-anchor-not-base64`, `install-anchor-padding-misplaced`, `install-anchor-not-a-whole-group`, `install-anchor-non-canonical-padding`, `install-anchor-trailing-content`, `install-anchor-empty`, `install-anchor-too-long`, `install-anchor-truncated-der`, `install-anchor-unexpected-tag`, `install-anchor-indefinite-length`, `install-anchor-non-minimal-length`, `install-anchor-length-out-of-range`, `install-anchor-trailing-der` |
-| the management endpoint line an administrator typed (`detail=` is the length and the bound on `install-endpoint-over-bound` and the octet count on `install-endpoint-too-few-octets`) | `install-endpoint-empty`, `install-endpoint-not-ascii`, `install-endpoint-over-bound`, `install-endpoint-no-colon`, `install-endpoint-too-many-colons`, `install-endpoint-trailing-bytes`, `install-endpoint-too-few-octets`, `install-endpoint-too-many-octets`, `install-endpoint-octet-empty`, `install-endpoint-octet-not-decimal`, `install-endpoint-octet-leading-zero`, `install-endpoint-octet-out-of-range`, `install-endpoint-unspecified`, `install-endpoint-loopback`, `install-endpoint-multicast`, `install-endpoint-broadcast`, `install-endpoint-reserved`, `install-endpoint-port-empty`, `install-endpoint-port-not-decimal`, `install-endpoint-port-leading-zero`, `install-endpoint-port-out-of-range` |
-| the key the package binds, the configuration it carries, and the one signature this appliance verifies for itself (none carries a `detail=`) | `install-device-key-is-not-this-appliance`, `install-configuration-refused`, `install-chain-not-verified`, `install-certificate-malformed`, `install-signature-algorithm-malformed`, `install-signature-malformed`, `install-anchor-key-malformed`, `install-signature-not-ecdsa-sha256`, `install-signature-algorithms-disagree`, `install-anchor-key-not-p256`, `install-signature-not-authentic` |
+| the one signature this appliance verifies for itself, under one algorithm, one curve and a path of length one (none carries a `detail=`) | `install-certificate-malformed`, `install-signature-algorithm-malformed`, `install-signature-malformed`, `install-anchor-key-malformed`, `install-signature-not-ecdsa-sha256`, `install-signature-algorithms-disagree`, `install-anchor-key-not-p256`, `install-signature-not-authentic` |
 
-Every `install-` token is a **management-plane attacker's**, and reading one is worth a moment. An
-onboarding package is authenticated by the session it arrived in and by nothing else, so every rule
-above is applied to bytes an uploader chose. The tokens are at the grain of the package contract's
-own rules because that is the grain an administrator can act on: which of the four files to open,
-and what about it was wrong. A `-unusable` token is the residual of a vocabulary that lives in
-another crate — it means a rule was broken that this domain has no name for, which is a defect
-rather than a package to correct.
-
-Three of them say something about the appliance rather than about the package.
-`install-already-owned` is an appliance that already has an owner: a package delivered over a
+The `install-` tokens above are this domain's own, and they say something about the **appliance**
+rather than about the package — the rules a package itself must satisfy are the shared catalogue
+below. `install-already-owned` is an appliance that already has an owner: a package delivered over a
 channel cannot move one management plane to another, and a **factory reset** is the way back.
 `installs-exhausted` is the budget on how many packages one boot will look at, which exists because
 each one costs a copy, an archive walk and a signature verification that a peer paces — it is not a
-lockout, and a reboot clears it. And `install-signature-not-authentic` is the sharp one: the
-delivered anchor did not sign the delivered device certificate, which is a package assembled out of
-two authorities' material.
+lockout, and a reboot clears it. A `-unusable` token is the residual of a vocabulary that lives in
+another crate — a rule was broken that this domain has no name for, which is a defect rather than a
+package to correct. And `install-signature-not-authentic` is the sharp one: the delivered anchor did
+not sign the delivered device certificate, which is a package assembled out of two authorities'
+material.
 
 **This is the second reading of those bytes, and its refusals are narrower than the first's.** The
 domain that terminated the upload validated the package against the certificate validator this
@@ -843,6 +858,32 @@ The primitive names in `primitive=` are `sha-256`, `hmac-sha-256`, `hkdf-sha-256
 `chacha20-poly1305`, `aes-256-gcm`, `chacha20-drbg`, `ecdsa-p256`, `x25519` and `ml-kem-768`. What
 each is proved against, and what the measured numbers mean, is in the
 [cryptography profile](crypto-profile.md).
+
+**`store` and `crypto`.** The onboarding package's own rules — **one catalogue, raised by both
+domains that read a package**, listed once. Two domains read every upload: the cryptography domain
+reads the bytes it took delivery of, against the certificate validator this appliance adopted, and
+refuses before it asks anybody to install anything; the store domain reads them again out of its own
+snapshot, against the key in its own state record, before it writes the medium. They are deliberately
+not the same reading — the first weighs a general chain policy the second declines to have — and the
+tokens are one set because the *rules* are one contract. **Read the token with the domain**, on the
+terms every other shared set is read: the token names which rule refused, and `domain=` says which
+reading of the upload it refused on. The same token from both is one package two readings agreed
+about; a token from `store` after `crypto` accepted the same upload means the two readings disagreed,
+which is worth far more than a third opinion would have been.
+
+The grain is the package contract's own rules, because that is the grain an administrator can act
+on: which of the four files to open, and what about it was wrong. Every one of these is a
+management-plane **attacker's** — an onboarding package is authenticated by the session it arrived
+in and by nothing else — so every rule below is applied to bytes an uploader chose.
+
+| group | tokens |
+|---|---|
+| the archive's own framing (`detail=` is the byte offset the fault was found at, or the two lengths where the token names a pair) | `install-archive-over-bound`, `install-archive-partial-block`, `install-archive-truncated-header`, `install-archive-no-terminator`, `install-archive-trailing-bytes`, `install-archive-not-ustar`, `install-archive-checksum-mismatch`, `install-archive-not-a-regular-file`, `install-archive-link-name-not-empty`, `install-archive-prefix-not-empty`, `install-archive-unknown-member`, `install-archive-size-empty`, `install-archive-checksum-empty`, `install-archive-size-not-octal`, `install-archive-checksum-not-octal`, `install-archive-size-over-bound`, `install-archive-checksum-over-bound`, `install-archive-member-truncated`, `install-archive-member-padding` |
+| a member missing, duplicated, or past its own bound — the three archive faults whose token names **which file** (`detail=` is the size and the bound on the last four) | `install-missing-device-certificate`, `install-missing-trust-anchor`, `install-missing-management-endpoint`, `install-missing-configuration`, `install-duplicate-device-certificate`, `install-duplicate-trust-anchor`, `install-duplicate-management-endpoint`, `install-duplicate-configuration`, `install-device-certificate-over-bound`, `install-trust-anchor-over-bound`, `install-management-endpoint-over-bound`, `install-configuration-over-bound` |
+| the **device certificate**'s armour and the DER inside it (`detail=` is the length and the bound on `install-device-line-too-long` and `install-device-too-long`, and absent on the rest) | `install-device-no-begin-boundary`, `install-device-no-end-boundary`, `install-device-line-too-long`, `install-device-not-base64`, `install-device-padding-misplaced`, `install-device-not-a-whole-group`, `install-device-non-canonical-padding`, `install-device-trailing-content`, `install-device-empty`, `install-device-too-long`, `install-device-truncated-der`, `install-device-unexpected-tag`, `install-device-indefinite-length`, `install-device-non-minimal-length`, `install-device-length-out-of-range`, `install-device-trailing-der` |
+| the **trust anchor**'s, which are the same rules over the other file (same `detail=` rule) | `install-anchor-no-begin-boundary`, `install-anchor-no-end-boundary`, `install-anchor-line-too-long`, `install-anchor-not-base64`, `install-anchor-padding-misplaced`, `install-anchor-not-a-whole-group`, `install-anchor-non-canonical-padding`, `install-anchor-trailing-content`, `install-anchor-empty`, `install-anchor-too-long`, `install-anchor-truncated-der`, `install-anchor-unexpected-tag`, `install-anchor-indefinite-length`, `install-anchor-non-minimal-length`, `install-anchor-length-out-of-range`, `install-anchor-trailing-der` |
+| the management endpoint line an administrator typed (`detail=` is the length and the bound on `install-endpoint-over-bound` and the octet count on `install-endpoint-too-few-octets`) | `install-endpoint-empty`, `install-endpoint-not-ascii`, `install-endpoint-over-bound`, `install-endpoint-no-colon`, `install-endpoint-too-many-colons`, `install-endpoint-trailing-bytes`, `install-endpoint-too-few-octets`, `install-endpoint-too-many-octets`, `install-endpoint-octet-empty`, `install-endpoint-octet-not-decimal`, `install-endpoint-octet-leading-zero`, `install-endpoint-octet-out-of-range`, `install-endpoint-unspecified`, `install-endpoint-loopback`, `install-endpoint-multicast`, `install-endpoint-broadcast`, `install-endpoint-reserved`, `install-endpoint-port-empty`, `install-endpoint-port-not-decimal`, `install-endpoint-port-leading-zero`, `install-endpoint-port-out-of-range` |
+| the key the package binds, the configuration it carries, and a chain that did not verify (none carries a `detail=`) | `install-device-key-is-not-this-appliance`, `install-configuration-refused`, `install-chain-not-verified` |
 
 ## `LFW-CFG` — configuration
 

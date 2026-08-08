@@ -59,7 +59,7 @@ in the *next* one.
 ## Metric inventory
 
 122 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 458 counter and gauge series from the 12 shards,
+domains publishing that family. A scrape is 459 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 99 784 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -260,7 +260,7 @@ already live, which is a very different thing.
 | `librefirewall_http_requests_overflowed_total` | counter | `management` | — | Requests that outgrew the bounded request buffer before their head ended. |
 | `librefirewall_http_requests_total` | counter | `management` | — | Requests the server read to their end and decided on. |
 | `librefirewall_http_response_bytes_total` | counter | `management` | — | Response bytes handed to the transport, headers included. |
-| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `408`, `413`, `414`, `429`, `431`, `503`, `505`) | Responses composed, by status code. `429` is the onboarding surface's rate limiter and cannot appear on this port, which limits nothing: the label set is the whole of what this appliance's one response writer can compose. |
+| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `408`, `410`, `413`, `414`, `429`, `431`, `503`, `505`) | Responses composed, by status code. `429` and `410` are the onboarding surface's — its rate limiter, and an appliance that has an owner and has shut that surface — and neither can appear on this port, which limits nothing and is never shut: the label set is the whole of what this appliance's one response writer can compose. |
 | `librefirewall_http_retransmits_unavailable_total` | counter | `management` | — | Ranges the transport asked for again that no response buffer held; ours, expected to stay zero. |
 | `librefirewall_http_slots_exhausted_total` | counter | `management` | — | Connections the server had no slot for; ours, the tables being one size, expected to stay zero. |
 

@@ -17,6 +17,12 @@ lfw-crypto = { path = "../../crates/crypto" }
 lfw-log = { path = "../../crates/log" }
 lfw-metrics = { path = "../../crates/metrics" }
 lfw-onboarding = { path = "../../crates/onboarding" }
+# The onboarding package's rules and the catalogue that names every refusal of
+# them. This domain reads an upload before it asks anybody to install one, and it
+# reads it against the same contract the installing domain does — one reader and
+# one vocabulary, so an operator holding two domains' records is holding one
+# appliance's account of one package.
+lfw-package = { path = "../../crates/package" }
 lfw-tls = { path = "../../crates/tls" }
 lfw-x509 = { path = "../../crates/x509" }
 pd-runtime = { path = "../../crates/pd-runtime" }

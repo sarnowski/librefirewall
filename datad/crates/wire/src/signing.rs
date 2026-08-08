@@ -132,6 +132,18 @@ pub const PUBLIC_KEY_LEN: usize = 65;
 /// anything renders it.
 pub const DEVICE_ID_LEN: usize = 16;
 
+/// The ownership word of a [`SignOperation::PublicKey`] answer: this appliance
+/// has no owner.
+///
+/// Zero, which is what a zeroed region holds — so a channel nothing has answered
+/// on reads as an appliance still to be onboarded, which is the state that keeps
+/// the onboarding surface open and is therefore the one a holder must say
+/// something to move away from.
+const NOT_OWNED: u8 = 0;
+
+/// The same word saying it has one.
+const OWNED: u8 = 1;
+
 /// Bytes of certificate a [`SignOperation::Certificate`] answer may carry, and so
 /// the widest thing this channel moves.
 ///
@@ -387,6 +399,15 @@ pub struct SignReply {
     /// because it is the only field whose length is stated rather than fixed by
     /// its type.
     certificate: [AtomicU8; MAX_CERTIFICATE_LEN],
+    /// Whether the holder's record says this appliance has an owner, published
+    /// beside the identity the same record produced.
+    ///
+    /// Appended after the certificate on that field's own terms, and it costs
+    /// the region nothing: the reply is eight-byte aligned and the certificate
+    /// ended seven bytes short of a multiple of eight, so this byte lands in
+    /// padding that was already there — which the size assertion at the foot of
+    /// this file states rather than leaves to be noticed.
+    owned: AtomicU8,
 }
 
 impl SignReply {
@@ -404,6 +425,7 @@ impl SignReply {
             public_key: [const { AtomicU8::new(0) }; PUBLIC_KEY_LEN],
             device_id: [const { AtomicU8::new(0) }; DEVICE_ID_LEN],
             certificate: [const { AtomicU8::new(0) }; MAX_CERTIFICATE_LEN],
+            owned: AtomicU8::new(NOT_OWNED),
         }
     }
 
@@ -494,6 +516,10 @@ mod peer {
             for (byte, cell) in into.iter_mut().zip(&self.0.certificate) {
                 *byte = cell.load(Ordering::Relaxed);
             }
+        }
+
+        pub(super) fn owned(&self) -> u8 {
+            self.0.owned.load(Ordering::Relaxed)
         }
     }
 
@@ -592,6 +618,15 @@ pub enum SignFault {
     /// and for a stronger reason: the answer to an install is the status word
     /// alone, so there is no field a length could be about at all.
     BytesOnInstall { len: u32 },
+    /// An ownership word outside the two this field has meanings for.
+    ///
+    /// Refused rather than read as "anything but zero is owned", on
+    /// [`SignOperation::from_bits`]'s terms: the field is peer-written, and a
+    /// coercion here would be this side deciding what a holder meant. The
+    /// caller loses the whole identity answer, which is the fail-closed
+    /// outcome — an appliance that cannot learn whether it has an owner
+    /// presents no identity at all rather than guessing.
+    OwnershipUnknown { owned: u8 },
 }
 
 /// Where one poll copies an answer's bytes.
@@ -632,6 +667,21 @@ impl Default for SignAnswerBuffer {
 pub struct DeviceIdentity {
     pub public_key: [u8; PUBLIC_KEY_LEN],
     pub device_id: [u8; DEVICE_ID_LEN],
+    /// Whether this appliance already has an owner, as the record on the
+    /// holder's medium says.
+    ///
+    /// It rides the identity answer because it is a fact about the same record
+    /// the other two come out of, read on the same boot by the domain that read
+    /// them — and because the domain that asks needs it before it answers its
+    /// first request. An onboarding surface is closed for good once an appliance
+    /// is owned, and the *durability* of that close is exactly this word: the
+    /// close is not a flag some domain sets and loses at the next boot, it is
+    /// what the medium says, asked again every time the appliance starts.
+    ///
+    /// Not a secret and not a key. It is one bit about whether a certificate the
+    /// appliance already publishes exists, which is a thing any peer learns by
+    /// connecting to the port and being told the surface is gone.
+    pub owned: bool,
 }
 
 /// What [`SignRequester::poll`] found.
@@ -717,7 +767,7 @@ impl SignRequester<'_> {
 
     /// Ask the holder to install the archive `staged` names.
     ///
-    /// It consumes the token [`crate::ArchiveUpload::stage`] minted, so the
+    /// It consumes the token [`crate::UploadCursor::finish`] minted, so the
     /// length this request states is the length that staging really produced and
     /// not a number a caller carried alongside it. That is a convenience of this
     /// side and **not a defence**: the holder is answering a byzantine
@@ -805,6 +855,12 @@ impl SignRequester<'_> {
                 if len != 0 {
                     return self.fault(SignFault::BytesOnIdentity { len });
                 }
+                let raw_owned = self.reply.owned();
+                let owned = match raw_owned {
+                    NOT_OWNED => false,
+                    OWNED => true,
+                    other => return self.fault(SignFault::OwnershipUnknown { owned: other }),
+                };
                 let mut public_key = [0_u8; PUBLIC_KEY_LEN];
                 let mut device_id = [0_u8; DEVICE_ID_LEN];
                 self.reply.public_key(&mut public_key);
@@ -812,6 +868,7 @@ impl SignRequester<'_> {
                 SignPoll::Identity(DeviceIdentity {
                     public_key,
                     device_id,
+                    owned,
                 })
             }
             SignOperation::Certificate => {
@@ -964,7 +1021,8 @@ impl SignResponder<'_> {
         published as usize
     }
 
-    /// Answer `demand` with the identity of the key this holder has.
+    /// Answer `demand` with the identity of the key this holder has, and with
+    /// whether the record that key came out of says the appliance has an owner.
     pub fn identity(&mut self, demand: SignDemand, identity: &DeviceIdentity) {
         for (cell, byte) in self.reply.public_key.iter().zip(identity.public_key) {
             cell.store(byte, Ordering::Relaxed);
@@ -972,6 +1030,10 @@ impl SignResponder<'_> {
         for (cell, byte) in self.reply.device_id.iter().zip(identity.device_id) {
             cell.store(byte, Ordering::Relaxed);
         }
+        self.reply.owned.store(
+            if identity.owned { OWNED } else { NOT_OWNED },
+            Ordering::Relaxed,
+        );
         self.publish(demand, SignOperation::PublicKey, SignStatus::Ok, 0);
     }
 
@@ -1105,12 +1167,33 @@ const _: () = {
         offset_of!(SignReply, certificate)
             == 24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN
     );
+    assert!(
+        offset_of!(SignReply, owned)
+            == 24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN
+    );
     assert!(align_of::<SignReply>() == 8);
+    assert!(
+        size_of::<SignReply>()
+            == (25 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN)
+                .next_multiple_of(align_of::<SignReply>())
+    );
+    // And the byte cost nothing: the certificate ended inside the tail padding
+    // an eight-byte alignment had already reserved, so appending the ownership
+    // word left the region the size it was. Stated rather than derived, because
+    // a field that *did* grow the type would push the region onto a second page
+    // and widen a capability in a diff nobody was reading — and the assertion
+    // below that pins the region to one page would then be the only thing
+    // catching it, by which point the reason is gone.
     assert!(
         size_of::<SignReply>()
             == (24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN)
                 .next_multiple_of(align_of::<SignReply>())
     );
+    // A zeroed reply says the appliance has no owner, which is the state that
+    // keeps the onboarding surface open — so a holder that never answered
+    // cannot close it, and the close is a thing a holder has to say.
+    assert!(NOT_OWNED == 0);
+    assert!(OWNED != NOT_OWNED);
     // Naturally aligned, which is what makes the counter a single access rather
     // than two a reader could tear across.
     assert!(offset_of!(SignReply, signed).is_multiple_of(align_of::<u64>()));

@@ -99,8 +99,18 @@ const STATUS_DETAIL_PAGE: &str = "book/src/developers/status-detail.md";
 /// Which console vocabulary a source file's hyphen-bearing lowercase literals
 /// belong to.
 enum Vocabulary {
-    /// `cause=` tokens raised by the named domain, as `domain=` spells it.
-    Causes(&'static str),
+    /// `cause=` tokens raised by every named domain, as `domain=` spells them.
+    ///
+    /// **A set rather than one domain**, because a catalogue can be shared. The
+    /// package contract's refusals are minted in one crate and raised by two
+    /// protection domains — the one that terminates an upload and the one that
+    /// installs it — and an operator reading both domains' records is reading one
+    /// appliance. Attributing that file to a single domain would leave the other
+    /// domain's tokens looking unminted; duplicating the catalogue into a second
+    /// table would make a reader learn one vocabulary twice, which is exactly
+    /// what the shared catalogue exists to prevent. So the file names both
+    /// domains, and the chapter's table names both in its lead-in.
+    Causes(&'static [&'static str]),
     /// Accounted for as data through an `ALL` array rather than by this scan, so
     /// the literals here are compared, just not from here. The reason names
     /// which array.
@@ -121,43 +131,66 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // comparison below is per domain and not over one union.
     (
         "crates/nic-driver-core/src/bringup.rs",
-        Vocabulary::Causes("nic-driver"),
+        Vocabulary::Causes(&["nic-driver"]),
     ),
     (
         "pds/nic-driver/src/main.rs",
-        Vocabulary::Causes("nic-driver"),
+        Vocabulary::Causes(&["nic-driver"]),
     ),
-    ("crates/blk/src/bringup.rs", Vocabulary::Causes("recorder")),
+    (
+        "crates/blk/src/bringup.rs",
+        Vocabulary::Causes(&["recorder"]),
+    ),
     // The boot-time proof of the path to the medium, which the recorder domain
     // raises and no other domain has a counterpart for.
-    ("crates/blk/src/smoke.rs", Vocabulary::Causes("recorder")),
-    ("pds/recorder/src/main.rs", Vocabulary::Causes("recorder")),
-    ("pds/clock/src/main.rs", Vocabulary::Causes("clock")),
+    ("crates/blk/src/smoke.rs", Vocabulary::Causes(&["recorder"])),
+    (
+        "pds/recorder/src/main.rs",
+        Vocabulary::Causes(&["recorder"]),
+    ),
+    ("pds/clock/src/main.rs", Vocabulary::Causes(&["clock"])),
     (
         "pds/management/src/main.rs",
-        Vocabulary::Causes("management"),
+        Vocabulary::Causes(&["management"]),
     ),
     (
         "pds/hardware-probe/src/main.rs",
-        Vocabulary::Causes("hardware-probe"),
+        Vocabulary::Causes(&["hardware-probe"]),
     ),
-    ("pds/crypto/src/main.rs", Vocabulary::Causes("crypto")),
+    ("pds/crypto/src/main.rs", Vocabulary::Causes(&["crypto"])),
+    // Taking delivery of an onboarding package: the room an upload is validated
+    // in, which this domain reserves out of its own arena before it places a
+    // byte. Named where the decision is, so scanning the domain's main file
+    // alone would leave both tokens uncompared.
+    ("pds/crypto/src/upload.rs", Vocabulary::Causes(&["crypto"])),
     // The delegation's own refusals, raised by the cryptography domain and named
     // where the variants are: `DelegationError::cause` is the one place that knows
     // what each way of failing to reach the key holder means, so scanning the
     // domain alone would leave half this group uncompared.
-    ("pds/crypto/src/delegate.rs", Vocabulary::Causes("crypto")),
-    ("pds/store/src/main.rs", Vocabulary::Causes("store")),
+    (
+        "pds/crypto/src/delegate.rs",
+        Vocabulary::Causes(&["crypto"]),
+    ),
+    ("pds/store/src/main.rs", Vocabulary::Causes(&["store"])),
     // The onboarding package's own refusals, named where the variants are:
     // `lfw_package`'s error types are the only place a match over them can be
-    // held exhaustive by the compiler, so the catalogue lives there and the
-    // domain that installs a package reads it rather than restating it.
-    ("crates/package/src/refusal.rs", Vocabulary::Causes("store")),
+    // held exhaustive by the compiler, so the catalogue lives there and both
+    // domains that read a package read it rather than restating it. Two
+    // domains, because two read one: the cryptography domain judges an upload
+    // against the adopted validator before it hands it on, and the store domain
+    // judges it again against its own record before it writes the medium.
+    (
+        "crates/package/src/refusal.rs",
+        Vocabulary::Causes(&["store", "crypto"]),
+    ),
     // The identity's own refusals, raised by the store domain and named where
     // the variants are: `lfw_store::IdentityError::cause` is the one place that
     // knows what each disagreement means, so scanning the domain alone would
     // leave half this vocabulary uncompared.
-    ("crates/store/src/identity.rs", Vocabulary::Causes("store")),
+    (
+        "crates/store/src/identity.rs",
+        Vocabulary::Causes(&["store"]),
+    ),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus
     // `Domain`'s and `Field`'s hyphenated ones. Every one of them is reachable
     // as an `ALL` array, so scanning this file would be the second copy.
@@ -431,7 +464,9 @@ fn check_literal_sites(literals: &BTreeMap<String, Vec<String>>, findings: &mut 
     for (path, vocabulary) in LITERAL_SITES {
         if !found.contains_key(path) {
             let what = match vocabulary {
-                Vocabulary::Causes(domain) => format!("the {domain} domain's `cause=` tokens"),
+                Vocabulary::Causes(domains) => {
+                    format!("the `cause=` tokens of {}", spell_domains(domains))
+                }
                 Vocabulary::AsData(source) => format!("literals accounted for by {source}"),
                 Vocabulary::Other(reason) => reason.to_string(),
             };
@@ -444,6 +479,10 @@ fn check_literal_sites(literals: &BTreeMap<String, Vec<String>>, findings: &mut 
 }
 
 /// The tokens each refusing domain's sites mint.
+///
+/// A file attributed to several domains contributes its tokens to each of them,
+/// which is what makes a shared catalogue readable from either domain's table
+/// without being written twice.
 fn minted_causes<'a>(
     literals: &'a BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<&'static str, BTreeSet<&'a str>> {
@@ -453,10 +492,13 @@ fn minted_causes<'a>(
         .map(|domain| (*domain, BTreeSet::new()))
         .collect();
     for (path, vocabulary) in LITERAL_SITES {
-        let Vocabulary::Causes(domain) = vocabulary else {
+        let Vocabulary::Causes(domains) = vocabulary else {
             continue;
         };
-        if let Some(hits) = found.get(path) {
+        let Some(hits) = found.get(path) else {
+            continue;
+        };
+        for domain in *domains {
             by_domain
                 .entry(*domain)
                 .or_default()
@@ -494,20 +536,29 @@ fn check_causes(
         ));
     }
 
+    // A table's tokens go to every domain its lead-in names, which is what lets
+    // one table serve a catalogue two domains raise without a reader meeting the
+    // same hundred tokens twice.
     let mut documented: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for table in &cause_tables {
-        let Some(domain) = table.owner.clone() else {
+        if table.owners.is_empty() {
             findings.push(format!(
                 "{CONSOLE_PAGE} line {}: a refusal-cause table sits under no `**`domain`.**` \
                  heading, so its tokens belong to no domain a reader or this check can name",
                 table.line
             ));
             continue;
-        };
-        let tokens = documented.entry(domain).or_default();
+        }
+        let mut listed: BTreeSet<String> = BTreeSet::new();
         for row in &table.rows {
             let Some(cell) = row.get(1) else { continue };
-            tokens.extend(backticked(&without_parentheses(cell)));
+            listed.extend(backticked(&without_parentheses(cell)));
+        }
+        for domain in &table.owners {
+            documented
+                .entry(domain.clone())
+                .or_default()
+                .extend(listed.iter().cloned());
         }
     }
 
@@ -1025,9 +1076,14 @@ struct Table {
     header: Vec<String>,
     rows: Vec<Vec<String>>,
     line: usize,
-    /// The backticked subject of the nearest preceding `**…**` lead-in, which is
-    /// how the console chapter says which domain a table of tokens is about.
-    owner: Option<String>,
+    /// Every backticked subject of the nearest preceding `**…**` lead-in, which
+    /// is how the console chapter says which domain — or which domains — a table
+    /// of tokens is about.
+    ///
+    /// A list rather than one name because a catalogue can be shared: the
+    /// package contract's refusals are raised by two domains out of one crate,
+    /// and its table says so by naming both.
+    owners: Vec<String>,
 }
 
 /// Every pipe table in `markdown`.
@@ -1040,12 +1096,15 @@ struct Table {
 fn tables(markdown: &str) -> Vec<Table> {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut found = Vec::new();
-    let mut owner: Option<String> = None;
+    let mut owners: Vec<String> = Vec::new();
     let mut at = 0;
     while at < lines.len() {
         let line = lines[at].trim();
         if line.starts_with("**") {
-            owner = backticked(line).into_iter().next();
+            // The bolded subject alone, and not the sentence that follows it: a
+            // lead-in often goes on to backtick a token prefix or an example,
+            // and those are prose rather than the domains the table is about.
+            owners = backticked(bold_lead(line));
         }
         let is_delimiter = lines
             .get(at + 1)
@@ -1077,7 +1136,7 @@ fn tables(markdown: &str) -> Vec<Table> {
             header,
             rows,
             line: at + 1,
-            owner: owner.clone(),
+            owners: owners.clone(),
         });
         at = row_at;
     }
@@ -1195,6 +1254,29 @@ fn trailing_count(text: &str) -> Option<usize> {
 /// A small count as the chapters spell it, for the claims that name a number in
 /// words. Only the sizes these chapters actually state; anything else is a
 /// finding rather than a guess at English.
+/// The text of a line's opening `**…**` run, which is the subject a table sits
+/// under. Everything after the closing marker is the sentence about it.
+fn bold_lead(line: &str) -> &str {
+    let rest = line.strip_prefix("**").unwrap_or(line);
+    match rest.split_once("**") {
+        Some((lead, _)) => lead,
+        None => rest,
+    }
+}
+
+/// The domains a literal site is attributed to, as a finding names them.
+fn spell_domains(domains: &[&str]) -> String {
+    let named: Vec<String> = domains
+        .iter()
+        .map(|domain| format!("the `{domain}` domain"))
+        .collect();
+    match named.split_last() {
+        None => String::from("no domain"),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 fn spell(count: usize) -> String {
     match count {
         0 => String::from("no"),

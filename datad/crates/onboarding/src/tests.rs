@@ -6,9 +6,95 @@ use proptest::prelude::*;
 
 use crate::{
     BASE_INTERVAL, BURST, Decision, Identity, Limiter, MAX_BACKOFF_SHIFT, MAX_PAGE_LEN,
-    MAX_RESPONSE_LEN, Onboarding, PageDoesNotFit, REQUEST_CAPACITY, REQUEST_RECORDS, Throttle,
-    write_page,
+    MAX_RESPONSE_LEN, MAX_UPLOAD_LEN, Onboarding, PageDoesNotFit, REQUEST_CAPACITY,
+    REQUEST_RECORDS, Throttle, Upload, UploadRefused, write_page,
 };
+
+/// An upload that keeps everything and installs everything, which is what makes
+/// every path through the surface reachable on a host: the protection domain's
+/// own writes into a shared region and its exchange with the key holder are the
+/// two things a host cannot have, and this is the shape of the hole they leave.
+///
+/// The knobs are the three answers a real one can give — refuse to begin, keep
+/// fewer bytes than were offered, refuse to install — so a test names the
+/// failure it is about rather than arranging one.
+#[derive(Default)]
+struct Sink {
+    body: Vec<u8>,
+    opened: Vec<usize>,
+    installs: u32,
+    refuse_open: bool,
+    /// Bytes to keep out of every segment offered, `None` for all of them.
+    keep: Option<usize>,
+    refuse_install: bool,
+}
+
+impl Sink {
+    fn refusing_to_open() -> Self {
+        Self {
+            refuse_open: true,
+            ..Self::default()
+        }
+    }
+
+    fn keeping(keep: usize) -> Self {
+        Self {
+            keep: Some(keep),
+            ..Self::default()
+        }
+    }
+
+    fn refusing_to_install() -> Self {
+        Self {
+            refuse_install: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl Upload for Sink {
+    fn open(&mut self, declared: usize) -> Result<(), UploadRefused> {
+        self.opened.push(declared);
+        if self.refuse_open {
+            return Err(UploadRefused);
+        }
+        Ok(())
+    }
+
+    fn take(&mut self, segment: &[u8]) -> usize {
+        let kept = self.keep.unwrap_or(segment.len()).min(segment.len());
+        self.body
+            .extend_from_slice(segment.get(..kept).unwrap_or_default());
+        kept
+    }
+
+    fn install(&mut self) -> Result<(), UploadRefused> {
+        self.installs += 1;
+        if self.refuse_install {
+            return Err(UploadRefused);
+        }
+        Ok(())
+    }
+}
+
+/// An upload nothing on this path ever reaches, for the requests that are not
+/// uploads. Its methods are unreachable and say so by failing the test rather
+/// than by quietly answering.
+struct NoUpload;
+
+impl Upload for NoUpload {
+    fn open(&mut self, _declared: usize) -> Result<(), UploadRefused> {
+        panic!("a request that is not an upload reserved one");
+    }
+
+    fn take(&mut self, _segment: &[u8]) -> usize {
+        panic!("a request that is not an upload offered a body");
+    }
+
+    fn install(&mut self) -> Result<(), UploadRefused> {
+        panic!("a request that is not an upload was installed");
+    }
+}
 
 const DEVICE: &[u8; DEVICE_ID_LEN] = b"51c2d7744c1c58082f4d4a84b4565ef9";
 const FINGERPRINT: &[u8; FINGERPRINT_LEN] =
@@ -25,9 +111,36 @@ fn identity() -> Identity {
 
 /// An appliance with an identity, at an instant a limiter can measure from.
 fn surface() -> Onboarding {
-    let mut onboarding = Onboarding::new(Some(identity()));
+    let mut onboarding = Onboarding::new(Some(identity()), false);
     onboarding.opened();
     onboarding
+}
+
+/// A `POST /configuration.tar` head declaring `len` bytes of body.
+fn upload_head(len: usize) -> Vec<u8> {
+    format!("POST /configuration.tar HTTP/1.1\r\nHost: appliance\r\nContent-Length: {len}\r\n\r\n")
+        .into_bytes()
+}
+
+/// Drive a whole upload over a fresh connection, delivering the head and the
+/// body in the pieces given.
+fn upload(
+    onboarding: &mut Onboarding,
+    sink: &mut Sink,
+    declared: usize,
+    deliveries: &[&[u8]],
+) -> (Decision, Vec<u8>) {
+    onboarding.opened();
+    let mut decision = Decision::Waiting;
+    for delivery in deliveries {
+        decision = onboarding.take(at(0), delivery, sink);
+    }
+    let _ = declared;
+    let mut answer = Vec::new();
+    answer.extend_from_slice(onboarding.pending());
+    let len = answer.len();
+    onboarding.sent(len);
+    (decision, answer)
 }
 
 /// Nanoseconds since boot as an instant, built the only way the clock crate
@@ -44,7 +157,7 @@ fn request(
     head: &[u8],
 ) -> (Decision, Vec<u8>) {
     onboarding.opened();
-    let decision = onboarding.take(now, head);
+    let decision = onboarding.take(now, head, &mut NoUpload);
     let mut answer = Vec::new();
     answer.extend_from_slice(onboarding.pending());
     let len = answer.len();
@@ -99,8 +212,12 @@ fn the_page_carries_the_name_and_the_fingerprint_and_links_to_the_request() {
     assert!(page.contains(core::str::from_utf8(DEVICE).expect("ascii")));
     assert!(page.contains(core::str::from_utf8(FINGERPRINT).expect("ascii")));
     assert!(page.contains("/certificate.csr"));
-    // And the sentence that stands in for the form this build does not have.
-    assert!(page.contains("POST /configuration.tar"));
+    // And the command that uploads a package, rather than a control that would
+    // have to be unwrapped: the package is the whole body of the request, and a
+    // browser form can only send one wrapped in an encoding of its own.
+    assert!(page.contains("/configuration.tar"));
+    assert!(page.contains("curl"));
+    assert!(page.contains("--data-binary"));
     assert!(!page.contains("<form"));
     assert!(!page.contains("<input"));
 }
@@ -152,14 +269,21 @@ fn a_request_arriving_in_pieces_is_answered_when_it_ends_and_not_before() {
     onboarding.opened();
     let head = get("/");
     for split in 1..head.len() {
-        let mut fresh = Onboarding::new(Some(identity()));
+        let mut fresh = Onboarding::new(Some(identity()), false);
         fresh.opened();
         let (front, back) = head.split_at(split);
-        assert_eq!(fresh.take(at(0), front), Decision::Waiting, "at {split}");
+        assert_eq!(
+            fresh.take(at(0), front, &mut NoUpload),
+            Decision::Waiting,
+            "at {split}"
+        );
         assert!(fresh.pending().is_empty(), "at {split}");
         assert!(!fresh.finished(), "at {split}");
         assert!(
-            matches!(fresh.take(at(0), back), Decision::Served { .. }),
+            matches!(
+                fresh.take(at(0), back, &mut NoUpload),
+                Decision::Served { .. }
+            ),
             "at {split}"
         );
     }
@@ -170,14 +294,14 @@ fn an_answered_connection_takes_nothing_further_and_finishes_when_it_has_gone() 
     let mut onboarding = surface();
     onboarding.opened();
     assert!(matches!(
-        onboarding.take(at(0), &get("/")),
+        onboarding.take(at(0), &get("/"), &mut NoUpload),
         Decision::Served { .. }
     ));
     assert!(!onboarding.finished());
     // A peer that pipelines a second request onto a connection already
     // committed to an answer is read and dropped, never parsed.
     assert_eq!(
-        onboarding.take(at(0), &get("/certificate.csr")),
+        onboarding.take(at(0), &get("/certificate.csr"), &mut NoUpload),
         Decision::Waiting
     );
     let owed = onboarding.pending().len();
@@ -192,12 +316,15 @@ fn an_answered_connection_takes_nothing_further_and_finishes_when_it_has_gone() 
 fn a_fresh_connection_inherits_no_byte_of_the_last_one() {
     let mut onboarding = surface();
     onboarding.opened();
-    assert_eq!(onboarding.take(at(0), b"GET / HT"), Decision::Waiting);
+    assert_eq!(
+        onboarding.take(at(0), b"GET / HT", &mut NoUpload),
+        Decision::Waiting
+    );
     onboarding.opened();
     // The half-written line above would make this one malformed if it were
     // still held.
     assert!(matches!(
-        onboarding.take(at(0), &get("/")),
+        onboarding.take(at(0), &get("/"), &mut NoUpload),
         Decision::Served { .. }
     ));
 }
@@ -229,16 +356,25 @@ fn each_way_a_request_is_refused_carries_a_token_of_its_own() {
     let mut onboarding = surface();
     // Every one of these is a different thing for an administrator to go and
     // change, so a token standing for two of them would name neither.
-    let cases: [(&[u8], OnboardRefusal, Status); 13] = [
+    let cases: [(&[u8], OnboardRefusal, Status); 14] = [
         (
             b"GET /nope HTTP/1.1\r\n\r\n",
             OnboardRefusal::UnknownRoute,
             Status::NotFound,
         ),
+        // The upload route exists and takes a body, so a `POST` to it declaring
+        // none is refused for being empty rather than for not being served.
         (
             b"POST /configuration.tar HTTP/1.1\r\n\r\n",
-            OnboardRefusal::UnknownRoute,
-            Status::NotFound,
+            OnboardRefusal::UploadEmpty,
+            Status::BadRequest,
+        ),
+        // And a `GET` of it is the method refusal, not the address one: the
+        // resource is there, under a method it is not served with.
+        (
+            b"GET /configuration.tar HTTP/1.1\r\n\r\n",
+            OnboardRefusal::MethodNotServed,
+            Status::MethodNotAllowed,
         ),
         (
             b"POST / HTTP/1.1\r\n\r\n",
@@ -290,10 +426,13 @@ fn each_way_a_request_is_refused_carries_a_token_of_its_own() {
             OnboardRefusal::ObsoleteLineFolding,
             Status::BadRequest,
         ),
+        // A body on a route that does not take one. The declared length is
+        // inside the bound — the bound is the archive's, for every route — so
+        // what refuses this is the method the resource is not served under.
         (
             b"POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\n",
-            OnboardRefusal::BodyTooLarge,
-            Status::ContentTooLarge,
+            OnboardRefusal::MethodNotServed,
+            Status::MethodNotAllowed,
         ),
     ];
     for (head, owed, status) in cases {
@@ -375,8 +514,11 @@ fn a_head_that_never_ends_is_refused_at_the_bound_rather_than_waited_on() {
     let mut onboarding = surface();
     onboarding.opened();
     let filler = vec![b'a'; REQUEST_CAPACITY];
-    assert_eq!(onboarding.take(at(0), b"GET /"), Decision::Waiting);
-    let decision = onboarding.take(at(0), &filler);
+    assert_eq!(
+        onboarding.take(at(0), b"GET /", &mut NoUpload),
+        Decision::Waiting
+    );
+    let decision = onboarding.take(at(0), &filler, &mut NoUpload);
     let Decision::Refused {
         refusal,
         status,
@@ -394,7 +536,7 @@ fn a_head_that_never_ends_is_refused_at_the_bound_rather_than_waited_on() {
 
 #[test]
 fn a_boot_with_no_identity_refuses_under_a_token_that_blames_nothing_on_the_peer() {
-    let mut onboarding = Onboarding::new(None);
+    let mut onboarding = Onboarding::new(None, false);
     let (decision, answer) = request(&mut onboarding, at(0), &get("/"));
     assert!(matches!(
         decision,
@@ -661,7 +803,7 @@ fn a_request_longer_than_the_armouring_can_be_is_clamped_rather_than_overrunning
     let over = vec![b'x'; MAX_CSR_PEM_LEN + 64];
     let identity = Identity::new(*DEVICE, *FINGERPRINT, &over);
     assert_eq!(identity.csr().len(), MAX_CSR_PEM_LEN);
-    let mut onboarding = Onboarding::new(Some(identity));
+    let mut onboarding = Onboarding::new(Some(identity), false);
     let (decision, answer) = request(&mut onboarding, at(0), &get("/certificate.csr"));
     assert!(matches!(decision, Decision::Served { .. }));
     assert_eq!(body(&answer).len(), MAX_CSR_PEM_LEN);
@@ -669,15 +811,346 @@ fn a_request_longer_than_the_armouring_can_be_is_clamped_rather_than_overrunning
 
 #[test]
 fn every_response_this_surface_composes_fits_the_bound_it_reserves() {
-    let mut onboarding = Onboarding::new(Some(Identity::new(
-        *DEVICE,
-        *FINGERPRINT,
-        &vec![b'x'; MAX_CSR_PEM_LEN],
-    )));
+    let mut onboarding = Onboarding::new(
+        Some(Identity::new(
+            *DEVICE,
+            *FINGERPRINT,
+            &vec![b'x'; MAX_CSR_PEM_LEN],
+        )),
+        false,
+    );
     for target in ["/", "/certificate.csr"] {
         let (_, answer) = request(&mut onboarding, at(0), &get(target));
         assert!(answer.len() <= MAX_RESPONSE_LEN, "{target}");
     }
+}
+
+#[test]
+fn a_package_is_handed_on_whole_and_installed_and_the_answer_carries_no_body() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let archive = vec![0xa5_u8; 4096];
+    let mut delivery = upload_head(archive.len());
+    delivery.extend_from_slice(&archive);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, archive.len(), &[&delivery]);
+
+    assert_eq!(decision, Decision::Installed { bytes: 4096 });
+    assert_eq!(sink.opened, vec![4096]);
+    assert_eq!(sink.body, archive);
+    assert_eq!(sink.installs, 1);
+    assert_eq!(status_line(&answer), "HTTP/1.1 200 OK");
+    // No body at all: the status is the whole of what a client is owed, and
+    // prose composed for one would be a second surface to keep true.
+    assert!(body(&answer).is_empty());
+    assert!(String::from_utf8_lossy(&answer).contains("Connection: close"));
+    assert!(onboarding.finished());
+}
+
+/// The whole reason the head is filled before it is parsed: one TLS delivery is
+/// tens of kibibytes, so an upload's first one carries a head and a great deal
+/// of body — and a surface that refused on the arithmetic would answer a
+/// legitimate upload "your headers are too large".
+#[test]
+fn a_first_delivery_far_longer_than_the_head_buffer_is_an_upload_and_not_a_long_head() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let archive = vec![7_u8; 8 * REQUEST_CAPACITY];
+    let mut delivery = upload_head(archive.len());
+    delivery.extend_from_slice(&archive);
+    let (decision, _) = upload(&mut onboarding, &mut sink, archive.len(), &[&delivery]);
+    assert_eq!(
+        decision,
+        Decision::Installed {
+            bytes: 8 * REQUEST_CAPACITY
+        }
+    );
+    assert_eq!(sink.body, archive);
+}
+
+/// A package arrives in whatever pieces the network chose, including pieces
+/// that cut the head, cut the boundary between head and body, and cut the body.
+#[test]
+fn a_package_split_anywhere_is_reassembled_in_order() {
+    let archive: Vec<u8> = (0..3000_u32).map(|byte| byte as u8).collect();
+    let mut whole = upload_head(archive.len());
+    let head_len = whole.len();
+    whole.extend_from_slice(&archive);
+    for split in [1, head_len - 1, head_len, head_len + 1, whole.len() - 1] {
+        let mut onboarding = surface();
+        let mut sink = Sink::default();
+        let (front, back) = whole.split_at(split);
+        let (decision, _) = upload(&mut onboarding, &mut sink, archive.len(), &[front, back]);
+        assert_eq!(
+            decision,
+            Decision::Installed {
+                bytes: archive.len()
+            },
+            "at {split}"
+        );
+        assert_eq!(sink.body, archive, "at {split}");
+    }
+}
+
+/// The body is judged when the last byte of it arrives and not before, so a peer
+/// that stops short is left waiting rather than having a short archive installed.
+#[test]
+fn a_body_that_stops_short_installs_nothing_and_answers_nothing() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let mut delivery = upload_head(64);
+    delivery.extend_from_slice(&[1_u8; 32]);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, 64, &[&delivery]);
+    assert_eq!(decision, Decision::Waiting);
+    assert_eq!(sink.installs, 0);
+    assert!(answer.is_empty());
+    assert!(!onboarding.finished());
+}
+
+/// A peer contradicting its own `Content-Length`. Refused rather than truncated
+/// to the declared length: two parties disagreeing about where a message ends is
+/// the one thing this surface's parser has only one opinion about.
+#[test]
+fn a_body_longer_than_it_declared_is_refused_by_name() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let mut delivery = upload_head(16);
+    delivery.extend_from_slice(&[9_u8; 64]);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, 16, &[&delivery]);
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::UploadOverran,
+            status: Status::BadRequest,
+            ..
+        }
+    ));
+    assert_eq!(sink.installs, 0);
+    assert_eq!(status_line(&answer), "HTTP/1.1 400 Bad Request");
+}
+
+/// The same, delivered a segment at a time: the overrun is refused on the
+/// segment that goes past rather than after the whole of it is taken.
+#[test]
+fn an_overrun_in_a_later_segment_is_refused_when_it_arrives() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let (decision, _) = upload(
+        &mut onboarding,
+        &mut sink,
+        4,
+        &[&upload_head(4), &[1, 2], &[3, 4, 5]],
+    );
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::UploadOverran,
+            ..
+        }
+    ));
+    // The two bytes that were inside the declared length were handed on; the
+    // segment that went past was not handed on at all.
+    assert_eq!(sink.body, vec![1, 2]);
+}
+
+/// An appliance with nowhere to put a package refuses before it takes a byte, so
+/// it never begins an upload it cannot finish.
+#[test]
+fn an_upload_with_nowhere_to_go_is_refused_before_a_byte_is_taken() {
+    let mut onboarding = surface();
+    let mut sink = Sink::refusing_to_open();
+    let mut delivery = upload_head(32);
+    delivery.extend_from_slice(&[3_u8; 32]);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, 32, &[&delivery]);
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::UploadUnavailable,
+            status: Status::ServiceUnavailable,
+            ..
+        }
+    ));
+    assert!(sink.body.is_empty());
+    assert_eq!(sink.installs, 0);
+    assert_eq!(status_line(&answer), "HTTP/1.1 503 Service Unavailable");
+}
+
+/// A caller that keeps fewer bytes than it was offered. Unreachable while a
+/// declared length is held to what was reserved, and answered by name rather
+/// than asserted, because nothing on a path a peer paces may fault.
+#[test]
+fn bytes_that_would_not_all_go_where_they_were_meant_to_are_refused_by_name() {
+    let mut onboarding = surface();
+    let mut sink = Sink::keeping(4);
+    let mut delivery = upload_head(32);
+    delivery.extend_from_slice(&[5_u8; 32]);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, 32, &[&delivery]);
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::UploadUnstaged,
+            status: Status::ServiceUnavailable,
+            ..
+        }
+    ));
+    assert_eq!(sink.installs, 0);
+    assert_eq!(status_line(&answer), "HTTP/1.1 503 Service Unavailable");
+}
+
+/// A package the domain that holds the key would not install. The surface says
+/// only that it got that far and was judged; which rule refused it is that
+/// domain's own record.
+#[test]
+fn a_package_the_key_holder_refuses_is_named_here_and_reasoned_about_there() {
+    let mut onboarding = surface();
+    let mut sink = Sink::refusing_to_install();
+    let mut delivery = upload_head(64);
+    delivery.extend_from_slice(&[2_u8; 64]);
+    let (decision, answer) = upload(&mut onboarding, &mut sink, 64, &[&delivery]);
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::PackageRefused,
+            status: Status::BadRequest,
+            ..
+        }
+    ));
+    assert_eq!(sink.installs, 1);
+    assert_eq!(status_line(&answer), "HTTP/1.1 400 Bad Request");
+    // Refused, so the surface is not shut: an administrator corrects the package
+    // and uploads again.
+    assert!(!onboarding.closed());
+}
+
+/// A declared length past the widest package this appliance looks at is refused
+/// at the head, so no byte of the body is accumulated on the way to finding out.
+#[test]
+fn a_declared_length_past_the_archive_bound_is_refused_at_the_head() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let (decision, answer) = upload(
+        &mut onboarding,
+        &mut sink,
+        0,
+        &[&upload_head(MAX_UPLOAD_LEN + 1)],
+    );
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::BodyTooLarge,
+            status: Status::ContentTooLarge,
+            ..
+        }
+    ));
+    assert!(sink.opened.is_empty());
+    assert_eq!(status_line(&answer), "HTTP/1.1 413 Content Too Large");
+}
+
+/// An appliance that has just been given an owner serves no onboarding, and it
+/// does not wait for a new connection to stop: the close is the same statement
+/// whether it is made by an install or by a record read at boot.
+#[test]
+fn an_installed_package_shuts_the_surface_for_every_route_and_for_good() {
+    let mut onboarding = surface();
+    let mut sink = Sink::default();
+    let mut delivery = upload_head(16);
+    delivery.extend_from_slice(&[4_u8; 16]);
+    let (decision, _) = upload(&mut onboarding, &mut sink, 16, &[&delivery]);
+    assert_eq!(decision, Decision::Installed { bytes: 16 });
+    assert!(onboarding.closed());
+
+    for target in ["/", "/certificate.csr", "/configuration.tar"] {
+        let (decision, answer) = request(&mut onboarding, at(0), &get(target));
+        assert!(
+            matches!(
+                decision,
+                Decision::Refused {
+                    refusal: OnboardRefusal::AlreadyOwned,
+                    status: Status::Gone,
+                    ..
+                }
+            ),
+            "{target}"
+        );
+        assert_eq!(status_line(&answer), "HTTP/1.1 410 Gone", "{target}");
+    }
+}
+
+/// The durable half of that close: an appliance whose record already names an
+/// owner is constructed shut, so a reboot does not reopen onboarding.
+#[test]
+fn an_appliance_that_boots_owned_serves_nothing_at_all() {
+    let mut onboarding = Onboarding::new(Some(identity()), true);
+    assert!(onboarding.closed());
+    for target in ["/", "/certificate.csr", "/configuration.tar"] {
+        let (decision, answer) = request(&mut onboarding, at(0), &get(target));
+        assert!(
+            matches!(
+                decision,
+                Decision::Refused {
+                    refusal: OnboardRefusal::AlreadyOwned,
+                    status: Status::Gone,
+                    ..
+                }
+            ),
+            "{target}"
+        );
+        assert_eq!(status_line(&answer), "HTTP/1.1 410 Gone", "{target}");
+    }
+}
+
+/// The close outranks a missing identity and is decided before the route, so an
+/// owned appliance answers one way whatever it is asked and whatever state its
+/// cryptography reached.
+#[test]
+fn a_closed_surface_answers_the_same_way_for_an_address_it_never_had() {
+    let mut onboarding = Onboarding::new(None, true);
+    let (decision, _) = request(&mut onboarding, at(0), &get("/nope"));
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::AlreadyOwned,
+            ..
+        }
+    ));
+}
+
+/// The limiter still runs first, so a closed appliance costs a peer the same
+/// allowance every other refusal does rather than being a free surface to hammer.
+#[test]
+fn the_limiter_runs_before_the_close_is_looked_at() {
+    let mut onboarding = Onboarding::new(Some(identity()), true);
+    for _ in 0..BURST {
+        let (decision, _) = request(&mut onboarding, at(0), &get("/"));
+        assert!(matches!(
+            decision,
+            Decision::Refused {
+                refusal: OnboardRefusal::AlreadyOwned,
+                ..
+            }
+        ));
+    }
+    let (decision, _) = request(&mut onboarding, at(0), &get("/"));
+    assert!(matches!(
+        decision,
+        Decision::Refused {
+            refusal: OnboardRefusal::RateLimited,
+            ..
+        }
+    ));
+}
+
+/// An installed package owes the console one record naming what it was, and no
+/// resource is named: nothing was served.
+#[test]
+fn an_install_reports_its_length_and_names_no_resource() {
+    let records = Decision::Installed { bytes: 4096 }.records();
+    assert_eq!(
+        records,
+        [
+            Some(DomainDetail::OnboardingInstalled { bytes: 4096 }),
+            None
+        ]
+    );
 }
 
 proptest! {
@@ -689,11 +1162,11 @@ proptest! {
         clocked in any::<bool>(),
         millis in any::<u64>(),
     ) {
-        let mut onboarding = Onboarding::new(Some(identity()));
+        let mut onboarding = Onboarding::new(Some(identity()), false);
         onboarding.opened();
         let now = if clocked { at(millis) } else { None };
         for piece in &pieces {
-            let decision = onboarding.take(now, piece);
+            let decision = onboarding.take(now, piece, &mut NoUpload);
             if let Decision::Served { bytes, .. } = decision {
                 prop_assert!(bytes <= crate::MAX_BODY_LEN);
             }

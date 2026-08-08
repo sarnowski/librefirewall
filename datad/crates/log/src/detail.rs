@@ -556,6 +556,22 @@ pub enum DomainDetail<C = &'static str> {
         status: u16,
         held: u64,
     },
+    /// One package upload the surface accepted and the domain that holds the
+    /// device key installed, and how many bytes of archive it was.
+    ///
+    /// Its own record rather than a resource that was served, because nothing
+    /// was: a request that installs answers with a status and no body, and the
+    /// count here is the body that came *in*. What the appliance now belongs to
+    /// is on the installing domain's own records — the anchor's fingerprint and
+    /// the endpoint — where it was decided and made durable; this says the
+    /// upload reached that domain and came back accepted, which is the one fact
+    /// the terminating domain holds and the other does not.
+    ///
+    /// It is emitted at most once per boot: an appliance with an owner shuts
+    /// this surface, so a second upload is refused before it is read.
+    OnboardingInstalled {
+        bytes: u64,
+    },
     /// What the limiter is doing, written beside the refusal it caused.
     ///
     /// Its own record rather than two more fields, because it answers a

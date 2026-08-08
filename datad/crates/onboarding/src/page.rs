@@ -12,11 +12,22 @@
 //!
 //! # There is no upload form, and that is a statement rather than an omission
 //!
-//! The finished surface takes a configuration package. This build does not, and
-//! the page says so in a sentence instead of offering a control that would fail
-//! — a form pointing at a route the appliance answers with "no such resource"
-//! is a promise the appliance does not keep, and an administrator who clicked
-//! it would learn less than the sentence tells them.
+//! The surface takes a configuration package and the page does not offer a
+//! control for one. A browser form can only send a body it has wrapped in an
+//! encoding of its own, and unwrapping that would be a second parser on the one
+//! path an unauthenticated peer reaches — for a wrapping that carries nothing,
+//! the package being the whole body of the request. So the page prints the
+//! command instead, which is a string an administrator runs rather than a
+//! format this appliance has to read.
+//!
+//! # The address is a placeholder and the fingerprint is not
+//!
+//! The command cannot name this appliance, because the only thing on the wire
+//! that claims to is the `Host` field a peer typed — and no byte a peer sent
+//! reaches this page. So the address is written as a placeholder an
+//! administrator substitutes; they know it, having just used it. The
+//! fingerprint beside it is this appliance's own and is rendered exactly once,
+//! the way the certificate profile fixes it.
 //!
 //! # Adversary
 //!
@@ -65,9 +76,21 @@ const AFTER_FINGERPRINT: &str = concat!(
     "application, which signs it and hands back a configuration package.</p>\n",
     "<p><a href=\"/certificate.csr\">/certificate.csr</a></p>\n",
     "<h2>Uploading the package</h2>\n",
-    "<p>This build does not accept one yet. The package will be uploaded to\n",
-    "<code>POST /configuration.tar</code>, which this appliance does not serve:\n",
-    "asking for it now is answered exactly as any other unknown address is.</p>\n",
+    "<p>Upload the package to this appliance, substituting the address you\n",
+    "reached this page on. There is no form: the package travels as the whole\n",
+    "body of the request, and a browser can only send one wrapped in an\n",
+    "encoding this appliance would then have to unwrap.</p>\n",
+    "<pre><code>curl -i --insecure --data-binary @package.tar \\\n",
+    "  https://APPLIANCE/configuration.tar</code></pre>\n",
+    "<p><code>--insecure</code> means this appliance has no certificate\n",
+    "authority above it, not that nothing was checked. The fingerprint above is\n",
+    "the check, and you have already made it.</p>\n",
+    "<p>A package that is accepted is answered <code>200</code> with no body,\n",
+    "and the console then carries the fingerprint of the authority this\n",
+    "appliance has accepted and the endpoint it will answer to. Anything else\n",
+    "names the refusal on the console. Once a package is accepted this page and\n",
+    "everything beside it are gone for good: an appliance with an owner serves\n",
+    "no onboarding, and a factory reset is the way back.</p>\n",
     "</body>\n",
     "</html>\n",
 );

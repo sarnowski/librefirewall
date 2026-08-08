@@ -260,13 +260,47 @@ closed_vocabulary! {
         MalformedHeaderName => "malformed-header-name",
         MalformedHeaderValue => "malformed-header-value",
         ObsoleteLineFolding => "obsolete-line-folding",
-        /// A body framed in a way the parser will not read, which on this
-        /// surface is every body: nothing here takes one.
+        /// A body framed in a way the parser will not read: any
+        /// `Transfer-Encoding`, a repeated or non-decimal `Content-Length`, or a
+        /// body on a method other than `POST`.
         BodyNotAccepted => "body-not-accepted",
-        /// A declared body length past what this surface holds.
+        /// A declared body length past the widest package this appliance will
+        /// look at. Refused at the head, so no byte of it is accumulated on the
+        /// way to finding out.
         BodyTooLarge => "body-too-large",
         /// Bytes no string can hold, which a head is never made of.
         NotUtf8 => "not-utf8",
+        /// This appliance already has an owner, so the surface is shut. Its own
+        /// token and not the one for an address that is not served: an
+        /// administrator told "no such resource" would go looking for a typing
+        /// mistake, and what has happened is that the appliance moved on. The
+        /// close is permanent and a **factory reset** is the way back.
+        AlreadyOwned => "already-owned",
+        /// A package upload declaring no body at all. Nothing was staged and
+        /// nothing was asked of the domain that holds the key, so no other
+        /// domain's record says anything about this request — which is why it
+        /// is named here rather than left to be inferred from silence.
+        UploadEmpty => "upload-empty",
+        /// The peer sent more body than the length it declared. Its own token
+        /// because it is the peer contradicting itself, rather than any rule
+        /// about what a package is.
+        UploadOverran => "upload-overran",
+        /// This appliance could not begin an upload: the room a package is
+        /// validated in was not free. Nothing about the request was wrong, and
+        /// the domain that refused says on its own console what it was short
+        /// of.
+        UploadUnavailable => "upload-unavailable",
+        /// The upload began and the bytes would not all go where they were
+        /// meant to. Unreachable while the declared length is held to the room
+        /// that was reserved for it, and named rather than asserted because
+        /// nothing on a path a peer paces may fault.
+        UploadUnstaged => "upload-unstaged",
+        /// The package arrived whole and the domain that holds the device key
+        /// did not install it. **Which rule refused it is that domain's
+        /// record**, in the package contract's own vocabulary, beside the facts
+        /// that place it; this token says the upload got that far and was
+        /// judged, which is what tells it apart from every refusal above.
+        PackageRefused => "package-refused",
     }
 }
 

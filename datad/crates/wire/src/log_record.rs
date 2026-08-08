@@ -99,7 +99,7 @@ pub const LOG_ONBOARD_ROUTE_COUNT: u8 = 2;
 
 /// How many ways a request on that surface may be refused —
 /// `lfw_log::OnboardRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
-pub const LOG_ONBOARD_REFUSAL_COUNT: u8 = 20;
+pub const LOG_ONBOARD_REFUSAL_COUNT: u8 = 26;
 
 /// Code points of one kind an offer record carries —
 /// `lfw_log::MAX_OFFERED_POINTS`. Eight, which is [`LOG_OPERANDS`] halved:
@@ -264,6 +264,11 @@ pub enum LogDetailKind {
     OnboardingServed,
     OnboardingRequest,
     OnboardingThrottled,
+    /// The upload the surface accepted, appended after the three above because
+    /// it arrived with the route that takes one. Its own discriminant on their
+    /// terms: nothing was served, so the count beside it is a body that came in
+    /// rather than one that went out.
+    OnboardingInstalled,
     /// The two an appliance that has just been given an owner produces: where it
     /// will answer to, and the fingerprint of the authority it will validate
     /// that channel against. Two discriminants rather than one, for
@@ -317,6 +322,7 @@ impl LogDetailKind {
             Self::OnboardingThrottled => 37,
             Self::Adopted => 38,
             Self::AnchorFingerprint => 39,
+            Self::OnboardingInstalled => 40,
         }
     }
 
@@ -363,6 +369,7 @@ impl LogDetailKind {
             37 => Some(Self::OnboardingThrottled),
             38 => Some(Self::Adopted),
             39 => Some(Self::AnchorFingerprint),
+            40 => Some(Self::OnboardingInstalled),
             _ => None,
         }
     }
@@ -1002,6 +1009,12 @@ impl LogRecord {
             Some(LogDetailKind::OnboardingThrottled) => CheckedDetail::OnboardingThrottled {
                 strikes: self.operands[0],
                 wait_millis: self.operands[1],
+            },
+            // One count and no token: every bit pattern of it is a length the
+            // emitting domain could have accumulated, so there is nothing here
+            // to range.
+            Some(LogDetailKind::OnboardingInstalled) => CheckedDetail::OnboardingInstalled {
+                bytes: self.operands[0],
             },
             // An address, a port and a generation. The address and the port are
             // ranged on `Dialled`'s terms — a wider word would render as an
@@ -1698,6 +1711,10 @@ pub enum CheckedDetail {
     OnboardingThrottled {
         strikes: u64,
         wait_millis: u64,
+    },
+    /// One package upload that was accepted and installed, and its length.
+    OnboardingInstalled {
+        bytes: u64,
     },
     /// Where an appliance that has just been given an owner will answer to.
     Adopted {

@@ -9,10 +9,24 @@
 
 use super::*;
 
-/// A minimal console chapter: the intro sentence, one domain heading and one
-/// token table per domain, and the `rejected=` table read from the code so the
-/// unrelated halves of the check stay quiet.
+/// A minimal console chapter: the intro sentence, the per-domain totals it
+/// states, one token table per lead-in, and the `rejected=` table read from the
+/// code so the unrelated halves of the check stay quiet.
+///
+/// The tables are given separately from the totals, because the two are not the
+/// same list: a catalogue two domains raise is one table naming both, and it is
+/// counted in each of their totals.
 fn console_page(tokens: &[(&str, &[&str])]) -> String {
+    let tables: Vec<(Vec<&str>, &[&str])> = tokens
+        .iter()
+        .map(|(domain, listed)| (vec![*domain], *listed))
+        .collect();
+    console_page_with_tables(tokens, &tables)
+}
+
+/// The same, with the tables stated explicitly: each is a list of the domains
+/// its lead-in names, and the tokens it lists.
+fn console_page_with_tables(totals: &[(&str, &[&str])], tables: &[(Vec<&str>, &[&str])]) -> String {
     let mut page = String::from(
         "# Console\n\n## `LFW-PD` refusal causes\n\nEvery `cause=` token \
                                  is listed below and the ",
@@ -20,10 +34,10 @@ fn console_page(tokens: &[(&str, &[&str])]) -> String {
     let _ = write!(
         page,
         "{} tables together are the complete set: ",
-        spell(tokens.len())
+        spell(tables.len())
     );
     let mut first = true;
-    for (domain, listed) in tokens {
+    for (domain, listed) in totals {
         if !first {
             page.push_str(", ");
         }
@@ -31,10 +45,15 @@ fn console_page(tokens: &[(&str, &[&str])]) -> String {
         let _ = write!(page, "{} the `{domain}` domain raises", listed.len());
     }
     page.push_str(".\n");
-    for (domain, listed) in tokens {
+    for (domains, listed) in tables {
+        let lead = domains
+            .iter()
+            .map(|domain| format!("`{domain}`"))
+            .collect::<Vec<_>>()
+            .join(" and ");
         let _ = write!(
             page,
-            "\n**`{domain}`.** Its tokens.\n\n| group | tokens |\n|---|---|\n"
+            "\n**{lead}.** Its tokens.\n\n| group | tokens |\n|---|---|\n"
         );
         let cell = listed
             .iter()
@@ -91,6 +110,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/hardware-probe/src/main.rs", &["aes-not-supported"]),
         ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
         ("pds/crypto/src/delegate.rs", &["delegated-key-refused"]),
+        ("pds/crypto/src/upload.rs", &["upload-window-unavailable"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         (
             "crates/package/src/refusal.rs",
@@ -108,29 +128,75 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
 }
 
 fn sound_console() -> String {
-    console_page(&[
-        ("nic-driver", &["not-virtio-net", "receive-pool-dma-base"]),
-        ("clock", &["hpet-not-present"]),
-        ("management", &["rdrand-exhausted"]),
-        (
-            "recorder",
-            &[
-                "not-virtio-blk",
-                "block-probe-silent",
-                "staging-region-dma-base",
-            ],
-        ),
-        ("hardware-probe", &["aes-not-supported"]),
-        ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
-        (
-            "store",
-            &[
-                "store-medium-too-small",
-                "install-endpoint-loopback",
-                "stored-scalar-unusable",
-            ],
-        ),
-    ])
+    // The package catalogue is minted once and raised by two domains, so it is
+    // one table naming both — and it is counted in each domain's total, exactly
+    // as the shipped chapter does it.
+    console_page_with_tables(
+        &[
+            (
+                "nic-driver",
+                &["not-virtio-net", "receive-pool-dma-base"][..],
+            ),
+            ("clock", &["hpet-not-present"][..]),
+            ("management", &["rdrand-exhausted"][..]),
+            (
+                "recorder",
+                &[
+                    "not-virtio-blk",
+                    "block-probe-silent",
+                    "staging-region-dma-base",
+                ][..],
+            ),
+            ("hardware-probe", &["aes-not-supported"][..]),
+            (
+                "crypto",
+                &[
+                    "rdrand-output-stuck",
+                    "delegated-key-refused",
+                    "upload-window-unavailable",
+                    "install-endpoint-loopback",
+                ][..],
+            ),
+            (
+                "store",
+                &[
+                    "store-medium-too-small",
+                    "install-endpoint-loopback",
+                    "stored-scalar-unusable",
+                ][..],
+            ),
+        ],
+        &[
+            (
+                vec!["nic-driver"],
+                &["not-virtio-net", "receive-pool-dma-base"][..],
+            ),
+            (vec!["clock"], &["hpet-not-present"][..]),
+            (vec!["management"], &["rdrand-exhausted"][..]),
+            (
+                vec!["recorder"],
+                &[
+                    "not-virtio-blk",
+                    "block-probe-silent",
+                    "staging-region-dma-base",
+                ][..],
+            ),
+            (vec!["hardware-probe"], &["aes-not-supported"][..]),
+            (
+                vec!["crypto"],
+                &[
+                    "rdrand-output-stuck",
+                    "delegated-key-refused",
+                    "upload-window-unavailable",
+                ][..],
+            ),
+            (
+                vec!["store"],
+                &["store-medium-too-small", "stored-scalar-unusable"][..],
+            ),
+            (vec!["store", "crypto"], &["install-endpoint-loopback"][..]),
+        ],
+    )
 }
 
 fn cause_findings(sites: &[(&str, &[&str])], console: &str) -> Vec<String> {
@@ -227,7 +293,15 @@ fn a_token_two_domains_share_is_not_a_finding() {
             ],
         ),
         ("hardware-probe", &["aes-not-supported"]),
-        ("crypto", &["rdrand-output-stuck", "delegated-key-refused"]),
+        (
+            "crypto",
+            &[
+                "rdrand-output-stuck",
+                "delegated-key-refused",
+                "upload-window-unavailable",
+                "install-endpoint-loopback",
+            ],
+        ),
         (
             "store",
             &[
@@ -295,14 +369,14 @@ fn a_stated_per_domain_count_that_disagrees_with_its_own_table_is_a_finding() {
 #[test]
 fn a_stated_table_count_that_disagrees_with_the_tables_present_is_a_finding() {
     let console = sound_console().replace(
-        "seven tables together are the complete set",
         "eight tables together are the complete set",
+        "nine tables together are the complete set",
     );
     let findings = cause_findings(&sound_sites(), &console);
     let joined = findings.join("\n");
-    assert!(joined.contains("7 refusal-cause table(s)"), "{joined}");
+    assert!(joined.contains("8 refusal-cause table(s)"), "{joined}");
     assert!(
-        joined.contains("the seven tables together are the complete set"),
+        joined.contains("the eight tables together are the complete set"),
         "{joined}"
     );
 }
@@ -507,9 +581,44 @@ fn a_tables_owner_is_the_bolded_subject_above_it() {
     let markdown = "**`clock`.** Words.\n\n| group | tokens |\n|---|---|\n| a | `x-y` |\n";
     let found = tables(markdown);
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].owner.as_deref(), Some("clock"));
+    assert_eq!(found[0].owners, ["clock"]);
     assert_eq!(found[0].header, ["group", "tokens"]);
     assert_eq!(found[0].rows, [["a", "`x-y`"]]);
+}
+
+/// A lead-in naming two domains attributes the table to both, which is how one
+/// catalogue two domains raise is written once and read from either side.
+#[test]
+fn a_table_can_belong_to_more_than_one_domain() {
+    let markdown =
+        "**`store` and `crypto`.** Words.\n\n| group | tokens |\n|---|---|\n| a | `x-y` |\n";
+    let found = tables(markdown);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].owners, ["store", "crypto"]);
+}
+
+/// And its tokens are counted for each of them, so neither domain's comparison
+/// reports the shared catalogue as missing.
+#[test]
+fn a_shared_tables_tokens_are_documented_for_every_domain_it_names() {
+    let console = "\
+Every `cause=` token is listed below and the two tables together are the complete set: 1 the \
+`store` domain raises, and 1 the `crypto` domain raises.\n\
+\n**`store` and `crypto`.** Shared.\n\n| group | tokens |\n|---|---|\n| a | `install-x` |\n";
+    let mut literals = BTreeMap::new();
+    literals.insert(
+        String::from("crates/package/src/refusal.rs"),
+        vec![String::from("install-x")],
+    );
+    let mut findings = Vec::new();
+    check_causes(&literals, console, &mut findings);
+    // The two domains this fixture names are satisfied by the one table; the
+    // other five have no minting site here and no table, which this fixture is
+    // not about.
+    assert!(
+        !findings.iter().any(|finding| finding.contains("install-x")),
+        "{findings:?}"
+    );
 }
 
 /// The habit that would otherwise put a hexadecimal number in the token set: an
@@ -574,7 +683,14 @@ fn the_shipped_chapters_present_the_tables_this_reader_needs() {
         .into_iter()
         .filter(|table| table.header == ["group", "tokens"])
         .count();
-    assert_eq!(cause_tables, REFUSING_DOMAINS.len(), "cause tables found");
+    // One more table than there are domains: the package contract's refusals are
+    // one catalogue two domains raise, so its table names both and is counted
+    // once here rather than written twice in the chapter.
+    assert_eq!(
+        cause_tables,
+        REFUSING_DOMAINS.len() + 1,
+        "cause tables found"
+    );
     assert!(
         tables(&console)
             .iter()

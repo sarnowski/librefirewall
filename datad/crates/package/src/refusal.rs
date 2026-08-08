@@ -17,15 +17,37 @@
 //! the crate that declares them the attribute has no effect, no arm here is a
 //! wildcard, and a variant added without a token fails to compile.
 //!
-//! # What is not decided here
+//! # The numbers beside the token are here too, and in nobody's vocabulary
 //!
-//! The numbers a refusal carries alongside its token. They are shaped by the
-//! record a domain writes rather than by this contract, so a caller reads them
-//! off the variant it already holds; what this crate owns is the name.
+//! A token names a rule and the numbers beside it place the fault — the offset a
+//! header was wrong at, the length that outgrew a bound. Those were once left to
+//! the one caller that wrote a record, on the reasoning that a record's shape is
+//! the domain's. With two domains reading a package that reasoning inverts: two
+//! hand-written mappings from the same variants to the same numbers are two
+//! things to keep in step, and the one that fell behind would place a fault
+//! wrongly rather than merely differently.
+//!
+//! So [`Operands`] is here beside the tokens, and it is deliberately **not** a
+//! console type: it is a count of numbers, which each domain then writes into
+//! whatever its own record carries. What this crate owns is the name and the
+//! numbers; what it still does not own is the record.
 
 use crate::{
     ArchiveError, CertificateError, EmptyField, EndpointError, Member, NumericField, PackageError,
 };
+
+/// The numbers that place a refusal, in the shape every domain's record can
+/// hold: none, one, or two.
+///
+/// Widened to `u64` here rather than by each reader, so the narrowing decision
+/// is made once — every field this is built from is a length, a bound or an
+/// offset inside an archive that is bounded well below what a `u64` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operands {
+    None,
+    One(u64),
+    Two(u64, u64),
+}
 
 impl PackageError {
     /// Which rule of the package contract refused, at the contract's own grain.
@@ -51,7 +73,56 @@ impl PackageError {
     }
 }
 
+impl PackageError {
+    /// The numbers that place this refusal, or none where the token is the whole
+    /// of what there is to say.
+    #[must_use]
+    pub const fn operands(self) -> Operands {
+        match self {
+            Self::Archive(error) => error.operands(),
+            Self::DeviceCertificate(error) | Self::TrustAnchor(error) => error.operands(),
+            Self::Endpoint(error) => error.operands(),
+            // The key comparison, the configuration reader's own refusal and an
+            // unverified chain each name a rule and no number: what an
+            // administrator does about them is open a file, not look at an
+            // offset in one.
+            Self::DeviceKeyIsNotThisAppliance | Self::Configuration(_) | Self::ChainNotVerified => {
+                Operands::None
+            }
+        }
+    }
+}
+
 impl ArchiveError {
+    /// Where in the archive the fault is, or the two numbers a bound turns on.
+    #[must_use]
+    pub const fn operands(self) -> Operands {
+        match self {
+            Self::ArchiveOverBound { len, bound }
+            | Self::MemberOverBound {
+                size: len, bound, ..
+            } => Operands::Two(len as u64, bound as u64),
+            Self::ChecksumMismatch {
+                stated, computed, ..
+            } => Operands::Two(stated as u64, computed as u64),
+            Self::NotAWholeNumberOfBlocks { len } => Operands::One(len as u64),
+            Self::TruncatedHeader { at }
+            | Self::BytesAfterEndOfArchive { at }
+            | Self::NotUstar { at }
+            | Self::NotARegularFile { at }
+            | Self::FieldIsNotEmpty { at, .. }
+            | Self::UnknownMember { at }
+            | Self::EmptyNumericField { at, .. }
+            | Self::NotOctal { at, .. }
+            | Self::NumericFieldOverBound { at, .. } => Operands::One(at as u64),
+            Self::MemberBodyTruncated { size, .. } => Operands::One(size as u64),
+            Self::EndsWithoutTerminator
+            | Self::DuplicateMember { .. }
+            | Self::MissingMember { .. }
+            | Self::MemberPaddingIsNotZero { .. } => Operands::None,
+        }
+    }
+
     /// The archive's own rules. Every one that names a position leaves the
     /// position to the caller, because a tar an administrator did not compose by
     /// hand is one whose fault is found by offset.
@@ -111,6 +182,33 @@ impl ArchiveError {
 }
 
 impl CertificateError {
+    /// The two lengths a certificate refusal turns on. The DER faults name an
+    /// element of a certificate and it is deliberately not carried: all nine
+    /// send an administrator to the same place, which is the tool that wrote the
+    /// file.
+    #[must_use]
+    pub const fn operands(self) -> Operands {
+        match self {
+            Self::LineTooLong { len, bound } | Self::CertificateTooLong { len, bound } => {
+                Operands::Two(len as u64, bound as u64)
+            }
+            Self::MissingBeginBoundary
+            | Self::MissingEndBoundary
+            | Self::NotBase64
+            | Self::PaddingMisplaced
+            | Self::NotAWholeGroup
+            | Self::NonCanonicalPadding
+            | Self::TrailingContent
+            | Self::CertificateIsEmpty
+            | Self::TruncatedDer { .. }
+            | Self::UnexpectedTag { .. }
+            | Self::IndefiniteLength { .. }
+            | Self::NonMinimalLength { .. }
+            | Self::LengthOutOfRange { .. }
+            | Self::TrailingDer => Operands::None,
+        }
+    }
+
     /// The device certificate's own rules.
     ///
     /// Two methods rather than one taking which, because the token is what tells
@@ -164,6 +262,34 @@ impl CertificateError {
 }
 
 impl EndpointError {
+    /// The length a bound turns on, or how many octets an address really had.
+    #[must_use]
+    pub const fn operands(self) -> Operands {
+        match self {
+            Self::OverBound { len, bound } => Operands::Two(len as u64, bound as u64),
+            Self::AddressHasTooFewOctets { octets } => Operands::One(octets as u64),
+            Self::Empty
+            | Self::NotAscii
+            | Self::MissingColon
+            | Self::TooManyColons
+            | Self::TrailingBytes
+            | Self::AddressHasTooManyOctets
+            | Self::OctetIsEmpty
+            | Self::OctetIsNotDecimal
+            | Self::OctetHasLeadingZero
+            | Self::OctetOutOfRange
+            | Self::AddressIsUnspecified
+            | Self::AddressIsLoopback
+            | Self::AddressIsMulticast
+            | Self::AddressIsBroadcast
+            | Self::AddressIsReserved
+            | Self::PortIsEmpty
+            | Self::PortIsNotDecimal
+            | Self::PortHasLeadingZero
+            | Self::PortOutOfRange => Operands::None,
+        }
+    }
+
     /// The endpoint line's own rules. An administrator typed this member, so
     /// every one of them is a thing to go and correct.
     #[must_use]
@@ -423,6 +549,111 @@ mod tests {
     fn the_two_certificates_are_never_confused() {
         for error in CERTIFICATE {
             assert_ne!(error.device_cause(), error.anchor_cause());
+        }
+    }
+
+    /// Every refusal a caller can hold answers a shape of operands, and no path
+    /// through the catalogue faults on the way there. Totality first, because a
+    /// domain writing a record calls this on whatever it was handed.
+    #[test]
+    fn every_refusal_answers_operands() {
+        for error in ARCHIVE {
+            let _ = PackageError::Archive(*error).operands();
+        }
+        for error in CERTIFICATE {
+            let _ = PackageError::DeviceCertificate(*error).operands();
+            let _ = PackageError::TrustAnchor(*error).operands();
+        }
+        for error in ENDPOINT {
+            let _ = PackageError::Endpoint(*error).operands();
+        }
+        assert_eq!(
+            PackageError::DeviceKeyIsNotThisAppliance.operands(),
+            Operands::None
+        );
+        assert_eq!(PackageError::ChainNotVerified.operands(), Operands::None);
+        assert_eq!(
+            PackageError::Configuration(ConfigError::Document(DocumentError {
+                fault: DocumentFault::MissingRootElement,
+                offset: 0,
+            }))
+            .operands(),
+            Operands::None
+        );
+    }
+
+    /// And the numbers are the ones the variant holds, in the order the variant
+    /// holds them. A pair written the other way round would place a fault
+    /// exactly wrongly — an operator reading "the bound was 1 and the length 0"
+    /// goes and shrinks the wrong thing.
+    #[test]
+    fn the_operands_are_the_numbers_the_variant_holds() {
+        assert_eq!(
+            PackageError::Archive(ArchiveError::ArchiveOverBound { len: 9, bound: 4 }).operands(),
+            Operands::Two(9, 4)
+        );
+        assert_eq!(
+            PackageError::Archive(ArchiveError::MemberOverBound {
+                member: Member::Configuration,
+                size: 7,
+                bound: 3,
+            })
+            .operands(),
+            Operands::Two(7, 3)
+        );
+        assert_eq!(
+            PackageError::Archive(ArchiveError::ChecksumMismatch {
+                at: 512,
+                stated: 11,
+                computed: 12,
+            })
+            .operands(),
+            Operands::Two(11, 12)
+        );
+        assert_eq!(
+            PackageError::Archive(ArchiveError::NotUstar { at: 1024 }).operands(),
+            Operands::One(1024)
+        );
+        assert_eq!(
+            PackageError::Archive(ArchiveError::NotAWholeNumberOfBlocks { len: 5 }).operands(),
+            Operands::One(5)
+        );
+        assert_eq!(
+            PackageError::Archive(ArchiveError::EndsWithoutTerminator).operands(),
+            Operands::None
+        );
+        assert_eq!(
+            PackageError::DeviceCertificate(CertificateError::LineTooLong { len: 80, bound: 64 })
+                .operands(),
+            Operands::Two(80, 64)
+        );
+        assert_eq!(
+            PackageError::TrustAnchor(CertificateError::NotBase64).operands(),
+            Operands::None
+        );
+        assert_eq!(
+            PackageError::Endpoint(EndpointError::OverBound { len: 40, bound: 32 }).operands(),
+            Operands::Two(40, 32)
+        );
+        assert_eq!(
+            PackageError::Endpoint(EndpointError::AddressHasTooFewOctets { octets: 3 }).operands(),
+            Operands::One(3)
+        );
+        assert_eq!(
+            PackageError::Endpoint(EndpointError::PortOutOfRange).operands(),
+            Operands::None
+        );
+    }
+
+    /// The two certificates place a fault the same way, which is the point of
+    /// their sharing one rule set: only the token says which file to open.
+    #[test]
+    fn the_two_certificates_place_a_fault_identically() {
+        for error in CERTIFICATE {
+            assert_eq!(
+                PackageError::DeviceCertificate(*error).operands(),
+                PackageError::TrustAnchor(*error).operands()
+            );
         }
     }
 }

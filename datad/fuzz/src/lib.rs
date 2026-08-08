@@ -28,6 +28,7 @@
 //! | [`recording`] | `lfw_recorder`'s pass and sink, and `lfw_capture_ring`'s superblock and ring | a byzantine neighbour PD on two channels **and** a hostile medium |
 //! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
 //! | [`onboarding_tls`] | `lfw_tls`'s onboarding server: the record layer, the buffering either side of it, and the outcome it settles on | a management-plane attacker |
+//! | [`onboarding_surface`] | `lfw_onboarding`'s request surface: the head read out of a plaintext stream cut into arbitrary deliveries, the body handed on to an upload as it arrives, and the twenty-six ways a request is refused | a management-plane attacker |
 //! | [`onboarding_package`] | `lfw_package`'s uploaded archive: the ustar framing, the armour around the two certificates, the walk that finds the key one binds, the endpoint line, and the `config` reader under it | a management-plane attacker |
 //! | [`onboarding_install`] | `lfw_store`'s install path: a staged region, the length a peer claims about it, the whole package contract read a second time, and the one signature this appliance verifies for itself | a management-plane attacker **and** a byzantine neighbour PD |
 //!
@@ -151,6 +152,7 @@ pub mod metrics_render;
 pub mod neighbour;
 pub mod onboarding_install;
 pub mod onboarding_package;
+pub mod onboarding_surface;
 pub mod onboarding_tls;
 pub mod pcapng;
 pub mod pipeline;
@@ -261,6 +263,10 @@ mod tests {
         (
             "metrics_render",
             crate::metrics_render::metrics_render_harness,
+        ),
+        (
+            "onboarding_surface",
+            crate::onboarding_surface::onboarding_surface_harness,
         ),
         (
             "onboarding_package",

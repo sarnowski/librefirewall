@@ -113,6 +113,7 @@ use alloc::sync::Arc;
 
 mod arena;
 mod delegate;
+mod upload;
 
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
@@ -143,6 +144,7 @@ use wire::{
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
 use delegate::{Delegated, DelegationError, HeldCertificate, HeldKey};
+use upload::PackageUpload;
 
 /// The appliance's only allocator, and the one exception to the rule that a
 /// protection domain has none. It is here because a proven TLS implementation
@@ -417,13 +419,11 @@ fn init() -> Crypto {
     let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
     let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
     // The onboarding package's staging region, which this domain maps read-write
-    // and the holder of the device key maps read-only. It is attached here and
-    // nothing in this build writes it: the request surface above the record
-    // layer serves two resources and takes no upload, so there is no path from a
-    // session to these bytes yet. It is attached rather than left unmapped
-    // because the grant is the system description's and a region no line of code
-    // names is authority nobody can account for.
-    let _staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
+    // and the holder of the device key maps read-only. An upload is written
+    // straight through it as it arrives, and the copy this domain validates is
+    // read back out of it — so the archive this domain accepts is the archive
+    // the holder installs.
+    let staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     // One requester for the whole boot, and behind an `Arc` because the library's
@@ -443,6 +443,8 @@ fn init() -> Crypto {
         arena.mark(),
         PdClock::new(calibration),
         outcome.established.take(),
+        staging,
+        Arc::clone(&delegated),
     );
     match &outcome.verdict {
         Ok(()) => announce(&sink, DomainState::Ready, DomainDetail::None),
@@ -605,11 +607,23 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
     // under a primitive it could not answer a vector for, or a delegation it
     // could not verify, would be answering an administrator with a channel this
     // appliance has no grounds to stand behind.
+    let appliance_key = match lfw_x509::spki(&delegation.held.public_key) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            outcome.verdict = Err(CryptoError(refusal(
+                "onboarding-key-unencodable",
+                RefusalDetail::None,
+            )));
+            return outcome;
+        }
+    };
     outcome.established = Some(Established {
         provider,
         certificate: delegation.certificate,
         operation: Arc::clone(delegated) as Arc<dyn lfw_tls::SignOperation>,
         identity,
+        appliance_key,
+        owned: delegation.held.owned,
     });
     outcome
 }
@@ -1227,6 +1241,16 @@ struct Established {
     /// session serves. Composed once at bring-up, so what a peer costs by
     /// asking for it is a copy rather than a signature in another domain.
     identity: Identity,
+    /// This appliance's own `SubjectPublicKeyInfo`, which an uploaded device
+    /// certificate must bind. Encoded here for the same reason the request is
+    /// composed here: it can fail, and a boot that could not encode its own key
+    /// establishes nothing rather than leaving a peer able to provoke the
+    /// failure.
+    appliance_key: [u8; lfw_x509::SPKI_LEN],
+    /// Whether the domain that holds the key says this appliance already has an
+    /// owner. What it decides is whether the surface serves onboarding at all —
+    /// see `lfw_onboarding`, which is constructed closed when it is true.
+    owned: bool,
 }
 
 /// What this domain terminates an onboarding session with: one TLS 1.3 server,
@@ -1271,8 +1295,14 @@ struct Onboarding {
     server: Option<lfw_tls::OnboardingServer<'static>>,
     /// The request surface, which outlives a session because its limiter does:
     /// an allowance a peer spent must not come back by opening a new
-    /// connection, which is the one thing a peer can always do.
+    /// connection, which is the one thing a peer can always do. It also carries
+    /// the permanent close, for a stronger version of the same reason — a close
+    /// a new connection could undo would be no close.
     surface: RequestSurface,
+    /// Where an uploaded package goes, and what judges it. It outlives a session
+    /// because the region and the window's accounting do; what it holds *of* a
+    /// session — the cursor and the window — is dropped at both ends of one.
+    upload: PackageUpload,
     /// What the last pass left for the console, taken by the domain after the
     /// pass that produced it. Plain data with no allocation behind it, which is
     /// what lets the arena be wound back under it.
@@ -1285,7 +1315,17 @@ struct Onboarding {
 /// request and then finished the session produces both sets and no more: one
 /// item ends at most one session, and one connection carries at most one
 /// answered request.
-const STAGED_RECORDS: usize = lfw_tls::OUTCOME_RECORDS + lfw_onboarding::REQUEST_RECORDS;
+const STAGED_RECORDS: usize =
+    lfw_tls::OUTCOME_RECORDS + lfw_onboarding::REQUEST_RECORDS + INSTALL_RECORDS;
+
+/// The console records a package upload owes beyond the surface's own.
+///
+/// One: the rule that refused it, under the package contract's name and beside
+/// the numbers that place it. The surface's own record says *that* a package was
+/// refused; this says which rule did it, and a request that was not an upload
+/// produces none. An accepted package produces none here either — what it
+/// changed is on the installing domain's records, where it was made durable.
+const INSTALL_RECORDS: usize = 1;
 
 impl Onboarding {
     fn new(
@@ -1293,8 +1333,23 @@ impl Onboarding {
         mark: usize,
         clock: PdClock<'static>,
         established: Option<Established>,
+        staging: &'static InstallStaging,
+        delegated: Arc<Delegated>,
     ) -> Self {
-        let surface = RequestSurface::new(established.as_ref().map(|held| held.identity));
+        // Closed on a boot that established nothing too: an appliance with no
+        // identity serves no onboarding either, and it says so with the token
+        // for the identity it does not have rather than this one.
+        let owned = established.as_ref().is_some_and(|held| held.owned);
+        let surface = RequestSurface::new(established.as_ref().map(|held| held.identity), owned);
+        let upload = PackageUpload::new(
+            arena,
+            staging,
+            delegated,
+            established
+                .as_ref()
+                .map_or([0; lfw_x509::SPKI_LEN], |held| held.appliance_key),
+            established.as_ref().map(|held| Arc::clone(&held.provider)),
+        );
         Self {
             arena,
             mark,
@@ -1302,6 +1357,7 @@ impl Onboarding {
             established,
             server: None,
             surface,
+            upload,
             staged: [None; STAGED_RECORDS],
         }
     }
@@ -1349,6 +1405,10 @@ impl Terminator for Onboarding {
     /// inherit what the attacker spent.
     fn opened(&mut self) {
         self.server = None;
+        // Before the reset, so the window an upload held is given up while the
+        // bookkeeper still accounts for it rather than after the cursor has
+        // moved back under it.
+        self.upload.opened(wall_seconds(&self.clock));
         self.arena.reset_to(self.mark);
         self.staged = [None; STAGED_RECORDS];
         // The buffers, and not the limiter: a peer must not inherit the last
@@ -1406,9 +1466,14 @@ impl Terminator for Onboarding {
         // The session first, so the plaintext this delivery produced is
         // available to the surface on this same turn.
         let first = server.advance(received, answer);
+        // Destructured so the surface and the upload are two disjoint borrows:
+        // the surface drives the upload, and both are fields of this value.
+        let Self {
+            surface, upload, ..
+        } = self;
         let decision = {
             let plaintext = server.received();
-            let decision = self.surface.take(now, plaintext);
+            let decision = surface.take(now, plaintext, upload);
             // Consumed whatever the surface made of it: the bytes are the
             // surface's now, and plaintext left unread is a bound of this
             // appliance's that a peer would trip instead of its own behaviour.
@@ -1429,6 +1494,12 @@ impl Terminator for Onboarding {
         let second = drive_again(server, answer, first.sent);
         let records = decision.records();
         self.stage(records.into_iter().flatten());
+        // The rule that refused a package, under the package contract's own
+        // name. Written after the surface's record, which says only that a
+        // package was refused: the order is the order an operator reads them in.
+        if let Some(refused) = self.upload.take_refusal() {
+            self.stage([DomainDetail::Refusal(refused)]);
+        }
         second
     }
 
@@ -1449,6 +1520,8 @@ impl Terminator for Onboarding {
                 self.stage(records.into_iter().flatten());
             }
         }
+        // Before the reset, on `opened`'s terms.
+        self.upload.opened(wall_seconds(&self.clock));
         self.arena.reset_to(self.mark);
     }
 }

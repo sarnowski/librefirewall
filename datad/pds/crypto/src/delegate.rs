@@ -63,7 +63,7 @@ use sel4_microkit::Channel;
 use wire::{
     DEVICE_ID_LEN, DeviceIdentity, MAX_CERTIFICATE_LEN, MAX_SIGNATURE_LEN, PUBLIC_KEY_LEN,
     PendingSignature, SignAnswerBuffer, SignOperation, SignPoll, SignReply, SignRequest,
-    SignRequester,
+    SignRequester, StagedUpload,
 };
 
 /// Reads of the reply region one request is given before it is refused.
@@ -119,6 +119,14 @@ pub struct HeldKey {
     pub public_key: [u8; PUBLIC_KEY_LEN],
     /// The appliance's 128-bit name, as the number the console renders.
     pub device: u128,
+    /// Whether the record that key came out of says this appliance already has
+    /// an owner.
+    ///
+    /// It arrives with the key rather than being asked for separately because it
+    /// is a fact about the same record, read on the same boot by the same
+    /// domain — and because what it decides is whether this domain serves
+    /// onboarding at all, which has to be settled before a peer connects.
+    pub owned: bool,
 }
 
 /// Why a request to the key holder produced nothing usable.
@@ -203,19 +211,50 @@ impl Delegated {
     /// # Errors
     /// [`DelegationError`], naming which way the exchange failed.
     pub fn held_key(&self) -> Result<HeldKey, DelegationError> {
-        match self.exchange(SignOperation::PublicKey, &[], None)? {
+        match self.exchange(Ask::Message(SignOperation::PublicKey, &[]), None)? {
             Answer::Identity(DeviceIdentity {
                 public_key,
                 device_id,
+                owned,
             }) => Ok(HeldKey {
                 public_key,
                 device: device_word(device_id),
+                owned,
             }),
             // The channel refuses a reply answering a different operation before
             // it reaches here, so these arms are unreachable. Answered as a fault
             // rather than asserted: nothing on a path the TLS library calls into
             // may panic.
-            Answer::Signature { .. } | Answer::Certificate { .. } => Err(DelegationError::Faulted),
+            Answer::Signature { .. } | Answer::Certificate { .. } | Answer::Installed => {
+                Err(DelegationError::Faulted)
+            }
+        }
+    }
+
+    /// Ask the holder to install the archive staged in the region this domain
+    /// wrote.
+    ///
+    /// It takes the token the cursor minted, so the length the request states is
+    /// the length that was really written. That is a convenience of this side and
+    /// not a defence: the holder ranges the stated length against its own region
+    /// and re-reads every rule of the package, because the domain that writes the
+    /// medium is the one that has to have read what it writes.
+    ///
+    /// A refusal comes back as [`DelegationError::Refused`] and carries nothing.
+    /// **Which** rule refused it is on the holder's own console, in the package
+    /// contract's vocabulary and beside the numbers that place it — a word here
+    /// spelling the same catalogue would be a second copy of it crossing a
+    /// region.
+    ///
+    /// # Errors
+    /// [`DelegationError`], naming which way the exchange failed.
+    pub fn install(&self, staged: StagedUpload) -> Result<(), DelegationError> {
+        match self.exchange(Ask::Install(staged), None)? {
+            Answer::Installed => Ok(()),
+            // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
+            Answer::Signature { .. } | Answer::Identity(_) | Answer::Certificate { .. } => {
+                Err(DelegationError::Faulted)
+            }
         }
     }
 
@@ -236,10 +275,15 @@ impl Delegated {
         // The destination is this frame's, handed down rather than returned up:
         // [`Answer`] says why.
         let mut bytes = [0_u8; MAX_CERTIFICATE_LEN];
-        match self.exchange(SignOperation::Certificate, &[], Some(&mut bytes))? {
+        match self.exchange(
+            Ask::Message(SignOperation::Certificate, &[]),
+            Some(&mut bytes),
+        )? {
             Answer::Certificate { len } => Ok(HeldCertificate { bytes, len }),
             // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
-            Answer::Signature { .. } | Answer::Identity(_) => Err(DelegationError::Faulted),
+            Answer::Signature { .. } | Answer::Identity(_) | Answer::Installed => {
+                Err(DelegationError::Faulted)
+            }
         }
     }
 
@@ -260,8 +304,7 @@ impl Delegated {
     /// request and a poll would have each claiming the other's reply.
     fn exchange(
         &self,
-        operation: SignOperation,
-        message: &[u8],
+        ask: Ask<'_>,
         certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
     ) -> Result<Answer, DelegationError> {
         while self
@@ -271,7 +314,7 @@ impl Delegated {
         {
             core::hint::spin_loop();
         }
-        let outcome = self.issue(operation, message, certificate);
+        let outcome = self.issue(ask, certificate);
         self.taken.store(false, Ordering::Release);
         outcome
     }
@@ -279,15 +322,21 @@ impl Delegated {
     /// The exchange itself, with the flag held.
     fn issue(
         &self,
-        operation: SignOperation,
-        message: &[u8],
+        ask: Ask<'_>,
         mut certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
     ) -> Result<Answer, DelegationError> {
         // SAFETY: the flag is held by the caller, so this is the only live
         // reference to the requester for the duration of the call, and the
         // reference does not escape this function.
         let requester = unsafe { &mut *self.requester.get() };
-        let mut pending: PendingSignature = requester.request(operation, message);
+        let mut pending: PendingSignature = match ask {
+            Ask::Message(operation, message) => requester.request(operation, message),
+            // The archive is not in this pair of regions at all: the request
+            // states how many bytes of the staging region hold it, and the
+            // sequence's own release store is what makes those bytes visible to
+            // the holder before the demand that names them is.
+            Ask::Install(staged) => requester.install(staged),
+        };
         // After the request is published and not before: the notification is what
         // makes the holder look, and a signal ahead of the sequence would be a
         // wakeup for a request that is not there yet.
@@ -334,14 +383,7 @@ impl Delegated {
                     });
                 }
                 SignPoll::Refused(_) => return Err(DelegationError::Refused),
-                // An answer to a question this domain has not asked. It cannot
-                // ask one yet — nothing here routes an uploaded package to the
-                // holder — and the ABI already refuses a reply whose operation
-                // is not the one that was requested, so reaching this arm would
-                // mean the check that does so had stopped. It is a fault for the
-                // reason every other undecodable reply is, rather than an arm
-                // that quietly agrees with a holder answering something else.
-                SignPoll::Installed => return Err(DelegationError::Faulted),
+                SignPoll::Installed => return Ok(Answer::Installed),
                 SignPoll::Faulted(_) => return Err(DelegationError::Faulted),
             }
         }
@@ -383,6 +425,23 @@ enum Answer {
     Certificate {
         len: usize,
     },
+    /// The package staged in the region was installed. It carries nothing, which
+    /// is the whole shape of the answer: the facts about what was installed reach
+    /// an operator on the holder's console, where they were decided and made
+    /// durable.
+    Installed,
+}
+
+/// What one exchange asks for.
+///
+/// Its own value rather than an operation and a message, because the fourth
+/// operation's subject is not a message at all: an install names bytes in a
+/// region this pair of regions cannot see, and a call taking `(operation,
+/// message)` would have to be handed an empty slice and a length carried
+/// alongside — which is exactly the pairing `StagedUpload` exists to prevent.
+enum Ask<'a> {
+    Message(SignOperation, &'a [u8]),
+    Install(StagedUpload),
 }
 
 impl TlsSignOperation for Delegated {
@@ -396,7 +455,7 @@ impl TlsSignOperation for Delegated {
     /// tally and the fault count this type exposes, on this domain's own records.
     fn sign(&self, message: &[u8], out: &mut [u8]) -> Result<usize, SignRefused> {
         let Ok(Answer::Signature { bytes, len }) =
-            self.exchange(SignOperation::Sign, message, None)
+            self.exchange(Ask::Message(SignOperation::Sign, message), None)
         else {
             return Err(SignRefused);
         };

@@ -115,7 +115,7 @@ pub use download::{
 };
 pub use install::{
     ArchiveUpload, INSTALL_STAGING_REGION_SIZE, InstallStaging, MAX_INSTALL_ARCHIVE, StagedArchive,
-    StagedUpload,
+    StagedUpload, UploadCursor,
 };
 pub use log_record::{
     CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,

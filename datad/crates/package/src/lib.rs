@@ -63,6 +63,7 @@ pub use certificate::{
     read_tlv, subject_public_key_info,
 };
 pub use endpoint::{Endpoint, EndpointError};
+pub use refusal::Operands;
 
 use certificate::Certificate;
 use config::ConfigError;

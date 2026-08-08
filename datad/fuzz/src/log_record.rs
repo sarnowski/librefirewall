@@ -154,7 +154,8 @@ const DETAIL_ONBOARDING_REQUEST: u8 = 36;
 const DETAIL_ONBOARDING_THROTTLED: u8 = 37;
 const DETAIL_ADOPTED: u8 = 38;
 const DETAIL_ANCHOR_FINGERPRINT: u8 = 39;
-const DETAIL_COUNT: u8 = 40;
+const DETAIL_ONBOARDING_INSTALLED: u8 = 40;
+const DETAIL_COUNT: u8 = 41;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -594,7 +595,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ONBOARDING_BACKLOGGED | DETAIL_ONBOARDING_SUITES
                 | DETAIL_ONBOARDING_GROUPS | DETAIL_ONBOARDING_SERVED
                 | DETAIL_ONBOARDING_REQUEST | DETAIL_ONBOARDING_THROTTLED
-                | DETAIL_ADOPTED | DETAIL_ANCHOR_FINGERPRINT => {
+                | DETAIL_ADOPTED | DETAIL_ANCHOR_FINGERPRINT
+                | DETAIL_ONBOARDING_INSTALLED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -896,6 +898,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         })
         .or_else(|| wide_code_point(record.operands[1])),
         DETAIL_ONBOARDING_THROTTLED => None,
+        // One count and no token: every bit pattern of it is a length the
+        // emitting domain could have accumulated, so there is nothing to range.
+        DETAIL_ONBOARDING_INSTALLED => None,
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the

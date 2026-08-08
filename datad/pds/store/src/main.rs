@@ -234,7 +234,7 @@ use lfw_log::{
     Domain, DomainDetail, DomainState, Event, Ipv4Address, Refusal, RefusalDetail, RingSink, Sink,
 };
 use lfw_metrics::StatsShard;
-use lfw_package::{ArchiveError, CertificateError, EndpointError, PackageError};
+use lfw_package::{Operands, PackageError};
 use lfw_store::{
     ChainFault, CheckedState, Cleared, Copies, IdentityError, InstallError, Onboarding,
     RESET_REQUEST_BYTES, RESET_REQUEST_SECTOR, ResetRequest, STATE_A_SECTOR, STATE_COPY_BYTES,
@@ -645,59 +645,19 @@ const fn chain_cause(fault: ChainFault) -> &'static str {
 }
 
 /// The numbers a package refusal turns on, where its variant carries them.
+/// The numbers a package refusal turns on, as this domain's record carries
+/// them.
+///
+/// Shaped by `lfw_package` and only *written* here: the two domains that read a
+/// package would otherwise each carry a hand-written mapping from the same
+/// variants to the same numbers, and the one that fell behind would place a
+/// fault wrongly. What stays this domain's is the record — a count of numbers is
+/// not a console type.
 const fn package_detail(error: PackageError) -> RefusalDetail {
-    match error {
-        PackageError::Archive(error) => archive_detail(error),
-        PackageError::DeviceCertificate(error) | PackageError::TrustAnchor(error) => {
-            certificate_detail(error)
-        }
-        PackageError::Endpoint(error) => endpoint_detail(error),
-        _ => RefusalDetail::None,
-    }
-}
-
-const fn archive_detail(error: ArchiveError) -> RefusalDetail {
-    match error {
-        ArchiveError::ArchiveOverBound { len, bound }
-        | ArchiveError::MemberOverBound {
-            size: len, bound, ..
-        } => RefusalDetail::Two(len as u64, bound as u64),
-        ArchiveError::ChecksumMismatch {
-            stated, computed, ..
-        } => RefusalDetail::Two(stated as u64, computed as u64),
-        ArchiveError::NotAWholeNumberOfBlocks { len } => RefusalDetail::One(len as u64),
-        ArchiveError::TruncatedHeader { at }
-        | ArchiveError::BytesAfterEndOfArchive { at }
-        | ArchiveError::NotUstar { at }
-        | ArchiveError::NotARegularFile { at }
-        | ArchiveError::FieldIsNotEmpty { at, .. }
-        | ArchiveError::UnknownMember { at }
-        | ArchiveError::EmptyNumericField { at, .. }
-        | ArchiveError::NotOctal { at, .. }
-        | ArchiveError::NumericFieldOverBound { at, .. } => RefusalDetail::One(at as u64),
-        ArchiveError::MemberBodyTruncated { size, .. } => RefusalDetail::One(size as u64),
-        _ => RefusalDetail::None,
-    }
-}
-
-/// The two lengths a certificate refusal turns on. The DER faults name an
-/// element of a certificate and it is deliberately not carried: all nine send an
-/// administrator to the same place, which is the tool that wrote the file.
-const fn certificate_detail(error: CertificateError) -> RefusalDetail {
-    match error {
-        CertificateError::LineTooLong { len, bound }
-        | CertificateError::CertificateTooLong { len, bound } => {
-            RefusalDetail::Two(len as u64, bound as u64)
-        }
-        _ => RefusalDetail::None,
-    }
-}
-
-const fn endpoint_detail(error: EndpointError) -> RefusalDetail {
-    match error {
-        EndpointError::OverBound { len, bound } => RefusalDetail::Two(len as u64, bound as u64),
-        EndpointError::AddressHasTooFewOctets { octets } => RefusalDetail::One(octets as u64),
-        _ => RefusalDetail::None,
+    match error.operands() {
+        Operands::None => RefusalDetail::None,
+        Operands::One(value) => RefusalDetail::One(value),
+        Operands::Two(first, second) => RefusalDetail::Two(first, second),
     }
 }
 
@@ -819,13 +779,18 @@ impl DeviceKey {
         })
     }
 
-    /// The two public values a `SignOperation::PublicKey` request is answered
-    /// with. `Copy`, so a caller holds no borrow of the key while it publishes
-    /// them.
-    const fn identity(&self) -> DeviceIdentity {
+    /// The public values a `SignOperation::PublicKey` request is answered with.
+    /// `Copy`, so a caller holds no borrow of the key while it publishes them.
+    ///
+    /// `owned` is not the key's and is passed in: the keypair is the same
+    /// whether or not a management plane has adopted this appliance, and the
+    /// ownership is a fact about the record — which this domain reads once at
+    /// start-up and moves exactly where it writes a new one.
+    const fn identity(&self, owned: bool) -> DeviceIdentity {
         DeviceIdentity {
             public_key: self.public_key,
             device_id: self.device_id,
+            owned,
         }
     }
 
@@ -1591,12 +1556,19 @@ impl Store {
             // The word named an operation this build has none of. Refused by name
             // rather than ignored, on the channel's own terms.
             None => self.refuse(demand, SignRefusal::NoSuchOperation),
-            // The public half and the name, copied out of the key before the reply
-            // is written so no borrow of the key is live across the publish.
-            Some(SignOperation::PublicKey) => match self.key.as_ref().map(DeviceKey::identity) {
-                Some(identity) => self.responder.identity(demand, &identity),
-                None => self.refuse(demand, SignRefusal::NoIdentity),
-            },
+            // The public half, the name and whether this appliance has an owner,
+            // copied out before the reply is written so no borrow of the key is
+            // live across the publish. The ownership fact is this domain's own
+            // record rather than the key's — read off the medium at start-up and
+            // moved by the one thing that changes it, which is an install this
+            // domain itself committed.
+            Some(SignOperation::PublicKey) => {
+                let owned = self.identity.onboarded;
+                match self.key.as_ref().map(|key| key.identity(owned)) {
+                    Some(identity) => self.responder.identity(demand, &identity),
+                    None => self.refuse(demand, SignRefusal::NoIdentity),
+                }
+            }
             Some(SignOperation::Certificate) => self.certificate(demand),
             Some(SignOperation::Sign) => self.sign(demand),
             Some(SignOperation::Install) => self.install(demand),

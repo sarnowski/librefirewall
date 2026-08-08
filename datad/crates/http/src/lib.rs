@@ -153,6 +153,13 @@ pub enum Status {
     NotFound,
     MethodNotAllowed,
     RequestTimeout,
+    /// What a resource that existed and has been withdrawn for good answers
+    /// with. The onboarding surface is the only one that can: an appliance that
+    /// has been given an owner closes it permanently, and a client told 404
+    /// would be told the address was never served — which would send an
+    /// administrator looking for a typing mistake instead of reading the state
+    /// the appliance is in.
+    Gone,
     ContentTooLarge,
     UriTooLong,
     /// What a rate limiter answers with. No server here has ever been able to
@@ -168,12 +175,13 @@ pub enum Status {
 impl Status {
     /// Every variant, so a counter table and a bound are built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Ok,
         Self::BadRequest,
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::RequestTimeout,
+        Self::Gone,
         Self::ContentTooLarge,
         Self::UriTooLong,
         Self::TooManyRequests,
@@ -190,6 +198,7 @@ impl Status {
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
             Self::RequestTimeout => 408,
+            Self::Gone => 410,
             Self::ContentTooLarge => 413,
             Self::UriTooLong => 414,
             Self::TooManyRequests => 429,
@@ -209,6 +218,7 @@ impl Status {
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
             Self::RequestTimeout => "Request Timeout",
+            Self::Gone => "Gone",
             Self::ContentTooLarge => "Content Too Large",
             Self::UriTooLong => "URI Too Long",
             Self::TooManyRequests => "Too Many Requests",
@@ -227,6 +237,7 @@ impl Status {
             Self::NotFound => "404",
             Self::MethodNotAllowed => "405",
             Self::RequestTimeout => "408",
+            Self::Gone => "410",
             Self::ContentTooLarge => "413",
             Self::UriTooLong => "414",
             Self::TooManyRequests => "429",

@@ -117,14 +117,16 @@ const ASKS: [Ask; 5] = [
         owed: Owed::Refused(OnboardRefusal::UnknownRoute, 404),
     },
     Ask {
-        // The upload the next step will use, asked for now. It is answered
-        // exactly as any other unknown address is — which is the whole reason
-        // the page states the endpoint in a sentence instead of offering a form
-        // that would fail here.
-        name: "the configuration upload, which this build does not serve",
+        // The upload route, asked for with no package behind it. It is served,
+        // so this is not the unknown-address refusal: what refuses it is that a
+        // `POST` carrying no body is an upload of nothing, and that has a token
+        // of its own because nothing was staged and no other domain's record
+        // says anything about it. An administrator who forgot the
+        // `--data-binary` reaches exactly this.
+        name: "the configuration upload with no package behind it",
         target: "/configuration.tar",
         arguments: &["-X", "POST"],
-        owed: Owed::Refused(OnboardRefusal::UnknownRoute, 404),
+        owed: Owed::Refused(OnboardRefusal::UploadEmpty, 400),
     },
     Ask {
         name: "the page under a method this surface does not serve it with",

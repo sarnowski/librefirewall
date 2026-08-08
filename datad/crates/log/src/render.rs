@@ -472,6 +472,9 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " onboard-http-strikes={strikes} onboard-http-wait={wait_millis}"
         ),
+        DomainDetail::OnboardingInstalled { bytes } => {
+            write!(cursor, " onboard-http-installed={bytes}")
+        }
         // Decimal, unlike a refusal's hexadecimal numbers below: these are
         // sequence numbers, and a peer's own capture and this appliance's
         // console are compared digit for digit.

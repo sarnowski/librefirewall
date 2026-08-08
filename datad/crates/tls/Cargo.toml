@@ -15,6 +15,13 @@ lfw-x509 = { path = "../x509" }
 # crate sees — and putting it here is what makes it host-testable arm by arm.
 # The dependency runs this way and never back: `lfw-log` reaches for no TLS.
 lfw-log = { path = "../log" }
+# The onboarding package's injected chain check. It is here because this crate
+# holds the appliance's one general X.509 policy engine — the adopted
+# validator — and the package reader deliberately holds none: what crosses is
+# the trait and a yes or a no, so the reader gains no certificate parser and
+# this crate gains no rule about what a package is. The dependency runs this way
+# and never back.
+lfw-package = { path = "../package" }
 # TLS itself. `default-features = false` drops `std`, the aws-lc-rs provider
 # and its C toolchain, TLS 1.2, and the logging facade; `custom-provider` is
 # how rustls is told that the provider comes from here and that no process-wide

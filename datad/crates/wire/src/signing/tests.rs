@@ -28,12 +28,22 @@ impl Channel {
     }
 }
 
+/// An archive in the staging region and the token that names it, which is what a
+/// cursor produces: the tests below care about the length a request states, not
+/// about the pieces the region was written in.
+fn staged(staging: &'static crate::InstallStaging, archive: &[u8]) -> crate::StagedUpload {
+    let mut cursor = staging.upload().cursor();
+    cursor.write(archive);
+    cursor.finish()
+}
+
 fn identity() -> DeviceIdentity {
     let mut public_key = [0x5A_u8; PUBLIC_KEY_LEN];
     public_key[0] = 0x04;
     DeviceIdentity {
         public_key,
         device_id: [0xA5; DEVICE_ID_LEN],
+        owned: false,
     }
 }
 
@@ -227,7 +237,9 @@ fn an_install_request_states_what_was_staged_and_is_answered_with_a_verdict() {
         Box::leak(Box::new(crate::InstallStaging::zero()));
     let mut channel = Channel::new();
 
-    let staged = staging.upload().stage(&[0x11; 3072]);
+    let mut cursor = staging.upload().cursor();
+    cursor.write(&[0x11; 3072]);
+    let staged = cursor.finish();
     assert_eq!(staged.len(), 3072);
     let pending = channel.requester.install(staged);
     assert_eq!(pending.operation(), SignOperation::Install);
@@ -254,7 +266,7 @@ fn a_refused_install_comes_back_as_a_refusal_and_not_as_a_fault() {
     let staging: &'static crate::InstallStaging =
         Box::leak(Box::new(crate::InstallStaging::zero()));
     let mut channel = Channel::new();
-    let pending = channel.requester.install(staging.upload().stage(&[0; 512]));
+    let pending = channel.requester.install(staged(staging, &[0; 512]));
     let demand = channel.responder.take().expect("a demand was published");
     channel
         .responder
@@ -301,7 +313,7 @@ fn two_installs_take_two_sequence_numbers() {
     let staging: &'static crate::InstallStaging =
         Box::leak(Box::new(crate::InstallStaging::zero()));
     let mut channel = Channel::new();
-    let first = channel.requester.install(staging.upload().stage(&[1; 8]));
+    let first = channel.requester.install(staged(staging, &[1; 8]));
     let demand = channel.responder.take().expect("the first demand");
     channel.responder.installed(demand);
     let mut into = SignAnswerBuffer::zero();
@@ -310,7 +322,7 @@ fn two_installs_take_two_sequence_numbers() {
         SignPoll::Installed
     );
 
-    let second = channel.requester.install(staging.upload().stage(&[2; 16]));
+    let second = channel.requester.install(staged(staging, &[2; 16]));
     assert_ne!(second.sequence(), channel.responder.served());
     let demand = channel.responder.take().expect("the second demand");
     assert_eq!(demand.stated_len(), 16);

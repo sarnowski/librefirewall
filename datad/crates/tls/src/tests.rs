@@ -1612,7 +1612,28 @@ fn offer_of(suites: &[u16], listed: u16, groups: &[u16], grouped: u16) -> crate:
 /// which is invisible in a unit test of either half.
 #[test]
 fn a_real_client_gets_the_page_and_the_request_over_the_session() {
-    use lfw_onboarding::{Decision, Identity as Onboarded, Monotonic, Onboarding as Surface};
+    use lfw_onboarding::{
+        Decision, Identity as Onboarded, Monotonic, Onboarding as Surface, Upload, UploadRefused,
+    };
+
+    /// This test drives the two resources that are served, so no upload is ever
+    /// begun. Its methods fail the test rather than answering, which is what
+    /// makes "nothing here uploads" an assertion instead of a comment.
+    struct NoUpload;
+
+    impl Upload for NoUpload {
+        fn open(&mut self, _declared: usize) -> Result<(), UploadRefused> {
+            panic!("a served request reserved an upload");
+        }
+
+        fn take(&mut self, _segment: &[u8]) -> usize {
+            panic!("a served request offered a body");
+        }
+
+        fn install(&mut self) -> Result<(), UploadRefused> {
+            panic!("a served request was installed");
+        }
+    }
 
     const DEVICE: &[u8; 32] = b"00000000000000000000000000000001";
     const FINGERPRINT: &[u8; 64] =
@@ -1636,7 +1657,7 @@ fn a_real_client_gets_the_page_and_the_request_over_the_session() {
         echo: false,
         answered: Vec::new(),
     };
-    let mut surface = Surface::new(Some(Onboarded::new(*DEVICE, *FINGERPRINT, REQUEST)));
+    let mut surface = Surface::new(Some(Onboarded::new(*DEVICE, *FINGERPRINT, REQUEST)), false);
     surface.opened();
     meeting.client.pending = b"GET / HTTP/1.1\r\nHost: appliance\r\n\r\n".to_vec();
 
@@ -1646,7 +1667,7 @@ fn a_real_client_gets_the_page_and_the_request_over_the_session() {
     for _ in 0..8 {
         meeting.round();
         let plaintext = meeting.server.received().to_vec();
-        let decision = surface.take(Some(Monotonic::BOOT), &plaintext);
+        let decision = surface.take(Some(Monotonic::BOOT), &plaintext, &mut NoUpload);
         meeting.server.consumed(plaintext.len());
         if let Decision::Served { route, bytes } = decision {
             served = Some((route, bytes));
@@ -1674,4 +1695,108 @@ fn a_real_client_gets_the_page_and_the_request_over_the_session() {
     assert!(answered.contains(core::str::from_utf8(FINGERPRINT).expect("ascii")));
     assert!(answered.contains(&format!("Content-Length: {bytes}\r\n")));
     assert_eq!(arena.refusals(), 0);
+}
+
+/// The chain check the onboarding package's device certificate is held to,
+/// which is the adopted validator asked one question.
+mod delivered_anchor {
+    use super::{NOW, assembled, entropy};
+    use crate::{DeliveredAnchor, Identity};
+    use lfw_package::{ChainRejected, ChainVerifier};
+    use lfw_x509::CertificateKind;
+
+    const AUTHORITY: &[u8] = b"librefirewall management";
+    const DEVICE: &[u8] = b"00000000000000000000000000000001";
+
+    /// A management authority and the device certificate it issued, as a package
+    /// carries them.
+    fn issued(fill: u8) -> (Vec<u8>, Vec<u8>) {
+        let seconds = i64::try_from(NOW).unwrap_or(i64::MAX);
+        let authority = Identity::self_signed(
+            entropy(fill),
+            seconds,
+            CertificateKind::ManagementCa,
+            AUTHORITY,
+        )
+        .expect("an authority");
+        let device = Identity::issued_by(
+            &authority,
+            entropy(fill.wrapping_add(1)),
+            seconds,
+            CertificateKind::Device,
+            DEVICE,
+            AUTHORITY,
+        )
+        .expect("a device certificate");
+        (
+            device.certificate().to_vec(),
+            authority.certificate().to_vec(),
+        )
+    }
+
+    fn verifier(fill: u8) -> DeliveredAnchor {
+        DeliveredAnchor::new(assembled(fill), NOW)
+    }
+
+    #[test]
+    fn a_certificate_the_delivered_anchor_issued_is_accepted() {
+        let (device, anchor) = issued(0x21);
+        assert_eq!(verifier(0x22).verify(&device, &anchor), Ok(()));
+    }
+
+    /// The whole point of the check: an anchor that did not issue the
+    /// certificate beside it is a package assembled out of two authorities'
+    /// material, and it is refused whatever else about it is well formed.
+    #[test]
+    fn a_certificate_another_authority_issued_is_refused() {
+        let (device, _) = issued(0x31);
+        let (_, other_anchor) = issued(0x41);
+        assert_eq!(
+            verifier(0x32).verify(&device, &other_anchor),
+            Err(ChainRejected)
+        );
+    }
+
+    /// The two ends are a peer's bytes, so neither being a certificate at all is
+    /// an ordinary input and one answer.
+    #[test]
+    fn bytes_that_are_not_certificates_are_refused_at_either_end() {
+        let (device, anchor) = issued(0x51);
+        let verifier = verifier(0x52);
+        assert_eq!(
+            verifier.verify(&device, b"not a certificate"),
+            Err(ChainRejected)
+        );
+        assert_eq!(
+            verifier.verify(b"not a certificate", &anchor),
+            Err(ChainRejected)
+        );
+        assert_eq!(verifier.verify(&[], &[]), Err(ChainRejected));
+    }
+
+    /// A self-signed appliance certificate is not something an authority issued,
+    /// so offering one as its own anchor does not make a chain: the anchor has to
+    /// be a certification authority, and the adopted validator is what says so.
+    #[test]
+    fn a_self_signed_certificate_is_not_its_own_anchor() {
+        let seconds = i64::try_from(NOW).unwrap_or(i64::MAX);
+        let appliance =
+            Identity::self_signed(entropy(0x61), seconds, CertificateKind::Onboarding, DEVICE)
+                .expect("an identity");
+        let certificate = appliance.certificate().to_vec();
+        assert_eq!(
+            verifier(0x62).verify(&certificate, &certificate),
+            Err(ChainRejected)
+        );
+    }
+
+    /// The validity window is judged against the instant the verifier was built
+    /// with, which is the appliance's own clock rather than anything a peer sent.
+    #[test]
+    fn a_certificate_outside_its_validity_window_is_refused() {
+        let (device, anchor) = issued(0x71);
+        // Ten years and change after the certificates were issued for.
+        let expired = DeliveredAnchor::new(assembled(0x72), NOW + 400 * 365 * 24 * 3600);
+        assert_eq!(expired.verify(&device, &anchor), Err(ChainRejected));
+    }
 }

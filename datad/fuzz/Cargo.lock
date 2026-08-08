@@ -459,6 +459,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-onboarding"
+version = "0.1.0"
+dependencies = [
+ "lfw-clock",
+ "lfw-http",
+ "lfw-log",
+ "lfw-x509",
+]
+
+[[package]]
 name = "lfw-package"
 version = "0.1.0"
 dependencies = [
@@ -503,6 +513,7 @@ version = "0.1.0"
 dependencies = [
  "lfw-crypto",
  "lfw-log",
+ "lfw-package",
  "lfw-x509",
  "rustls",
 ]
@@ -545,6 +556,7 @@ dependencies = [
  "lfw-ip-endpoint",
  "lfw-log",
  "lfw-metrics",
+ "lfw-onboarding",
  "lfw-package",
  "lfw-pcapng",
  "lfw-recorder",

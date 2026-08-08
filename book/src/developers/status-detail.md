@@ -2652,12 +2652,49 @@ unauthenticated peer could make that domain sign as often as it could open a con
 bring-up it cannot, and what a peer can ask for is a copy of an array. A boot that could not compose
 it refuses at boot under one of three tokens of its own rather than at a request.
 
-**There is no upload form on the page, and that is a statement.** The finished surface takes a
-configuration package at `POST /configuration.tar`; this build does not, so the page names the
-endpoint in a sentence and says plainly that it is not accepted yet. A form pointing at an address
-the appliance answers with "no such resource" is a promise the appliance does not keep, and an
-administrator who clicked it would learn less than the sentence tells them. The route itself is not
-stubbed either: asking for it is answered exactly as any other unknown address is.
+**And the writing half runs on it too: `POST /configuration.tar` takes the package.** The head goes
+through the same parser under one framing and no other — a single decimal `Content-Length` on a
+`POST`, bounded at the archive's own 128 KiB — and the body never rests in the surface at all: it is
+handed on segment by segment as it arrives, into the staging region the domain that holds the device
+key reads out of. The head buffer is filled *before* it is parsed, which is what makes that work: one
+TLS delivery is tens of kibibytes, so an upload's first one carries a head and a great deal of body,
+and a surface that refused on the arithmetic would answer a legitimate upload "your headers are too
+large".
+
+**There is no upload form on the page, and that is a statement.** The page prints the `curl` command
+instead, with the address as a placeholder an administrator substitutes — no byte a peer sent reaches
+the page, so the one thing on the wire that claims to name this appliance is not something the page
+may repeat. A browser form can only send a body it has wrapped in an encoding of its own, and
+unwrapping that would be a second parser on the one path an unauthenticated peer reaches, for a
+wrapping that carries nothing.
+
+**The package is read twice, and the first reading is here.** The cryptography domain copies the
+staged archive back out of the region into a 128 KiB window taken from its bounded arena — read back
+rather than accumulated, so the bytes it judges are the bytes the other domain will install — and
+holds them to the whole [package contract](../contracts/configuration-package.md), with the chain
+check answered by the **adopted certificate validator**: a client verifier over a root store holding
+the delivered anchor, asked whether it issued the delivered device certificate. The window is
+reserved before a byte of the body is placed, against the arena's own remaining headroom, so an
+appliance with nowhere to put a package refuses the request rather than beginning one it cannot
+finish. What passes goes to the store domain over the `Install` delegation, which reads it a second
+and deliberately narrower time against its own record.
+
+**An accepted package shuts the surface, and the close survives a reboot.** It is shut on the spot,
+before the answer is composed, and every later request on any address is answered `410 Gone` under a
+token of its own rather than "no such resource" — an administrator told the latter would go looking
+for a typing mistake. The durable half is not a flag: the delegation's identity answer now carries
+**whether the record on the medium names an owner**, read off that medium on every boot, and the
+surface is *constructed* shut when it does. A factory reset is the way back, as it is for every other
+part of ownership.
+
+**Every distinct refusal is its own token.** Twenty-six now, where there were twenty: the five the
+surface already decided, the fifteen the parser distinguishes, and six more — the appliance being
+owned, an upload declaring no body, a peer sending past the length it declared, this appliance having
+no room to validate one, bytes that would not all go where they were meant to, and a package the key
+holder judged and refused. That last one carries no reason, deliberately: which rule refused it is
+the deciding domain's own record, in the package contract's vocabulary and beside the numbers that
+place it, and a second copy of that catalogue travelling back over a region is what the shared
+catalogue exists to prevent.
 
 **Every distinct way a request can be refused has a console token of its own** — twenty of them.
 Five are the surface's own decisions: the rate limiter, an identity that does not exist yet, an
@@ -2805,16 +2842,17 @@ is owned one generation on with both certificates and the endpoint in it, that a
 refuses a second package, and that an appliance holding another point adopts nothing whatever else
 was right.
 
-**Missing.** `POST /configuration.tar` itself: **nothing routes an upload to the install path**. The
-onboarding surface has no POST route, the cryptography domain has no chain verifier over the
-validator it carries and so never calls `lfw_package::read`, nothing writes the staging region, and
-the QEMU harness has no management-server role to carry a package to a booted node — so no console
-record, no metric and no scenario reaches any of this, and none is claimed. **The configuration
-document a package carries is validated and not persisted**: committing it needs the ownership fact
-to reach the configuration domain, which is a change to a different handover. The host-side reader
-is otherwise complete. The unboarded/onboarded state machine has nowhere to be stored, so
-nothing closes the onboarding server permanently after onboarding, though the record the state
-machine would be stored in now carries the ownership. The rate limiter is proved on the
+**Missing.** **No boot has ever carried a package.** The route, the chain verifier, the staging
+write, the install exchange and the permanent close all exist and are proved on the host; what does
+not exist is a **management-server role in the QEMU harness** to carry a real package to a booted
+node, and without one no scenario reaches any of it — so no console record, no metric and no boot
+evidence is claimed for the upload path, and the whole of it stands on host tests and one fuzz target
+today. **The configuration document a package carries is validated and not persisted**: committing it
+needs the ownership fact to reach the configuration domain, which is a change to a different
+handover, so an onboarded appliance still forwards under whatever the boot document said. And
+**nothing fails closed on being unowned**: an appliance without an owner is supposed to forward
+nothing, and the ownership fact now reaches the domain that serves onboarding but not the domain that
+forwards. The rate limiter is proved on the
 host and not on the image — tripping it needs more sessions than a boot spends handshakes on, and
 what the image proves instead is that two other refusals reach two different tokens. What no scenario
 reaches is the port's behaviour **under a peer

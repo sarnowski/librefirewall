@@ -1674,10 +1674,12 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // is a request the management server will not sign.
     //
     // THREE OF THE FIVE MUST BE REFUSED, each under a token of its own: an
-    // address that does not exist, the configuration upload the next step will
-    // use and this build does not serve, and the page under a method it is not
-    // served with. A boot that answered all three the same way would satisfy a
-    // contract that only asked whether a bad request was refused.
+    // address that does not exist, the configuration upload asked for with no
+    // package behind it, and the page under a method it is not served with. A
+    // boot that answered all three the same way would satisfy a contract that
+    // only asked whether a bad request was refused. Note that the second is now
+    // a *served* route refusing an empty upload rather than an address that does
+    // not exist, which is what keeps the three tokens three.
     Scenario {
         name: "onboarding-requests",
         document: image::CONFIGURATION_DOCUMENT,

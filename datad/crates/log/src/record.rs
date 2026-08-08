@@ -679,6 +679,10 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::OnboardingThrottled.to_bits();
                     record.operands = [*strikes, *wait_millis, 0, 0];
                 }
+                DomainDetail::OnboardingInstalled { bytes } => {
+                    record.detail = LogDetailKind::OnboardingInstalled.to_bits();
+                    record.operands = [*bytes, 0, 0, 0];
+                }
                 DomainDetail::Delegated {
                     device,
                     signatures,
@@ -1064,6 +1068,9 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             strikes: *strikes,
             wait_millis: *wait_millis,
         },
+        CheckedDetail::OnboardingInstalled { bytes } => {
+            DomainDetail::OnboardingInstalled { bytes: *bytes }
+        }
         // Total for the same reason with nothing ranged at all: an identifier is
         // 128 bits of randomness and both counts are tallies, so every bit pattern
         // of the four words is one a delegating domain could have read.
@@ -1205,6 +1212,9 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         strikes,
                         wait_millis,
                     },
+                    DomainDetail::OnboardingInstalled { bytes } => {
+                        DomainDetail::OnboardingInstalled { bytes }
+                    }
                     DomainDetail::Operation { primitive, cycles } => {
                         DomainDetail::Operation { primitive, cycles }
                     }

@@ -199,6 +199,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "nic_driver_paths",
     "find_virtio_caps",
     "store_state",
+    "onboarding_surface",
     "onboarding_package",
     "onboarding_install",
 ];
