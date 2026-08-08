@@ -753,12 +753,14 @@ fn a_stated_count_about_the_gate_is_held_to_the_list_it_is_about() {
     let scenarios = crate::qemu::SCENARIOS.len();
     let sound = format!(
         "The gate boots {scenarios} system scenarios, and the {} scenarios that reach the \
-         management port judge every surface. Coverage covers {} library crates.",
+         management port judge every surface. Coverage covers {} library crates, and the {} \
+         persistent fuzz targets the gate runs cover the untrusted parsers.",
         crate::qemu::SCENARIOS
             .iter()
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
         crate::host::library_crate_count(),
+        crate::host::fuzz_target_count(),
     );
     let mut findings = Vec::new();
     check_stated_counts(&sound, &mut findings);
@@ -797,12 +799,15 @@ fn a_mention_that_states_no_number_is_left_alone() {
     let mixed = format!(
         "Every system scenario boots the release image. The gate boots {scenarios} system \
          scenarios in all, and the {} scenarios that reach the management port are scraped. \
-         Coverage runs over {} library crates, and the library crates are all `no_std`.",
+         Coverage runs over {} library crates, and the library crates are all `no_std`. The {} \
+         persistent fuzz targets the gate runs always build, and the persistent fuzz targets the \
+         gate runs are listed in one place.",
         crate::qemu::SCENARIOS
             .iter()
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
         crate::host::library_crate_count(),
+        crate::host::fuzz_target_count(),
     );
     let mut findings = Vec::new();
     check_stated_counts(&mixed, &mut findings);
@@ -829,7 +834,7 @@ fn a_second_statement_of_one_count_is_compared_too() {
     assert!(joined.contains("\"99 system scenarios\""), "{joined}");
     assert_eq!(
         findings.len(),
-        // The two counts the text says nothing about, plus the stale one.
+        // The counts the text says nothing about, plus the stale one.
         STATED_COUNTS.len() - 1 + 1,
         "{findings:#?}"
     );

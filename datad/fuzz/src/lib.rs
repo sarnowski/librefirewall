@@ -27,6 +27,7 @@
 //! | [`driver`] | `nic_driver_core` rx/tx paths | a hostile device **and** a byzantine neighbour PD |
 //! | [`recording`] | `lfw_recorder`'s pass and sink, and `lfw_capture_ring`'s superblock and ring | a byzantine neighbour PD on two channels **and** a hostile medium |
 //! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
+//! | [`store_state`] | `lfw_store`'s own state record read back off the medium: the two copies, the digest over each, and the identity decoded out of the one that wins | an attacker holding the disk, composing offline with this decoder's source in hand |
 //! | [`onboarding_tls`] | `lfw_tls`'s onboarding server: the record layer, the buffering either side of it, and the outcome it settles on | a management-plane attacker |
 //! | [`onboarding_surface`] | `lfw_onboarding`'s request surface: the head read out of a plaintext stream cut into arbitrary deliveries, the body handed on to an upload as it arrives, and the twenty-six ways a request is refused | a management-plane attacker |
 //! | [`onboarding_package`] | `lfw_package`'s uploaded archive: the ustar framing, the armour around the two certificates, the walk that finds the key one binds, the endpoint line, and the `config` reader under it | a management-plane attacker |
@@ -231,8 +232,14 @@ mod tests {
     /// list so a target added without a seed corpus fails the smoke test
     /// instead of shipping an unseeded target.
     ///
-    /// Ordered from the smallest, most self-contained surface to the deepest
-    /// composite one, and `tools/xtask`'s `FUZZ_TARGETS` matches. A defect in
+    /// **Which** targets it names is held to the `[[bin]]` tables of this crate's
+    /// own manifest by a test below, as `tools/xtask`'s `FUZZ_TARGETS` is on its
+    /// own side: the manifest is the one place a target is declared, so neither
+    /// list can come to disagree with it or, through it, with the other.
+    ///
+    /// The **order** is this list's own — from the smallest, most self-contained
+    /// surface to the deepest composite one — and is not compared with anything,
+    /// the two lists ordering the same set for different runs. A defect in
     /// the ledger shows up in `free_list_ownership`, in `pd_runtime_pipeline`,
     /// and in `nic_driver_paths` alike; one in the handover image shows up
     /// in `config_image` and again in `config_document`, which builds one; and
@@ -295,6 +302,12 @@ mod tests {
             "find_virtio_caps",
             crate::virtio_pci::find_virtio_caps_harness,
         ),
+        // Driven here as well as by its own module test, which adds a sweep of
+        // synthetic regions this shared loop has no way to express. Being absent
+        // from this table was the same defect as being absent from the run list:
+        // a target whose seeds this loop never carried, in a table that reads as
+        // holding every one of them.
+        ("store_state", crate::store_state::store_state_harness),
     ];
 
     /// Read every committed seed for a target so the smoke tests drive the
@@ -334,6 +347,58 @@ mod tests {
             for input in seeds(target).into_iter().chain(edge_inputs()) {
                 harness(&input);
             }
+        }
+    }
+
+    /// Every target this crate declares a binary for, which is the whole truth
+    /// about which targets exist.
+    fn declared_targets() -> Vec<String> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let manifest = fs::read_to_string(&path).expect("this crate's own manifest");
+        let declared: Vec<String> = manifest
+            .split("[[bin]]")
+            .skip(1)
+            .map(|section| {
+                section
+                    .split_once("name = \"")
+                    .expect("a [[bin]] table declares a name")
+                    .1
+                    .split_once('"')
+                    .expect("the binary name is terminated")
+                    .0
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            declared.len() >= 3,
+            "the manifest parse produced {declared:?}, which cannot be the whole target set"
+        );
+        declared
+    }
+
+    /// A libFuzzer binary and the harness the smoke tests drive are two readings
+    /// of one target, and nothing but this compared them. A binary with no entry
+    /// here is built and fuzzed but never carried over its seeds, so the corpus
+    /// that is supposed to catch a lost rule with no live fuzzing at all is never
+    /// read; an entry with no binary is a harness that no fuzzer ever drives.
+    /// Both are the same defect the target list in `tools/xtask` had: a target
+    /// counted as covered by a run that never touched it.
+    #[test]
+    fn every_declared_target_has_a_harness_and_every_harness_has_a_binary() {
+        let declared = declared_targets();
+        for target in &declared {
+            assert!(
+                HARNESSES.iter().any(|(name, _)| name == target),
+                "Cargo.toml declares the target {target}, but no harness here is named for it, so \
+                 its seed corpus is never driven by the smoke tests"
+            );
+        }
+        for (target, _) in HARNESSES {
+            assert!(
+                declared.iter().any(|declared| declared == target),
+                "a harness is named {target}, but Cargo.toml declares no [[bin]] for it, so no \
+                 fuzzer ever drives it"
+            );
         }
     }
 

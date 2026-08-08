@@ -171,15 +171,24 @@ const SEL4_KERNEL_CONFIGS: &[&str] = &[image::DEBUG_CONFIG, image::RELEASE_CONFI
 
 /// The persistent fuzz targets under `fuzz/`, driven by [`fuzz`], ordered from
 /// the smallest, most self-contained untrusted-input surface to the deepest
-/// composite one, matching the harness list in `fuzz/src/lib.rs`. One defect
-/// often reaches several targets, and the narrowest one that reproduces it is
-/// the one worth reading, so it runs first.
+/// composite one. One defect often reaches several targets, and the narrowest one
+/// that reproduces it is the one worth reading, so it runs first. That order is
+/// this list's own and nothing compares it — the harness list in `fuzz/src/lib.rs`
+/// orders the same targets for a different run.
+///
+/// **Which** targets it names is not a judgement at all but a fact about the fuzz
+/// manifest, and the two are held equal in both directions by a test below. They
+/// were once only meant to agree: a target was declared, built under the sanitizer
+/// on every run, and left off here, so it had never once been executed while the
+/// gate reported it as covered — a target that cannot reach a bug reading as
+/// coverage, which is the failure this whole stage exists to prevent.
 const FUZZ_TARGETS: &[&str] = &[
     "config_image",
     "log_record",
     "free_list_ownership",
     "route_frame",
     "ip_endpoint",
+    "neighbour_cache",
     "tcp_segments",
     "flow_table",
     "http_request",
@@ -203,6 +212,15 @@ const FUZZ_TARGETS: &[&str] = &[
     "onboarding_package",
     "onboarding_install",
 ];
+
+/// How many persistent fuzz targets the gate runs.
+///
+/// Exposed for the same reason as [`library_crate_count`]: the status pages state
+/// how broad this stage is, and a number in prose that nothing compares is a
+/// number that goes stale ([`crate::reference_contract`]).
+pub(crate) fn fuzz_target_count() -> usize {
+    FUZZ_TARGETS.len()
+}
 
 pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     run_command(
@@ -1347,6 +1365,72 @@ mod tests {
         assert_eq!(tail(b"only one\n", 5), "only one");
         assert_eq!(tail(b"", 5), "");
         assert_eq!(tail(b"\n  \n\n", 3), "");
+    }
+
+    /// The binaries the fuzz manifest declares — the whole truth about which
+    /// targets exist, because a target is a `[[bin]]` there and nothing else.
+    fn declared_fuzz_targets(root: &Path) -> Vec<String> {
+        let path = root.join("fuzz").join("Cargo.toml");
+        let manifest = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        // Everything after a `[[bin]]` header up to the next one is that
+        // binary's table, and the first quoted name in it is the binary's.
+        let declared: Vec<String> = manifest
+            .split("[[bin]]")
+            .skip(1)
+            .map(|section| {
+                section
+                    .split_once("name = \"")
+                    .expect("a [[bin]] table declares a name")
+                    .1
+                    .split_once('"')
+                    .expect("the binary name is terminated")
+                    .0
+                    .to_owned()
+            })
+            .collect();
+        // The same guard the workspace parse carries, for the same reason: the
+        // comparison below is a loop, so a parse that silently produced nothing
+        // would agree with everything.
+        assert!(
+            declared.len() >= 3,
+            "the fuzz manifest parse produced {declared:?}, which cannot be the whole target set"
+        );
+        declared
+    }
+
+    #[test]
+    fn every_declared_fuzz_target_is_run_and_every_target_run_is_declared() {
+        // What this closes: FUZZ_TARGETS was hand-maintained beside the fuzz
+        // manifest with nothing comparing them, and the two had already drifted
+        // — `neighbour_cache` was declared, built under AddressSanitizer on
+        // every run, and never once executed, which is the worst shape this
+        // stage can take: a target that cannot reach a bug, counted as one that
+        // covers a surface.
+        //
+        // Both directions, because they fail differently. A declared target
+        // missing here is silent — it builds, so nothing complains, and only a
+        // reader diffing two lists would notice. A target named here and not
+        // declared is loud but late: `cargo fuzz run` fails in the middle of the
+        // slow gate rather than in the fast one.
+        let root = crate::util::workspace_root().expect("the workspace root");
+        let declared = declared_fuzz_targets(&root);
+        for target in &declared {
+            assert!(
+                FUZZ_TARGETS.contains(&target.as_str()),
+                "fuzz/Cargo.toml declares the target {target}, but FUZZ_TARGETS does not name it, \
+                 so the gate builds it under the sanitizer and never runs it — it is instrumented \
+                 coverage that has never executed. Add it, or delete the target nothing drives."
+            );
+        }
+        for target in FUZZ_TARGETS {
+            assert!(
+                declared.iter().any(|declared| declared == target),
+                "FUZZ_TARGETS names {target}, but fuzz/Cargo.toml declares no [[bin]] for it, so \
+                 the fuzz stage would fail on a target that cannot be built. Declare it, or drop \
+                 the name from the list."
+            );
+        }
     }
 
     #[test]

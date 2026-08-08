@@ -90,10 +90,11 @@ const METRICS_PAGE: &str = "book/src/reference/metrics.md";
 /// Not for its prose, and not for its status verdicts — those are a human's
 /// judgement about the product and no comparison can make them. What is readable as
 /// data is a number it states about a list this build holds: how many system
-/// scenarios there are, how many of them reach the management port, and how many
-/// library crates carry the coverage floor. Every one of those had gone stale at
-/// least once, silently, with every stage of the gate green — which is the same
-/// defect the two chapters above are read for.
+/// scenarios there are, how many of them reach the management port, how many
+/// library crates carry the coverage floor, and how many persistent fuzz targets
+/// the gate runs. Every one of those had gone stale at least once, silently, with
+/// every stage of the gate green — which is the same defect the two chapters
+/// above are read for.
 const STATUS_DETAIL_PAGE: &str = "book/src/developers/status-detail.md";
 
 /// Which console vocabulary a source file's hyphen-bearing lowercase literals
@@ -350,6 +351,13 @@ const STATED_COUNTS: &[StatedCount] = &[
     StatedCount {
         phrase: "library crates",
         count: crate::host::library_crate_count,
+    },
+    // Worded to name the whole stage rather than one surface, because the chapter
+    // also counts the targets over a single surface in its prose and those are
+    // different numbers. The phrase is the handle, so the two must not share one.
+    StatedCount {
+        phrase: "persistent fuzz targets the gate runs",
+        count: crate::host::fuzz_target_count,
     },
 ];
 
