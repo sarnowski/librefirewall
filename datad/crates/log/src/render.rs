@@ -275,6 +275,29 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             }
             Ok(())
         }
+        // The authority an appliance has just accepted, rendered exactly as its
+        // own `fingerprint=` is and for the same reason: an administrator
+        // compares this string against what the management server shows, and two
+        // formats for one kind of digest would be two things to get right.
+        DomainDetail::AnchorFingerprint(digest) => {
+            cursor.write_str(" anchor-fingerprint=")?;
+            for byte in digest {
+                write!(cursor, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+        // Where an appliance that has just been given an owner will answer to,
+        // and the generation the record saying so stands at. The address is
+        // spelled as an address on `dial-destination=`'s terms.
+        DomainDetail::Adopted {
+            destination,
+            port,
+            generation,
+        } => write!(
+            cursor,
+            " adopted-endpoint={destination} adopted-port={port} \
+             adopted-generation={generation}"
+        ),
         // What a reset destroyed, as three fields keyed to the past: the record
         // this appliance no longer has, the versions that went with it, and
         // whether there was an owner to give up. `cleared-generation=0` is a
@@ -819,6 +842,45 @@ mod tests {
                  fingerprint={}",
                 "0".repeat(64)
             )
+        );
+    }
+
+    /// The two records an appliance emits when it is given an owner: where it
+    /// will answer to, and the fingerprint of the authority it will validate that
+    /// channel against.
+    ///
+    /// The anchor's digest is rendered exactly as the appliance's own is —
+    /// 64 lowercase hexadecimal characters, no separators — because an
+    /// administrator compares both against strings a management server showed
+    /// them, and a second format would be a second thing to read carefully.
+    #[test]
+    fn taking_ownership_reports_the_endpoint_and_the_authority() {
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::Adopted {
+                    destination: Ipv4Address::from_octets([192, 168, 42, 1]),
+                    port: 8443,
+                    generation: 2,
+                },
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             adopted-endpoint=192.168.42.1 adopted-port=8443 adopted-generation=2"
+        );
+
+        let mut digest = [0_u8; 32];
+        for (at, byte) in digest.iter_mut().enumerate() {
+            *byte = 0xff - at as u8;
+        }
+        assert_eq!(
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::AnchorFingerprint(digest),
+            }),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             anchor-fingerprint=fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0"
         );
     }
 
@@ -1469,6 +1531,12 @@ mod tests {
                 onboarded: true,
             },
             DomainDetail::Fingerprint([0xff; 32]),
+            DomainDetail::AnchorFingerprint([0xff; 32]),
+            DomainDetail::Adopted {
+                destination: Ipv4Address::from_octets([255, 255, 255, 255]),
+                port: u16::MAX,
+                generation: u64::MAX,
+            },
             DomainDetail::Dialled {
                 destination: Ipv4Address::from_octets([255, 255, 255, 255]),
                 port: u16::MAX,
@@ -1651,6 +1719,14 @@ mod tests {
                 }
             }),
             any::<[u8; 32]>().prop_map(DomainDetail::Fingerprint),
+            any::<[u8; 32]>().prop_map(DomainDetail::AnchorFingerprint),
+            any::<([u8; 4], u16, u64)>().prop_map(|(octets, port, generation)| {
+                DomainDetail::Adopted {
+                    destination: Ipv4Address::from_octets(octets),
+                    port,
+                    generation,
+                }
+            }),
             any::<(u64, u64, bool)>().prop_map(|(generation, documents, was_owned)| {
                 DomainDetail::Reset {
                     generation,

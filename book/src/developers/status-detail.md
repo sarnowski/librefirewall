@@ -2753,10 +2753,68 @@ body, a size field lying in both directions, a checksum that does not verify, a 
 a GNU long name, a symlink, a directory, a member over its bound, an archive over its own, and the
 anchor put in the device certificate's place, which is a well-formed certificate over the wrong key.
 
-**Missing.** `POST /configuration.tar` itself: nothing routes an upload to that reader, nothing
-persists what a package carries, and no protection domain holds the reader — it is host-side only,
-so no console record, metric or QEMU scenario reaches it and none is claimed. The unboarded/onboarded state machine has nowhere to be stored, so
-nothing closes the onboarding server permanently after onboarding. The rate limiter is proved on the
+**And the appliance now takes ownership out of a package, in the domain that holds its key.** The
+store domain answers a fourth delegation operation, `Install`: the archive crosses in a **dedicated
+staging region** of 128 KiB that the cryptography domain maps read-write and the store domain
+read-only, and the delegation request states only how many bytes of it there are. A region rather
+than the request's own 256-byte message field, because chunking an archive through that would be
+five hundred and twelve attacker-paced round trips and a reassembler holding partial state in the
+domain that owns the medium — which would cost the delegation the one property worth keeping, that
+one demand produces one reply. The reply is the **status word alone**: installed, or refused. The
+reply region already uses 945 of the 4096 bytes it is granted, so a byte string would have been
+free and is still refused — *which rule* refused a package is a vocabulary that belongs where the
+decision was made, and a word here spelling it would be a second copy of it crossing a region.
+
+**The store snapshots the region before it validates.** The bytes are copied into the upper half of
+the domain's own `blk_io` window — the state record's own span sits at the front of that window and
+is untouched — and every rule is then applied to that copy, so a writer that keeps writing cannot
+change a package between a rule passing and a sector being written. The order is the borrow's rather
+than this text's: the snapshot is held while the package is read, and the record cannot be composed
+into the window until that borrow ends.
+
+**Its check is deliberately narrower than the one the cryptography domain will run, and that is the
+point of running two.** It repeats everything structural — the archive framing, the armour, the DER
+shape, the endpoint line, and `config::load` — and it adds the one thing this domain can answer
+better than anybody: the device certificate must bind **the point in its own state record**, not one
+the package offers and not one a peer named over a channel. What it adds beyond that is **one
+signature under one profile**: one algorithm, one curve, a path of length one, checked by a bounded
+DER descent and `lfw_crypto`'s own verification. It weighs no name constraint, no key usage, no
+basic constraint, no validity window and no revocation — those are the adopted validator's, and a
+second general policy engine in the domain holding the private key is what this appliance declines
+to have. Two checks that agree mean one upload survived two independent readings; two that disagree
+mean something between them changed the bytes.
+
+Taking ownership is the A/B record's own transaction: the record is read back off the medium, held
+to itself as an identity again, the ownership written into it, and the whole state composed into the
+copy the generation's parity selects and flushed. Only then are the two console records emitted —
+the anchor's SPKI fingerprint, then the endpoint with the generation the record now stands at — so a
+line here is a statement about durable state rather than about an intention. **One hundred and nine
+console tokens** carry the refusals, one per distinct rule of the package contract at the grain an
+administrator acts on: which of the four files to open and what about it was wrong. An install costs
+a copy, a whole archive walk and a signature verification that a peer paces, so **one boot serves
+eight of them** and the ninth is refused by name — a first-party bound on both the work and the
+console records a peer can provoke.
+
+**The fuzz target drives the region and the claim about it.** `onboarding_install` takes a
+four-byte stated length followed by the region, so a length past what was staged, a length short of
+the archive and a length of zero over a whole package are ordinary inputs rather than shapes the
+harness cannot express. It asserts that reading is total and deterministic, that a claim past the
+region is refused by that rule and nothing else, that an accepted install yields a dialable
+endpoint and a fingerprint that is the digest over the anchor's own key, that the resulting record
+is owned one generation on with both certificates and the endpoint in it, that an owned appliance
+refuses a second package, and that an appliance holding another point adopts nothing whatever else
+was right.
+
+**Missing.** `POST /configuration.tar` itself: **nothing routes an upload to the install path**. The
+onboarding surface has no POST route, the cryptography domain has no chain verifier over the
+validator it carries and so never calls `lfw_package::read`, nothing writes the staging region, and
+the QEMU harness has no management-server role to carry a package to a booted node — so no console
+record, no metric and no scenario reaches any of this, and none is claimed. **The configuration
+document a package carries is validated and not persisted**: committing it needs the ownership fact
+to reach the configuration domain, which is a change to a different handover. The host-side reader
+is otherwise complete. The unboarded/onboarded state machine has nowhere to be stored, so
+nothing closes the onboarding server permanently after onboarding, though the record the state
+machine would be stored in now carries the ownership. The rate limiter is proved on the
 host and not on the image — tripping it needs more sessions than a boot spends handshakes on, and
 what the image proves instead is that two other refusals reach two different tokens. What no scenario
 reaches is the port's behaviour **under a peer

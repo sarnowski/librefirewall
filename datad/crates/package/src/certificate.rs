@@ -33,13 +33,24 @@ const END_LINE: &[u8] = b"-----END CERTIFICATE-----";
 const LINE_CHARS: usize = 64;
 
 /// The DER universal tag for a SEQUENCE, constructed.
-const SEQUENCE: u8 = 0x30;
+///
+/// The four tags below are public beside [`read_tlv`] and for its reason: a
+/// caller descending with this walker needs the alphabet it is written in, and a
+/// second copy of `0x30` somewhere else is a byte two readers can disagree about.
+pub const SEQUENCE: u8 = 0x30;
 
 /// The DER universal tag for an INTEGER.
-const INTEGER: u8 = 0x02;
+pub const INTEGER: u8 = 0x02;
+
+/// The DER universal tag for a BIT STRING, which is how a certificate carries a
+/// public key and a signature.
+pub const BIT_STRING: u8 = 0x03;
+
+/// The DER universal tag for an OBJECT IDENTIFIER.
+pub const OBJECT_IDENTIFIER: u8 = 0x06;
 
 /// The DER tag of the explicit `[0]` the version is wrapped in.
-const CONTEXT_ZERO: u8 = 0xA0;
+pub const CONTEXT_ZERO: u8 = 0xA0;
 
 /// Which element of a certificate a structural refusal was about.
 ///
@@ -56,6 +67,14 @@ pub enum Element {
     Validity,
     Subject,
     SubjectPublicKeyInfo,
+    /// The `AlgorithmIdentifier` inside one of the two places a certificate
+    /// carries one, and the object identifier inside that.
+    AlgorithmIdentifier,
+    /// The BIT STRING inside a `SubjectPublicKeyInfo`, which is where the point
+    /// itself is.
+    SubjectPublicKey,
+    /// The BIT STRING a certificate's own signature is in.
+    SignatureValue,
 }
 
 /// Why a member is not one certificate.
@@ -176,7 +195,13 @@ pub(crate) fn binds_key(
 }
 
 /// Read one tag-length-value, answering its content and what follows it.
-fn read_tlv(
+///
+/// Public because the appliance has exactly one bounded DER walk and this is it:
+/// the domain that checks whether an anchor signed a certificate descends the
+/// same structures under the same rules — definite lengths, minimally encoded,
+/// nothing running past what encloses it — and a second walk written beside this
+/// one would be a second set of those rules to keep true.
+pub fn read_tlv(
     bytes: &[u8],
     element: Element,
     expected: u8,

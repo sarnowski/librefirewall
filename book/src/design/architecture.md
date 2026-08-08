@@ -346,6 +346,15 @@ than writing an equivalent one for itself, which would leave the appliance with 
 one key and nobody able to say which one a peer was shown. A certificate is public, so moving it
 gives nothing away; the channel still has no field a private key fits in.
 
+**Ownership is installed by the same domain, for the same reason.** An onboarding package binds a
+certificate to the device key and names the management server the appliance answers to, and both of
+those are facts about the identity this domain owns — so the domain that terminates the upload hands
+the archive over and the store domain decides. That makes it the one domain that both holds the
+private key and reads bytes an unauthenticated party composed, which is a cost paid deliberately:
+the alternative is a domain installing an identity it cannot see the key of. Two things bound it —
+the archive crosses in a region of its own that the store domain may only read, and the store domain
+copies it before applying a rule, so what it validates is what it writes.
+
 **The key is plaintext on the medium**: no TPM, no secure element, nowhere to keep a wrapping key.
 Physical access to the store device is identity theft, recorded as such in the
 [threat model](threat-model.md), and [factory reset](updates.md#factory-reset) overwrites the key

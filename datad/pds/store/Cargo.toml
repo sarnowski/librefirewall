@@ -17,6 +17,10 @@ lfw-blk = { path = "../../crates/blk" }
 lfw-crypto = { path = "../../crates/crypto" }
 lfw-log = { path = "../../crates/log" }
 lfw-metrics = { path = "../../crates/metrics" }
+# The onboarding package's own refusal tree, so a console token names the rule
+# the contract states rather than a class of them. The reading itself is
+# `lfw-store`'s; what is reached for here is the vocabulary of the answer.
+lfw-package = { path = "../../crates/package" }
 lfw-store = { path = "../../crates/store" }
 pd-runtime = { path = "../../crates/pd-runtime" }
 virtio = { path = "../../crates/virtio" }

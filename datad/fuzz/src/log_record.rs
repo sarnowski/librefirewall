@@ -152,7 +152,9 @@ const DETAIL_ONBOARDING_GROUPS: u8 = 34;
 const DETAIL_ONBOARDING_SERVED: u8 = 35;
 const DETAIL_ONBOARDING_REQUEST: u8 = 36;
 const DETAIL_ONBOARDING_THROTTLED: u8 = 37;
-const DETAIL_COUNT: u8 = 38;
+const DETAIL_ADOPTED: u8 = 38;
+const DETAIL_ANCHOR_FINGERPRINT: u8 = 39;
+const DETAIL_COUNT: u8 = 40;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -591,7 +593,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ONBOARDING_REFUSED | DETAIL_ONBOARDING_ALERT
                 | DETAIL_ONBOARDING_BACKLOGGED | DETAIL_ONBOARDING_SUITES
                 | DETAIL_ONBOARDING_GROUPS | DETAIL_ONBOARDING_SERVED
-                | DETAIL_ONBOARDING_REQUEST | DETAIL_ONBOARDING_THROTTLED => {
+                | DETAIL_ONBOARDING_REQUEST | DETAIL_ONBOARDING_THROTTLED
+                | DETAIL_ADOPTED | DETAIL_ANCHOR_FINGERPRINT => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -742,6 +745,9 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         | DETAIL_ARENA
         | DETAIL_PROVEN
         | DETAIL_FINGERPRINT
+        // The anchor's fingerprint joins it for the same reason, being the same
+        // four unranged words over somebody else's key.
+        | DETAIL_ANCHOR_FINGERPRINT
         // The channel's refused-reply counts join them: four unranged tallies of
         // what a link answered, and no shape a rule can turn away.
         | DETAIL_DIAL_UNLEARNED
@@ -831,6 +837,16 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // does not carry is one the record check reads and this one calls
         // unknown.
         DETAIL_ONBOARDING_PORT => None,
+        // The ownership detail reads three words and ranges two, in the order
+        // the ABI reads them: an address that is thirty-two bits wide wherever
+        // IPv4 names one, and a port that is sixteen. The generation behind them
+        // is unranged — every bit pattern of it is a position a record could
+        // stand at — and there is no token here, so the leading word is not one.
+        DETAIL_ADOPTED => (record.operands[0] > u64::from(u32::MAX))
+            .then_some(LogRecordError::AddressTooWide {
+                value: record.operands[0],
+            })
+            .or_else(|| wide_code_point(record.operands[1])),
         // The seven a handshake on that port produces. Every one of them leads
         // with a token naming how the handshake ended, and each ranges what
         // follows for the shape it will be rendered as — restated here in the
@@ -1502,6 +1518,47 @@ mod tests {
                         // as a flag would refuse this record, and the certificate
                         // length it carries is a tally with no range to hold it to.
                         u64::MAX,
+                    ],
+                    ..domain_record()
+                }),
+            ),
+            // The ownership detail, whose first two words are an address and a
+            // port and whose third is a plain number. Committed because a
+            // uniform draw over a discriminant plus four words reaches the
+            // ranged pair almost never: both are at their widest admissible
+            // value here, which is what a check written with `>=` instead of
+            // `>` would wrongly refuse.
+            (
+                "valid_domain_adopted",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ADOPTED,
+                    operands: [u64::from(u32::MAX), u64::from(u16::MAX), u64::MAX, 0],
+                    ..domain_record()
+                }),
+            ),
+            // And one past the address's width, which is the refusal that pair
+            // exists for: a record naming an address no wire has.
+            (
+                "adopted_address_one_past_its_width",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ADOPTED,
+                    operands: [u64::from(u32::MAX) + 1, 0, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            // The anchor's fingerprint, four words of digest over somebody
+            // else's key. Committed beside the appliance's own for its reason:
+            // a seed that read them as two would leave the second half of every
+            // fingerprint uncovered.
+            (
+                "valid_domain_anchor_fingerprint",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_ANCHOR_FINGERPRINT,
+                    operands: [
+                        0xe0e1_e2e3_e4e5_e6e7,
+                        0xe8e9_eaeb_eced_eeef,
+                        0xf0f1_f2f3_f4f5_f6f7,
+                        0xf8f9_fafb_fcfd_feff,
                     ],
                     ..domain_record()
                 }),

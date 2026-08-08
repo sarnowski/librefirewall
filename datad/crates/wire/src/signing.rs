@@ -34,6 +34,31 @@
 //! still structural — every field is one of those four shapes, and none of them
 //! is 32 bytes of private scalar under any interpretation.
 //!
+//! # What the reply *cannot* carry, now that a fourth operation asks a question
+//!
+//! [`SignOperation::Install`] asks the holder to take ownership of the appliance
+//! out of an archive staged in [`crate::InstallStaging`], and its answer is **the
+//! status word and nothing else**: installed, or refused. No field is added for
+//! it, which is the measurement that decided the shape — the reply already uses
+//! 945 of the 4096 bytes its region grants, so a byte string would have been free
+//! and is still refused.
+//!
+//! It is refused because the vocabulary that would go in one is not this ABI's.
+//! **Which rule** refused a package is the holder's own catalogue of the package
+//! contract, and it reaches an operator on the console of the domain that made
+//! the decision, where the facts that place it are. A word here spelling the same
+//! catalogue would be a second copy of it crossing a region — one that a
+//! byzantine holder could spell wrongly and that would have to be kept in step
+//! with the first for as long as both existed. So what crosses is the verdict,
+//! which is the part the asking domain acts on, and the reason stays where it was
+//! decided.
+//!
+//! The archive itself never crosses this pair at all. It sits in a region of its
+//! own that the asking domain writes and the holder reads, and the request states
+//! only how many bytes of it there are — so the delegation keeps carrying words
+//! and small fixed fields, and the one large object in this handover is somewhere
+//! neither side has to reassemble.
+//!
 //! # Two regions, because a region is the unit of grant
 //!
 //! [`SignRequest`] is the asking domain's to write and the holding domain's to
@@ -55,12 +80,13 @@
 //!
 //! # The reply carries the operation it answers
 //!
-//! A signature, a public key and a certificate are different shapes — and two of
-//! them are variable-length byte strings with different bounds — so a channel
-//! whose reply said only "here are some bytes" would leave the caller to remember
-//! which question was outstanding *and* which bound to hold the length to. So the
-//! operation travels back with the answer and a mismatch is a fault: answering the
-//! wrong question is the responder's error and not the requester's obligation.
+//! A signature, a public key, a certificate and an install verdict are different
+//! shapes — two of them are variable-length byte strings with different bounds and
+//! one carries no bytes at all — so a channel whose reply said only "here are some
+//! bytes" would leave the caller to remember which question was outstanding *and*
+//! which bound to hold the length to. So the operation travels back with the
+//! answer and a mismatch is a fault: answering the wrong question is the
+//! responder's error and not the requester's obligation.
 //!
 //! The stated length is then ranged **against the operation that was answered**,
 //! which is why [`SignAnswerBuffer`] carries one destination per shape rather than
@@ -80,7 +106,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::MAPPING_ALIGN;
+use crate::{MAPPING_ALIGN, install::StagedUpload};
 
 /// Bytes of message one signing request may carry.
 ///
@@ -147,6 +173,22 @@ pub enum SignOperation {
     /// equivalent one for itself would leave the appliance with two certificates
     /// over one key and no domain able to say which one a peer saw.
     Certificate,
+    /// Install the onboarding package staged in [`crate::InstallStaging`], and
+    /// say whether it was installed.
+    ///
+    /// The one operation whose subject is not in this pair of regions: the
+    /// request states how many bytes of the staging region hold the archive, and
+    /// **that number is a claim** — it is the asking domain's, it is not clamped
+    /// on the way in, and the holder ranges it against its own region rather
+    /// than believing it.
+    ///
+    /// It travels this channel because installing is what the holder of the
+    /// device key does with a package: the archive's device certificate must
+    /// bind *that* key, and the appliance's ownership is state on the medium
+    /// only this holder can write. A domain that installed elsewhere would be
+    /// deciding whose the appliance is without being able to see whose key it
+    /// holds.
+    Install,
 }
 
 impl SignOperation {
@@ -156,6 +198,7 @@ impl SignOperation {
             Self::Sign => 0,
             Self::PublicKey => 1,
             Self::Certificate => 2,
+            Self::Install => 3,
         }
     }
 
@@ -170,6 +213,7 @@ impl SignOperation {
             0 => Some(Self::Sign),
             1 => Some(Self::PublicKey),
             2 => Some(Self::Certificate),
+            3 => Some(Self::Install),
             _ => None,
         }
     }
@@ -192,6 +236,15 @@ pub enum SignStatus {
     /// The request's message length is past what a request may carry, so there is
     /// nothing well-defined to sign.
     MessageTooLong,
+    /// The holder looked at the staged archive and did not install it.
+    ///
+    /// The one value here that is a **verdict about the request's subject**
+    /// rather than about this channel or about the holder's own state: nothing
+    /// went wrong, a package was judged and refused. It rides the refusal shape
+    /// because it produces no bytes, and which rule refused it is on the holder's
+    /// console rather than in this word — see the header on what this reply
+    /// deliberately cannot carry.
+    InstallRefused,
 }
 
 impl SignStatus {
@@ -203,6 +256,7 @@ impl SignStatus {
             Self::SigningFailed => 2,
             Self::NoSuchOperation => 3,
             Self::MessageTooLong => 4,
+            Self::InstallRefused => 5,
         }
     }
 
@@ -216,6 +270,7 @@ impl SignStatus {
             2 => Some(Self::SigningFailed),
             3 => Some(Self::NoSuchOperation),
             4 => Some(Self::MessageTooLong),
+            5 => Some(Self::InstallRefused),
             _ => None,
         }
     }
@@ -228,6 +283,7 @@ pub enum SignRefusal {
     SigningFailed,
     NoSuchOperation,
     MessageTooLong,
+    InstallRefused,
 }
 
 impl SignRefusal {
@@ -238,6 +294,7 @@ impl SignRefusal {
             Self::SigningFailed => SignStatus::SigningFailed,
             Self::NoSuchOperation => SignStatus::NoSuchOperation,
             Self::MessageTooLong => SignStatus::MessageTooLong,
+            Self::InstallRefused => SignStatus::InstallRefused,
         }
     }
 
@@ -250,6 +307,7 @@ impl SignRefusal {
             SignStatus::SigningFailed => Some(Self::SigningFailed),
             SignStatus::NoSuchOperation => Some(Self::NoSuchOperation),
             SignStatus::MessageTooLong => Some(Self::MessageTooLong),
+            SignStatus::InstallRefused => Some(Self::InstallRefused),
         }
     }
 }
@@ -530,6 +588,10 @@ pub enum SignFault {
     /// responder making one is not this protocol's, which is worth saying rather
     /// than ignoring.
     BytesOnIdentity { len: u32 },
+    /// An install answer stating a length, on [`Self::BytesOnIdentity`]'s terms
+    /// and for a stronger reason: the answer to an install is the status word
+    /// alone, so there is no field a length could be about at all.
+    BytesOnInstall { len: u32 },
 }
 
 /// Where one poll copies an answer's bytes.
@@ -592,6 +654,15 @@ pub enum SignPoll<'buf> {
     /// The holder answered with the appliance's certificate over that key.
     /// `certificate` is the DER encoding, bounded by the region.
     Certificate { certificate: &'buf [u8] },
+    /// The holder installed the staged package: this appliance now has an owner,
+    /// and the record that says so is durable.
+    ///
+    /// It carries nothing, and the absence is the answer's whole shape — the
+    /// facts about what was installed reach an operator on the holder's console,
+    /// where they were decided. A refusal comes back as
+    /// [`SignRefusal::InstallRefused`] rather than as a variant here, so a caller
+    /// that forgets to handle one gets the refusal arm it already has.
+    Installed,
     /// The holder answered and produced nothing, saying why.
     Refused(SignRefusal),
     /// The reply carried this request's sequence and could not be believed.
@@ -641,6 +712,37 @@ impl SignRequester<'_> {
         PendingSignature {
             sequence: self.sequence,
             operation,
+        }
+    }
+
+    /// Ask the holder to install the archive `staged` names.
+    ///
+    /// It consumes the token [`crate::ArchiveUpload::stage`] minted, so the
+    /// length this request states is the length that staging really produced and
+    /// not a number a caller carried alongside it. That is a convenience of this
+    /// side and **not a defence**: the holder is answering a byzantine
+    /// neighbour, so it ranges the stated length against its own region whatever
+    /// wrote it — see [`SignOperation::Install`].
+    ///
+    /// The request carries no message. Its bytes are in the staging region, and
+    /// the `Release` store of the sequence below is what makes them visible to
+    /// the holder before the demand that names them is.
+    pub fn install(&mut self, staged: StagedUpload) -> PendingSignature {
+        // Zero is *no request*, on `request`'s terms.
+        self.sequence = match self.sequence.wrapping_add(1) {
+            0 => 1,
+            next => next,
+        };
+        self.request
+            .operation
+            .store(SignOperation::Install.to_bits(), Ordering::Relaxed);
+        self.request.len.store(staged.len(), Ordering::Relaxed);
+        self.request
+            .sequence
+            .store(self.sequence, Ordering::Release);
+        PendingSignature {
+            sequence: self.sequence,
+            operation: SignOperation::Install,
         }
     }
 
@@ -724,6 +826,12 @@ impl SignRequester<'_> {
                     certificate: target,
                 }
             }
+            SignOperation::Install => {
+                if len != 0 {
+                    return self.fault(SignFault::BytesOnInstall { len });
+                }
+                SignPoll::Installed
+            }
         }
     }
 
@@ -770,9 +878,16 @@ impl SignDemand {
         self.operation
     }
 
-    /// The message length the requester stated, **unclamped**: a length past
-    /// [`MAX_SIGN_MESSAGE`] is a request to refuse and not one to shorten, so it
+    /// The length the requester stated, **unclamped**: a length past what the
+    /// operation admits is a request to refuse and not one to shorten, so it
     /// arrives as what was claimed.
+    ///
+    /// What it is a length *of* is the operation's. For [`SignOperation::Sign`]
+    /// it is the message this request carries, and [`Self::message`] is what
+    /// ranges it. For [`SignOperation::Install`] it is bytes of the staging
+    /// region, which this pair of regions cannot see at all — so the holder
+    /// ranges it against that region itself, and this is the raw claim it starts
+    /// from.
     #[must_use]
     pub const fn stated_len(&self) -> u32 {
         self.len
@@ -882,6 +997,16 @@ impl SignResponder<'_> {
         published as usize
     }
 
+    /// Answer `demand` with the fact that the staged package was installed.
+    ///
+    /// Publishes a zero length, and there is nothing else to publish: the answer
+    /// to an install is the status word, so a length here would be a claim about
+    /// a field that does not exist — which the requester raises as
+    /// [`SignFault::BytesOnInstall`].
+    pub fn installed(&mut self, demand: SignDemand) {
+        self.publish(demand, SignOperation::Install, SignStatus::Ok, 0);
+    }
+
     /// Answer `demand` with nothing, saying why. Publishes a zero length, which is
     /// what makes [`SignFault::BytesOnRefusal`] a fault the requester can raise
     /// against a peer that does otherwise.
@@ -953,8 +1078,8 @@ const _: () = {
     assert!(SignStatus::Ok.to_bits() == 0);
     assert!(SignOperation::Sign.to_bits() == 0);
     assert!(SignRefusal::from_status(SignStatus::Ok).is_none());
-    assert!(SignStatus::from_bits(5).is_none());
-    assert!(SignOperation::from_bits(3).is_none());
+    assert!(SignStatus::from_bits(6).is_none());
+    assert!(SignOperation::from_bits(4).is_none());
 
     assert!(offset_of!(SignRequest, sequence) == 0);
     assert!(offset_of!(SignRequest, operation) == 4);

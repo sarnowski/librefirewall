@@ -556,8 +556,13 @@ pub fn store_sample(
     }
 }
 
-/// What one boot established about the appliance's identity, as the five values
-/// its shard exposes.
+/// What the appliance's identity has come to, as the five values its shard
+/// exposes.
+///
+/// Established at start-up and, on two of the five, moved afterwards: taking
+/// ownership out of an onboarding package advances the generation and turns
+/// `onboarded` on, so a scrape reads what the medium now holds rather than what
+/// the boot found.
 ///
 /// A struct rather than four arguments because they are one answer: an
 /// appliance that is established and was minted this boot is a different node
@@ -583,9 +588,10 @@ pub struct StoreIdentity {
 ///
 /// Its own struct beside [`StoreIdentity`] rather than two more fields inside it,
 /// because they answer a different question and change on a different schedule:
-/// an identity is established once in a boot and never moves, and these move
-/// every time a peer asks. A caller that had to pass all seven positionally is a
-/// caller that can swap two `u64`s.
+/// these move every time a peer asks, while an identity is established at
+/// start-up and afterwards changes only when the appliance is given an owner. A
+/// caller that had to pass all seven positionally is a caller that can swap two
+/// `u64`s.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreSigning {
     /// Signatures produced under the device key.

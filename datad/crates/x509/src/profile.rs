@@ -346,7 +346,14 @@ pub fn fingerprint_hex(digest: &[u8; DIGEST_LEN]) -> [u8; FINGERPRINT_LEN] {
 }
 
 /// The object identifiers this profile names, each as its DER content bytes.
-mod oid {
+///
+/// Public, so the one reader that has to recognise what this writer produced —
+/// the check that an anchor really signed a device certificate — compares
+/// against the profile's own constants rather than against a second
+/// transcription of them. A writer and a reader disagreeing about an object
+/// identifier is a certificate this appliance would refuse for a reason that is
+/// nowhere in the certificate.
+pub mod oid {
     /// `1.2.840.10045.2.1` — an elliptic-curve public key.
     pub const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
     /// `1.2.840.10045.3.1.7` — the P-256 curve.

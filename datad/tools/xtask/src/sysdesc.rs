@@ -84,9 +84,10 @@ use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
-    DOWNLOAD_REQUEST_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
-    RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
-    SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
+    DOWNLOAD_REQUEST_REGION_SIZE, INSTALL_STAGING_REGION_SIZE, LOG_CONSUME_REGION_SIZE,
+    LOG_RECORDS_REGION_SIZE, RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE,
+    SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
+    TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -376,6 +377,28 @@ const SIGNING_WITHHELD: &str = "exactly two domains map the signing delegation, 
      cannot cross either region, which is a property of this row TOGETHER WITH the ABI — \
      `wire::signing` has no field a 32-byte scalar fits in, in either direction, and this row is \
      what makes the holder the only party that chooses what the asking domain reads";
+
+/// What the onboarding package's staging region withholds, and why the one edge
+/// it does open is one this system can afford.
+///
+/// It is the only region written by the domain an unauthenticated peer talks to
+/// and read by the domain that holds the device key, so the direction is worth
+/// stating rather than leaving to be noticed. Three things make it safe, and the
+/// checker holds only the first:
+///
+/// * **The grant.** Exactly two domains, and the perms are the asymmetry: the
+///   store domain cannot write here, so it cannot install an archive nobody
+///   uploaded; the cryptography domain cannot read the verdict into existence,
+///   the reply being a region it may only read.
+/// * **The reader's snapshot.** The store domain copies the whole region into
+///   its own `blk2_io` window before it looks at a byte, so every rule is applied
+///   to bytes the writer can no longer reach — which is what makes "the archive
+///   that passed is the archive that was written" true against a writer that
+///   keeps writing.
+/// * **What crosses.** A byte string and nothing else. No address, no
+///   descriptor, no pointer and no length the reader believes: the length is a
+///   word of the request and is ranged against this region's own extent.
+const INSTALL_STAGING_WITHHELD: &str = "exactly two domains map the onboarding package's staging      region, and no third maps it in either direction — no driver, no forwarder, no recorder, no      console, no configuration domain, and NOT THE MANAGEMENT DOMAIN, which owns the port the      upload arrives on and hands the session's bytes to the cryptography domain rather than      placing them here itself. Between the two that do map it the withholding is in the perms,      and this is the one row where the WRITER is the domain an unauthenticated peer talks to: it      may fill this region and may not read the answer, and the store domain — which holds the      device key and owns the medium an ownership is written to — may read it and CANNOT WRITE IT,      so it cannot install an archive nobody uploaded. What makes the direction affordable is not      this row alone: the reader snapshots the whole region into its own staging window before it      applies a rule, so what it validates is bytes the writer can no longer reach, and what      crosses is a byte string with no address, no descriptor and no pointer in it";
 
 /// What the TLS relay's two regions withhold, and why the pair widens nothing.
 ///
@@ -1014,6 +1037,20 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("crypto"), read_write("store")],
         withheld: Some(SIGNING_WITHHELD),
+    },
+    // The onboarding package's staging region, beside the delegation it is
+    // asked about over. It is the delegation's third region rather than a pair
+    // of its own: nothing is answered here, so there is no reverse direction to
+    // grant.
+    RegionRule {
+        name: "install_staging",
+        size: ExpectedSize {
+            rust_name: "wire::INSTALL_STAGING_REGION_SIZE",
+            bytes: INSTALL_STAGING_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto"), read_only("store")],
+        withheld: Some(INSTALL_STAGING_WITHHELD),
     },
     // The TLS relay, the signing delegation's split between a different pair of
     // domains: the one that owns the network writes what arrived and reads what

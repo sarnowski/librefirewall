@@ -334,6 +334,14 @@ impl Delegated {
                     });
                 }
                 SignPoll::Refused(_) => return Err(DelegationError::Refused),
+                // An answer to a question this domain has not asked. It cannot
+                // ask one yet — nothing here routes an uploaded package to the
+                // holder — and the ABI already refuses a reply whose operation
+                // is not the one that was requested, so reaching this arm would
+                // mean the check that does so had stopped. It is a fault for the
+                // reason every other undecodable reply is, rather than an arm
+                // that quietly agrees with a holder answering something else.
+                SignPoll::Installed => return Err(DelegationError::Faulted),
                 SignPoll::Faulted(_) => return Err(DelegationError::Faulted),
             }
         }

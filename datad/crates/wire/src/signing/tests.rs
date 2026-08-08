@@ -219,6 +219,108 @@ fn an_empty_certificate_and_a_measured_identity_are_both_faults() {
     }
 }
 
+/// The whole install exchange: a staged archive, a request stating exactly what
+/// staging produced, and an answer that is the status word and nothing else.
+#[test]
+fn an_install_request_states_what_was_staged_and_is_answered_with_a_verdict() {
+    let staging: &'static crate::InstallStaging =
+        Box::leak(Box::new(crate::InstallStaging::zero()));
+    let mut channel = Channel::new();
+
+    let staged = staging.upload().stage(&[0x11; 3072]);
+    assert_eq!(staged.len(), 3072);
+    let pending = channel.requester.install(staged);
+    assert_eq!(pending.operation(), SignOperation::Install);
+
+    let demand = channel.responder.take().expect("a demand was published");
+    assert_eq!(demand.operation(), Some(SignOperation::Install));
+    // The archive's length, taken from the request rather than from the region:
+    // the region carries no length of its own, deliberately.
+    assert_eq!(demand.stated_len(), 3072);
+    channel.responder.installed(demand);
+
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        channel.requester.poll(pending, &mut into),
+        SignPoll::Installed
+    );
+}
+
+/// A package the holder judged and would not take. It is a *refusal* on this
+/// channel because it produces no bytes, and it is deliberately not a fault:
+/// nothing about the exchange went wrong.
+#[test]
+fn a_refused_install_comes_back_as_a_refusal_and_not_as_a_fault() {
+    let staging: &'static crate::InstallStaging =
+        Box::leak(Box::new(crate::InstallStaging::zero()));
+    let mut channel = Channel::new();
+    let pending = channel.requester.install(staging.upload().stage(&[0; 512]));
+    let demand = channel.responder.take().expect("a demand was published");
+    channel
+        .responder
+        .refuse(demand, SignRefusal::InstallRefused);
+
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        channel.requester.poll(pending, &mut into),
+        SignPoll::Refused(SignRefusal::InstallRefused)
+    );
+    assert_eq!(channel.requester.faults(), 0);
+    assert_eq!(
+        SignRefusal::InstallRefused.to_status(),
+        SignStatus::InstallRefused
+    );
+}
+
+/// An install answer has no field a length could be about, so a responder
+/// stating one is answering a protocol other than this.
+#[test]
+fn an_install_answer_stating_a_length_is_a_fault_of_its_own() {
+    let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+    let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+    let mut requester = request.requester(reply);
+    let pending = requester.request(SignOperation::Install, &[]);
+    publish_raw(
+        reply,
+        pending.sequence(),
+        SignStatus::Ok.to_bits(),
+        SignOperation::Install.to_bits(),
+        4,
+    );
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        SignPoll::Faulted(SignFault::BytesOnInstall { len: 4 })
+    );
+}
+
+/// The requester's own sequence advances for an install exactly as it does for
+/// every other operation, so two installs cannot be answered by one reply.
+#[test]
+fn two_installs_take_two_sequence_numbers() {
+    let staging: &'static crate::InstallStaging =
+        Box::leak(Box::new(crate::InstallStaging::zero()));
+    let mut channel = Channel::new();
+    let first = channel.requester.install(staging.upload().stage(&[1; 8]));
+    let demand = channel.responder.take().expect("the first demand");
+    channel.responder.installed(demand);
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        channel.requester.poll(first, &mut into),
+        SignPoll::Installed
+    );
+
+    let second = channel.requester.install(staging.upload().stage(&[2; 16]));
+    assert_ne!(second.sequence(), channel.responder.served());
+    let demand = channel.responder.take().expect("the second demand");
+    assert_eq!(demand.stated_len(), 16);
+    channel.responder.installed(demand);
+    assert_eq!(
+        channel.requester.poll(second, &mut into),
+        SignPoll::Installed
+    );
+}
+
 #[test]
 fn a_reply_carrying_another_sequence_is_ignored_entirely() {
     let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
@@ -600,6 +702,13 @@ proptest! {
                 SignPoll::Identity(_) => {
                     prop_assert_eq!(offset, 0);
                     prop_assert_eq!(asked, SignOperation::PublicKey);
+                }
+                SignPoll::Installed => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::Install);
+                    // An install answer carries nothing, so a stated length
+                    // could never have reached this arm.
+                    prop_assert_eq!(len, 0);
                 }
                 SignPoll::Refused(_) => prop_assert_eq!(offset, 0),
                 SignPoll::Faulted(_) => {

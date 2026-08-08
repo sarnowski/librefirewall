@@ -29,6 +29,7 @@
 //! | [`pcapng`] | `lfw_pcapng`'s block encoders, over the lengths a frame and an annotation bring them | untrusted network traffic **and** a byzantine neighbour PD, one remove out |
 //! | [`onboarding_tls`] | `lfw_tls`'s onboarding server: the record layer, the buffering either side of it, and the outcome it settles on | a management-plane attacker |
 //! | [`onboarding_package`] | `lfw_package`'s uploaded archive: the ustar framing, the armour around the two certificates, the walk that finds the key one binds, the endpoint line, and the `config` reader under it | a management-plane attacker |
+//! | [`onboarding_install`] | `lfw_store`'s install path: a staged region, the length a peer claims about it, the whole package contract read a second time, and the one signature this appliance verifies for itself | a management-plane attacker **and** a byzantine neighbour PD |
 //!
 //! Every crate in the workspace that interprets bytes it did not write appears
 //! in that table, which is the reviewable form of that obligation: the
@@ -148,6 +149,7 @@ pub mod log_ring;
 pub mod log_ring_abi;
 pub mod metrics_render;
 pub mod neighbour;
+pub mod onboarding_install;
 pub mod onboarding_package;
 pub mod onboarding_tls;
 pub mod pcapng;
@@ -263,6 +265,10 @@ mod tests {
         (
             "onboarding_package",
             crate::onboarding_package::onboarding_package_harness,
+        ),
+        (
+            "onboarding_install",
+            crate::onboarding_install::onboarding_install_harness,
         ),
         ("config_document", crate::document::document_harness),
         (

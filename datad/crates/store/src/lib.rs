@@ -12,12 +12,21 @@
 //! formats are — given the same randomness and the same instant it is the same
 //! arithmetic on a host as on the appliance.
 //!
+//! And it takes the ownership an onboarding package delivers ([`install`]): the
+//! whole package contract re-applied, the device certificate held to the key this
+//! record already carries, and one signature verified under one profile. Here for
+//! the same reason again — every rule of it is arithmetic over a byte string a
+//! host test can hold, and what the protection domain keeps is the region the
+//! bytes crossed in and the device they are written to.
+//!
 //! Nothing here touches a device. What a transfer is and how one is submitted
 //! belongs to `lfw_blk`, and which sector to move belongs to the protection
 //! domain that owns the medium; this crate decides what the bytes mean, so all
 //! of it is reachable by a host test.
 //!
 //! # The adversary
+//!
+//! Two, and only one of them arrives off the medium.
 //!
 //! **A hostile or malfunctioning device**, and behind it a physical attacker who
 //! wrote the medium at leisure. Every byte decoded here arrived off a disk: a
@@ -35,6 +44,14 @@
 //! to keep a wrapping key, so physical possession of the medium is identity
 //! theft. Nothing in this crate renders, formats or `Debug`s a private scalar,
 //! and [`state::State`] derives no `Debug` for that reason.
+//!
+//! And, on the install path alone, a **management-plane attacker** with a
+//! **byzantine neighbour protection domain** behind them: an onboarding package
+//! is authenticated by the session it arrived in and by nothing else, and it
+//! reaches [`install`] across a region a second domain writes. Those bytes are
+//! held to the package contract and to nothing weaker, and the same three rules
+//! hold on that path as on this one — no panicking construct, no bare index, no
+//! unbounded loop.
 //!
 //! # Why a double buffer and not a ring
 //!
@@ -67,6 +84,7 @@
 //! slot carries no self-description at all.
 
 mod identity;
+mod install;
 mod layout;
 mod reset;
 mod slots;
@@ -76,6 +94,7 @@ mod state;
 mod tests;
 
 pub use identity::{Identity, IdentityError, Minted, mint, verify};
+pub use install::{Adoption, ChainFault, InstallError, read as read_package};
 pub use layout::{
     RESET_REQUEST_SECTOR, SECTOR_SIZE, SLOT_COUNT, SLOT_SECTORS, SLOTS_START_SECTOR,
     STATE_A_SECTOR, STATE_B_SECTOR, STATE_COPY_BYTES, STATE_COPY_SECTORS, STORE_SECTORS,

@@ -485,6 +485,7 @@ name = "lfw-store"
 version = "0.1.0"
 dependencies = [
  "lfw-crypto",
+ "lfw-package",
  "lfw-x509",
 ]
 

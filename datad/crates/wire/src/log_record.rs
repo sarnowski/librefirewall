@@ -264,6 +264,13 @@ pub enum LogDetailKind {
     OnboardingServed,
     OnboardingRequest,
     OnboardingThrottled,
+    /// The two an appliance that has just been given an owner produces: where it
+    /// will answer to, and the fingerprint of the authority it will validate
+    /// that channel against. Two discriminants rather than one, for
+    /// [`Self::Fingerprint`]'s reason — a digest fills all four operand words,
+    /// so nothing else fits beside it.
+    Adopted,
+    AnchorFingerprint,
 }
 
 impl LogDetailKind {
@@ -308,6 +315,8 @@ impl LogDetailKind {
             Self::OnboardingServed => 35,
             Self::OnboardingRequest => 36,
             Self::OnboardingThrottled => 37,
+            Self::Adopted => 38,
+            Self::AnchorFingerprint => 39,
         }
     }
 
@@ -352,6 +361,8 @@ impl LogDetailKind {
             35 => Some(Self::OnboardingServed),
             36 => Some(Self::OnboardingRequest),
             37 => Some(Self::OnboardingThrottled),
+            38 => Some(Self::Adopted),
+            39 => Some(Self::AnchorFingerprint),
             _ => None,
         }
     }
@@ -991,6 +1002,23 @@ impl LogRecord {
             Some(LogDetailKind::OnboardingThrottled) => CheckedDetail::OnboardingThrottled {
                 strikes: self.operands[0],
                 wait_millis: self.operands[1],
+            },
+            // An address, a port and a generation. The address and the port are
+            // ranged on `Dialled`'s terms — a wider word would render as an
+            // address or a port no wire has — and the generation is unranged
+            // because every bit pattern of it is a position a record could stand
+            // at. There is no token here, so the leading word is not one.
+            Some(LogDetailKind::Adopted) => CheckedDetail::Adopted {
+                destination: address_bits(self.operands[0])?,
+                port: code_point(self.operands[1])?,
+                generation: self.operands[2],
+            },
+            // Four words of digest and nothing to refuse, exactly as
+            // `Fingerprint`: every bit pattern of a SHA-256 output is a digest,
+            // and a rule here would refuse a fingerprint really taken over a key
+            // an administrator really delivered.
+            Some(LogDetailKind::AnchorFingerprint) => CheckedDetail::AnchorFingerprint {
+                words: self.operands,
             },
         };
         Ok(CheckedBody::Domain {
@@ -1670,6 +1698,16 @@ pub enum CheckedDetail {
     OnboardingThrottled {
         strikes: u64,
         wait_millis: u64,
+    },
+    /// Where an appliance that has just been given an owner will answer to.
+    Adopted {
+        destination: u32,
+        port: u16,
+        generation: u64,
+    },
+    /// The fingerprint of the authority it will validate that channel against.
+    AnchorFingerprint {
+        words: [u64; LOG_OPERANDS],
     },
 }
 

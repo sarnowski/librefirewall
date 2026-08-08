@@ -57,7 +57,10 @@ mod endpoint;
 mod tests;
 
 pub use archive::{ARCHIVE_BOUND, ArchiveError, BLOCK, EmptyField, Member, NumericField};
-pub use certificate::{CertificateError, Element, subject_public_key_info};
+pub use certificate::{
+    BIT_STRING, CONTEXT_ZERO, CertificateError, Element, INTEGER, OBJECT_IDENTIFIER, SEQUENCE,
+    read_tlv, subject_public_key_info,
+};
 pub use endpoint::{Endpoint, EndpointError};
 
 use certificate::Certificate;

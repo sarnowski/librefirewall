@@ -76,6 +76,11 @@ pub use event::{
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};
 pub use render::{MAX_LINE_LEN, RenderError, render};
+// Re-exported because this crate's own vocabulary names it: three details carry
+// an address, so a caller composing one needs the type, and reaching past this
+// crate for it would make every emitting domain depend on a networking crate
+// whether it touches a frame or not.
+pub use net_headers::Ipv4Address;
 pub use ring::RingSink;
 pub use stamp::{Clock, Stamp};
 

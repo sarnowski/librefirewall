@@ -567,6 +567,37 @@ pub enum DomainDetail<C = &'static str> {
         strikes: u64,
         wait_millis: u64,
     },
+    /// What an appliance that has just been given an owner will answer to, and
+    /// the generation the record saying so was written at.
+    ///
+    /// Appended, never inserted. The three travel together because none of them
+    /// is worth reading alone: an address without a port is not somewhere to
+    /// dial, and neither of them without a generation says whether the record
+    /// that carries them is the one now on the medium. It is emitted **once**,
+    /// by the domain that wrote that record, and only where the write and the
+    /// flush behind it both succeeded — so a line carrying it is a statement
+    /// about durable state and not about an intention.
+    ///
+    /// **No key material and no byte of the package has a representation here.**
+    /// What is reported is where this appliance will go and how far its state has
+    /// advanced; the authority it will trust is the record beside this one, as a
+    /// digest.
+    Adopted {
+        destination: Ipv4Address,
+        port: u16,
+        generation: u64,
+    },
+    /// The fingerprint of the authority an appliance has just accepted: SHA-256
+    /// over the DER `SubjectPublicKeyInfo` of the delivered trust anchor.
+    ///
+    /// Its own detail rather than a field beside [`Self::Adopted`], for
+    /// [`Self::Fingerprint`]'s reason exactly: it is rendered as one field of 64
+    /// hexadecimal characters and an administrator compares it character for
+    /// character against what the management server shows, so it crosses whole
+    /// and is never joined by hand. It is the appliance's own fingerprint
+    /// definition applied to somebody else's key, which is what makes the two
+    /// comparable at all.
+    AnchorFingerprint([u8; 32]),
     /// The two sequence numbers behind an unacceptable acknowledgement: what the
     /// peer claimed, and what this end had actually sent.
     ///

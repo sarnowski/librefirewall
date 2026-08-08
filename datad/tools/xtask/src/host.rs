@@ -200,6 +200,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "find_virtio_caps",
     "store_state",
     "onboarding_package",
+    "onboarding_install",
 ];
 
 pub(crate) fn test_host(root: &Path) -> Result<(), String> {

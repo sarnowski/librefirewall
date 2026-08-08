@@ -17,8 +17,21 @@ lfw-crypto = { path = "../crypto" }
 # for rather than restated: a second X.509 writer would be a second profile to
 # keep in step with the one the management plane validates against.
 lfw-x509 = { path = "../x509" }
+# The onboarding package an administrator uploads. Reached for rather than
+# reimplemented: taking ownership means holding an archive to every rule of the
+# package contract, and a second reader of that contract in the domain that
+# writes the medium would be a second set of rules to keep in step with the one
+# the upload was already read by.
+lfw-package = { path = "../package" }
 
 [dev-dependencies]
+# Two crates named only to measure. The install path runs the configuration
+# reader and the block driver's own structures sit in the domain around it, and
+# the one test that holds the store domain's declared stack to what an install
+# really occupies has to be able to say `size_of` of both. Neither is reachable
+# from production code here.
+config = { path = "../config" }
+lfw-blk = { path = "../blk" }
 proptest = { workspace = true }
 
 [lints]

@@ -137,8 +137,8 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    ClockCalibration, LogConsume, LogRecords, RelayRefusal, RelayReply, RelayRequest, SignReply,
-    SignRequest,
+    ClockCalibration, InstallStaging, LogConsume, LogRecords, RelayRefusal, RelayReply,
+    RelayRequest, SignReply, SignRequest,
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
@@ -416,6 +416,14 @@ fn init() -> Crypto {
     // the network end believe a peer said something it did not.
     let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
     let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
+    // The onboarding package's staging region, which this domain maps read-write
+    // and the holder of the device key maps read-only. It is attached here and
+    // nothing in this build writes it: the request surface above the record
+    // layer serves two resources and takes no upload, so there is no path from a
+    // session to these bytes yet. It is attached rather than left unmapped
+    // because the grant is the system description's and a region no line of code
+    // names is authority nobody can account for.
+    let _staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     // One requester for the whole boot, and behind an `Arc` because the library's

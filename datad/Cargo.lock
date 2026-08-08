@@ -940,7 +940,10 @@ dependencies = [
 name = "lfw-store"
 version = "0.1.0"
 dependencies = [
+ "config",
+ "lfw-blk",
  "lfw-crypto",
+ "lfw-package",
  "lfw-x509",
  "proptest",
 ]
@@ -1917,6 +1920,7 @@ dependencies = [
  "lfw-crypto",
  "lfw-log",
  "lfw-metrics",
+ "lfw-package",
  "lfw-store",
  "pd-runtime",
  "sel4-microkit",

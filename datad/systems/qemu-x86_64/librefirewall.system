@@ -706,6 +706,52 @@
     <memory_region name="sign_request" size="0x1000" />
     <memory_region name="sign_reply" size="0x1000" />
 
+    <!-- THE ONBOARDING PACKAGE'S STAGING REGION, and the one region in this
+         description whose whole content is a stranger's bytes.
+
+         An administrator uploads a tar archive to the onboarding port. The
+         CRYPTOGRAPHY domain terminates that session and accumulates the upload
+         into this region, which it maps READ-WRITE; the STORE domain — which
+         holds the device key and owns the medium the ownership is written to —
+         maps it READ-ONLY and reads it to decide whether to install. Nobody else
+         maps it in either direction.
+
+         WHY A REGION AND NOT THE DELEGATION'S MESSAGE FIELD. `sign_request`
+         carries 256 bytes and an archive is bounded at 128 KiB, so chunking one
+         through it would be five hundred and twelve attacker-paced round trips
+         and a reassembler holding partial state in the domain that owns the
+         medium. That would cost the delegation the one property worth keeping —
+         one demand produces one reply — and would hold it only as long as the
+         peer cooperated. Thirty-two pages of address space buys the whole
+         archive present or absent, and the request states only how many bytes of
+         it there are.
+
+         THE DIRECTION IS THE UNCOMFORTABLE PART AND IS THE POINT. This region is
+         written by the domain an UNAUTHENTICATED PEER talks to and read by the
+         domain that holds the appliance's private key, which is the only such
+         edge in this system. What makes it safe is not the grant and not the
+         writer's good behaviour: it is that the reader takes a SNAPSHOT into its
+         own `blk2_io` window before it looks at a byte, so every rule is applied
+         to bytes the writer can no longer reach, and the archive that passes is
+         byte-for-byte the archive that is written to a sector. The grant's half
+         of it is the perms — the store domain cannot write here, so it cannot
+         install an archive nobody uploaded, and the cryptography domain cannot
+         read the reply into existence.
+
+         WHAT IT STILL DOES NOT REACH. The store domain gains no path to a frame:
+         this region carries no address, no descriptor and no pointer, and the
+         domain that fills it holds no network region of its own either. What
+         crosses is a byte string, and a byte string is the one thing a parser
+         with no allocator, bounded loops and typed refusals is built for.
+
+         The size is `wire::INSTALL_STAGING_REGION_SIZE`, its type's `size_of`
+         rounded up to the mapping granularity and equal to it exactly: the
+         archive bound is already a whole number of pages, so a larger region
+         would be address space granted for nothing.
+
+         It carries no phys_addr, for the reason `cfg` does not. -->
+    <memory_region name="install_staging" size="0x20000" />
+
     <!-- THE TLS RELAY, one region per direction, and the handover that lets the
          appliance terminate an encrypted session without the domain that owns the
          network holding a key, a session secret or a plaintext byte.
@@ -1719,6 +1765,7 @@
         <map mr="sign_reply" vaddr="0x7_100_000" perms="r" cached="true" setvar_vaddr="sign_reply_vaddr" />
         <map mr="relay_request" vaddr="0x7_200_000" perms="r" cached="true" setvar_vaddr="relay_request_vaddr" />
         <map mr="relay_reply" vaddr="0x7_300_000" perms="rw" cached="true" setvar_vaddr="relay_reply_vaddr" />
+        <map mr="install_staging" vaddr="0x7_400_000" perms="rw" cached="true" setvar_vaddr="install_staging_vaddr" />
     </protection_domain>
 
     <!-- The store domain: the one holder of the appliance's own identity, and
@@ -1733,6 +1780,17 @@
          later boot it loads it, holds it to itself, reports which appliance
          returned, and parks. The protection domain is documented in pds/store.
 
+         AND IT INSTALLS AN OWNER, which is the second thing that writes this
+         medium and the reason it now holds the device for its whole life. An
+         administrator's onboarding package crosses in `install_staging`, which
+         this domain maps READ-ONLY, and a fourth delegation operation asks it to
+         take ownership: it snapshots that region into its own `blk2_io` window,
+         holds the package to every rule of the package contract, compares the
+         device certificate against the point in its OWN record rather than
+         against anything a peer offered, verifies one signature under one
+         profile, and writes the result into the copy the generation's parity
+         selects behind a flush. Nothing routes an upload to it yet.
+
          AND IT SIGNS UNDER THAT IDENTITY, which is what it gained and the whole
          reason its priority moved. The domain that terminates a
          mutually-authenticated session needs a signature under this key on every
@@ -1742,7 +1800,8 @@
          the Microkit event loop and the asking domain wakes it.
 
          WHAT IT MAPS is the second block device, the four grants every reporting
-         domain here carries, and the delegation's two regions, and nothing else.
+         domain here carries, the delegation's two regions and the staging region
+         it reads a package out of, and nothing else.
          Its ECAM page, its BAR window, its DMA region and its staging window are
          `ecam4`, `bar4`, `blk2_dma` and `blk2_io`, and NO other domain maps any of
          them — not the recorder, which owns the other block device and no part of
@@ -1804,11 +1863,35 @@
          WHAT STILL BOUNDS IT is unchanged and is what makes the cost payable:
          `lfw_blk`'s own poll budget and nothing the device controls, so a hostile
          or dead device cannot hold the higher priority for longer than that budget
-         however it misbehaves. The serving path waits on nothing at all — a demand
-         is taken, answered and published in one pass — and the number of demands
-         one wakeup answers is a constant of `pds/store` rather than of how fast a
-         peer writes. -->
-    <protection_domain name="store" priority="3" stack_size="0x8000">
+         however it misbehaves. Two of the three things it serves wait on nothing
+         at all — a signature and a certificate are a demand taken, answered and
+         published in one pass — and an install waits, because it reads the record
+         and writes it back, on transfers that same budget bounds. The number of
+         demands one wakeup answers, and the number of installs a boot serves, are
+         constants of `pds/store` rather than of how fast a peer writes.
+
+         THE STACK IS 256 KiB, AND IT GREW EIGHTFOLD IN ONE CHANGE. It was 32 KiB
+         while this domain established an identity and then held only a keypair:
+         the device went away with the establishing run, and the one large frame
+         was the 8 KiB the state record crosses in.
+
+         Two things moved it. This domain now holds the device for its whole life,
+         because installing an onboarding package writes the medium and that
+         happens when a peer asks rather than while the domain is starting. And an
+         install READS A CONFIGURATION DOCUMENT: the package carries one, it is
+         held to the same reader every document goes through, and that reader's
+         model is 24 KiB built and discarded inside a frame that already holds the
+         state record twice over and both certificates' fixed storage. At 32 KiB
+         and again at 64 KiB the domain took a write fault one page past its stack
+         on the boot after the change, which is exactly what a stack sized for the
+         old shape produces.
+
+         The number is measured rather than chosen, and it is held to the types:
+         `lfw_store`'s `an_install_fits_the_stack_the_store_domain_is_declared_with`
+         bounds the composition at half of it, so the next thing added to an
+         install fails a host test rather than a boot. Memory rather than
+         authority: nothing this domain may reach changes. -->
+    <protection_domain name="store" priority="3" stack_size="0x40000">
         <program_image path="store.elf" />
         <map mr="ecam4" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="ecam_vaddr" />
         <map mr="bar4" vaddr="0x10_100_000" perms="rw" cached="false" setvar_vaddr="bar_vaddr" />
@@ -1820,6 +1903,7 @@
         <map mr="stats_store" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <map mr="sign_request" vaddr="0x7_000_000" perms="r" cached="true" setvar_vaddr="sign_request_vaddr" />
         <map mr="sign_reply" vaddr="0x7_100_000" perms="rw" cached="true" setvar_vaddr="sign_reply_vaddr" />
+        <map mr="install_staging" vaddr="0x7_400_000" perms="r" cached="true" setvar_vaddr="install_staging_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar4" />
         <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
         <setvar symbol="io_paddr" region_paddr="blk2_io" />

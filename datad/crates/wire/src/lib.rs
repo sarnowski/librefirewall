@@ -91,6 +91,7 @@ mod clock;
 mod config_rule;
 mod download;
 mod image;
+mod install;
 mod log_record;
 mod log_ring;
 mod log_slot;
@@ -111,6 +112,10 @@ pub use download::{
     DOWNLOAD_REPLY_REGION_SIZE, DOWNLOAD_REQUEST_REGION_SIZE, DOWNLOAD_WINDOW_LEN, DownloadDemand,
     DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply, DownloadRequest,
     DownloadRequester, DownloadResponder, DownloadSink, DownloadStatus, PendingDownload,
+};
+pub use install::{
+    ArchiveUpload, INSTALL_STAGING_REGION_SIZE, InstallStaging, MAX_INSTALL_ARCHIVE, StagedArchive,
+    StagedUpload,
 };
 pub use log_record::{
     CauseImage, CheckedBody, CheckedCause, CheckedDetail, CheckedIdentifier, CheckedOperands,

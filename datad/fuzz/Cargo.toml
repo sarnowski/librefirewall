@@ -65,7 +65,9 @@ cargo-fuzz = true
 #                   decoded one is resumed into
 #   lfw-store       the appliance's own state record, whose every byte is a
 #                   PHYSICAL attacker's: not merely chosen by one, but composed
-#                   offline with this decoder's source in hand
+#                   offline with this decoder's source in hand — and, on its
+#                   install path, an uploaded archive in a region a peer PD
+#                   writes together with the length that peer claims about it
 #   lfw-pcapng      the block encoders those two write through: a frame's
 #                   length on the wire and an annotation's bytes are the
 #                   network's and a peer's, and both become a length field
@@ -322,6 +324,13 @@ bench = false
 [[bin]]
 name = "onboarding_package"
 path = "fuzz_targets/onboarding_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onboarding_install"
+path = "fuzz_targets/onboarding_install.rs"
 test = false
 doc = false
 bench = false

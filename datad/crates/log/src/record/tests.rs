@@ -312,6 +312,15 @@ fn every_domain_detail_shape_survives_the_crossing() {
             signatures: u64::MAX,
             certificate: 452,
         },
+        DomainDetail::AnchorFingerprint([0xff; 32]),
+        DomainDetail::AnchorFingerprint(counting_digest()),
+        // No two fields equal, for the reason the channel's five are that way:
+        // a field read out of the wrong operand word survives only symmetry.
+        DomainDetail::Adopted {
+            destination: net_headers::Ipv4Address::from_octets([192, 168, 42, 1]),
+            port: 8443,
+            generation: 2,
+        },
         // The channel's own five, each at a value that would survive a field
         // read out of the wrong operand word only if the words were symmetric —
         // which is why no two fields of one shape are equal here.

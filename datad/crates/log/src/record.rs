@@ -505,6 +505,23 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Fingerprint.to_bits();
                     record.operands = digest_words(digest);
                 }
+                DomainDetail::AnchorFingerprint(digest) => {
+                    record.detail = LogDetailKind::AnchorFingerprint.to_bits();
+                    record.operands = digest_words(digest);
+                }
+                DomainDetail::Adopted {
+                    destination,
+                    port,
+                    generation,
+                } => {
+                    record.detail = LogDetailKind::Adopted.to_bits();
+                    record.operands = [
+                        u64::from(destination.bits()),
+                        u64::from(*port),
+                        *generation,
+                        0,
+                    ];
+                }
                 DomainDetail::Reset {
                     generation,
                     documents,
@@ -861,6 +878,20 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
         },
         // And here: every bit pattern of four words is a digest.
         CheckedDetail::Fingerprint { words } => DomainDetail::Fingerprint(digest_bytes(words)),
+        CheckedDetail::AnchorFingerprint { words } => {
+            DomainDetail::AnchorFingerprint(digest_bytes(words))
+        }
+        // Total: `wire` ranged the address and the port, and a generation is a
+        // position every bit pattern of which a record could stand at.
+        CheckedDetail::Adopted {
+            destination,
+            port,
+            generation,
+        } => DomainDetail::Adopted {
+            destination: net_headers::Ipv4Address::from_octets(destination.to_be_bytes()),
+            port: *port,
+            generation: *generation,
+        },
         // Total for `Identity`'s reason: `wire` ranged the flag, and a generation
         // and a count are numbers every bit pattern of which a reset could have
         // found.
@@ -1187,6 +1218,18 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         onboarded,
                     },
                     DomainDetail::Fingerprint(digest) => DomainDetail::Fingerprint(digest),
+                    DomainDetail::AnchorFingerprint(digest) => {
+                        DomainDetail::AnchorFingerprint(digest)
+                    }
+                    DomainDetail::Adopted {
+                        destination,
+                        port,
+                        generation,
+                    } => DomainDetail::Adopted {
+                        destination,
+                        port,
+                        generation,
+                    },
                     DomainDetail::Reset {
                         generation,
                         documents,
