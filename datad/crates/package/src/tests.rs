@@ -1116,3 +1116,45 @@ fn the_corpus_and_the_table_are_the_same_set() {
         "the seed a cold run starts from is not the package the tests read"
     );
 }
+
+/// The cryptography domain reads a package on the stack the system description
+/// declares for it, and the frame that dominates that read is the configuration
+/// reader's. This holds the sizes that frame is built out of to the declaration,
+/// so a type that outgrows the budget fails here rather than on a booted node.
+///
+/// What it pins: the model the document reader moves through its shapes, and the
+/// package this reader hands back — the two sizes that make the frame the size
+/// it is, and the two that a later change can move. What it cannot pin: the
+/// compiled frame itself, which is codegen no host test can see, and the depth
+/// the TLS record layer below this reader had already spent, which is
+/// third-party. Both are measured numbers recorded here.
+///
+/// Those two unknowns are why the budget is half the stack rather than all of
+/// it, and the size of the gap is known rather than guessed: three models are
+/// 73,020 bytes of the 82,056 the frame measured, so about nine kibibytes of the
+/// reader's own locals and spill slots are outside anything counted here.
+#[test]
+fn reading_a_package_fits_the_stack_the_cryptography_domain_is_declared_with() {
+    /// `<protection_domain name="crypto" stack_size="0x60000">`.
+    const CRYPTO_STACK: usize = 0x60000;
+    /// Measured on the boot that overran a 128 KiB stack, as the document
+    /// reader's own probe target against the domain's initial stack pointer:
+    /// the relay's turn, the TLS record layer, the onboarding surface and the
+    /// upload that reads the staged archive back. Nothing sized here moves it.
+    const BELOW_THIS_READER: usize = 60_856;
+    /// Models the document reader holds live at once — the one it builds, the
+    /// one it returns, and the slot that is moved into.
+    const MODELS_HELD: usize = 3;
+
+    let document = MODELS_HELD * size_of::<config::Model>();
+    let package = size_of::<Package<'static>>();
+    let demand = BELOW_THIS_READER + document + package;
+
+    assert!(
+        demand <= CRYPTO_STACK / 2,
+        "reading a package costs {demand} bytes ({BELOW_THIS_READER} spent below this reader, \
+         {document} for the document and {package} for the package it hands back) against a \
+         {CRYPTO_STACK}-byte stack, which leaves under the twofold headroom the frame it is \
+         measured from is sized by"
+    );
+}

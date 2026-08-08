@@ -1753,8 +1753,50 @@
          own priority would never run to write one. See the store domain's row.
          Its work is bounded by its own compile-time constants — a fixed vector
          corpus, a fixed number of timing rounds, and the delegation's own read
-         budget — and the domain then blocks for good. -->
-    <protection_domain name="crypto" priority="2" stack_size="0x20000">
+         budget — and the domain then blocks for good.
+
+         THE STACK IS 384 KiB, AND IT IS A BUDGET RATHER THAN A NUMBER. At 128 KiB
+         no package could be installed on this image at all: the first upload to
+         reach the document check faulted, and it faulted the same way every time
+         because nothing about it depends on what the peer sent. The arithmetic,
+         measured off the faulting boot rather than estimated:
+
+           60,856 bytes  spent before the document reader is entered — the relay's
+                         turn, the TLS record layer under it, the onboarding
+                         surface, and the upload that reads the staged archive back
+           82,056 bytes  the document reader's own frame: 48 bytes of saved
+                         registers, an 80 KiB probe span and 88 bytes of residual
+          ══════════════
+          142,912 bytes  demanded, against 131,072 declared — an overshoot of
+                         11,840, which the probe turns into a clean data fault one
+                         page under the stack rather than into a silent write
+
+         So 393,216 leaves 250,304 bytes of headroom, a factor of 2.75 on the
+         deepest path measured — and every other path this domain runs, the vector
+         corpus and the handshake included, fitted the 128 KiB it had for as long
+         as it had it. That factor is the point and the number is its consequence:
+         the first term is third-party depth that moves when the TLS stack is
+         bumped, and the second is a constant of the document reader that moves
+         when the configuration model grows. Half of the budget is therefore held
+         by `lfw_package`'s
+         `reading_a_package_fits_the_stack_the_cryptography_domain_is_declared_with`,
+         which sizes the model and the package it hands back and fails on a
+         developer's machine long before either could reach a booted node.
+
+         WHY IT WAS URGENT rather than a tuning matter: the faulting path is
+         reachable by the unauthenticated peer this port faces. A device
+         certificate need only carry this appliance's public key, which the
+         appliance publishes on its own page and in its request, so an attacker
+         signs one with an authority of their own and the archive reaches the
+         document check on its way to being refused. That made a remote fault of
+         the domain holding the device key and the appliance's only allocator.
+
+         MEMORY RATHER THAN AUTHORITY. Nothing this domain may reach changes: no
+         region added or removed, no mapping's extent, cacheability or permissions
+         altered, no channel and no send capability touched. The generated report
+         gains 64 `frame_crypto_stack` pages and nothing else; the description
+         still holds 80 regions and 151 mappings. -->
+    <protection_domain name="crypto" priority="2" stack_size="0x60000">
         <program_image path="crypto.elf" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_crypto" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
