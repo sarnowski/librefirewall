@@ -39,8 +39,8 @@ use std::{
 use arbitrary::Unstructured;
 use lfw_crypto::{Drbg, Entropy, SEED_LEN};
 use lfw_tls::{
-    Bump, CertificateKind, HELD_MAX, Identity, LocalKey, OnboardingServer, ServerOutcome,
-    CryptoProvider, SignOperation, provider,
+    Bump, CertificateKind, CryptoProvider, HELD_MAX, Identity, LocalKey, OnboardingServer,
+    ServerOutcome, SignOperation, provider,
 };
 
 use crate::{any_index, any_u16, guard::Guarded};

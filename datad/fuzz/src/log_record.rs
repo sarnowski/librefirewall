@@ -86,9 +86,8 @@ use wire::{
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
     LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_ONBOARD_END_COUNT,
     LOG_ONBOARD_OUTCOME_COUNT, LOG_ONBOARD_REFUSAL_COUNT, LOG_ONBOARD_ROUTE_COUNT,
-    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT,
-    LOG_TLS_INCOMPATIBLE_COUNT, LOG_TLS_REFUSAL_COUNT, LogRecord, LogRecordError, LogText,
-    TextImage, ValueImage,
+    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LOG_TLS_INCOMPATIBLE_COUNT,
+    LOG_TLS_REFUSAL_COUNT, LogRecord, LogRecordError, LogText, TextImage, ValueImage,
 };
 
 /// Bytes one record occupies, and so what one corpus entry is.
@@ -584,18 +583,39 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // details join them for the same reason — their first word is
                 // a token rather than a count, but it is read from the same
                 // place and refused separately below.
-                DETAIL_EXTENT | DETAIL_PROVEN | DETAIL_PROVED | DETAIL_MEASURED
-                | DETAIL_SESSION | DETAIL_EXCHANGE | DETAIL_PEER | DETAIL_ARENA
-                | DETAIL_OPERATION | DETAIL_IDENTITY | DETAIL_FINGERPRINT | DETAIL_RESET
-                | DETAIL_DELEGATED | DETAIL_DIALLED | DETAIL_DIAL_ROUTE
-                | DETAIL_DIAL_UNLEARNED | DETAIL_DIAL_SEGMENTS | DETAIL_DIAL_SEQUENCE
-                | DETAIL_ONBOARDED | DETAIL_ONBOARDING_PORT | DETAIL_ONBOARDING_HANDSHAKE
-                | DETAIL_ONBOARDING_ENDED | DETAIL_ONBOARDING_INCOMPATIBLE
-                | DETAIL_ONBOARDING_REFUSED | DETAIL_ONBOARDING_ALERT
-                | DETAIL_ONBOARDING_BACKLOGGED | DETAIL_ONBOARDING_SUITES
-                | DETAIL_ONBOARDING_GROUPS | DETAIL_ONBOARDING_SERVED
-                | DETAIL_ONBOARDING_REQUEST | DETAIL_ONBOARDING_THROTTLED
-                | DETAIL_ADOPTED | DETAIL_ANCHOR_FINGERPRINT
+                DETAIL_EXTENT
+                | DETAIL_PROVEN
+                | DETAIL_PROVED
+                | DETAIL_MEASURED
+                | DETAIL_SESSION
+                | DETAIL_EXCHANGE
+                | DETAIL_PEER
+                | DETAIL_ARENA
+                | DETAIL_OPERATION
+                | DETAIL_IDENTITY
+                | DETAIL_FINGERPRINT
+                | DETAIL_RESET
+                | DETAIL_DELEGATED
+                | DETAIL_DIALLED
+                | DETAIL_DIAL_ROUTE
+                | DETAIL_DIAL_UNLEARNED
+                | DETAIL_DIAL_SEGMENTS
+                | DETAIL_DIAL_SEQUENCE
+                | DETAIL_ONBOARDED
+                | DETAIL_ONBOARDING_PORT
+                | DETAIL_ONBOARDING_HANDSHAKE
+                | DETAIL_ONBOARDING_ENDED
+                | DETAIL_ONBOARDING_INCOMPATIBLE
+                | DETAIL_ONBOARDING_REFUSED
+                | DETAIL_ONBOARDING_ALERT
+                | DETAIL_ONBOARDING_BACKLOGGED
+                | DETAIL_ONBOARDING_SUITES
+                | DETAIL_ONBOARDING_GROUPS
+                | DETAIL_ONBOARDING_SERVED
+                | DETAIL_ONBOARDING_REQUEST
+                | DETAIL_ONBOARDING_THROTTLED
+                | DETAIL_ADOPTED
+                | DETAIL_ANCHOR_FINGERPRINT
                 | DETAIL_ONBOARDING_INSTALLED => {
                     kept.operands = record.operands;
                 }
@@ -1667,12 +1687,7 @@ mod tests {
                 "valid_domain_onboarding_suites",
                 region_from_record(&LogRecord {
                     detail: DETAIL_ONBOARDING_SUITES,
-                    operands: [
-                        0x1301_1302_1303_1304,
-                        0x1305_1306_1307_1308,
-                        40,
-                        0,
-                    ],
+                    operands: [0x1301_1302_1303_1304, 0x1305_1306_1307_1308, 40, 0],
                     ..domain_record()
                 }),
             ),

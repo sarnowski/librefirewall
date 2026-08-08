@@ -229,6 +229,16 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
             .args(["fmt", "--all", "--check"]),
         "check formatting",
     )?;
+    // The fuzz harnesses are a second workspace, so the check above — which
+    // walks the members of *this* one — never saw them, and they had drifted.
+    // They are first-party code holding the model every restated ABI is judged
+    // against, so they are held to the same formatting as the code they model.
+    run_command(
+        Command::new("cargo")
+            .current_dir(root.join("fuzz"))
+            .args(["fmt", "--all", "--check"]),
+        "check formatting of the fuzz harnesses",
+    )?;
     enforce_budgets(root)?;
     // Beside the budgets and for the same reason: it reads two files and
     // compares numbers, so it costs milliseconds against the minutes below it,

@@ -235,7 +235,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 
 | Check | Command |
 |---|---|
-| Formatting | `cargo fmt --all --check` |
+| Formatting, in both workspaces — the fuzz harnesses are their own, so one invocation never saw them | `cargo fmt --all --check` |
 | Lints, warnings denied — every host crate, and the protection domains for seL4 in **both** kernel configurations | `cargo clippy` over an explicit `-p` list, in `xtask test` |
 | A `SAFETY` comment *present* on every `unsafe` block | `undocumented_unsafe_blocks = "deny"` |
 | Per-file comment ratio and per-crate `unsafe` count never rise, across `datad/crates/` and `datad/pds/` | `xtask test` (the budget ratchets) |

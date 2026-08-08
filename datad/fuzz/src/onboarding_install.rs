@@ -103,49 +103,49 @@ pub fn onboarding_install_harness(input: &[u8]) {
     }
 
     if let Ok(adoption) = answer {
-            let endpoint = adoption.endpoint();
-            let fingerprint = adoption.anchor_fingerprint();
-            assert_dialable(endpoint);
+        let endpoint = adoption.endpoint();
+        let fingerprint = adoption.anchor_fingerprint();
+        assert_dialable(endpoint);
 
-            let mut owned = appliance(APPLIANCE_POINT);
-            let before = owned.generation();
-            adoption.take_ownership(&mut owned);
-            assert!(
-                matches!(owned.onboarding(), lfw_store::Onboarding::Onboarded),
-                "an accepted package left the appliance unowned"
-            );
-            assert_eq!(
-                owned.generation(),
-                before + 1,
-                "taking ownership did not advance the generation"
-            );
-            assert!(
-                !owned.device_certificate().is_empty() && !owned.anchor_certificate().is_empty(),
-                "an owned record is missing one of the two certificates"
-            );
-            assert!(
-                !owned.endpoint().is_absent(),
-                "an owned record has nowhere to dial"
-            );
-            // The fingerprint is the digest over the anchor's own key, taken by
-            // the walk that binds it rather than over bytes found by a search.
-            let spki = subject_public_key_info(owned.anchor_certificate().as_bytes())
-                .expect("an adopted anchor is shaped like a certificate");
-            assert_eq!(
-                fingerprint,
-                sha256(spki),
-                "the reported fingerprint is not the anchor's own key"
-            );
+        let mut owned = appliance(APPLIANCE_POINT);
+        let before = owned.generation();
+        adoption.take_ownership(&mut owned);
+        assert!(
+            matches!(owned.onboarding(), lfw_store::Onboarding::Onboarded),
+            "an accepted package left the appliance unowned"
+        );
+        assert_eq!(
+            owned.generation(),
+            before + 1,
+            "taking ownership did not advance the generation"
+        );
+        assert!(
+            !owned.device_certificate().is_empty() && !owned.anchor_certificate().is_empty(),
+            "an owned record is missing one of the two certificates"
+        );
+        assert!(
+            !owned.endpoint().is_absent(),
+            "an owned record has nowhere to dial"
+        );
+        // The fingerprint is the digest over the anchor's own key, taken by
+        // the walk that binds it rather than over bytes found by a search.
+        let spki = subject_public_key_info(owned.anchor_certificate().as_bytes())
+            .expect("an adopted anchor is shaped like a certificate");
+        assert_eq!(
+            fingerprint,
+            sha256(spki),
+            "the reported fingerprint is not the anchor's own key"
+        );
 
-            // And an appliance that already has an owner refuses this very
-            // package, which is what makes a factory reset the only way back.
-            assert!(
-                matches!(
-                    read_package(stated, region, &owned),
-                    Err(InstallError::AlreadyOwned)
-                ),
-                "an owned appliance took a second package"
-            );
+        // And an appliance that already has an owner refuses this very
+        // package, which is what makes a factory reset the only way back.
+        assert!(
+            matches!(
+                read_package(stated, region, &owned),
+                Err(InstallError::AlreadyOwned)
+            ),
+            "an owned appliance took a second package"
+        );
     }
 
     // Determinism: one region under one claim answers the same way twice.
@@ -199,5 +199,8 @@ fn assert_dialable(endpoint: StoredEndpoint) {
         leading & 0xf0 != 240,
         "an address in the reserved top of the space was adopted"
     );
-    assert!(endpoint.address != [255; 4], "the broadcast address was adopted");
+    assert!(
+        endpoint.address != [255; 4],
+        "the broadcast address was adopted"
+    );
 }

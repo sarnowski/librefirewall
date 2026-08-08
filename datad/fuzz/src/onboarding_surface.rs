@@ -76,7 +76,8 @@ const FINGERPRINT: &[u8; FINGERPRINT_LEN] =
 
 /// A request PEM that is not one, which is all the surface needs: it serves
 /// these bytes and reads none of them.
-const REQUEST: &[u8] = b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBAA==\n-----END CERTIFICATE REQUEST-----\n";
+const REQUEST: &[u8] =
+    b"-----BEGIN CERTIFICATE REQUEST-----\nMIIBAA==\n-----END CERTIFICATE REQUEST-----\n";
 
 /// The upload the surface is driven against: what it kept, and the three ways it
 /// can say no.
@@ -276,7 +277,11 @@ pub fn drive(data: &[u8]) -> Reached {
         "one connection asked for {} installs",
         sink.installs
     );
-    assert!(sink.opens <= 1, "one connection opened {} uploads", sink.opens);
+    assert!(
+        sink.opens <= 1,
+        "one connection opened {} uploads",
+        sink.opens
+    );
     reached.opens = sink.opens;
     reached.installs_asked = sink.installs;
     // The close is absorbing: once shut, every later request on a fresh
