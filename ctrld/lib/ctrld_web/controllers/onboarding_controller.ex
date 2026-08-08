@@ -19,7 +19,7 @@ defmodule CtrldWeb.OnboardingController do
   use CtrldWeb, :controller
 
   alias Ctrld.{Appliances, ChannelEndpoint, Configuration, Package, PKI}
-  alias Ctrld.PKI.CSR
+  alias Ctrld.PKI.{Certificate, CSR}
 
   def new(conn, _params) do
     render(conn, :new,
@@ -110,5 +110,9 @@ defmodule CtrldWeb.OnboardingController do
   defp describe(:already_onboarded = reason), do: Appliances.describe(reason)
   defp describe(:no_authority = reason), do: Appliances.describe(reason)
   defp describe({:member_too_large, _, _, _} = reason), do: Package.describe(reason)
+
+  defp describe({:certificate_too_long, _, _, _} = reason),
+    do: Certificate.describe(reason)
+
   defp describe(reason), do: Configuration.describe(reason)
 end

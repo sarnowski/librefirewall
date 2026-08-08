@@ -15,6 +15,18 @@
 //! an operator read the first would be talking to somebody else entirely. So an
 //! octet is written the one way a decimal number is written, and a leading zero
 //! is refused rather than interpreted.
+//!
+//! # Well-formed is not the same as dialable
+//!
+//! Five address ranges are well-formed dotted quads that name something other
+//! than a host a management server answers on: the unspecified address, the
+//! loopback block, the multicast block, the limited broadcast address, and the
+//! reserved top of the space. An appliance handed one of them would come up,
+//! accept the package, and then spend its life reporting a next hop it can
+//! never reach — for a cause an operator reading that report cannot act on,
+//! because nothing about the failure says the address was never a host. So each
+//! is refused here, under its own name, while the administrator who composed
+//! the package is still standing in front of the appliance.
 
 /// Bytes the member may occupy, which bounds every loop below.
 const MEMBER_BOUND: usize = crate::Member::ManagementEndpoint.bound();
@@ -63,6 +75,20 @@ pub enum EndpointError {
     /// numbers.
     OctetHasLeadingZero,
     OctetOutOfRange,
+    /// All four octets zero, which names no host at all.
+    AddressIsUnspecified,
+    /// The loopback block, which names the appliance itself: an appliance told
+    /// to dial it would be its own management server.
+    AddressIsLoopback,
+    /// The multicast block, which names a group rather than a host, and a
+    /// management session is not something a group answers.
+    AddressIsMulticast,
+    /// The limited broadcast address. Its own reason rather than the reserved
+    /// block it sits inside, because an administrator who typed it meant
+    /// something — every host on the link — and needs telling that.
+    AddressIsBroadcast,
+    /// The reserved top of the space, which is not routed to a host.
+    AddressIsReserved,
     PortIsEmpty,
     PortIsNotDecimal,
     PortHasLeadingZero,
@@ -107,10 +133,38 @@ pub(crate) fn parse(member: &[u8]) -> Result<Endpoint, EndpointError> {
         return Err(EndpointError::TooManyColons);
     }
 
+    let address = address(address_text)?;
+    dialable(address)?;
     Ok(Endpoint {
-        address: address(address_text)?,
+        address,
         port: port(port_text)?,
     })
+}
+
+/// Whether the quad names somewhere a host can be dialled at, or which range it
+/// falls in instead.
+///
+/// Broadcast is asked before the reserved block that contains it, so the
+/// narrower of the two overlapping reasons is the one an administrator is
+/// given.
+const fn dialable(address: [u8; OCTETS]) -> Result<(), EndpointError> {
+    let [first, second, third, fourth] = address;
+    if first == 0 && second == 0 && third == 0 && fourth == 0 {
+        return Err(EndpointError::AddressIsUnspecified);
+    }
+    if first == 127 {
+        return Err(EndpointError::AddressIsLoopback);
+    }
+    if first == 255 && second == 255 && third == 255 && fourth == 255 {
+        return Err(EndpointError::AddressIsBroadcast);
+    }
+    if first & 0xf0 == 224 {
+        return Err(EndpointError::AddressIsMulticast);
+    }
+    if first & 0xf0 == 240 {
+        return Err(EndpointError::AddressIsReserved);
+    }
+    Ok(())
 }
 
 /// Four decimal octets, dot separated, each written the one way it is written.
@@ -232,12 +286,58 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(b"255.255.255.255:65535\n"),
+            parse(b"223.255.255.254:65535\n"),
             Ok(Endpoint {
-                address: [255, 255, 255, 255],
+                address: [223, 255, 255, 254],
                 port: 65535
             })
         );
+    }
+
+    #[test]
+    fn an_address_that_names_no_host_is_refused_under_its_own_name() {
+        assert_eq!(
+            parse(b"0.0.0.0:8443"),
+            Err(EndpointError::AddressIsUnspecified)
+        );
+        assert_eq!(
+            parse(b"127.0.0.1:8443"),
+            Err(EndpointError::AddressIsLoopback)
+        );
+        assert_eq!(
+            parse(b"127.255.255.255:8443"),
+            Err(EndpointError::AddressIsLoopback)
+        );
+        assert_eq!(
+            parse(b"224.0.0.1:8443"),
+            Err(EndpointError::AddressIsMulticast)
+        );
+        assert_eq!(
+            parse(b"239.255.255.255:8443"),
+            Err(EndpointError::AddressIsMulticast)
+        );
+        // The narrower of the two overlapping reasons: broadcast sits inside
+        // the reserved block and is answered for itself.
+        assert_eq!(
+            parse(b"255.255.255.255:8443"),
+            Err(EndpointError::AddressIsBroadcast)
+        );
+        assert_eq!(
+            parse(b"240.0.0.1:8443"),
+            Err(EndpointError::AddressIsReserved)
+        );
+        assert_eq!(
+            parse(b"255.255.255.254:8443"),
+            Err(EndpointError::AddressIsReserved)
+        );
+        // The neighbours on either side of each block are ordinary addresses.
+        assert!(parse(b"0.0.0.1:8443").is_ok());
+        assert!(parse(b"126.255.255.255:8443").is_ok());
+        assert!(parse(b"128.0.0.1:8443").is_ok());
+        assert!(parse(b"223.255.255.255:8443").is_ok());
+        // The address is judged before the port, so a package that is wrong in
+        // both is reported by the fault an administrator has to fix first.
+        assert_eq!(parse(b"127.0.0.1:0"), Err(EndpointError::AddressIsLoopback));
     }
 
     #[test]

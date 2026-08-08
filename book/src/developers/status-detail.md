@@ -2699,9 +2699,17 @@ empty `prefix`, a name compared byte for byte against the four constants with no
 every numeric field read as bounded octal and every header checksum verified, each member inside its
 own bound and the whole archive inside the outer one, and exactly four members each exactly once
 with order not significant. The content rules are the contract's: the device certificate must bind
-the appliance's own key, the endpoint must be a dotted quad and a port from 1 to 65535, and the
-document must pass `config::load` — the same reader and the same rules as a document submitted any
-other way.
+the appliance's own key, the endpoint must be a dotted quad and a port from 1 to 65535 naming an
+address a host can be dialled at, and the document must pass `config::load` — the same reader and
+the same rules as a document submitted any other way. Well-formed is not the same as dialable, so
+the five ranges that name something other than a host — the unspecified address, loopback,
+multicast, the limited broadcast address, and the reserved top of the space — are refused under
+five separate names, and broadcast is answered before the reserved block containing it so the
+narrower of the two overlapping reasons is the one an administrator is given. A package that cannot
+work is refused while an administrator is still standing in front of the appliance, which is the
+only moment at which it is cheap to fix. A certificate's DER carries the profile's own bound, which
+is the number the appliance's state record reserves and the number the management server refuses to
+sign past — one bound, stated by the profile, enforced on both sides.
 
 **The key check is a walk, not a search.** A certificate can carry the bytes of a key in an
 extension, a name or a serial without binding them to anything, so searching for them would answer a
@@ -2734,8 +2742,9 @@ two languages drift silently; these two gates are what stops it.
 **The fuzz target drives it as the uploader.** `onboarding_package` takes the archive unshaped and
 asserts invariants rather than the absence of a panic: reading is total and deterministic; nothing
 is yielded unless every rule passed, checked by taking a yielded package apart again from the
-outside; the same input read with a verifier that refuses yields a package never, whatever else was
-right about it; the verifier is only ever asked about a certificate that already binds the
+outside — the yielded endpoint's address among it, which is asserted to be dialable and not merely
+well-formed; the same input read with a verifier that refuses yields a package never, whatever else
+was right about it; the verifier is only ever asked about a certificate that already binds the
 appliance's key, so the domain holding the cryptography is not made to spend a signature on an
 archive the structural rules would have refused; and an archive past the outer bound is refused by
 that bound and nothing else. Its seeds are the real package and a mutation of it per rule — each
@@ -2782,7 +2791,13 @@ delivered anchor and matches the profile in every field.
   comes from the profile and from the request's key: the request is a proof of key possession and a
   name, and one carrying an attribute is refused rather than honoured in part. Certificates are
   built with the runtime's own `:public_key` and `:crypto`; the server implements no cryptographic
-  algorithm and links no native one.
+  algorithm and links no native one. **It also refuses to issue what an appliance could not
+  persist**: the DER of every certificate is measured against the profile's bound as it is signed,
+  and one past it is a typed refusal naming the subject and both numbers rather than an artifact
+  handed to an administrator. The bound is the appliance's state record's, so catching it here is
+  what keeps an appliance from accepting a package and then failing to store what it accepted — and
+  the only variable-length input on this side is the subject name, so the remedy the refusal names
+  is to shorten it.
 - **Private keys are sealed.** AES-256-GCM under a base64 key from the environment, a fresh
   initialisation vector per record, and associated data naming the table, so a ciphertext moved
   between rows opens to nothing. The server refuses to start without a usable key, and no surface

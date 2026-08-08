@@ -7,7 +7,7 @@ defmodule Ctrld.PKI.CertificateTest do
 
   setup do
     now = ~U[2026-08-04 12:00:00Z]
-    {issued, key} = Certificate.create_authority("test authority", now)
+    {:ok, {issued, key}} = Certificate.create_authority("test authority", now)
     %{now: now, authority: issued, authority_key: key}
   end
 
@@ -63,7 +63,7 @@ defmodule Ctrld.PKI.CertificateTest do
       device = device_id()
       subject_key = KeyPair.generate()
 
-      issued =
+      {:ok, issued} =
         Certificate.issue_under(
           :device,
           device,
@@ -128,7 +128,7 @@ defmodule Ctrld.PKI.CertificateTest do
     setup %{authority: authority, authority_key: key, now: now} do
       subject_key = KeyPair.generate()
 
-      issued =
+      {:ok, issued} =
         Certificate.issue_under(
           {:channel_endpoint, {192, 0, 2, 10}},
           "192.0.2.10",
@@ -164,18 +164,84 @@ defmodule Ctrld.PKI.CertificateTest do
 
   describe "validity encoding" do
     test "uses UTCTime through 2049 and GeneralizedTime from 2050" do
-      {through, _} = Certificate.create_authority("early", ~U[2030-01-01 00:00:00Z])
-      {beyond, _} = Certificate.create_authority("late", ~U[2045-01-01 00:00:00Z])
+      {:ok, {through, _}} = Certificate.create_authority("early", ~U[2030-01-01 00:00:00Z])
+      {:ok, {beyond, _}} = Certificate.create_authority("late", ~U[2045-01-01 00:00:00Z])
 
       assert {:Validity, {:utcTime, _}, {:utcTime, _}} = validity(decode(through.der))
       assert {:Validity, {:utcTime, _}, {:generalTime, _}} = validity(decode(beyond.der))
     end
 
     test "a leap day does not produce a date the calendar does not have" do
-      {issued, _} = Certificate.create_authority("leap", ~U[2028-02-29 00:00:00Z])
+      {:ok, {issued, _}} = Certificate.create_authority("leap", ~U[2028-02-29 00:00:00Z])
       assert issued.not_after.month == 2
       assert issued.not_after.day == 28
       assert issued.not_after.year == 2038
+    end
+  end
+
+  describe "the profile's bound on a certificate's DER" do
+    test "everything this profile issues is well inside it", %{
+      authority: authority,
+      authority_key: key,
+      now: now
+    } do
+      bound = Profile.max_certificate_der_bytes()
+      subject_key = KeyPair.generate()
+
+      {:ok, device} =
+        Certificate.issue_under(
+          :device,
+          device_id(),
+          KeyPair.public_point(subject_key),
+          authority.subject_common_name,
+          key,
+          now
+        )
+
+      {:ok, endpoint} =
+        Certificate.issue_under(
+          {:channel_endpoint, {192, 0, 2, 10}},
+          "192.0.2.10",
+          KeyPair.public_point(subject_key),
+          authority.subject_common_name,
+          key,
+          now
+        )
+
+      for issued <- [authority, device, endpoint] do
+        assert byte_size(issued.der) <= bound
+      end
+    end
+
+    test "a subject that would carry a certificate past it is refused rather than signed", %{
+      now: now
+    } do
+      bound = Profile.max_certificate_der_bytes()
+      assert {:error, reason} = Certificate.create_authority(String.duplicate("n", bound), now)
+      assert {:certificate_too_long, _subject, size, ^bound} = reason
+      assert size > bound
+      assert Certificate.describe(reason) =~ "shorten the subject name"
+    end
+
+    test "an end-entity certificate is refused on the same rule", %{
+      authority: authority,
+      authority_key: key,
+      now: now
+    } do
+      bound = Profile.max_certificate_der_bytes()
+      subject_key = KeyPair.generate()
+
+      assert {:error, {:certificate_too_long, _subject, size, ^bound}} =
+               Certificate.issue_under(
+                 :device,
+                 String.duplicate("d", bound),
+                 KeyPair.public_point(subject_key),
+                 authority.subject_common_name,
+                 key,
+                 now
+               )
+
+      assert size > bound
     end
   end
 

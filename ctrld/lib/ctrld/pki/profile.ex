@@ -29,6 +29,7 @@ defmodule Ctrld.PKI.Profile do
   @validity_years 10
   @serial_bits 128
   @device_id_hex_length 32
+  @max_certificate_der_bytes 768
 
   @doc "The named curve every key in the management plane is on."
   def curve_oid, do: @curve_oid
@@ -59,6 +60,21 @@ defmodule Ctrld.PKI.Profile do
 
   @doc "How many hexadecimal characters a device identifier renders as."
   def device_id_hex_length, do: @device_id_hex_length
+
+  @doc """
+  The bound on a certificate's DER, in bytes.
+
+  It is what an appliance can persist, and it is a hard limit rather than a
+  courtesy: this profile fixes one algorithm, one curve and a subject of one
+  attribute, so everything issued under it is a few hundred bytes and the bound
+  is far from tight — but the appliance's state record reserves exactly this
+  much, so a certificate past it is one the appliance could accept and never
+  store. The issuer is where that is caught, because this is the side that can
+  still do something about it: a subject long enough to exceed the bound is a
+  name to shorten, and the moment to say so is before anything is signed.
+  """
+  @spec max_certificate_der_bytes() :: pos_integer()
+  def max_certificate_der_bytes, do: @max_certificate_der_bytes
 
   @doc """
   Whether a string is a device identifier: 32 lowercase hexadecimal characters.

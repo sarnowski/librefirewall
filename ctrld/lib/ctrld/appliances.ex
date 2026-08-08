@@ -64,7 +64,12 @@ defmodule Ctrld.Appliances do
   """
   @spec onboard(CSR.t(), map()) ::
           {:ok, %{appliance: Appliance.t(), package: binary()}}
-          | {:error, atom() | Ecto.Changeset.t() | Package.reason() | Configuration.reason()}
+          | {:error,
+             atom()
+             | Ecto.Changeset.t()
+             | Package.reason()
+             | Configuration.reason()
+             | Certificate.reason()}
   def onboard(%CSR{} = request, attributes) do
     %{
       name: name,
@@ -78,10 +83,9 @@ defmodule Ctrld.Appliances do
 
     with :ok <- Configuration.validate(document),
          :ok <- unclaimed(request),
-         {:ok, authority} <- signing_authority() do
-      issued =
-        PKI.issue_device_certificate(authority, request.public_point, request.device_id, now)
-
+         {:ok, authority} <- signing_authority(),
+         {:ok, issued} <-
+           PKI.issue_device_certificate(authority, request.public_point, request.device_id, now) do
       appliance_changeset =
         Appliance.changeset(%Appliance{}, %{
           device_id: request.device_id,

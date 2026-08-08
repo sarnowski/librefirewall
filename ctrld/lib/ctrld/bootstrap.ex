@@ -102,6 +102,9 @@ defmodule Ctrld.Bootstrap do
 
             {:ok, :certificate_authority}
 
+          {:error, {:certificate_too_long, _, _, _} = reason} ->
+            {:error, {:certificate_authority, PKI.Certificate.describe(reason)}}
+
           {:error, changeset} ->
             {:error, {:certificate_authority, changeset}}
         end
@@ -137,6 +140,9 @@ defmodule Ctrld.Bootstrap do
         Logger.info("ctrld: issued the channel endpoint certificate for #{rendered}")
         {:ok, :endpoint_certificate}
 
+      {:error, {:certificate_too_long, _, _, _} = reason} ->
+        {:error, {:endpoint_certificate, PKI.Certificate.describe(reason)}}
+
       {:error, changeset} ->
         {:error, {:endpoint_certificate, changeset}}
     end
@@ -147,6 +153,9 @@ defmodule Ctrld.Bootstrap do
       {:ok, _certificate} ->
         Logger.info("ctrld: re-issued the channel endpoint certificate for #{rendered}")
         {:ok, :endpoint_certificate}
+
+      {:error, {:certificate_too_long, _, _, _} = reason} ->
+        {:error, {:endpoint_certificate, PKI.Certificate.describe(reason)}}
 
       {:error, reason} ->
         {:error, {:endpoint_certificate, reason}}

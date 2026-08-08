@@ -39,6 +39,13 @@ literal in decimal, a colon, and a decimal port from 1 to 65535, optionally foll
 trailing line feed and nothing else. It is an address literal, never a name — DNS stays off the
 untrusted path, so no resolver exists to be poisoned between an appliance and its management server.
 
+The address is one a host can be dialled at: **the unspecified address, a loopback address, a
+multicast or broadcast address, and the whole of the reserved top of the space are refused by
+name.** Each of them names something other than a management server, and an appliance told to dial
+one would spend its life reporting an unreachable next hop for a reason no operator could act on —
+a package that cannot work is refused while an administrator is standing in front of the appliance,
+which is the only moment at which it is cheap to fix.
+
 **The endpoint is its own member, deliberately not an element of the configuration document.** The
 configuration document is what later travels the channel, and the
 [threat model](../design/threat-model.md#the-compromised-management-server) requires that a

@@ -29,10 +29,20 @@ const WRITER_SLACK: usize = 16;
 /// hexadecimal, with no separators.
 pub const FINGERPRINT_LEN: usize = 2 * DIGEST_LEN;
 
-/// A buffer wide enough for any certificate this profile produces. Derived
-/// from the widest: a CA-issued endpoint certificate carries two names, a
-/// validity, a public key, four extensions and a signature, and comes to under
-/// five hundred bytes — this leaves room for a name at the profile's bound.
+/// **The profile's bound on a certificate's DER**, and the authoritative one:
+/// every consumer of a certificate in this appliance — the writer here, the
+/// reader that unwraps a delivered one, the state record that persists it, the
+/// region it crosses a protection-domain boundary in — holds this number, and
+/// so does the management server that issues under the same profile and refuses
+/// to sign past it. It is a limit the profile states rather than a buffer size
+/// read off what this writer happens to produce.
+///
+/// Seven hundred and sixty-eight is far from tight, which is deliberate: the
+/// widest certificate the profile admits is a CA-issued endpoint certificate —
+/// two names, a validity, a public key, four extensions and a signature, under
+/// five hundred bytes — so the slack above it is room for a subject name, and a
+/// name that outgrows even that is one the issuer shortens rather than one an
+/// appliance discovers it cannot persist.
 pub const MAX_CERTIFICATE_LEN: usize = 768;
 
 /// A buffer wide enough for any certificate signing request this profile

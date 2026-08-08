@@ -59,6 +59,15 @@ defmodule Ctrld.PKITest do
       refute changeset.valid?
     end
 
+    test "a name that would not fit the profile's certificate bound leaves no row behind" do
+      bound = Profile.max_certificate_der_bytes()
+
+      assert {:error, {:certificate_too_long, _subject, _size, ^bound}} =
+               PKI.create_authority(String.duplicate("n", bound))
+
+      assert PKI.active_authority() == nil
+    end
+
     test "active_authority!/0 refuses when there is none" do
       assert_raise RuntimeError, ~r/no active certificate authority/, &PKI.active_authority!/0
     end
@@ -116,7 +125,7 @@ defmodule Ctrld.PKITest do
       %{pem: pem} = csr_fixture()
       {:ok, request} = Ctrld.PKI.CSR.parse(pem)
 
-      issued =
+      {:ok, issued} =
         PKI.issue_device_certificate(
           authority,
           request.public_point,

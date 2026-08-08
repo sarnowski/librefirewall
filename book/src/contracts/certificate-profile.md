@@ -87,4 +87,12 @@ verified at first contact still names the appliance after issuance.
 
 Every certificate travels as PEM with the `CERTIFICATE` label; the CSR as PEM with the
 `CERTIFICATE REQUEST` label — one encapsulated structure per file, no leading or trailing content.
+Line feeds after the closing boundary are not content: a writer that ends its output with a blank
+line is producing one structure and a reader accepts it. Any other byte outside the boundaries is.
+
+**A certificate's DER is bounded at 768 bytes**, which is what an appliance can persist. The profile
+fixes one algorithm, one curve and a subject of one attribute, so a certificate issued to it is a
+few hundred bytes and the bound is far from tight — but it is a hard limit rather than a courtesy,
+and the issuer enforces it when it signs rather than letting an appliance discover it when it is
+handed one. A subject long enough to exceed it is a name the issuer must shorten.
 The [configuration package](configuration-package.md) bounds the files these travel in.

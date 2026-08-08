@@ -8,6 +8,15 @@ defmodule Ctrld.PKI.Certificate do
   proof of key possession and a name, never a way of reaching into the
   contents of what is issued, so this module takes a public key and a name and
   never a requested extension.
+
+  Issuance can be refused, and there is one reason it is: the DER came out
+  longer than the profile bounds a certificate at. That is checked here, on the
+  issuing side, rather than left for an appliance to discover when it is handed
+  something it has nowhere to put — the appliance's state record reserves the
+  profile's bound and no more, so a certificate past it is one that would be
+  accepted and then fail to persist, on a node with no way to say why. Here the
+  only variable-length input is the subject name, and the answer is to shorten
+  it.
   """
 
   require Record
@@ -33,17 +42,24 @@ defmodule Ctrld.PKI.Certificate do
           spki_fingerprint: String.t()
         }
 
+  @typedoc "Why nothing was issued."
+  @type reason :: {:certificate_too_long, String.t(), pos_integer(), pos_integer()}
+
   @doc """
   Create a self-signed certificate authority.
 
   Returns the issued certificate and the key it was created with; the caller
-  seals that key before it goes anywhere.
+  seals that key before it goes anywhere. A refusal leaves neither behind.
   """
-  @spec create_authority(String.t(), DateTime.t()) :: {issued(), :public_key.private_key()}
+  @spec create_authority(String.t(), DateTime.t()) ::
+          {:ok, {issued(), :public_key.private_key()}} | {:error, reason()}
   def create_authority(name, now) when is_binary(name) do
     key = KeyPair.generate()
     point = KeyPair.public_point(key)
-    {issue(:certificate_authority, name, point, name, key, now), key}
+
+    with {:ok, issued} <- issue(:certificate_authority, name, point, name, key, now) do
+      {:ok, {issued, key}}
+    end
   end
 
   @doc """
@@ -60,10 +76,17 @@ defmodule Ctrld.PKI.Certificate do
           :public_key.private_key(),
           DateTime.t()
         ) ::
-          issued()
+          {:ok, issued()} | {:error, reason()}
   def issue_under(kind, subject, subject_point, issuer, issuer_key, now)
       when kind != :certificate_authority do
     issue(kind, subject, subject_point, issuer, issuer_key, now)
+  end
+
+  @doc "A refusal in the words the administrator who asked for the certificate needs."
+  @spec describe(reason()) :: String.t()
+  def describe({:certificate_too_long, subject, size, bound}) do
+    "a certificate for #{inspect(subject)} encodes to #{size} bytes and the profile bounds one " <>
+      "at #{bound}; shorten the subject name"
   end
 
   defp issue(kind, subject, subject_point, issuer, issuer_key, now) do
@@ -86,14 +109,22 @@ defmodule Ctrld.PKI.Certificate do
         extensions: Profile.extensions(kind)
       )
 
-    %{
-      der: :public_key.pkix_sign(certificate, issuer_key),
-      serial: serial,
-      not_before: not_before,
-      not_after: not_after,
-      subject_common_name: subject,
-      spki_fingerprint: KeyPair.fingerprint(subject_point)
-    }
+    der = :public_key.pkix_sign(certificate, issuer_key)
+    bound = Profile.max_certificate_der_bytes()
+
+    if byte_size(der) > bound do
+      {:error, {:certificate_too_long, subject, byte_size(der), bound}}
+    else
+      {:ok,
+       %{
+         der: der,
+         serial: serial,
+         not_before: not_before,
+         not_after: not_after,
+         subject_common_name: subject,
+         spki_fingerprint: KeyPair.fingerprint(subject_point)
+       }}
+    end
   end
 
   @doc "A certificate as PEM, one encapsulated structure and nothing around it."

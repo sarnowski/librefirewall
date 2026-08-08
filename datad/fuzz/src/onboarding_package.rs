@@ -35,8 +35,10 @@
 //!   configuration reloads through the configuration reader, the device
 //!   certificate's `SubjectPublicKeyInfo` is the appliance's own, the two
 //!   certificates are distinct DER structures inside their profile bound, the
-//!   endpoint is dialable, and the document handed back is a slice of the
-//!   caller's own archive rather than a copy of something else.
+//!   endpoint names a port and an address a host can be dialled at — not the
+//!   unspecified address, a loopback, multicast or broadcast address, or one in
+//!   the reserved top of the space — and the document handed back is a slice of
+//!   the caller's own archive rather than a copy of something else.
 //! * **The verifier is load-bearing.** The same input read with a verifier that
 //!   refuses yields a package never, whatever else was right about it — so
 //!   acceptance genuinely requires the chain to have been accepted, rather than
@@ -174,6 +176,30 @@ fn assert_package(archive: &[u8], package: &Package<'_>, appliance_key: &[u8; lf
 
     let endpoint = package.endpoint();
     assert!(endpoint.port != 0, "an endpoint with no port was yielded");
+    // Dialable, which is more than well-formed: an address out of one of the
+    // five ranges that name no host would be an appliance accepted into a life
+    // of reporting an unreachable next hop.
+    let leading = endpoint.address[0];
+    assert!(
+        u32::from_be_bytes(endpoint.address) != 0,
+        "the unspecified address was yielded as an endpoint"
+    );
+    assert!(
+        leading != 127,
+        "a loopback address was yielded as an endpoint"
+    );
+    assert!(
+        leading & 0xf0 != 224,
+        "a multicast address was yielded as an endpoint"
+    );
+    assert!(
+        leading & 0xf0 != 240,
+        "an address in the reserved top of the space was yielded as an endpoint"
+    );
+    assert!(
+        endpoint.address != [255; 4],
+        "the broadcast address was yielded as an endpoint"
+    );
 
     let document = package.configuration();
     assert!(

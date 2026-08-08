@@ -42,12 +42,18 @@ defmodule Ctrld.PKI do
   Create the signing authority.
 
   The key is generated, used to self-sign, sealed, and dropped; nothing but
-  the sealed form is ever written.
+  the sealed form is ever written. A name that will not fit the profile's
+  certificate bound is refused before anything is sealed or inserted.
   """
   @spec create_authority(String.t(), DateTime.t()) ::
-          {:ok, CertificateAuthority.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, CertificateAuthority.t()} | {:error, Ecto.Changeset.t() | Certificate.reason()}
   def create_authority(name, now \\ DateTime.utc_now()) do
-    {issued, key} = Certificate.create_authority(name, now)
+    with {:ok, {issued, key}} <- Certificate.create_authority(name, now) do
+      insert_authority(issued, key, name)
+    end
+  end
+
+  defp insert_authority(issued, key, name) do
     sealed = Vault.seal(KeyPair.private_key_pem(key), CertificateAuthority.sealing_context())
 
     %CertificateAuthority{}
@@ -76,7 +82,7 @@ defmodule Ctrld.PKI do
   validates what it dialed.
   """
   @spec issue_endpoint_certificate(ChannelEndpoint.t(), DateTime.t()) ::
-          {:ok, EndpointCertificate.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, EndpointCertificate.t()} | {:error, Ecto.Changeset.t() | Certificate.reason()}
   def issue_endpoint_certificate(%ChannelEndpoint{} = endpoint, now \\ DateTime.utc_now()) do
     authority = active_authority!()
     authority_key = unseal_authority_key!(authority)
@@ -85,16 +91,20 @@ defmodule Ctrld.PKI do
     point = KeyPair.public_point(key)
     subject = ChannelEndpoint.address_text(endpoint.address)
 
-    issued =
-      Certificate.issue_under(
-        {:channel_endpoint, endpoint.address},
-        subject,
-        point,
-        authority.subject_common_name,
-        authority_key,
-        now
-      )
+    with {:ok, issued} <-
+           Certificate.issue_under(
+             {:channel_endpoint, endpoint.address},
+             subject,
+             point,
+             authority.subject_common_name,
+             authority_key,
+             now
+           ) do
+      insert_endpoint_certificate(authority, endpoint, issued, key)
+    end
+  end
 
+  defp insert_endpoint_certificate(authority, endpoint, issued, key) do
     sealed = Vault.seal(KeyPair.private_key_pem(key), EndpointCertificate.sealing_context())
 
     %EndpointCertificate{}
@@ -150,7 +160,7 @@ defmodule Ctrld.PKI do
   reaches it, because a validated request asks for nothing.
   """
   @spec issue_device_certificate(CertificateAuthority.t(), binary(), String.t(), DateTime.t()) ::
-          Certificate.issued()
+          {:ok, Certificate.issued()} | {:error, Certificate.reason()}
   def issue_device_certificate(%CertificateAuthority{} = authority, point, device_id, now) do
     Certificate.issue_under(
       :device,
