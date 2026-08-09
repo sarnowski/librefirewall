@@ -37,21 +37,21 @@ use crate::catalog::{
     HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS, INVARIANT_FAULTS,
     LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, NEIGHBOUR_ENTRIES_EXPIRED, NEIGHBOUR_REPLIES,
     NEIGHBOUR_REQUESTS, NEIGHBOUR_RESOLUTIONS_FAILED, ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES,
-    ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED, ONBOARD_SESSIONS_CLOSED, OUTBOUND_ANSWER_OVERFLOWED,
-    OUTBOUND_BYTES, OUTBOUND_DIALS, OUTBOUND_SEGMENTS_DROPPED, OUTBOUND_SESSIONS, POLICY_BYTES,
-    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
-    POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS,
-    RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS,
-    RECORDING_RECORDS_DROPPED, RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN,
-    RECORDING_SEGMENTS_CLOSED, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
-    RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
-    RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
-    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET,
-    STORE_SIGN_REFUSALS, STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST,
-    TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED,
-    TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED,
-    TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES,
-    UART_TRANSMITTER_TIMEOUTS, plain, s,
+    ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED, ONBOARD_SESSIONS_CLOSED, OUTBOUND_ANSWERS_REFUSED,
+    OUTBOUND_BYTES, OUTBOUND_DIALS, OUTBOUND_OVERFLOWED, OUTBOUND_SEGMENTS_DROPPED,
+    OUTBOUND_SESSIONS, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS,
+    POLICY_SWEEP_RUNNING, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
+    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
+    RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
+    RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
+    RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
+    RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
+    RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, STORE_GENERATION,
+    STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET, STORE_SIGN_REFUSALS,
+    STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES,
+    TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS,
+    TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES,
+    TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 use crate::rules::MAX_RULE_SERIES;
 
@@ -1147,13 +1147,16 @@ pub struct NeighbourSample {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OutboundSample {
     /// Sessions, in the order the label values are declared: opened, refused,
-    /// answered, failed.
+    /// established, ended.
     pub sessions: [u64; 4],
     pub dialled: u64,
     pub dropped_unresolved: u64,
-    /// Request bytes handed to the transport, and answer bytes kept.
+    /// Bytes handed to the transport, and bytes taken off the peer and kept.
     pub bytes: [u64; 2],
-    pub answer_overflowed: u64,
+    /// Bytes a peer sent past the room left, dropped.
+    pub overflowed: u64,
+    /// Bytes the consumer above answered with that there was no room for.
+    pub refused: u64,
 }
 
 /// What the onboarding port has done with the byte stream it carries, one field
@@ -1176,7 +1179,7 @@ pub struct OnboardSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 142;
+pub const MANAGEMENT_SLOTS: usize = 143;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1312,13 +1315,14 @@ impl ManagementSample {
         // And the sessions it originates over it.
         s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "opened")]),
         s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "refused")]),
-        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "answered")]),
-        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "failed")]),
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "established")]),
+        s(&OUTBOUND_SESSIONS, &[Label::new("outcome", "ended")]),
         plain(&OUTBOUND_DIALS),
         plain(&OUTBOUND_SEGMENTS_DROPPED),
-        s(&OUTBOUND_BYTES, &[Label::new("direction", "request")]),
-        s(&OUTBOUND_BYTES, &[Label::new("direction", "answer")]),
-        plain(&OUTBOUND_ANSWER_OVERFLOWED),
+        s(&OUTBOUND_BYTES, &[Label::new("direction", "sent")]),
+        s(&OUTBOUND_BYTES, &[Label::new("direction", "received")]),
+        plain(&OUTBOUND_OVERFLOWED),
+        plain(&OUTBOUND_ANSWERS_REFUSED),
         // And the byte stream the second listening port carries, whose counts a
         // scrape reads whether or not a session ever finished: a peer that
         // floods the port and vanishes leaves no session record at all, and
@@ -1748,7 +1752,8 @@ impl ManagementSample {
         put(&mut values, &mut at, outbound.dialled);
         put(&mut values, &mut at, outbound.dropped_unresolved);
         put_all(&mut values, &mut at, &outbound.bytes);
-        put(&mut values, &mut at, outbound.answer_overflowed);
+        put(&mut values, &mut at, outbound.overflowed);
+        put(&mut values, &mut at, outbound.refused);
 
         let onboard = &self.onboard;
         put(&mut values, &mut at, onboard.accepted);

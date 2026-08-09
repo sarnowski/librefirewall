@@ -528,6 +528,7 @@ pub mod download;
 pub mod endpoint;
 pub mod handover;
 pub mod owner;
+pub mod reconnect;
 pub mod relay;
 pub mod stats;
 pub mod tap;
@@ -557,12 +558,14 @@ pub use lfw_ip_endpoint::onboard::{
     OUTBOUND_CAPACITY as ONBOARD_OUTBOUND_CAPACITY, StreamCounters as OnboardCounters,
 };
 pub use lfw_ip_endpoint::outbound::{
-    DialFacts, Ended, OpenError, REQUEST_CAPACITY as DIAL_REQUEST_CAPACITY, Resolutions,
+    DialFacts, Ended, OpenError, RECEIVE_CAPACITY as DIAL_RECEIVE_CAPACITY, Resolutions,
+    SEND_CAPACITY as DIAL_SEND_CAPACITY,
 };
-pub use lfw_ip_endpoint::route::{RouteRefusal, Via};
+pub use lfw_ip_endpoint::route::{Hop, RouteRefusal, Via};
 pub use net_headers::Ipv4Address;
 pub use owner::{OwnershipChange, OwnershipWatch};
 pub use pipeline::{Configuration, Ownership, PolicySweep, Tracking};
+pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
 pub use relay::{
     ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered,
     DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Relay, RelayFailure, RelayPass, RelayReport,

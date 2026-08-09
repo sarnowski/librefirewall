@@ -58,8 +58,8 @@ in the *next* one.
 
 ## Metric inventory
 
-123 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 462 counter and gauge series from the 12 shards,
+124 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 463 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 100 136 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -179,21 +179,25 @@ tells a quiet link from one somebody else is on.
 ### The management port: the connection it dials out
 
 The other direction of the port. Everything above is the appliance answering something that arrived;
-these five are the one connection it **originates**, which is the channel a management plane is
-reached over.
+these six are the one connection it **originates**, which is the channel a management plane is
+reached over — a byte stream this appliance holds open, and re-dials on a backoff for as long as it
+is down.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_endpoint_outbound_answer_overflowed_total` | counter | `management` | — | Answer bytes a peer sent past the room one session keeps, dropped rather than allowed to displace what came before them. |
-| `librefirewall_endpoint_outbound_bytes_total` | counter | `management` | `direction`&nbsp;(`answer`, `request`) | Request bytes handed to the transport, and answer bytes taken from a peer and kept. |
+| `librefirewall_endpoint_outbound_answers_refused_total` | counter | `management` | — | Bytes the domain above this port answered with that there was no room for. Ours rather than a peer's: it says a first-party answer outgrew the room this end keeps for one. |
+| `librefirewall_endpoint_outbound_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Bytes handed to the transport for the stream this appliance originated, and bytes taken off its peer and kept. |
 | `librefirewall_endpoint_outbound_dials_total` | counter | `management` | — | `SYN`s the transport composed for an originated connection. |
+| `librefirewall_endpoint_outbound_overflowed_total` | counter | `management` | — | Bytes a peer sent past the room one session keeps, dropped rather than allowed to displace what came before them. Unreachable while the window is honoured, so a number here is a peer that ignored the one it was given. |
 | `librefirewall_endpoint_outbound_segments_dropped_total` | counter | `management` | — | Segments composed and then dropped for want of a hardware address for the next hop. Each is re-sent by the transport's own retransmission, so a small number is a resolution that ran while a timer was armed and a large one is a next hop that answers slowly or not at all. |
-| `librefirewall_endpoint_outbound_sessions_total` | counter | `management` | `outcome`&nbsp;(`answered`, `failed`, `opened`, `refused`) | Connections this appliance originated, by what became of each. `opened` and `refused` are what this end decided before a frame was composed; `answered` and `failed` are how the ones that went out ended. **`opened` minus `answered` minus `failed` is the session running now**, which is at most one. |
+| `librefirewall_endpoint_outbound_sessions_total` | counter | `management` | `outcome`&nbsp;(`ended`, `established`, `opened`, `refused`) | Connections this appliance originated, by what became of each. `opened` and `refused` are what this end decided before a frame was composed; `established` counts the ones whose handshake completed and `ended` the ones that finished. **`established` minus `ended` is the channel being up now**, which is one or nothing. |
 
-**These five and the console's own `dial-outcome=` record are two readings of one channel**, and
-they answer different questions: the record says how the channel ended and is written once, while
-these say how much was spent getting there. A node whose `sessions_total{outcome="failed"}` moves
-without `outbound_dials_total` moving is one refusing its own opens rather than one nothing answers.
+**These six and the console's own `dial-outcome=` records are two readings of one channel**, and
+they answer different questions: the records say how each attempt stood and are written once per
+attempt, while these say how much was spent getting there. A node whose
+`sessions_total{outcome="opened"}` climbs steadily while `established` stays put is one whose
+channel is never coming up; one whose `opened` climbs *quickly* is one whose backoff is not being
+taken.
 
 ### The management port: the onboarding port it listens on
 

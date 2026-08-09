@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ ownership=<owned|unowned>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ delegated-anchor-delivered=<true|false> delegated-anchor=<n>][ published-endpoint=<address> published-port=<n> published=<true|false>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ ownership=<owned|unowned>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ delegated-anchor-delivered=<true|false> delegated-anchor=<n>][ published-endpoint=<address> published-port=<n> published=<true|false>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-retry-in=<n> dial-retry-bound=<n>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -54,7 +54,7 @@ written waits forever:
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, exactly one `ready` reporting the channel it dialled, and **two** `ready` records per **onboarding session** that ends on its second listening port — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; the dial's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `answered` three further `ready` records follow it carrying the counts that place the failure — a fourth where the station acknowledged a number that was never sent. A session's carries `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`, always followed by a second `ready` carrying the port's own totals as `onboard-accepted=`, `onboard-forgotten=`, `onboard-overflowed=` and `onboard-refused=`, and then by a `ready` carrying the refusal group where this appliance was the one that ended it. A `ready` carrying the refusal group on its own is one of the three narrow refusals this domain reports without declining to start |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, one `ready` per **attempt** on the channel it dials, and **two** `ready` records per **onboarding session** that ends on its second listening port — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; an attempt's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `established` four further `ready` records follow it carrying the counts that place the failure and the wait before the next attempt — a fifth where the station acknowledged a number that was never sent. An appliance with nowhere to dial emits no such record at all and says so once with `cause=dial-endpoint-unpublished` instead. A session's carries `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`, always followed by a second `ready` carrying the port's own totals as `onboard-accepted=`, `onboard-forgotten=`, `onboard-overflowed=` and `onboard-refused=`, and then by a `ready` carrying the refusal group where this appliance was the one that ended it. A `ready` carrying the refusal group on its own is one of the four narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused` | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`, and the two after it carry `start=` and `sectors=`, one per recording, which is the only place an operator learns where a recording is |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them. Afterwards, **two more `ready` records per onboarding package it installs**, and one carrying the refusal group per package it will not | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, the second carries `fingerprint=` and the third carries `published-endpoint=`, `published-port=` and `published=` — where this domain has told the domain that opens the management channel to dial, which is nowhere on an appliance nobody has taken. The first two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. An installed package adds a `ready` carrying `anchor-fingerprint=` and then one carrying `adopted-endpoint=`, `adopted-port=` and `adopted-generation=` — the authority the appliance has just accepted and where it will now answer. A refused one adds a single `ready` carrying the refusal group, which is a package this domain would not take and **not** a domain that failed to start. `refused` carries the refusal group |
@@ -309,44 +309,57 @@ node: an operator holding a silent appliance still has only the external act.
   address succeeds is the dialling domain's to say. This line is the store domain stating what it
   put where the other domain reads it — which is why it appears on every boot, owned or not, rather
   than only where there is somewhere to go.
-- `dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>` — **the
-  channel this appliance reached *out* with, and what became of it.** Every other record on this
-  channel is about traffic the appliance answered; this one is about a connection it originated, so
-  it is the one place an operator sees the management port acting rather than replying.
+- `dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>` — **one
+  attempt on the channel this appliance reaches *out* with, and how it stands.** Every other record
+  on this channel is about traffic the appliance answered; this one is about a connection it
+  originated, so it is the one place an operator sees the management port acting rather than
+  replying.
 
-  It appears **exactly once per boot**, whichever way the channel went, and never again: a channel
-  is reported when it is decided, and a decided channel is not re-opened. `dial-destination=` and
-  `dial-port=` are where it went, spelled as an address so that this line and the configuration
-  document's own `gateway=` compare as one string against another. `dial-attempts=` is how many
-  sessions were spent on it — the appliance's own bound, not a peer's, so a channel that never came
-  up ends after a fixed number of tries rather than waiting on a station that will not answer.
+  It appears **once per attempt**, and the appliance keeps attempting: the channel is a connection
+  it holds open, so every close is answered by another attempt for as long as the node is up. A
+  channel that is down therefore writes a record set, waits, and writes another — which is what an
+  operator watching a node come back needs to see, and what a single verdict per boot could never
+  say. `dial-destination=` and `dial-port=` are where it went, spelled as an address so that this
+  line and the configuration document's own `gateway=` compare as one string against another; they
+  are what the appliance's owner installed, so an appliance nobody owns writes no such record at
+  all (below). `dial-attempts=` is **which attempt this record is about**, counted from one over
+  the boot: a first record reading `1` and a later one reading `40` is a channel that has been down
+  a while, and a number that never moves is a counter that is not counting.
 
-  `dial-outcome=` is the last session's own end, and it is one of 13 outcomes:
+  `dial-outcome=` is how that attempt stands, and it is one of 13 outcomes:
 
   | dial outcome | what it means |
   |---|---|
-  | `answered` | the station answered and both halves closed. The channel works. |
+  | `established` | the connection came up and the appliance is holding it. **The channel works**, and this is the only outcome that is not an ending: the appliance says nothing further about this attempt unless it goes away. |
+  | `closed-by-peer` | the far end closed its half and the connection finished. A management channel is meant to persist, so **a server that hangs up is a thing to go and look at** rather than a healthy end — and the appliance re-dials it. |
   | `next-hop-unreachable` | every request for the next hop's hardware address went unanswered, so no frame could be addressed at all — **nothing on this link claims that address**. A link where somebody answers for a *different* address ends here too: the appliance learns what it asked about and nothing else, and the refused-reply counts below say which of the two it was. |
   | `no-room-to-resolve` | the neighbour table held only live entries, so the next hop could not even be asked about. |
   | `unanswered` | a station claimed the next hop's address, the handshake went out, and **nothing whatever came back** before the retransmission budget ran out. Either nothing holds the address that answered, or something does and it is not listening in a way that says so. |
   | `reset-by-peer` | a station answered the handshake with a reset. **Somebody is there and is refusing this port** — the clearest refusal there is, and the fastest. |
-  | `unacceptable-acknowledgement` | a station answered the handshake acknowledging a sequence number the appliance never sent. That draws a reset and, per the arrival order, leaves the dial standing rather than cancelling it, so the channel then runs its attempts out — a single segment naming a number nobody sent cannot cancel a connection this node originated. The two numbers are on the `dial-acknowledged=` record below, and what they usually mean is a station replaying an old exchange, one composing a handshake it never received, or a middlebox rewriting the field. |
-  | `connection-lost` | the connection went away and **none of the three above explains it**: segments arrived that advanced nothing, or this node's own table took the slot back. It is the residual and not a class — read the counts below, which say what did arrive. |
+  | `unacceptable-acknowledgement` | a station answered the handshake acknowledging a sequence number the appliance never sent. That draws a reset and, per the arrival order, leaves the dial standing rather than cancelling it, so the attempt then runs its retransmission budget out — a single segment naming a number nobody sent cannot cancel a connection this node originated. The two numbers are on the `dial-acknowledged=` record below, and what they usually mean is a station replaying an old exchange, one composing a handshake it never received, or a middlebox rewriting the field. |
+  | `connection-lost` | the connection went away and **none of the causes above explains it**: segments arrived that advanced nothing, or this node's own table took the slot back. It is the residual and not a class — read the counts below, which say what did arrive. |
   | `no-room-to-dial` | this node's own transport had no room in its table and nothing in it could be taken back. A table under pressure is a flood; what to look at is this node. |
-  | `connection-already-open` | this node's own transport already held a connection on the same peer address and port — the one case its table cannot tell two connections apart in. Not a channel that ran out of attempts: a session gives its connection back when it ends, so each attempt meets a table the one before it left as it found it. |
+  | `connection-already-open` | this node's own transport already held a connection on the same peer address and port — the one case its table cannot tell two connections apart in. A session gives its connection back when it ends, so each attempt meets a table the one before it left as it found it. |
   | `syn-did-not-fit` | the handshake did not fit the storage offered for it. **This appliance's own defect**, and it should never appear. |
   | `session-already-running` | a session was already running on this port when another was asked for. This appliance's own state. |
-  | `destination-unroutable` | no next hop could be chosen at all: the destination, this port's prefix, or its gateway makes the address unreachable. Nothing a peer does changes it, and what to look at is this appliance's management address, prefix and gateway. |
-  | `probe-too-long` | what the channel carries was longer than the room a session holds for it. This appliance's own defect. |
+  | `destination-unroutable` | no next hop could be chosen at all: the destination, this port's prefix, or its gateway makes the address unreachable. Nothing a peer does changes it, and what to look at is this appliance's management address, prefix and gateway — which the appliance will go on re-reading, so a document that fixes it is picked up without a reboot. |
 
-  **Where the outcome is not `answered`, three further records follow it** — and a fourth where the
-  station acknowledged a number that was never sent. They carry the counts that place the fault
+  **Where the outcome is not `established`, four further records follow it** — and a fifth where
+  the station acknowledged a number that was never sent. They carry the counts that place the fault
   without a capture, because a deployed node has no shell and the console is the only place they can
   be read. They are separate records rather than a wider one because a record carries four numbers
-  and this is more than four facts; a healthy boot emits none of them, because there is nothing to
-  place.
+  and this is more than four facts; an attempt that came up emits none of them, because there is
+  nothing to place and nothing to wait for.
+
+  **An appliance with nowhere to dial writes none of this**, and says so once instead: a
+  `state=ready` record carrying `cause=dial-endpoint-unpublished`. Nowhere to dial is a state and
+  not a failed attempt — nothing is counted, nothing is scheduled, and the first attempt opens the
+  moment a destination appears — so an operator holding a node that opens no management session
+  reads that line beside the store domain's own `published=false` and knows the node has no owner
+  rather than an unreachable one.
 - `dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n>
-  dial-learned=<n>` — **where the frames actually went, and what the link made of the asking.**
+  dial-learned=<n>` — **where this attempt's frames actually went, and what the link made of the
+  asking.**
   `dial-next-hop=` is the station they were handed to, which is the destination itself where it
   sits inside this port's prefix and the port's gateway where it does not; `dial-next-hop-via=`
   says which of the two, and it is on the record because the address alone cannot say — a gateway
@@ -354,11 +367,11 @@ node: an operator holding a silent appliance still has only the external act.
   different halves of the configuration to go and read. `none` is the third answer and means **no
   next hop was chosen at all**, which is what `destination-unroutable` reports: the address beside
   it is then where the appliance meant to go rather than a station it picked. `dial-requests=` is
-  how many requests for that station's hardware address the channel put on the wire, and
+  how many requests for that station's hardware address this attempt put on the wire, and
   `dial-learned=` how many replies resolved it. **Requests without a learned reply is the whole of
   what `next-hop-unreachable` means.**
 - `dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n>
-  dial-reply-contradicted=<n>` — **the replies that reached this port during the channel and became
+  dial-reply-contradicted=<n>` — **the replies that reached this port during this attempt and became
   no entry, by reason.** It is the other half of the line above: requests going out with nothing
   learned and all four of these at zero is a silent link, and requests going out with these moving
   is a link where **somebody is answering and it is not the next hop**. `unsolicited` is a reply
@@ -367,12 +380,24 @@ node: an operator holding a silent appliance still has only the external act.
   may be addressed to; `contradicted` one whose own claim about its sender the frame carrying it
   disagreed with.
 - `dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>` —
-  **what the channel's own connections did on the wire.** `dial-syns=` counts every handshake the
-  transport composed, retransmissions and every attempt included. `dial-answered=` is the fact the
-  tokens rest on: a budget that ran out with it `false` is silence, and one that ran out with it
-  `true` is a station that said something. The two reset counts say which way it said it — one
-  received ends a connection, one sent is this appliance refusing a segment the protocol says must
-  be refused that way.
+  **what this attempt's own connection did on the wire.** `dial-syns=` counts every handshake the
+  transport composed for it, retransmissions included. `dial-answered=` is the fact the tokens rest
+  on: a budget that ran out with it `false` is silence, and one that ran out with it `true` is a
+  station that said something. The two reset counts say which way it said it — one received ends a
+  connection, one sent is this appliance refusing a segment the protocol says must be refused that
+  way.
+- `dial-retry-in=<n> dial-retry-bound=<n>` — **how long until the next attempt, and how far the
+  backoff has climbed.** Both in milliseconds. The appliance re-dials on bounded exponential
+  backoff with full jitter: the wait is drawn uniformly between zero and the bound, and the bound
+  starts at one second, doubles after every attempt that fails, and stops at five minutes. So
+  `dial-retry-in=` alone is misleading — a short wait beside a five-minute bound is a node that has
+  been failing for a long time and drew a lucky number — and it is the pair that says where the
+  schedule stands.
+
+  **The bound only goes back to one second when the appliance and its server have actually agreed a
+  greeting**, not merely when a connection comes up. A server that accepts and immediately closes
+  cannot shorten this, which is what keeps such a server from being handed a redial loop. The jitter
+  is drawn per appliance and per boot, so a fleet disconnected together does not come back together.
 - `dial-acknowledged=<n> dial-expected=<n>` — **the two sequence numbers behind an unacceptable
   acknowledgement**: what the station claimed, and what this appliance had actually sent. Written
   in decimal, so they compare digit for digit against a capture of the same exchange. This record
@@ -599,7 +624,7 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 19 the `management` domain raises, 39
+`nic-driver` domain raises, 30 the `clock` domain raises, 20 the `management` domain raises, 39
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 143 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
@@ -668,7 +693,7 @@ metrics surface.
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
-**`management`.** Twenty tokens, and the four groups differ in what they mean for the domain.
+**`management`.** Twenty-one tokens, and the five groups differ in what they mean for the domain.
 
 The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
 its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
@@ -689,6 +714,14 @@ is a **build fact rather than a run-time condition** (the table is a fixed size)
 once at bring-up and never again, and the port carries on rather than refusing to start. An operator
 seeing it should read it as "this image cannot serve its recordings", not as a fault in the recorder,
 which is unaffected and still writing them to the medium.
+
+The sixth rides on **`state=ready`** as well, and it is not a failure at all: this appliance has
+nowhere to dial. An appliance learns where its management plane is when it takes an owner, so an
+appliance nobody owns has no destination to open a channel to — and saying so once is what separates
+that node from one whose channel is failing silently. It is stated once per boot and the moment a
+destination is published the first attempt opens, so a node that is adopted while running dials
+without being rebooted. Read it beside the store domain's own `published=false`, which is the same
+fact from the domain that holds the record.
 
 The last thirteen ride on **`state=ready`** too, and they are the onboarding port's: one per way a
 session on it can fail. They are read with the `onboard-ended=refused` record beside them, which
@@ -712,14 +745,15 @@ Every one of the thirteen ends the connection an administrator was holding, and 
 touches anything else: the metric surface, the recordings, the configuration surface and the
 dataplane are unaffected, because the port they are on carries none of those.
 
-`signalled=` is always `false` on all nineteen: no device was told to stop, because none was told
+`signalled=` is always `false` on all twenty-one: no device was told to stop, because none was told
 anything.
 
 | group | tokens |
 |---|---|
-| the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the two 64-bit draws failed) |
+| the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the three 64-bit draws failed) |
 | the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused), `clock-implausible-epoch` (the nanoseconds refused) |
 | the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
+| nowhere to dial (a `ready` record, no `detail=`; the port serves everything else and opens no channel) | `dial-endpoint-unpublished` |
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
 | an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown` |
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |

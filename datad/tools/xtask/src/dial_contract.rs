@@ -1,5 +1,5 @@
-//! The one record the appliance owes about the channel it dials out of its
-//! management port.
+//! The records the appliance owes about **one attempt** on the channel it dials
+//! out of its management port.
 //!
 //! [`crate::management_contract`]'s pattern on the other half of that port. There
 //! the harness knows the numbers in advance because it put them on the wire;
@@ -9,21 +9,30 @@
 //! else. Each of those has exactly one right outcome, and this is where the
 //! appliance's own account of the channel is held to it.
 //!
-//! # The record is one, and that is half the contract
+//! # The attempt is the unit, and that is half the contract
 //!
-//! A channel is reported when it is decided and a decided channel is never
-//! re-opened, so the console carries exactly one `dial-outcome=` record per
-//! boot. Two would be a domain that reopened a channel it had already given a
-//! verdict on, and an operator reading the first would have been told something
-//! that later stopped being true. So the count is asserted, not just the content.
+//! The channel is a persistent connection and is re-dialled for as long as it is
+//! down, so the console carries a record set **per attempt** rather than one
+//! verdict per boot. What this contract reads is the **first** set: it is the one
+//! whose station behaviour the run decided, its `dial-attempts=1` is what says
+//! the appliance counted from its first try, and reading the first rather than
+//! the last is what keeps the verdict from depending on how long the emulator
+//! happened to run.
 //!
-//! # What an attempt count catches that a token cannot
+//! # What an attempt number catches that a token cannot
 //!
-//! The token says how the last session ended; the attempt count says how many
-//! the appliance spent getting there. A channel that came up on the first dial
-//! and one that came up after two failures are the same token and a different
-//! node, and a channel that failed *without* spending its attempts is a bound
-//! that did not hold. Both are stated.
+//! The token says how the attempt ended; the number says which attempt it was.
+//! An appliance whose first record already reads `dial-attempts=4` has spent
+//! three attempts nobody heard about, and one whose every record reads `1` has a
+//! counter that never moves — which would make a channel failing for an hour
+//! read exactly like one failing for the first time.
+//!
+//! # And what the wait catches that neither does
+//!
+//! A channel that re-dials without a schedule is a flood, and a schedule that
+//! never climbs is the same flood one attempt later. So the wait after the first
+//! failure is read as well: it is drawn below the schedule's floor, and the
+//! bound beside it is what says where the backoff stands.
 //!
 //! # And what the counts catch that a token cannot
 //!
@@ -59,7 +68,7 @@ const PORT: &str = "dial-port";
 const ATTEMPTS: &str = "dial-attempts";
 const OUTCOME: &str = "dial-outcome";
 
-/// The fields of the three records a failed channel adds, and of the fourth an
+/// The fields of the four records a failed attempt adds, and of the fifth an
 /// unacceptable acknowledgement adds after them.
 const NEXT_HOP: &str = "dial-next-hop";
 const NEXT_HOP_VIA: &str = "dial-next-hop-via";
@@ -75,6 +84,8 @@ const RESETS_SENT: &str = "dial-resets-sent";
 const ANSWERED: &str = "dial-answered";
 const ACKNOWLEDGED: &str = "dial-acknowledged";
 const EXPECTED: &str = "dial-expected";
+const RETRY_IN: &str = "dial-retry-in";
+const RETRY_BOUND: &str = "dial-retry-bound";
 
 /// What a count on one of those records must be.
 ///
@@ -138,6 +149,15 @@ pub(crate) struct DialAccount {
     /// obliges it to be present and to carry exactly what the station on the far
     /// end read off the wire, which the run supplies.
     pub acknowledged: bool,
+    /// The bound the wait after this attempt was drawn below, in milliseconds.
+    ///
+    /// Stated **exactly**, because it is the schedule's own floor and nothing a
+    /// timer chooses: the first failure of a boot is followed by a wait drawn
+    /// below one second, whatever happened on the wire. The delay itself is not
+    /// a field here — it is a draw, so no number states it — and what is checked
+    /// about it instead is that it lies inside the bound, which is the whole
+    /// meaning of drawing one.
+    pub retry_bound: Count,
 }
 
 /// What the appliance must say about the channel, given how the station on the
@@ -158,41 +178,42 @@ pub(crate) struct DialVerdict {
     pub account: Option<DialAccount>,
 }
 
-/// Whether the appliance has decided the channel and said **all** of what that
-/// decision owes.
+/// Whether the appliance has reported its **first** attempt and said all of what
+/// that report owes.
 ///
 /// The observable a boot with a misbehaving station waits on. Such a boot never
-/// sees a channel close — that is what makes it the boot it is — so what says
-/// the appliance has finished is its own records, which are events rather than a
-/// duration.
+/// sees a channel come up — that is what makes it the boot it is — and it never
+/// sees one give up either, the channel re-dialling for as long as the appliance
+/// is running. So what says there is something to judge is the appliance's own
+/// first record set, which is an event rather than a duration.
 ///
-/// **The whole set and not the first of it.** A failed channel reports the
-/// outcome and then the three records that place it, and the domain emits them
-/// in one pass — but a console renders a ring at 115200 baud, so a run that
-/// stopped at the outcome could kill the emulator with the evidence still in the
-/// UART and then fail for want of the very records the appliance had already
-/// written. Waiting on the last of them is waiting on the observable this
-/// contract is about to judge.
+/// **The whole set and not the first line of it.** A failed attempt reports the
+/// outcome and then the records that place it, and the domain emits them in one
+/// pass — but a console renders a ring at 115200 baud, so a run that stopped at
+/// the outcome could kill the emulator with the evidence still in the UART and
+/// then fail for want of the very records the appliance had already written.
+/// Waiting on the last of them is waiting on the observable this contract is
+/// about to judge.
 pub(crate) fn reported(serial: &[u8]) -> bool {
     let text = String::from_utf8_lossy(serial);
-    let [record] = records(&text)[..] else {
+    let Some(record) = records(&text).first().copied() else {
         return false;
     };
     // Which record the appliance emits last is decided by the outcome, and the
-    // three cases are the three shapes of the report: a channel that came up
+    // three cases are the three shapes of the report: an attempt that came up
     // places no fault and owes nothing further, one that failed places it in
-    // three more records, and one a station misacknowledged adds the pair it
+    // four more records, and one a station misacknowledged adds the pair it
     // claimed after those.
     let last = match value(record, OUTCOME) {
-        Some(token) if token == DialOutcome::Answered.name() => return true,
+        Some(token) if token == DialOutcome::Established.name() => return true,
         Some(token) if token == DialOutcome::UnacceptableAcknowledgement.name() => ACKNOWLEDGED,
-        _ => SYNS,
+        _ => RETRY_IN,
     };
     !ours_carrying(&text, last).is_empty()
 }
 
-/// Judge the appliance's record of its dialled channel against what the station
-/// on the far end of it did.
+/// Judge the appliance's record of the **first attempt** on its dialled channel
+/// against what the station on the far end of it did.
 ///
 /// # Errors
 /// The verdict, naming the field and the two values, and where the whole run log
@@ -206,14 +227,13 @@ pub(crate) fn judge(
 ) -> Result<String, String> {
     let text = String::from_utf8_lossy(serial);
     let ours = records(&text);
-    let [record] = ours[..] else {
+    let Some(record) = ours.first().copied() else {
         return Err(format!(
-            "the console carried {} `{}` record(s) for the management domain naming a dialled \
-             channel, and a boot produces exactly one: the channel is reported when it is decided \
-             and a decided channel is never re-opened. None means the domain never decided it — \
-             it was left with a session running, or it never reached a committed generation to \
-             open one from\n  full run log: {}",
-            ours.len(),
+            "the console carried no `{}` record for the management domain naming a dialled \
+             channel, and a boot produces at least one per attempt: none means the domain never \
+             opened an attempt — it was left with one running, it never reached a committed \
+             generation to open one from, or it was told nowhere to dial and said so with a \
+             `cause=dial-endpoint-unpublished` line instead\n  full run log: {}",
             LIFECYCLE_PREFIX.trim_end(),
             log.display()
         ));
@@ -243,10 +263,11 @@ pub(crate) fn judge(
     let attempts = number(record, ATTEMPTS, log)?;
     if attempts != owed.attempts {
         return Err(format!(
-            "the appliance spent {attempts} session(s) on the channel and this station's \
-             behaviour obliges {}. The count is what separates a channel that came up at once \
-             from one that came up after failures, and a channel that failed short of its bound \
-             is that bound not holding\n  the record: {record:?}\n  full run log: {}",
+            "the appliance's first record about this channel says it was attempt {attempts} and \
+             this station's behaviour obliges {}. The number is what tells a node's first try \
+             from its hundredth, so a first record that does not say `1` is either a counter \
+             that started somewhere else or attempts nobody was told about\n  the record: \
+             {record:?}\n  full run log: {}",
             owed.attempts,
             log.display()
         ));
@@ -255,7 +276,7 @@ pub(crate) fn judge(
     let stated = read(record, OUTCOME, log)?;
     if stated != owed.outcome.name() {
         return Err(format!(
-            "the appliance reported the channel as `{stated}` and this station's behaviour \
+            "the appliance reported this attempt as `{stated}` and this station's behaviour \
              obliges `{}`. The token is a closed vocabulary and each of its values names a \
              different thing to go and look at, so the wrong one is an operator sent to the \
              wrong place\n  the record: {record:?}\n  full run log: {}",
@@ -265,43 +286,47 @@ pub(crate) fn judge(
     }
 
     let Some(account) = owed.account else {
-        // A channel that came up owes no counts, and must carry none: the extra
+        // An attempt that came up owes no counts, and must carry none: the extra
         // records exist to place a failure, and a healthy boot emitting them
         // would be a console saying something happened that did not.
-        for key in [NEXT_HOP, UNSOLICITED, SYNS, ACKNOWLEDGED] {
+        for key in [NEXT_HOP, UNSOLICITED, SYNS, RETRY_IN, ACKNOWLEDGED] {
             if let Some(found) = ours_carrying(&text, key).first() {
                 return Err(format!(
                     "the channel came up and the console carries a `{key}=` record anyway: a \
-                     healthy boot places no fault, so these records are emitted only where there \
-                     is one\n  the record: {found:?}\n  full run log: {}",
+                     healthy boot places no fault and waits for nothing, so these records are \
+                     emitted only where there is one\n  the record: {found:?}\n  full run \
+                     log: {}",
                     log.display()
                 ));
             }
         }
         return Ok(format!(
-            "the appliance reported its channel to {expected}:{port} as `{stated}` after \
-             {attempts} attempt(s)"
+            "the appliance reported its channel to {expected}:{port} as `{stated}` on attempt \
+             {attempts}"
         ));
     };
     let placed = judge_account(&text, log, account, claimed)?;
     Ok(format!(
-        "the appliance reported its channel to {expected}:{port} as `{stated}` after {attempts} \
-         attempt(s), and placed it: {placed}"
+        "the appliance reported attempt {attempts} on its channel to {expected}:{port} as \
+         `{stated}`, and placed it: {placed}"
     ))
 }
 
-/// Hold the three records a failed channel adds — and the fourth an unacceptable
+/// Hold the four records a failed attempt adds — and the fifth an unacceptable
 /// acknowledgement adds — to what this station's behaviour obliges.
 ///
 /// Each record is read on its own, by a key only it carries, so a missing one is
-/// reported as the record it is rather than as a field of another.
+/// reported as the record it is rather than as a field of another. The **first**
+/// of each key is read, which is the first attempt's: the domain emits a set per
+/// attempt in order, so the first of every key belongs to the same attempt as
+/// the first outcome.
 fn judge_account(
     text: &str,
     log: &Path,
     owed: DialAccount,
     claimed: Option<(u32, u32)>,
 ) -> Result<String, String> {
-    let route = only(text, log, NEXT_HOP)?;
+    let route = first(text, log, NEXT_HOP)?;
     let (address, via) = owed.next_hop;
     let expected = address.map(|octet| octet.to_string()).join(".");
     let stated = read(&route, NEXT_HOP, log)?;
@@ -326,7 +351,7 @@ fn judge_account(
     counted(&route, REQUESTS, owed.requests, log)?;
     counted(&route, LEARNED, owed.learned, log)?;
 
-    let unlearned = only(text, log, UNSOLICITED)?;
+    let unlearned = first(text, log, UNSOLICITED)?;
     for (key, owed) in [UNSOLICITED, REBINDING, NOT_UNICAST, CONTRADICTED]
         .into_iter()
         .zip(owed.unlearned)
@@ -334,7 +359,7 @@ fn judge_account(
         counted(&unlearned, key, owed, log)?;
     }
 
-    let segments = only(text, log, SYNS)?;
+    let segments = first(text, log, SYNS)?;
     counted(&segments, SYNS, owed.syns, log)?;
     counted(&segments, RESETS_RECEIVED, owed.resets_received, log)?;
     counted(&segments, RESETS_SENT, owed.resets_sent, log)?;
@@ -363,7 +388,7 @@ fn judge_account(
                 log.display()
             ));
         };
-        let record = only(text, log, ACKNOWLEDGED)?;
+        let record = first(text, log, ACKNOWLEDGED)?;
         counted(
             &record,
             ACKNOWLEDGED,
@@ -382,8 +407,27 @@ fn judge_account(
         }
         String::new()
     };
+    // And the wait the schedule drew for the attempt after this one. The bound
+    // is exact — it is the schedule's own floor and no timer chooses it — and
+    // the delay is held to the interval rather than to a value, a draw having no
+    // number a contract could state.
+    let retry = first(text, log, RETRY_IN)?;
+    counted(&retry, RETRY_BOUND, owed.retry_bound, log)?;
+    let delay = number(&retry, RETRY_IN, log)?;
+    let bound = number(&retry, RETRY_BOUND, log)?;
+    if delay > bound {
+        return Err(format!(
+            "the appliance says it will wait {delay} ms before its next attempt and that it drew \
+             that below a bound of {bound} ms. A full-jitter draw lies inside its bound by \
+             definition, so a delay past one is a schedule that is not drawing what it says it \
+             is — and a fleet disconnected together would come back together\n  the record: \
+             {retry:?}\n  full run log: {}",
+            log.display()
+        ));
+    }
     Ok(format!(
-        "{} request(s) and {} learned, {} handshake(s), {} reset(s) in and {} out, answered={}{claimed}",
+        "{} request(s) and {} learned, {} handshake(s), {} reset(s) in and {} out, \
+         answered={}{claimed}, and it waits {delay} ms of a {bound} ms bound before trying again",
         read(&route, REQUESTS, log)?,
         read(&route, LEARNED, log)?,
         read(&segments, SYNS, log)?,
@@ -393,21 +437,22 @@ fn judge_account(
     ))
 }
 
-/// The one management record carrying `key`, refusing none and refusing two.
+/// The **first** management record carrying `key`, refusing none.
 ///
-/// A record per key rather than a search of everything: each of the four carries
-/// a key no other does, and a boot emitting one of them twice would be a domain
-/// that decided a channel twice — the same defect the outcome record's own count
-/// exists to catch.
-fn only(text: &str, log: &Path, key: &str) -> Result<String, String> {
+/// A record per key rather than a search of everything: each of the five carries
+/// a key no other does. The first rather than the only one, because the channel
+/// re-dials for as long as it is down and each attempt writes its own set — so
+/// what is read here is the set belonging to the first outcome, and a later
+/// attempt's copy of the same key is a later attempt rather than a domain that
+/// reported one twice.
+fn first(text: &str, log: &Path, key: &str) -> Result<String, String> {
     let found = ours_carrying(text, key);
-    let [record] = &found[..] else {
+    let Some(record) = found.first() else {
         return Err(format!(
-            "the console carried {} management record(s) with a `{key}=` field, and a channel \
-             that failed produces exactly one: none means the appliance reported a token with no \
+            "the console carried no management record with a `{key}=` field, and an attempt that \
+             failed produces one: its absence means the appliance reported a token with no \
              evidence beside it, which is a failure an operator cannot act on without the \
              wire\n  full run log: {}",
-            found.len(),
             log.display()
         ));
     };
@@ -429,7 +474,8 @@ fn counted(record: &str, key: &str, owed: Count, log: &Path) -> Result<(), Strin
     ))
 }
 
-/// Every lifecycle record of the management domain that names a dialled channel.
+/// Every lifecycle record of the management domain that names an attempt on the
+/// dialled channel, in the order the appliance emitted them.
 fn records(text: &str) -> Vec<&str> {
     ours(text)
         .into_iter()
@@ -484,7 +530,7 @@ mod tests {
     const STATION: ([u8; 4], u16) = ([10, 0, 2, 2], 4433);
 
     const CAME_UP: DialVerdict = DialVerdict {
-        outcome: DialOutcome::Answered,
+        outcome: DialOutcome::Established,
         attempts: 1,
         account: None,
     };
@@ -500,9 +546,10 @@ mod tests {
         resets_sent: Count::Exactly(0),
         answered: false,
         acknowledged: false,
+        retry_bound: Count::Exactly(1_000),
     };
 
-    /// The three records a failed channel adds, in the order it emits them.
+    /// The four records a failed attempt adds, in the order it emits them.
     fn placed() -> String {
         String::from(
             "LFW-PD domain=management state=ready dial-next-hop=10.0.2.2 \
@@ -510,7 +557,9 @@ mod tests {
              LFW-PD domain=management state=ready dial-reply-unsolicited=0 \
              dial-reply-rebinding=0 dial-reply-not-unicast=0 dial-reply-contradicted=0\r\n\
              LFW-PD domain=management state=ready dial-syns=18 dial-resets-received=0 \
-             dial-resets-sent=0 dial-answered=false\r\n",
+             dial-resets-sent=0 dial-answered=false\r\n\
+             LFW-PD domain=management state=ready dial-retry-in=317 \
+             dial-retry-bound=1000\r\n",
         )
     }
 
@@ -541,12 +590,12 @@ mod tests {
 
     #[test]
     fn a_channel_reported_as_this_station_behaved_is_accepted() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "answered");
+        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "established");
         let proved =
             judge(capture.as_bytes(), log(), CAME_UP, STATION, None).expect("the right record");
         assert!(proved.contains("10.0.2.2:4433"), "{proved}");
-        assert!(proved.contains("`answered`"), "{proved}");
-        assert!(proved.contains("1 attempt"), "{proved}");
+        assert!(proved.contains("`established`"), "{proved}");
+        assert!(proved.contains("attempt 1"), "{proved}");
     }
 
     /// Every token of the vocabulary is readable back as itself, so a contract
@@ -554,17 +603,17 @@ mod tests {
     #[test]
     fn each_outcome_is_held_to_its_own_token() {
         for owed in DialOutcome::ALL {
-            let capture = booted() + &dialled("10.0.2.2", 4433, 3, owed.name());
+            let capture = booted() + &dialled("10.0.2.2", 4433, 1, owed.name());
             let verdict = DialVerdict {
                 outcome: owed,
-                attempts: 3,
+                attempts: 1,
                 account: None,
             };
             judge(capture.as_bytes(), log(), verdict, STATION, None).expect("its own token");
             for other in DialOutcome::ALL.into_iter().filter(|other| *other != owed) {
                 let wrong = DialVerdict {
                     outcome: other,
-                    attempts: 3,
+                    attempts: 1,
                     account: None,
                 };
                 let refused = judge(capture.as_bytes(), log(), wrong, STATION, None)
@@ -575,49 +624,59 @@ mod tests {
         }
     }
 
+    /// A first record that does not name the first attempt is attempts nobody
+    /// was told about, and is refused naming both numbers.
     #[test]
-    fn a_channel_that_spent_the_wrong_number_of_attempts_names_both_counts() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 2, "connection-lost");
+    fn a_first_record_naming_the_wrong_attempt_names_both_numbers() {
+        let capture = booted() + &dialled("10.0.2.2", 4433, 4, "connection-lost");
         let owed = DialVerdict {
             outcome: DialOutcome::ConnectionLost,
-            attempts: 3,
+            attempts: 1,
             account: None,
         };
         let verdict =
-            judge(capture.as_bytes(), log(), owed, STATION, None).expect_err("two of three");
-        assert!(verdict.contains("spent 2 session(s)"), "{verdict}");
-        assert!(verdict.contains("obliges 3"), "{verdict}");
+            judge(capture.as_bytes(), log(), owed, STATION, None).expect_err("the fourth attempt");
+        assert!(verdict.contains("was attempt 4"), "{verdict}");
+        assert!(verdict.contains("obliges 1"), "{verdict}");
     }
 
     #[test]
     fn a_channel_taken_to_another_address_or_port_is_refused_by_the_field_that_moved() {
-        let elsewhere = booted() + &dialled("10.0.2.3", 4433, 1, "answered");
+        let elsewhere = booted() + &dialled("10.0.2.3", 4433, 1, "established");
         let verdict = judge(elsewhere.as_bytes(), log(), CAME_UP, STATION, None)
             .expect_err("another address");
         assert!(verdict.contains("dialled 10.0.2.3"), "{verdict}");
 
-        let other_port = booted() + &dialled("10.0.2.2", 443, 1, "answered");
+        let other_port = booted() + &dialled("10.0.2.2", 443, 1, "established");
         let verdict =
             judge(other_port.as_bytes(), log(), CAME_UP, STATION, None).expect_err("another port");
         assert!(verdict.contains("dialled port 443"), "{verdict}");
     }
 
-    /// A channel is decided once. Two records mean a domain that gave a verdict
-    /// and then gave another, which makes the first a thing an operator was told
-    /// and that stopped being true.
+    /// A channel that keeps trying keeps reporting, and **the first record is
+    /// the one judged**: a later attempt's outcome never stands in for the
+    /// first, which is what keeps the verdict from depending on how long the
+    /// emulator happened to run.
     #[test]
-    fn a_channel_reported_twice_is_refused_as_readily_as_one_never_reported() {
-        let twice = booted()
-            + &dialled("10.0.2.2", 4433, 1, "answered")
+    fn a_later_attempt_never_stands_in_for_the_first_and_no_record_at_all_is_refused() {
+        let again = booted()
+            + &dialled("10.0.2.2", 4433, 1, "established")
             + &dialled("10.0.2.2", 4433, 2, "connection-lost");
+        judge(again.as_bytes(), log(), CAME_UP, STATION, None).expect("the first attempt");
+
+        // And the other way round: a first attempt that failed is not excused by
+        // a second that came up.
+        let recovered = booted()
+            + &dialled("10.0.2.2", 4433, 1, "connection-lost")
+            + &dialled("10.0.2.2", 4433, 2, "established");
         let verdict =
-            judge(twice.as_bytes(), log(), CAME_UP, STATION, None).expect_err("two records");
-        assert!(verdict.contains("carried 2"), "{verdict}");
+            judge(recovered.as_bytes(), log(), CAME_UP, STATION, None).expect_err("the first");
+        assert!(verdict.contains("`connection-lost`"), "{verdict}");
 
         let never = booted();
         let verdict =
             judge(never.as_bytes(), log(), CAME_UP, STATION, None).expect_err("no record");
-        assert!(verdict.contains("carried 0"), "{verdict}");
+        assert!(verdict.contains("carried no"), "{verdict}");
     }
 
     /// Another domain's record is never read as this one's, on
@@ -627,10 +686,10 @@ mod tests {
     fn another_domains_record_is_never_read_as_the_management_ports() {
         let capture = booted()
             + "LFW-PD domain=forwarder state=ready dial-destination=10.0.2.2 dial-port=4433 \
-               dial-attempts=1 dial-outcome=answered\r\n";
+               dial-attempts=1 dial-outcome=established\r\n";
         let verdict =
             judge(capture.as_bytes(), log(), CAME_UP, STATION, None).expect_err("not ours");
-        assert!(verdict.contains("carried 0"), "{verdict}");
+        assert!(verdict.contains("carried no"), "{verdict}");
         assert!(!reported(capture.as_bytes()));
     }
 
@@ -640,40 +699,40 @@ mod tests {
     #[test]
     fn a_failed_channel_is_reported_only_once_its_evidence_has_arrived_as_well() {
         assert!(!reported(booted().as_bytes()));
-        let outcome_alone = booted() + &dialled("10.0.2.2", 4433, 3, "next-hop-unreachable");
+        let outcome_alone = booted() + &dialled("10.0.2.2", 4433, 1, "next-hop-unreachable");
         assert!(!reported(outcome_alone.as_bytes()));
         assert!(reported((outcome_alone + &placed()).as_bytes()));
     }
 
-    /// A channel that came up owes none of them, so its outcome record is the
+    /// An attempt that came up owes none of them, so its outcome record is the
     /// whole of what there is to wait for.
     #[test]
     fn a_channel_that_came_up_is_reported_by_its_outcome_alone() {
         assert!(reported(
-            (booted() + &dialled("10.0.2.2", 4433, 1, "answered")).as_bytes()
+            (booted() + &dialled("10.0.2.2", 4433, 1, "established")).as_bytes()
         ));
     }
 
-    /// A misacknowledged channel adds a fifth record after the three, so the
-    /// three are not the whole of what to wait for on that one outcome.
+    /// A misacknowledged attempt adds a sixth record after the four, so the four
+    /// are not the whole of what to wait for on that one outcome.
     #[test]
     fn a_misacknowledged_channel_is_reported_only_once_its_pair_has_arrived() {
         let placed =
-            booted() + &dialled("10.0.2.2", 4433, 3, "unacceptable-acknowledgement") + &placed();
+            booted() + &dialled("10.0.2.2", 4433, 1, "unacceptable-acknowledgement") + &placed();
         assert!(!reported(placed.as_bytes()));
         assert!(reported(
             (placed + &acknowledged(0x1234_5678, 99)).as_bytes()
         ));
     }
 
-    /// The counts a failed channel places, read record by record and each held
+    /// The counts a failed attempt places, read record by record and each held
     /// to what the station's behaviour obliges.
     #[test]
     fn a_channel_that_placed_its_fault_is_accepted_and_its_counts_are_reported() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 3, "unanswered") + &placed();
+        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "unanswered") + &placed();
         let owed = DialVerdict {
             outcome: DialOutcome::Unanswered,
-            attempts: 3,
+            attempts: 1,
             account: Some(PLACED),
         };
         let proved =
@@ -684,11 +743,11 @@ mod tests {
 
     /// Every count is checked, and each names itself when it is wrong: a
     /// contract that reported "the counts disagree" would leave an author
-    /// diffing four records by eye.
+    /// diffing five records by eye.
     #[test]
     fn each_count_that_disagrees_names_its_own_field() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 3, "unanswered") + &placed();
-        let cases: [(DialAccount, &str); 5] = [
+        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "unanswered") + &placed();
+        let cases: [(DialAccount, &str); 6] = [
             (
                 DialAccount {
                     syns: Count::Exactly(4),
@@ -729,11 +788,18 @@ mod tests {
                 },
                 "dial-answered=false",
             ),
+            (
+                DialAccount {
+                    retry_bound: Count::Exactly(2_000),
+                    ..PLACED
+                },
+                "dial-retry-bound=1000",
+            ),
         ];
         for (account, named) in cases {
             let owed = DialVerdict {
                 outcome: DialOutcome::Unanswered,
-                attempts: 3,
+                attempts: 1,
                 account: Some(account),
             };
             let refused = judge(capture.as_bytes(), log(), owed, STATION, None)
@@ -749,11 +815,11 @@ mod tests {
     fn a_channel_routed_elsewhere_is_refused_by_the_field_that_moved() {
         let owed = DialVerdict {
             outcome: DialOutcome::Unanswered,
-            attempts: 3,
+            attempts: 1,
             account: Some(PLACED),
         };
         let elsewhere = booted()
-            + &dialled("10.0.2.2", 4433, 3, "unanswered")
+            + &dialled("10.0.2.2", 4433, 1, "unanswered")
             + &placed().replace("dial-next-hop=10.0.2.2", "dial-next-hop=10.0.2.99");
         let refused =
             judge(elsewhere.as_bytes(), log(), owed, STATION, None).expect_err("another next hop");
@@ -763,30 +829,30 @@ mod tests {
         );
 
         let by_gateway = booted()
-            + &dialled("10.0.2.2", 4433, 3, "unanswered")
+            + &dialled("10.0.2.2", 4433, 1, "unanswered")
             + &placed().replace("dial-next-hop-via=prefix", "dial-next-hop-via=gateway");
         let refused =
             judge(by_gateway.as_bytes(), log(), owed, STATION, None).expect_err("the other answer");
         assert!(refused.contains("`gateway`"), "{refused}");
     }
 
-    /// A channel that failed and placed nothing is the defect this whole
+    /// An attempt that failed and placed nothing is the defect this whole
     /// contract exists for: a token with no evidence beside it is a failure an
     /// operator cannot act on. Each missing record is named as the record it is.
     #[test]
     fn a_failed_channel_that_placed_nothing_is_refused_record_by_record() {
         let owed = DialVerdict {
             outcome: DialOutcome::Unanswered,
-            attempts: 3,
+            attempts: 1,
             account: Some(PLACED),
         };
-        let bare = booted() + &dialled("10.0.2.2", 4433, 3, "unanswered");
+        let bare = booted() + &dialled("10.0.2.2", 4433, 1, "unanswered");
         let refused = judge(bare.as_bytes(), log(), owed, STATION, None).expect_err("no evidence");
         assert!(refused.contains("`dial-next-hop=`"), "{refused}");
 
         // And each of the others in turn, with the ones before it present.
-        for key in ["dial-reply-unsolicited", "dial-syns"] {
-            let mut capture = booted() + &dialled("10.0.2.2", 4433, 3, "unanswered");
+        for key in ["dial-reply-unsolicited", "dial-syns", "dial-retry-in"] {
+            let mut capture = booted() + &dialled("10.0.2.2", 4433, 1, "unanswered");
             for line in placed().lines() {
                 if !line.contains(key) {
                     capture.push_str(line);
@@ -799,18 +865,44 @@ mod tests {
         }
     }
 
-    /// A channel that came up owes no counts and must carry none: the records
+    /// An attempt that came up owes no counts and must carry none: the records
     /// place a fault, and a healthy boot emitting them would say something
     /// happened that did not.
     #[test]
     fn a_channel_that_came_up_and_placed_a_fault_anyway_is_refused() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "answered") + &placed();
+        let capture = booted() + &dialled("10.0.2.2", 4433, 1, "established") + &placed();
         let refused = judge(capture.as_bytes(), log(), CAME_UP, STATION, None)
             .expect_err("evidence with no fault");
         assert!(
             refused.contains("carries a `dial-next-hop=` record anyway"),
             "{refused}"
         );
+    }
+
+    /// A full-jitter draw lies inside its bound by definition, so a delay past
+    /// one is a schedule that is not drawing what it says it is — and a fleet
+    /// disconnected together would come back together.
+    #[test]
+    fn a_wait_drawn_past_its_own_bound_is_refused() {
+        let owed = DialVerdict {
+            outcome: DialOutcome::Unanswered,
+            attempts: 1,
+            account: Some(PLACED),
+        };
+        let capture = booted()
+            + &dialled("10.0.2.2", 4433, 1, "unanswered")
+            + &placed().replace("dial-retry-in=317", "dial-retry-in=1317");
+        let refused =
+            judge(capture.as_bytes(), log(), owed, STATION, None).expect_err("a draw outside");
+        assert!(refused.contains("wait 1317 ms"), "{refused}");
+        assert!(refused.contains("bound of 1000 ms"), "{refused}");
+
+        // And the bound itself is reachable, a full-jitter interval being closed
+        // at both ends.
+        let edge = booted()
+            + &dialled("10.0.2.2", 4433, 1, "unanswered")
+            + &placed().replace("dial-retry-in=317", "dial-retry-in=1000");
+        judge(edge.as_bytes(), log(), owed, STATION, None).expect("the bound itself");
     }
 
     /// The sequence pair is reported only where a station claimed one, and is
@@ -820,12 +912,12 @@ mod tests {
         let pair = "LFW-PD domain=management state=ready dial-acknowledged=3735928559 \
                     dial-expected=1\r\n";
         let capture = booted()
-            + &dialled("10.0.2.2", 4433, 3, "unacceptable-acknowledgement")
+            + &dialled("10.0.2.2", 4433, 1, "unacceptable-acknowledgement")
             + &placed()
             + pair;
         let owed = |acknowledged| DialVerdict {
             outcome: DialOutcome::UnacceptableAcknowledgement,
-            attempts: 3,
+            attempts: 1,
             account: Some(DialAccount {
                 acknowledged,
                 ..PLACED
@@ -851,7 +943,7 @@ mod tests {
         assert!(refused.contains("reports a pair anyway"), "{refused}");
 
         let without =
-            booted() + &dialled("10.0.2.2", 4433, 3, "unacceptable-acknowledgement") + &placed();
+            booted() + &dialled("10.0.2.2", 4433, 1, "unacceptable-acknowledgement") + &placed();
         let refused = judge(without.as_bytes(), log(), owed(true), STATION, station_read)
             .expect_err("a pair that was claimed and not reported");
         assert!(refused.contains("`dial-acknowledged=`"), "{refused}");
@@ -866,7 +958,8 @@ mod tests {
 
     #[test]
     fn an_attempt_count_that_is_no_number_is_reported_rather_than_read_as_zero() {
-        let capture = booted() + &dialled("10.0.2.2", 4433, 0, "answered").replace("=0 ", "=many ");
+        let capture =
+            booted() + &dialled("10.0.2.2", 4433, 0, "established").replace("=0 ", "=many ");
         let verdict =
             judge(capture.as_bytes(), log(), CAME_UP, STATION, None).expect_err("a bad field");
         assert!(verdict.contains("is no number"), "{verdict}");

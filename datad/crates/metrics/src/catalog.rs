@@ -504,8 +504,9 @@ pub const OUTBOUND_SESSIONS: Metric = metric(
     Kind::Counter,
     "Connections this appliance originated out of its management port, by what became of each. \
      `opened` counts every one begun and `refused` those declined before a frame was composed, \
-     so the two say what this end decided; `answered` and `failed` say how the ones that went \
-     out ended.",
+     so the two say what this end decided; `established` counts the ones whose handshake \
+     completed and `ended` the ones that finished, so a channel that is up now is the \
+     difference between them.",
 );
 
 pub const OUTBOUND_DIALS: Metric = metric(
@@ -526,14 +527,23 @@ pub const OUTBOUND_SEGMENTS_DROPPED: Metric = metric(
 pub const OUTBOUND_BYTES: Metric = metric(
     "librefirewall_endpoint_outbound_bytes_total",
     Kind::Counter,
-    "Request bytes handed to the transport, and answer bytes taken from a peer and kept.",
+    "Bytes handed to the transport for the stream this appliance originated, and bytes taken \
+     off its peer and kept.",
 );
 
-pub const OUTBOUND_ANSWER_OVERFLOWED: Metric = metric(
-    "librefirewall_endpoint_outbound_answer_overflowed_total",
+pub const OUTBOUND_OVERFLOWED: Metric = metric(
+    "librefirewall_endpoint_outbound_overflowed_total",
     Kind::Counter,
-    "Answer bytes a peer sent past the room one session keeps, dropped rather than allowed to \
-     displace what came before them.",
+    "Bytes a peer sent past the room one session keeps, dropped rather than allowed to \
+     displace what came before them. Unreachable while the window is honoured, so a number \
+     here is a peer that ignored the one it was given.",
+);
+
+pub const OUTBOUND_ANSWERS_REFUSED: Metric = metric(
+    "librefirewall_endpoint_outbound_answers_refused_total",
+    Kind::Counter,
+    "Bytes the domain above this port answered with that there was no room for. Ours rather \
+     than a peer's: it says a first-party answer outgrew the room this end keeps for one.",
 );
 
 // ── The onboarding port: the second listening port, carrying a byte stream ──
@@ -1059,7 +1069,8 @@ pub const ALL_METRICS: &[&Metric] = &[
     &OUTBOUND_DIALS,
     &OUTBOUND_SEGMENTS_DROPPED,
     &OUTBOUND_BYTES,
-    &OUTBOUND_ANSWER_OVERFLOWED,
+    &OUTBOUND_OVERFLOWED,
+    &OUTBOUND_ANSWERS_REFUSED,
     &ONBOARD_CONNECTIONS,
     &ONBOARD_BYTES,
     &ONBOARD_SESSIONS_CLOSED,

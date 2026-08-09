@@ -1463,8 +1463,8 @@ them rather than tallied in advance — to the frame and to the byte; and one of
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
 not satisfy it. Four of the six are the boots whose station misbehaves, and there the same equality
 is the evidence that the node stayed healthy: most of the frames they inject are spent keeping the
-port awake while a channel that never comes up runs out the appliance's attempt count, and a domain
-that faulted or lost its place under that could not report them all.
+port awake while an attempt that never comes up runs out the transport's retransmission budget, and
+a domain that faulted or lost its place under that could not report them all.
 
 **Missing.**
 
@@ -1687,52 +1687,79 @@ established one.
 - **No dataplane consumer.** The only caller is the management domain. Nothing proxies, nothing
   terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
   is untouched (see the [status table](../status.md)).
-- **The appliance dials, to a constant.** The management domain opens one outbound session per boot
-  — resolve the next hop, dial, carry a fixed probe, read the answer, close — and reports the
-  outcome in exactly one console record whichever way it goes, and — where the channel did not come
-  up — the counts that place the failure in three further records beside it, four where a station
-  claimed a sequence number that was never sent. The destination and the port are
-  **first-party constants compiled into that domain** rather than anything the appliance was told:
-  the store holds no endpoint yet, and replacing the constant with the one it holds is the next
-  step. So the channel goes where this build was written to take it, and an image whose management
-  prefix does not contain that address reaches the station and is right to refuse what it says back,
-  its own addressing rules putting that address off-link.
-- **Nothing runs over the dial.** What crosses is ten bytes of first-party probe and whatever comes
-  back, judged only as *an answer arrived*. There is no TLS on it, no authentication of either end,
-  and no protocol above the transport — the session the cryptography domain proves against itself is
-  still not carried by anything. That is the layer this dial exists to put underneath.
-- **Nothing retries after the channel is decided.** The attempt count bounds one boot's channel, and
-  a node whose station never answered reports its outcome and dials no more until it reboots. A
-  channel that reopens itself needs a schedule this domain has no timer to keep.
+- **The appliance dials where it was told, and keeps dialling.** The management domain reads the
+  endpoint the store domain published — an address literal and a port in one word it maps read-only
+  — and opens an outbound session to it: resolve the next hop, dial, hold the connection. It reports
+  **one console record per attempt** whichever way that attempt goes, and — where the attempt did
+  not come up — the counts that place the failure in four further records beside it, five where a
+  station claimed a sequence number that was never sent. **An appliance nobody owns has nowhere to
+  dial**, which is a state and not a failed attempt: nothing is counted, nothing is scheduled, and
+  the domain says so once with `cause=dial-endpoint-unpublished` rather than being silent. The first
+  attempt opens the moment a destination is published, so an appliance adopted while it is running
+  dials without being rebooted.
+- **The outbound half is a byte stream, and nothing puts a byte on it.** What the transport carries
+  is whatever a consumer above it pushes and whatever the peer sends back, moved and never read —
+  two fixed arrays sized for the records a TLS session composes rather than for any fixed message,
+  with the receive window kept equal to the room actually left. **No consumer is wired to it**:
+  there is no TLS on the connection, no authentication of either end, and no protocol above the
+  transport, so what a booted appliance puts on this wire is a handshake and then nothing at all.
+  That is the layer this dial exists to put underneath, and the client and the codec that will fill
+  it are both built and both unreached.
+- **It re-dials on bounded exponential backoff with full jitter**, as the
+  [channel framing contract](../contracts/channel-framing.md) requires: the wait is drawn uniformly
+  between zero and a bound that starts at one second, doubles after every attempt that fails, and
+  stops at five minutes. The draw comes from a generator seeded once per boot from `RDRAND`, and
+  **from a draw of its own rather than from the transport's sequence-number secret** — a redial
+  instant is observable to anybody on the wire, so a schedule seeded from that secret would leak it
+  through its own timing. The clock domain's hundred-millisecond tick is what reaches the deadline,
+  so a wait is honoured to within one tick and the drawn instants are quantised to it.
+- **Only an agreed greeting starts the schedule fresh**, and this appliance cannot yet agree one:
+  there is no HELLO exchange because there is no session over the transport, so **every schedule in
+  this build goes on doubling to the cap**. That is the contract's own rule rather than a
+  simplification — a server that accepts a connection and closes it must not be able to shorten the
+  wait, or it is handed a redial loop — and the reset is implemented and host-tested against the
+  moment a greeting will reach it.
+- **Management unreachability is never traffic-affecting.** The dataplane keeps forwarding the last
+  committed configuration however long the channel is down, and nothing about the channel's state
+  gates it: the two domains share no region that carries it, the forwarding domain holds no
+  management ring and maps no endpoint word, and the channel's whole state — its attempt count, its
+  schedule, its running session — lives in the management domain and is read by nothing else. What
+  the two do share is the committed configuration, which the management domain maps **read-only**
+  and cannot delay, refuse or acknowledge.
 - **How it fails is now proved on a booted node**, on four boots of the release image whose station
   misbehaves in each of the four ways a management server or the link to it can. One answers the
   resolution and never the connection; one refuses the connection with a reset that acknowledges the
   `SYN` it received; one answers a `SYN` by acknowledging a number that was never sent — which draws
   a reset and, per RFC 793's arrival order, leaves the dial standing rather than cancelling it, so
-  that channel too runs out its attempts; and one answers the resolution for an address nothing
-  asked about, which this end does not learn from. They end `unanswered`, `reset-by-peer`,
-  `unacceptable-acknowledgement` and `next-hop-unreachable`, each after three sessions.
+  that attempt too runs out its retransmission budget; and one answers the resolution for an address
+  nothing asked about, which this end does not learn from. They end `unanswered`, `reset-by-peer`,
+  `unacceptable-acknowledgement` and `next-hop-unreachable`, and **what each boot is held to is its
+  first attempt** — the one whose contents that station's behaviour decides, and the one a verdict
+  can name without depending on how long the emulator happened to run.
   **In every one the node stays healthy**: its routed contract is met in the same boot, its
   management port reports every frame
   put on that wire to the byte, and the station holds the appliance to the arithmetic of its own
-  constants — at most three sessions, at most five re-sends of an unanswered `SYN`, at most three
-  requests per resolution — and calls a node past any of them broken.
+  constants — at most five re-sends of an unanswered `SYN`, at most three requests per resolution,
+  and no two attempts closer together than one clock tick — and calls a node past any of them
+  broken. That last is what a bound can still catch now that the appliance never gives up: not that
+  it retries, which is the design, but that it retries **without taking the wait**.
 - **A channel that does not come up is diagnosable from the console alone**, which is what the four
   boots above now assert rather than merely produce. The first three of them once shared one token,
   `connection-lost`, so an operator reading it could not tell a dead server from one refusing the
   port from one that is not speaking TCP correctly, and `not-opened` folded three refusals about
-  this node's own addressing the same way. The vocabulary is now 13 outcomes, one per distinct
-  cause: one for a channel that came up, two for the link and this node's neighbour table, four for
-  what a peer did, three for what this node's own transport refused, and three for what its own
-  addressing or state refused.
-  Beside the outcome a failing channel emits three further records — the station its frames were
+  this node's own addressing the same way. The vocabulary is 13 outcomes, one per distinct
+  cause: one for an attempt that came up, one for a far end that hung up, two for the link and this
+  node's neighbour table, four for what a peer did, three for what this node's own transport
+  refused, and two for what its own addressing or state refused.
+  Beside the outcome a failing attempt emits four further records — the station its frames were
   handed to and whether the prefix or the gateway chose it, with the requests the resolution spent
-  and what it learned; the replies the port turned away, one count per reason; and the handshakes
-  composed, the resets in each direction, and whether anything came back at all — and a fourth
-  where a station claimed a sequence number, carrying that number against the one really sent. Four
+  and what it learned; the replies the port turned away, one count per reason; the handshakes
+  composed, the resets in each direction, and whether anything came back at all; and the wait before
+  the next attempt with the bound it was drawn below — and a fifth where a station claimed a
+  sequence number, carrying that number against the one really sent. Separate
   records rather than a wider one because a record carries four numbers and this is more than four
-  facts, and widening the array would grow every log region by a page and still not hold them. A
-  channel that came up emits none of them. The scenarios assert the counts and not only the tokens,
+  facts, and widening the array would grow every log region by a page and still not hold them. An
+  attempt that came up emits none of them. The scenarios assert the counts and not only the tokens,
   which is what keeps the un-folding from quietly folding back; and the claimed sequence pair is
   compared against what the station on the far end read off the wire rather than against anything
   the appliance also supplied.
@@ -2783,7 +2810,7 @@ host-testable codec and nothing else: the eight-byte header — a big-endian pay
 a mebibyte, a type byte, three reserved bytes that must be zero — the ten frames, both greetings, and
 the closed byte vocabularies inside the payloads. It has no transport under it and no session state
 above it. What it deliberately does **not** decide is *when* a frame is sent: there is no flush
-cadence, no acknowledgement timer, no backoff, no commit-confirm sequencing. Those are the session's,
+cadence, no acknowledgement timer, no commit-confirm sequencing. Those are the session's,
 and a codec that guessed at them would be inventing behaviour the contract assigns elsewhere.
 
 **Both directions, from one crate.** The frames come both ways, so the codec is the protocol's rather

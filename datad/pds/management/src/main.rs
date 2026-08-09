@@ -164,16 +164,15 @@ use lfw_log::{
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
-    Configurations, DIAL_REQUEST_CAPACITY, DialFacts, Downloads, Ended, EndpointRegions,
-    EndpointStage, ForwardRings, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY,
-    OnboardCounters, OpenError, PdClock, Pool, RELAY_ANSWER_TIMEOUT, Relay, RelayFailure,
-    RelayReport, Resolutions, ReturnRing, StatsRegions, Via, attach_region, log_sample,
-    read_timestamp_counter,
+    Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage, ForwardRings, Hop,
+    Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OnboardCounters, OpenError, PdClock, Pool,
+    RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
+    StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    DownloadReply, DownloadRequest, LogConsume, LogRecords, ManagementEndpoint, RelayFault,
-    RelayRefusal, RelayReply, RelayRequest,
+    DownloadReply, DownloadRequest, LogConsume, LogRecords, ManagementDestination,
+    ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest,
 };
 
 /// How many dataplane ports the build has, and so the bound a committed image's
@@ -270,38 +269,6 @@ fn relay_refusal(failure: RelayFailure) -> Refusal {
     }
 }
 
-/// The station this port reaches out to, and the port on it.
-///
-/// First-party constants: a management channel goes where this appliance was
-/// told to take it and nowhere a peer names, and until the store holds an
-/// endpoint of its own there is nowhere else to read one from. They are the
-/// gateway the committed document states and a port of this appliance's own
-/// choosing, so the dial leaves through the station the operator already
-/// declared rather than through one this domain invented.
-const DIAL_DESTINATION: Ipv4Address = Ipv4Address::from_octets([10, 0, 2, 2]);
-const DIAL_PORT: u16 = 4433;
-
-/// What the channel carries, fixed and first-party. It is a transport-level
-/// probe and not a protocol: what belongs here is the greeting of the session
-/// that will one day be negotiated over it, and the bytes are chosen so that a
-/// station reading them can tell this appliance apart from anything else that
-/// dialled it.
-const DIAL_PROBE: &[u8] = b"LFW-DIAL/1";
-
-/// The room a session holds for a request is a build fact, so a probe that did
-/// not fit is a compile failure rather than an open refused at run time.
-const _: () = assert!(DIAL_PROBE.len() <= DIAL_REQUEST_CAPACITY);
-
-/// How many sessions this domain spends on the channel before it reports what
-/// became of it.
-///
-/// A first-party bound and the whole of what ends a channel that never comes
-/// up: every session under it leaves on something this end can observe, and
-/// nothing here waits on a wall-clock gap. Three because a station that answered
-/// none of three separate dials is one an operator has to go and look at, and a
-/// fourth would say the same thing later.
-const DIAL_ATTEMPTS: u64 = 3;
-
 /// This domain's lifecycle record.
 fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
     sink.emit(&Event::Domain {
@@ -336,150 +303,240 @@ fn entropy_refusal(error: EntropyError) -> Refusal {
 /// The channel this port reaches *out* with, and how far it has got.
 ///
 /// It is a state machine rather than a call because nothing here may block: the
-/// domain is woken, drains, and returns, so a session crosses several wakeups
+/// domain is woken, drains, and returns, so an attempt crosses several wakeups
 /// and what carries it between them is this. Every transition below is driven by
-/// something observable — a phase the endpoint reports, or this end's own
-/// attempt count — and none of them by an elapsed time, so a channel that is
-/// slow is a channel that is slow rather than a channel that failed.
-struct Dial {
-    /// Sessions opened so far, bounded by [`DIAL_ATTEMPTS`].
+/// something observable — a phase the endpoint reports, this end's own schedule,
+/// or the destination the store domain published — and none of them by a
+/// wall-clock gap on the wire, so an attempt that is slow is an attempt that is
+/// slow rather than one that failed.
+///
+/// **It never gives up.** The channel is a persistent connection, so every close
+/// is answered by another attempt under the schedule below, for as long as the
+/// appliance is up. What was once a bounded run of attempts and a single verdict
+/// is now a report per attempt: a verdict on a channel that has not finished
+/// would be a line an operator was told and that later stopped being true.
+struct OutboundChannel {
+    /// Attempts opened this boot, counted from one. Not a bound — nothing bounds
+    /// them — but the number an operator reads to tell a node's first try from
+    /// its hundredth.
     attempts: u64,
-    /// Whether one of them is running now.
+    /// Whether one is running now.
     running: bool,
-    /// Whether the outcome record this channel owes has been made. It is what
-    /// makes that record exactly one: a channel is reported when it is decided,
-    /// and a decided channel is never re-opened.
-    reported: bool,
-    /// Every session's frames, folded together. A channel spends more than one
-    /// session and what an operator reads is the channel, so a station that
-    /// answered none of them is reported as every handshake it ignored rather
-    /// than as the last session's share of them.
-    facts: DialFacts,
-    /// The station the last session's frames were handed to, and which of the
-    /// port's two answers chose it. The last rather than a fold: every session
-    /// of one channel routes the same way, so there is one answer and not three,
-    /// and `None` is a channel refused before a route was ever chosen.
-    hop: Option<(Ipv4Address, Via)>,
-    /// The port's resolution counts as they stood when this channel opened its
-    /// first session. Subtracted at the report, which is what turns a running
-    /// total of the port into an account of the channel.
+    /// Whether the attempt running now has already been reported as up. It is
+    /// what makes that record one per attempt: a connection is announced when it
+    /// comes up and not on every pass that finds it still up.
+    established: bool,
+    /// When the next attempt may open, and how long the wait after a failure
+    /// may be. **The only thing that resets it is a greeting agreed with the far
+    /// end**, which is a thing this domain cannot yet do — so every schedule
+    /// here goes on doubling, which is exactly what a server that refuses every
+    /// connection must not be able to shorten.
+    schedule: Reconnect,
+    /// Where the store domain published this appliance's management plane, as
+    /// this domain last read it. It is what tells the two silences apart on the
+    /// console: an appliance told nowhere, and one told somewhere it cannot
+    /// reach.
+    published: Option<ManagementDestination>,
+    /// Whether the state above has been reported since it last changed. The
+    /// region only ever gains a destination within a boot, so this is one record
+    /// for an appliance nobody owns and none at all for one that was told where
+    /// to go before its first pass.
+    stated: bool,
+    /// The port's resolution counts as they stood when the running attempt
+    /// opened. Subtracted at the report, which is what turns a running total of
+    /// the port into an account of one attempt.
     resolutions_before: Option<Resolutions>,
-    /// The sequence numbers a station claimed against what this end had sent,
-    /// where one did. Kept beside the outcome because the token names the fault
-    /// and these two are the whole of what places it.
-    acknowledged: Option<(u32, u32)>,
 }
 
-impl Dial {
-    const fn new() -> Self {
+impl OutboundChannel {
+    const fn new(jitter: u64) -> Self {
         Self {
             attempts: 0,
             running: false,
-            reported: false,
-            facts: DialFacts::new(),
-            hop: None,
+            established: false,
+            schedule: Reconnect::new(jitter),
+            published: None,
+            stated: false,
             resolutions_before: None,
-            acknowledged: None,
         }
     }
 
     /// Carry the channel forward by one wakeup.
     ///
-    /// A pass either opens a session, moves the running one, or ends the
-    /// channel; a pass over a port with no address yet does nothing at all,
-    /// which is the ordinary state of a node between boot and its first commit.
-    fn drive(&mut self, stage: &mut EndpointStage<'static>, now: Monotonic, sink: &dyn Sink) {
-        if self.reported {
-            return;
+    /// A pass either opens an attempt, moves the running one, reports one that
+    /// came up, or reports one that ended and schedules the next. A pass over a
+    /// port with no address yet does nothing at all, which is the ordinary state
+    /// of a node between boot and its first commit.
+    fn drive(
+        &mut self,
+        stage: &mut EndpointStage<'static>,
+        endpoint: &ManagementEndpoint,
+        now: Monotonic,
+        sink: &dyn Sink,
+    ) {
+        if !self.running {
+            self.open(stage, endpoint, now, sink);
         }
         if !self.running {
-            // Read before the first session opens anything, so the subtraction
-            // at the report covers the channel and not the boot.
-            if self.resolutions_before.is_none() {
-                self.resolutions_before = Some(stage.resolutions());
-            }
-            match stage.open_dial(DIAL_DESTINATION, DIAL_PORT, DIAL_PROBE) {
-                // Unaddressed: there is no source address to open a session
-                // from, and one will arrive with the next committed generation.
-                None => return,
-                Some(Ok(())) => {
-                    self.attempts = self.attempts.saturating_add(1);
-                    self.running = true;
-                }
-                // This end refused before a frame was composed, and no further
-                // attempt would be answered differently: nothing a peer does
-                // changes a destination this node cannot route to, a probe this
-                // node cannot fit, or a session this node is already running.
-                Some(Err(error)) => {
-                    self.report(stage, sink, refused_open(error));
-                    return;
-                }
-            }
+            return;
         }
         stage.drive_dial(now);
+        // Before the ending is read, because an attempt can come up and go away
+        // between two passes and the console owes both facts: a channel that was
+        // up for a minute and one that never came up at all are different things
+        // to go and look at, and only this record tells them apart.
+        if !self.established && stage.dial_established() {
+            self.established = true;
+            self.announce_attempt(sink, DialOutcome::Established);
+        }
         let Some(ended) = stage.dial_ended() else {
             return;
         };
-        // Before the close, which drops the session and everything it watched:
-        // the counts are the evidence beside the token, and a token with no
-        // evidence is the record this change exists to be rid of.
-        if let Some((hop, facts)) = stage.dial_facts() {
-            self.facts = self.facts.joined(facts);
-            self.hop = Some((hop.address, hop.via));
-        }
-        // The two numbers travel with the ending that carries them and with no
-        // other: a pair kept from a session that ended some other way would be
-        // numbers reported beside a fault they did not belong to.
-        if let Ended::UnacceptableAcknowledgement { claimed, expected } = ended {
-            self.acknowledged = Some((claimed, expected));
-        }
+        // Read before the close, which drops the session and everything it
+        // watched: the counts are the evidence beside the token, and a token
+        // with no evidence is a failure an operator cannot act on.
+        let hop = stage.dial_facts();
         stage.close_dial();
         self.running = false;
-        if ended.succeeded() || self.attempts >= DIAL_ATTEMPTS {
-            self.report(stage, sink, outcome_of(ended));
+        // The attempt is over and nothing was agreed with the far end, so the
+        // schedule goes on rather than starting fresh. This is the whole of what
+        // keeps a server that closes every connection from inviting a tight
+        // redial loop.
+        let wait = self.schedule.failed(now);
+        self.report(stage, sink, outcome_of(ended), hop, Some(ended), wait);
+    }
+
+    /// Open the next attempt, or say why there is none to open.
+    fn open(
+        &mut self,
+        stage: &mut EndpointStage<'static>,
+        endpoint: &ManagementEndpoint,
+        now: Monotonic,
+        sink: &dyn Sink,
+    ) {
+        // Read every pass and never cached across one: the store domain writes
+        // this region while this domain runs, so an appliance that takes an
+        // owner mid-boot dials on the pass after it rather than at the next
+        // reboot.
+        let published = endpoint.destination();
+        if published != self.published {
+            self.published = published;
+            self.stated = false;
+        }
+        let Some(destination) = published else {
+            // **Nowhere to dial is a state and not a failed attempt**, so
+            // nothing is counted, nothing is scheduled, and the next attempt is
+            // due the instant a destination appears. What it owes is one line:
+            // a node that never dials and says nothing would be a node an
+            // operator cannot tell from one whose channel is failing silently.
+            if !self.stated {
+                self.stated = true;
+                announce(
+                    sink,
+                    DomainState::Ready,
+                    DomainDetail::Refusal(Refusal {
+                        cause: "dial-endpoint-unpublished",
+                        detail: RefusalDetail::None,
+                        signalled: false,
+                    }),
+                );
+            }
+            return;
+        };
+        self.stated = true;
+        if !self.schedule.due(now) {
+            return;
+        }
+        let address = Ipv4Address::from_octets(destination.address);
+        // Read before this attempt opens anything, so the subtraction at the
+        // report covers the attempt and not the boot.
+        self.resolutions_before = Some(stage.resolutions());
+        match stage.open_dial(address, destination.port) {
+            // Unaddressed: there is no source address to open a session from,
+            // and one will arrive with the next committed generation. Not an
+            // attempt either, for the reason nowhere to dial is not one.
+            None => (),
+            Some(Ok(())) => {
+                self.attempts = self.attempts.saturating_add(1);
+                self.running = true;
+                self.established = false;
+            }
+            // This end refused before a frame was composed. It is still an
+            // attempt — it was this appliance's own turn and it produced
+            // nothing — so it is counted, reported, and followed by a wait like
+            // any other: a destination this node cannot route to is a
+            // configuration an operator may fix while the node keeps trying.
+            Some(Err(error)) => {
+                self.attempts = self.attempts.saturating_add(1);
+                let wait = self.schedule.failed(now);
+                self.report(stage, sink, refused_open(error), None, None, wait);
+            }
         }
     }
 
-    /// What the channel owes the console, whichever way it went.
-    ///
-    /// **One record on a channel that came up, and four or five on one that did
-    /// not.** A deployed node has no shell, so the counts that place a failure
-    /// have to be on the console or nowhere — and they are more facts than the
-    /// four operand words a record carries, which makes them further records
-    /// rather than a wider one. A healthy boot stays quiet because there is
-    /// nothing to place.
-    ///
-    /// The number of records is bounded by the shape of the outcome and never by
-    /// anything that happened on the wire: a channel that spent every attempt it
-    /// had and a great many handshakes reports the same lines as one that spent
-    /// a single attempt and one handshake.
-    fn report(&mut self, stage: &EndpointStage<'static>, sink: &dyn Sink, outcome: DialOutcome) {
-        self.reported = true;
+    /// The one record every attempt owes: where it went, which attempt it was,
+    /// and how it stands.
+    fn announce_attempt(&self, sink: &dyn Sink, outcome: DialOutcome) {
+        // A default rather than a branch: this is only ever reached with a
+        // destination in hand, and a zero address on a record nobody can produce
+        // is a value rather than a panic on the path a peer's traffic paces.
+        let (address, port) =
+            self.published
+                .map_or((Ipv4Address::from_octets([0, 0, 0, 0]), 0), |destination| {
+                    (
+                        Ipv4Address::from_octets(destination.address),
+                        destination.port,
+                    )
+                });
         announce(
             sink,
             DomainState::Ready,
             DomainDetail::Dialled {
-                destination: DIAL_DESTINATION,
-                port: DIAL_PORT,
+                destination: address,
+                port,
                 attempts: self.attempts,
                 outcome,
             },
         );
-        if outcome == DialOutcome::Answered {
-            return;
-        }
+    }
+
+    /// What an attempt that failed owes the console.
+    ///
+    /// **One record on an attempt that came up, and five or six on one that did
+    /// not.** A deployed node has no shell, so the counts that place a failure
+    /// have to be on the console or nowhere — and they are more facts than the
+    /// four operand words a record carries, which makes them further records
+    /// rather than a wider one. An attempt that came up places nothing, because
+    /// there is nothing to place.
+    ///
+    /// The number of records is bounded by the shape of the outcome and never by
+    /// anything that happened on the wire: an attempt that spent a great many
+    /// handshakes reports the same lines as one that spent a single one.
+    fn report(
+        &self,
+        stage: &EndpointStage<'static>,
+        sink: &dyn Sink,
+        outcome: DialOutcome,
+        hop: Option<(Hop, DialFacts)>,
+        ended: Option<Ended>,
+        wait: Wait,
+    ) {
+        self.announce_attempt(sink, outcome);
         // The route the frames really took. Where an open was refused before one
         // was chosen there is none, and the record says so rather than naming
         // one of the two real answers: the address then stands for where this
         // domain meant to go, and a next hop of zero would name a station.
-        let (next_hop, via) = self
-            .hop
-            .map_or((DIAL_DESTINATION, NextHopVia::None), |(address, via)| {
-                (address, chosen_via(via))
+        let intended = self
+            .published
+            .map_or(Ipv4Address::from_octets([0, 0, 0, 0]), |destination| {
+                Ipv4Address::from_octets(destination.address)
             });
-        // The resolution's own account, over the life of the channel rather than
-        // over the boot: the port asks about nothing else, but a subtraction says
-        // so rather than assuming it.
+        let (next_hop, via) = hop.map_or((intended, NextHopVia::None), |(hop, _)| {
+            (hop.address, chosen_via(hop.via))
+        });
+        // The resolution's own account, over the life of this attempt rather
+        // than over the boot: the port asks about nothing else, but a
+        // subtraction says so rather than assuming it.
         let resolutions = stage
             .resolutions()
             .since(self.resolutions_before.unwrap_or_default());
@@ -503,19 +560,32 @@ impl Dial {
                 contradicted: resolutions.contradicted,
             },
         );
+        let facts = hop.map_or(DialFacts::new(), |(_, facts)| facts);
         announce(
             sink,
             DomainState::Ready,
             DomainDetail::DialSegments {
-                syns: self.facts.syns,
-                resets_received: self.facts.resets_received,
-                resets_sent: self.facts.resets_sent,
-                answered: self.facts.answered,
+                syns: facts.syns,
+                resets_received: facts.resets_received,
+                resets_sent: facts.resets_sent,
+                answered: facts.answered,
+            },
+        );
+        // How long until the next attempt, and the bound it was drawn below.
+        // Last of the group, because it is the only one that looks forward: an
+        // operator reads what happened and then reads when the node will try
+        // again.
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::DialRetry {
+                delay_millis: wait.delay_millis(),
+                bound_millis: wait.bound_millis(),
             },
         );
         // Only where a station claimed one: the numbers exist exactly then, and
         // a record carrying two zeroes would be a pair this domain invented.
-        if let Some((claimed, expected)) = self.acknowledged {
+        if let Some(Ended::UnacceptableAcknowledgement { claimed, expected }) = ended {
             announce(
                 sink,
                 DomainState::Ready,
@@ -587,7 +657,7 @@ fn announce_session(sink: &dyn Sink, report: &RelayReport, port: OnboardCounters
 /// ambiguity the endpoint went to the trouble of resolving.
 const fn outcome_of(ended: Ended) -> DialOutcome {
     match ended {
-        Ended::Answered => DialOutcome::Answered,
+        Ended::ClosedByPeer => DialOutcome::ClosedByPeer,
         Ended::NextHopUnreachable => DialOutcome::NextHopUnreachable,
         Ended::NoRoomToResolve => DialOutcome::NoRoomToResolve,
         Ended::Unanswered => DialOutcome::Unanswered,
@@ -603,13 +673,12 @@ const fn outcome_of(ended: Ended) -> DialOutcome {
 /// An open this end refused before a frame was composed, in the same
 /// vocabulary. Its own function because the two sets it maps from are different
 /// — one is a session that ran and one is a session that never began — and each
-/// of these three is a different line of this node's own configuration to go and
+/// of these two is a different line of this node's own configuration to go and
 /// read.
 const fn refused_open(error: OpenError) -> DialOutcome {
     match error {
         OpenError::Busy { .. } => DialOutcome::SessionAlreadyRunning,
         OpenError::Unroutable(_) => DialOutcome::DestinationUnroutable,
-        OpenError::RequestTooLong { .. } => DialOutcome::ProbeTooLong,
     }
 }
 
@@ -652,20 +721,19 @@ fn init() -> Management {
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
     // Where the appliance dials, published by the domain that holds its record
-    // and mapped read-only here. Attached and **not read**: this domain dials a
-    // destination compiled into it, and nothing yet consults this region. The
-    // attach is not optional even so — a domain granted a mapping whose image has
-    // no symbol for it is a description the Microkit tool refuses to build — so
-    // the binding this domain will use exists from the boot its grant does.
-    let _endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
+    // and mapped read-only here. **Read every pass and never cached across one**:
+    // the writer runs while this domain does, an appliance takes an owner within
+    // a boot, and a reading held from start-up would leave a node that was just
+    // adopted dialling nowhere until it was rebooted.
+    let endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting, DomainDetail::None);
 
     // First, because it is the one thing that can refuse: a port that came up and
     // then turned out to have no secret would have answered a `SYN` in the
     // meantime with a predictable sequence number.
-    let secret = match entropy::secret_bytes() {
-        Ok(bytes) => IsnSecret::from_bytes(bytes),
+    let drawn = match entropy::draw_entropy() {
+        Ok(drawn) => drawn,
         Err(error) => {
             announce(
                 &sink,
@@ -704,7 +772,7 @@ fn init() -> Management {
             transmit_returns: attach_region!(mgmt_tx_free_vaddr: ReturnRing),
             transmit_pool: attach_region!(mgmt_tx_pool_vaddr: Pool),
         },
-        secret,
+        IsnSecret::from_bytes(drawn.secret),
         stats,
     );
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
@@ -754,7 +822,11 @@ fn init() -> Management {
         relay,
         handover,
         clock,
-        dial: Dial::new(),
+        endpoint,
+        // Seeded from a draw of its own, never from the transport's secret: a
+        // redial instant is observable from the wire, and a schedule seeded
+        // from that secret would leak it through its own timing.
+        channel: OutboundChannel::new(drawn.jitter),
         sink,
     })
 }
@@ -795,9 +867,12 @@ struct Running {
     relay: Relay<'static>,
     handover: &'static ConfigHandover,
     clock: &'static ClockCalibration,
+    /// Where this appliance was told to dial, read afresh on every pass.
+    endpoint: &'static ManagementEndpoint,
     /// The channel this port reaches out with, kept for the domain's life
-    /// because a session crosses wakeups and the record it owes is made once.
-    dial: Dial,
+    /// because an attempt crosses wakeups and the schedule between attempts
+    /// outlives every one of them.
+    channel: OutboundChannel,
     sink: RingSink<'static, PdClock<'static>>,
 }
 
@@ -875,7 +950,9 @@ impl Handler for Management {
         // shard is published again here, so a scrape reads the channel's own
         // counters as of this pass rather than the one before it.
         if let Some(now) = now {
-            running.dial.drive(&mut running.stage, now, &running.sink);
+            running
+                .channel
+                .drive(&mut running.stage, running.endpoint, now, &running.sink);
             // The onboarding port, after the drain so a record that arrived in
             // this very pass is handed over in it, and before the send below so
             // an answer that came back goes out in it too. One item crosses per

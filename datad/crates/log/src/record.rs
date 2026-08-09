@@ -617,6 +617,13 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::DialSequence.to_bits();
                     record.operands = [u64::from(*claimed), u64::from(*expected), 0, 0];
                 }
+                DomainDetail::DialRetry {
+                    delay_millis,
+                    bound_millis,
+                } => {
+                    record.detail = LogDetailKind::DialRetry.to_bits();
+                    record.operands = [*delay_millis, *bound_millis, 0, 0];
+                }
                 DomainDetail::Onboarded {
                     relayed,
                     received,
@@ -1023,6 +1030,17 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             claimed: *claimed,
             expected: *expected,
         },
+        // Total: two spans in milliseconds, and every bit pattern of each is a
+        // span the schedule could have drawn or climbed to. Neither is ranged
+        // against the schedule's own cap, because a record is what a domain
+        // said rather than what a reader wishes it had said.
+        CheckedDetail::DialRetry {
+            delay_millis,
+            bound_millis,
+        } => DomainDetail::DialRetry {
+            delay_millis: *delay_millis,
+            bound_millis: *bound_millis,
+        },
         // The token was ranged to the vocabulary by `wire`; the three counts are
         // tallies the emitting domain kept about its own session, so every bit
         // pattern of each is one it could have written.
@@ -1362,6 +1380,13 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::DialSequence { claimed, expected } => {
                         DomainDetail::DialSequence { claimed, expected }
                     }
+                    DomainDetail::DialRetry {
+                        delay_millis,
+                        bound_millis,
+                    } => DomainDetail::DialRetry {
+                        delay_millis,
+                        bound_millis,
+                    },
                     DomainDetail::Onboarded {
                         relayed,
                         received,

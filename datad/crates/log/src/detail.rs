@@ -308,26 +308,50 @@ pub enum DomainDetail<C = &'static str> {
         /// nobody reads off a serial line, and a length is what says one arrived.
         certificate: u64,
     },
-    /// What became of the connection this appliance reached *out* of its
-    /// management port with: where it dialled, how many attempts it spent, and
-    /// how the last of them finished.
+    /// What became of **one attempt** on the connection this appliance reaches
+    /// *out* of its management port with: where it dialled, which attempt it
+    /// was, and how that attempt stands.
+    ///
+    /// One record per attempt rather than one per boot, because the channel is a
+    /// stream meant to persist and is re-dialled for as long as it is down: a
+    /// single record would be a verdict on a channel that had not finished, and
+    /// a reader watching a node come back needs to see the attempt that did.
     ///
     /// Appended, never inserted, on the four details above's terms. The four
     /// fields travel together because no three of them answer the operator's
     /// question: an outcome without a destination does not say what could not be
-    /// reached, and an outcome without an attempt count does not say whether the
-    /// appliance gave up early or spent everything it had. **No byte of the
-    /// exchange has a representation here** — what the peer said reaches the two
+    /// reached, and an outcome without an attempt number does not say whether
+    /// this is a node's first try or its hundredth. **No byte of the exchange
+    /// has a representation here** — what the peer said reaches the two
     /// recording sinks and nothing else, and what a console reports is where the
     /// appliance went and how it got on.
     Dialled {
         destination: Ipv4Address,
         port: u16,
-        /// Sessions opened for this channel, the last of which is what
-        /// `outcome` reports. Bounded by the caller's own attempt count, so a
-        /// number here is a first-party decision and never a peer's.
+        /// Which attempt this record is about, counted from one over the boot.
+        /// A count of this appliance's own opens, so a number here is a
+        /// first-party decision and never a peer's.
         attempts: u64,
         outcome: DialOutcome,
+    },
+    /// How long the channel will wait before the attempt after a failed one, and
+    /// the bound that wait was drawn below.
+    ///
+    /// Both numbers, because neither alone says where the schedule stands: the
+    /// delay is one draw out of an interval and the bound is how far the backoff
+    /// has climbed, so a delay of half a second beside a five-minute bound is a
+    /// node that has been failing for a long time and got a short wait, which
+    /// reads as a healthy node if the bound is left off.
+    ///
+    /// Emitted only where an attempt failed, there being nothing to wait for
+    /// after one that came up. Milliseconds, on the record's own terms: an
+    /// operator compares this against a wall clock rather than against a
+    /// counter.
+    DialRetry {
+        /// The wait drawn for the next attempt, in milliseconds.
+        delay_millis: u64,
+        /// The bound it was drawn uniformly below, in milliseconds.
+        bound_millis: u64,
     },
     /// Where the frames of a failed channel were **actually** handed, and what
     /// the link made of the asking.
@@ -862,7 +886,7 @@ mod tests {
                 detail: RefusalDetail::None,
                 signalled: false,
             }),
-            // The four a failed channel adds. All four are counts at the same
+            // The five a failed attempt adds. All of them are counts at the same
             // zero, which is exactly the shape this test exists to keep apart:
             // three zeroed segment counts and three zeroed refusal counts are
             // different records about different things.
@@ -887,6 +911,10 @@ mod tests {
             DomainDetail::DialSequence {
                 claimed: 0,
                 expected: 0,
+            },
+            DomainDetail::DialRetry {
+                delay_millis: 0,
+                bound_millis: 0,
             },
         ];
         for (index, shape) in shapes.iter().enumerate() {

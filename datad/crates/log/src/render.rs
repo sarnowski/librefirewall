@@ -506,6 +506,16 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " dial-acknowledged={claimed} dial-expected={expected}"
         ),
+        // Milliseconds, and both of them: an operator reads a wait against a
+        // wall clock, and the bound beside it is what says whether the schedule
+        // has been climbing.
+        DomainDetail::DialRetry {
+            delay_millis,
+            bound_millis,
+        } => write!(
+            cursor,
+            " dial-retry-in={delay_millis} dial-retry-bound={bound_millis}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -1051,8 +1061,9 @@ mod tests {
         );
     }
 
-    /// The record the management port makes about the channel it dialled: where
-    /// it went, what it cost, and how it ended — one line whichever way it went.
+    /// The record the management port makes about one attempt on the channel it
+    /// dials: where it went, which attempt it was, and how it stands — one line
+    /// whichever way it went.
     #[test]
     fn a_management_domain_renders_where_it_dialled_and_how_that_ended() {
         let dialled = |octets: [u8; 4], port, attempts, outcome| {
@@ -1068,9 +1079,9 @@ mod tests {
             })
         };
         assert_eq!(
-            dialled([10, 0, 2, 2], 4433, 1, DialOutcome::Answered),
+            dialled([10, 0, 2, 2], 4433, 1, DialOutcome::Established),
             "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=management state=ready \
-             dial-destination=10.0.2.2 dial-port=4433 dial-attempts=1 dial-outcome=answered"
+             dial-destination=10.0.2.2 dial-port=4433 dial-attempts=1 dial-outcome=established"
         );
         // The failure a station that never answered for the next hop leaves, and
         // the widest values the fields can hold.
@@ -1677,6 +1688,10 @@ mod tests {
                 claimed: u32::MAX,
                 expected: u32::MAX,
             },
+            DomainDetail::DialRetry {
+                delay_millis: u64::MAX,
+                bound_millis: u64::MAX,
+            },
             DomainDetail::Onboarded {
                 relayed: u64::MAX,
                 received: u64::MAX,
@@ -1868,6 +1883,10 @@ mod tests {
             ),
             any::<(u32, u32)>()
                 .prop_map(|(claimed, expected)| DomainDetail::DialSequence { claimed, expected }),
+            any::<(u64, u64)>().prop_map(|(delay_millis, bound_millis)| DomainDetail::DialRetry {
+                delay_millis,
+                bound_millis,
+            }),
             (any::<(u64, u64, u64)>(), (0..OnboardEnd::ALL.len())).prop_map(
                 |((relayed, received, sent), ended)| DomainDetail::Onboarded {
                     relayed,

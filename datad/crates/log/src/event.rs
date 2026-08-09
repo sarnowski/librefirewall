@@ -97,7 +97,15 @@ closed_vocabulary! {
     /// different place. The order is the wire encoding, so a variant is appended
     /// and never inserted.
     DialOutcome {
-        Answered => "answered",
+        /// The connection came up and this appliance is holding it. **Not an
+        /// ending**: the channel is a stream meant to persist, so this is the
+        /// one token that says an attempt is still running rather than what
+        /// became of it.
+        Established => "established",
+        /// The far end closed its half and the connection finished. A cause like
+        /// any other rather than a healthy end: a channel meant to persist that
+        /// the server hung up on is a thing to go and look at.
+        ClosedByPeer => "closed-by-peer",
 
         // The link: nothing this end sent could be addressed at all.
         NextHopUnreachable => "next-hop-unreachable",
@@ -111,8 +119,9 @@ closed_vocabulary! {
         /// refusing this port.
         ResetByPeer => "reset-by-peer",
         /// The peer acknowledged a number this end never sent, which draws a
-        /// reset and leaves the dial standing, so the channel then runs its
-        /// attempts out. The two numbers are on the record beside this token.
+        /// reset and leaves the dial standing, so the attempt then runs its
+        /// retransmission budget out. The two numbers are on the record beside
+        /// this token.
         UnacceptableAcknowledgement => "unacceptable-acknowledgement",
         /// The connection went away and none of the three above explains it.
         /// The residual, and named as one: what makes it readable is that the
@@ -136,8 +145,6 @@ closed_vocabulary! {
         /// No next hop could be chosen: the destination, the prefix or the
         /// gateway is wrong.
         DestinationUnroutable => "destination-unroutable",
-        /// The probe was longer than the room a session holds for one.
-        ProbeTooLong => "probe-too-long",
     }
 }
 

@@ -1,6 +1,7 @@
-//! The one random number this domain needs, and the instruction that yields it.
+//! The two random numbers this domain needs, and the instruction that yields
+//! them.
 //!
-//! # What it is for, and why nothing weaker will do
+//! # What they are for, and why nothing weaker will do
 //!
 //! The transport derives every initial sequence number from a keyed hash of the
 //! connection's 4-tuple (RFC 6528, `lfw_tcp::isn`), and the key is a secret this
@@ -11,6 +12,17 @@
 //! **management-plane attacker**. So the secret must be unpredictable, and it
 //! must be *per boot*: a constant compiled in, or one derived from the
 //! configuration, is one an attacker reads out of the image.
+//!
+//! The second is the seed the management channel's redial schedule draws its
+//! jitter from, and it is **a draw of its own rather than a second use of the
+//! first**. A redial instant is observable to anybody watching the wire, so a
+//! schedule seeded from the sequence-number secret would leak that secret
+//! through its own timing — which is the off-path injection primitive above,
+//! arrived at the long way round. Two words are drawn and neither is the other.
+//!
+//! Both come from one call, because they have one failure story: a part with no
+//! generator has neither, and there is nothing useful to say about which of them
+//! a broken generator refused first.
 //!
 //! There is no other source. This system has no entropy pool, no seed file and no
 //! persistent storage a domain may write; the counter this domain also reads is
@@ -41,8 +53,12 @@ use core::arch::x86_64::{__cpuid, _rdrand64_step};
 /// Guide* is the source of the number; see the module header.
 const DRAW_ATTEMPTS: usize = 10;
 
-/// Words drawn: a 128-bit key, which is `lfw_tcp::IsnSecret`'s width.
-const WORDS: usize = 2;
+/// Words drawn for the sequence-number secret: a 128-bit key, which is
+/// `lfw_tcp::IsnSecret`'s width.
+const SECRET_WORDS: usize = 2;
+
+/// Words drawn in all: the secret's two and the schedule's one.
+const WORDS: usize = SECRET_WORDS + 1;
 
 /// The CPUID leaf and the bit in its `ECX` that reports `RDRAND`.
 const FEATURE_LEAF: u32 = 1;
@@ -61,32 +77,54 @@ pub enum EntropyError {
     NotSupported { feature_word: u32 },
     /// The instruction is available and did not produce a number in
     /// [`DRAW_ATTEMPTS`] attempts, which is a hardware fault rather than a busy
-    /// queue. `word` says which of the two draws failed.
+    /// queue. `word` says which of the draws failed.
     Exhausted { word: usize },
 }
 
-/// Sixteen bytes of hardware randomness, or the reason there are none.
+/// What one boot draws: the transport's secret, and the schedule's seed.
+///
+/// A struct rather than a tuple, because the two must never be confused for one
+/// another at a call site — one is a secret that must reach no surface, and the
+/// other seeds timing anybody on the wire can watch.
+#[derive(Clone, Copy, Debug)]
+pub struct Entropy {
+    /// The key every initial sequence number is derived from. **A secret**: it
+    /// reaches the transport and nothing else, and no surface of this appliance
+    /// carries it or anything computed from it.
+    pub secret: [u8; 16],
+    /// The seed the redial schedule's jitter is drawn from. Not the secret and
+    /// never derived from it, on the module header's terms.
+    pub jitter: u64,
+}
+
+/// One boot's hardware randomness, or the reason there is none.
 ///
 /// # Errors
 /// [`EntropyError`], on the terms in the module header: a part with no `RDRAND`,
 /// or one whose generator will not answer.
-pub fn secret_bytes() -> Result<[u8; 16], EntropyError> {
+pub fn draw_entropy() -> Result<Entropy, EntropyError> {
     let feature_word = feature_word();
     if feature_word & RDRAND_BIT == 0 {
         return Err(EntropyError::NotSupported { feature_word });
     }
-    let mut bytes = [0u8; 16];
-    for word in 0..WORDS {
+    let mut secret = [0u8; 16];
+    for word in 0..SECRET_WORDS {
         let drawn = draw().ok_or(EntropyError::Exhausted { word })?;
         // Bounded by construction: two eight-byte chunks of a sixteen-byte array,
         // and the index is this loop's own rather than anything external.
         let at = word * 8;
-        for (slot, byte) in bytes.iter_mut().skip(at).zip(drawn.to_le_bytes()) {
+        for (slot, byte) in secret.iter_mut().skip(at).zip(drawn.to_le_bytes()) {
             *slot = byte;
         }
     }
-    Ok(bytes)
+    let jitter = draw().ok_or(EntropyError::Exhausted { word: SECRET_WORDS })?;
+    Ok(Entropy { secret, jitter })
 }
+
+// The draws are counted rather than assumed: a secret narrower than the
+// transport's key, or a seed taken from a word the secret also used, would each
+// be a defect this file could otherwise carry silently.
+const _: () = assert!(WORDS == SECRET_WORDS + 1);
 
 /// `CPUID.01H:ECX`, the word carrying the `RDRAND` feature bit.
 fn feature_word() -> u32 {
@@ -113,7 +151,7 @@ fn draw() -> Option<u64> {
         let mut value = 0u64;
         // SAFETY: `_rdrand64_step` requires the `rdrand` target feature to be
         // available on the part it executes on, and the guarantor of that is the
-        // `CPUID` check in `secret_bytes` above — the only caller, which returns
+        // `CPUID` check in `draw_entropy` above — the only caller, which returns
         // `EntropyError::NotSupported` before reaching this function when
         // `CPUID.01H:ECX[30]` is clear. The kernel is the guarantor of the same
         // unprivileged-execution fact `feature_word` records. The intrinsic

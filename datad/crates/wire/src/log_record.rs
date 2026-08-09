@@ -292,6 +292,9 @@ pub enum LogDetailKind {
     /// Where the domain holding the record has told the dialling domain to go.
     /// Appended, never inserted.
     Published,
+    /// How long the dialling domain will wait before its next attempt, and the
+    /// bound that wait was drawn below. Appended, never inserted.
+    DialRetry,
 }
 
 impl LogDetailKind {
@@ -342,6 +345,7 @@ impl LogDetailKind {
             Self::Ownership => 41,
             Self::DelegatedAnchor => 42,
             Self::Published => 43,
+            Self::DialRetry => 44,
         }
     }
 
@@ -392,6 +396,7 @@ impl LogDetailKind {
             41 => Some(Self::Ownership),
             42 => Some(Self::DelegatedAnchor),
             43 => Some(Self::Published),
+            44 => Some(Self::DialRetry),
             _ => None,
         }
     }
@@ -946,6 +951,14 @@ impl LogRecord {
             Some(LogDetailKind::DialSequence) => CheckedDetail::DialSequence {
                 claimed: sequence_bits(self.operands[0])?,
                 expected: sequence_bits(self.operands[1])?,
+            },
+            // Two spans in milliseconds, neither ranged: every bit pattern of
+            // each is a span the emitting domain's own schedule could have
+            // drawn or climbed to, and a range checked here would be this
+            // layer deciding what that domain is allowed to have said.
+            Some(LogDetailKind::DialRetry) => CheckedDetail::DialRetry {
+                delay_millis: self.operands[0],
+                bound_millis: self.operands[1],
             },
             // A token and three counts, in `Dialled`'s order: the token takes
             // the leading word wherever a detail's first word names a
@@ -1683,6 +1696,14 @@ pub enum CheckedDetail {
     DialSequence {
         claimed: u32,
         expected: u32,
+    },
+    /// The wait before the next attempt and the bound it was drawn below, both
+    /// in milliseconds. Neither is ranged: a span is a span, and the schedule's
+    /// own cap is a fact about the emitting domain rather than about what a
+    /// record may carry.
+    DialRetry {
+        delay_millis: u64,
+        bound_millis: u64,
     },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.

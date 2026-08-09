@@ -290,12 +290,17 @@ pub(crate) enum DialContract {
     /// The dial is answered and nothing is required of it. Every scenario whose
     /// subject is something else takes this.
     Answered,
-    /// The dial must complete: the station sees the resolution, the handshake,
-    /// the probe and the close, and the appliance reports the channel on its
-    /// console as `answered` on its first attempt. One scenario carries it, for
-    /// the reason every other pairing in this table has one — the claim is about
-    /// the appliance and not about the document, so proving it twice would state
+    /// The dial must come up: the station sees the resolution and the
+    /// handshake, and the appliance reports the attempt on its console as
+    /// `established` on its first try. One scenario carries it, for the reason
+    /// every other pairing in this table has one — the claim is about the
+    /// appliance and not about the document, so proving it twice would state
     /// the same fact twice.
+    ///
+    /// It stops at the handshake because the channel is a **stream** and this
+    /// appliance has nothing to say over one yet: nothing is composed, so what
+    /// the station can observe ends where the connection comes up, and the
+    /// connection is then held rather than closed.
     Judged,
     /// The station misbehaves in the named way, and the appliance must report the
     /// channel as the one outcome that misbehaviour can produce — while the node
@@ -346,6 +351,14 @@ impl DialContract {
     /// token are what keep the three apart even if the tokens ever drifted back
     /// together, and each scenario states the subset that distinguishes it.
     ///
+    /// **Every verdict here is about the FIRST attempt.** The channel re-dials
+    /// for as long as it is down, so a boot against a misbehaving station
+    /// produces record set after record set — and the one whose contents this
+    /// station's behaviour decides is the first. Which is why the counts below
+    /// are one attempt's rather than three attempts' worth, and why the attempt
+    /// number is one: a verdict stated against the last set would depend on how
+    /// long the emulator happened to run.
+    ///
     /// Every station on this wire is on this port's own prefix, so the route
     /// decision hands each of them the destination itself and never the gateway
     /// — stated in all four, because a channel that went somewhere else would
@@ -359,101 +372,104 @@ impl DialContract {
             // it by name, which turns a table entry that cannot mean anything
             // into a verdict a reader can act on rather than a crash.
             Self::Misbehaves(DialMisbehaviour::Answers) => return None,
-            // One session, answered — and no counts at all, a channel that came
-            // up having no fault to place.
-            Self::Judged => (DialOutcome::Answered, 1, None),
-            // Three sessions, each carried to the end of the transport's own
+            // One attempt, up — and no counts at all, an attempt that came up
+            // having no fault to place and nothing to wait for.
+            Self::Judged => (DialOutcome::Established, 1, None),
+            // The first attempt, carried to the end of the transport's own
             // retransmission budget with nothing at the far end answering. What
-            // says so is `answered=false` beside a handshake count that spans
-            // every attempt: the station took all of them and returned
-            // nothing.
+            // says so is `answered=false` beside the handshake count: the
+            // station took every one of them and returned nothing.
             Self::Misbehaves(DialMisbehaviour::SilentToTheDial) => (
                 DialOutcome::Unanswered,
-                3,
+                1,
                 Some(DialAccount {
                     next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
                     // The resolution worked: the station answers for the address
                     // it holds and only the connection is ignored. A floor
-                    // rather than an exact count, because a cache entry that
-                    // expires between sessions is asked about again.
+                    // rather than an exact count, because a request the cache
+                    // re-sends inside one attempt is asked again.
                     requests: Count::AtLeast(1),
                     learned: Count::AtLeast(1),
                     unlearned: [Count::Exactly(0); 4],
-                    // At least one per session and every re-send of it. A floor,
-                    // the number of re-sends inside a boot being the backoff's.
-                    syns: Count::AtLeast(3),
+                    // The dial and every re-send of it. A floor, the number of
+                    // re-sends inside one attempt being the transport's backoff.
+                    syns: Count::AtLeast(1),
                     resets_received: Count::Exactly(0),
                     resets_sent: Count::Exactly(0),
                     answered: false,
                     acknowledged: false,
+                    // The first failure of a boot waits below the schedule's own
+                    // floor. Exact, because no timer chooses it.
+                    retry_bound: Count::Exactly(1_000),
                 }),
             ),
-            // Three sessions, each refused by a reset the moment it opened. The
+            // The first attempt, refused by a reset the moment it opened. The
             // reset count is what separates this from the silence above, and the
             // absence of one *sent* is the protocol's own rule: a reset is never
             // answered with another.
             Self::Misbehaves(DialMisbehaviour::ResetsTheDial) => (
                 DialOutcome::ResetByPeer,
-                3,
+                1,
                 Some(DialAccount {
                     next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
                     requests: Count::AtLeast(1),
                     learned: Count::AtLeast(1),
                     unlearned: [Count::Exactly(0); 4],
-                    syns: Count::AtLeast(3),
+                    syns: Count::AtLeast(1),
                     resets_received: Count::AtLeast(1),
                     resets_sent: Count::Exactly(0),
                     answered: true,
                     acknowledged: false,
+                    retry_bound: Count::Exactly(1_000),
                 }),
             ),
-            // Three sessions again, and for a reason worth stating: the bogus
-            // handshake does NOT end one. It draws a reset and leaves the dial
-            // where it was, so each session runs out the same retransmission
+            // The first attempt again, and for a reason worth stating: the bogus
+            // handshake does NOT end it. It draws a reset and leaves the dial
+            // where it was, so the attempt runs out the same retransmission
             // budget the silent station's does — and what tells the two apart on
             // the console is `answered=true`, a reset count that moved *outward*
             // rather than inward, and the two numbers the station claimed.
             Self::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence) => (
                 DialOutcome::UnacceptableAcknowledgement,
-                3,
+                1,
                 Some(DialAccount {
                     next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
                     requests: Count::AtLeast(1),
                     learned: Count::AtLeast(1),
                     unlearned: [Count::Exactly(0); 4],
-                    syns: Count::AtLeast(3),
+                    syns: Count::AtLeast(1),
                     resets_received: Count::Exactly(0),
-                    // One per bogus handshake refused, which is at least one per
-                    // session. A floor for the handshake count's reason.
-                    resets_sent: Count::AtLeast(3),
+                    // One per bogus handshake refused, which is at least one.
+                    // A floor for the handshake count's reason.
+                    resets_sent: Count::AtLeast(1),
                     answered: true,
                     // The pair itself is the station's arithmetic and is
                     // supplied by the run: this scenario states that one is
                     // owed, and the numbers the appliance prints are compared
                     // against what the station read off the wire.
                     acknowledged: true,
+                    retry_bound: Count::Exactly(1_000),
                 }),
             ),
-            // Three sessions, none of which reached a connection: the neighbour
-            // cache asked, was answered by somebody else, gave up, and no `SYN`
-            // ever crossed the wire — which is the claim, and the station is
-            // what holds it.
+            // The first attempt, which never reached a connection: the
+            // neighbour cache asked, was answered by somebody else, gave up, and
+            // no `SYN` ever crossed the wire — which is the claim, and the
+            // station is what holds it.
             //
-            // Every one of the three ends on the link rather than on this node,
-            // and the last is what the record names. Each session leaves behind
-            // the connection its `SYN` was composed on — that segment was
+            // It ends on the link rather than on this node. The attempt leaves
+            // behind the connection its `SYN` was composed on — that segment was
             // dropped for want of an address, so the transport holds it in
             // `SynSent` and nothing at the far end will ever answer it — and
-            // ending the session gives that connection back, so the dial after
-            // it opens a new one rather than meeting this node's own table.
-            // That is what keeps the token a fact about the link: an operator
-            // reading it goes and looks at what claims the next hop.
+            // ending the attempt gives that connection back, so the attempt
+            // after it opens a new one rather than meeting this node's own
+            // table. That is what keeps the token a fact about the link: an
+            // operator reading it goes and looks at what claims the next hop.
             Self::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress) => (
                 DialOutcome::NextHopUnreachable,
-                3,
+                1,
                 Some(DialAccount {
                     next_hop: (forward_harness::DIAL_DESTINATION, "prefix"),
-                    // The whole request budget, three times over, and nothing
+                    // The whole request budget of one attempt, and nothing
                     // learned from any of them: the pair is the entire meaning
                     // of the token.
                     requests: Count::AtLeast(3),
@@ -468,17 +484,18 @@ impl DialContract {
                         Count::Exactly(0),
                         Count::Exactly(0),
                     ],
-                    // At least one per session, composed and dropped for want
-                    // of an address — and re-sent by the transport's own
-                    // backoff while the resolution runs, which is why this is a
-                    // floor and not the three sessions. **None of them reached
-                    // the wire**, which is the claim this scenario rests on and
-                    // the station holds it separately by seeing no `SYN` at all.
-                    syns: Count::AtLeast(3),
+                    // One composed and dropped for want of an address — and
+                    // re-sent by the transport's own backoff while the
+                    // resolution runs, which is why this is a floor. **None of
+                    // them reached the wire**, which is the claim this scenario
+                    // rests on and the station holds it separately by seeing no
+                    // `SYN` at all.
+                    syns: Count::AtLeast(1),
                     resets_received: Count::Exactly(0),
                     resets_sent: Count::Exactly(0),
                     answered: false,
                     acknowledged: false,
+                    retry_bound: Count::Exactly(1_000),
                 }),
             ),
         };
@@ -1698,8 +1715,10 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // somebody else — and each of those has exactly one right outcome.
     //
     // TWO THINGS HOLD ON EACH, and the second matters more than the first. The
-    // appliance reports the typed outcome for what happened, after the number of
-    // sessions its own bound allows. And THE NODE STAYS HEALTHY: its routed
+    // appliance reports the typed outcome for what happened, on the first
+    // attempt it spends — it keeps attempting for as long as the channel is
+    // down, so the first is the one whose contents this station decides. And
+    // THE NODE STAYS HEALTHY: its routed
     // contract is met in the same boot, so the dataplane went on forwarding
     // throughout; its management port reports every frame the harness put on that
     // wire to the byte, so the domain that owns the failing channel neither
@@ -1754,12 +1773,13 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     },
     // And the one where nothing reaches a connection at all: the station answers
     // every resolution for an address nobody asked about, so nothing is learned
-    // from it and no `SYN` ever crosses — the station holds both — and each of
-    // the three sessions ends on the link rather than on this node. It is the
-    // boot that holds the token to the fact it names: three attempts against an
-    // unresolvable next hop must all read `next-hop-unreachable`, which they do
-    // only because ending a session gives its connection back and leaves the
-    // next dial a table the one before it did not touch.
+    // from it and no `SYN` ever crosses — the station holds both — and every
+    // attempt ends on the link rather than on this node. It is the boot that
+    // holds the token to the fact it names: an attempt after an unresolvable
+    // next hop must read `next-hop-unreachable` again rather than this node's
+    // own table, which it does only because ending an attempt gives its
+    // connection back and leaves the next one a table the one before it did not
+    // touch.
     Scenario {
         name: "dial-unresolvable",
         document: image::CONFIGURATION_DOCUMENT,

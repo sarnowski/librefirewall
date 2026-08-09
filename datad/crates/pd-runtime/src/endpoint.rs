@@ -69,7 +69,7 @@ use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
     http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
     onboard::{Ended as OnboardEnded, StreamCounters},
-    outbound::{DialFacts, Ended, OpenError, Resolutions},
+    outbound::{DialFacts, Ended, OpenError, Resolutions, Session},
     route::Hop,
 };
 use lfw_log::RejectReason;
@@ -876,25 +876,68 @@ impl<'ring> EndpointStage<'ring> {
         }
     }
 
-    /// Open the one connection this port reaches out with, carrying `request`.
+    /// Open the one connection this port reaches out with.
     ///
-    /// Nothing leaves here, on `Endpoint::open_outbound`'s terms: it is
-    /// [`drive_dial`](Self::drive_dial) that puts a frame on the wire. `None`
-    /// where the port has no address yet, which is a state to wait out rather
-    /// than a refusal — a session cannot be opened out of a port that has no
-    /// source address to open it from.
+    /// Nothing leaves here and nothing is carried, on `Endpoint::open_outbound`'s
+    /// terms: it is [`drive_dial`](Self::drive_dial) that puts a frame on the
+    /// wire, and what the session carries is pushed once it is up. `None` where
+    /// the port has no address yet, which is a state to wait out rather than a
+    /// refusal — a session cannot be opened out of a port that has no source
+    /// address to open it from.
     ///
     /// # Errors
-    /// `OpenError`, for a session already running, a destination this port
-    /// cannot reach, or a request longer than the room for one.
+    /// `OpenError`, for a session already running or a destination this port
+    /// cannot reach.
     pub fn open_dial(
         &mut self,
         destination: Ipv4Address,
         port: u16,
-        request: &[u8],
     ) -> Option<Result<(), OpenError>> {
         let endpoint = self.endpoint.as_mut()?;
-        Some(endpoint.open_outbound(destination, port, request))
+        Some(endpoint.open_outbound(destination, port))
+    }
+
+    /// Whether the channel's connection has come up, so the stream over it may
+    /// carry bytes.
+    #[must_use]
+    pub fn dial_established(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .and_then(Endpoint::outbound)
+            .is_some_and(Session::established)
+    }
+
+    /// Bytes the channel's peer sent that have not been taken.
+    #[must_use]
+    pub fn dial_received(&self) -> &[u8] {
+        self.endpoint
+            .as_ref()
+            .and_then(Endpoint::outbound)
+            .map_or(&[], Session::received)
+    }
+
+    /// Drop the first `bytes` of them, which the consumer above has taken.
+    pub fn dial_consumed(&mut self, bytes: usize) {
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.consume_outbound(bytes);
+        }
+    }
+
+    /// Put `bytes` on the channel's connection, answering how many there was
+    /// room for. Zero where the port has no addressing or no session, which is
+    /// bytes with nowhere to go rather than an answer that was refused.
+    pub fn dial_push(&mut self, bytes: &[u8]) -> usize {
+        self.endpoint
+            .as_mut()
+            .map_or(0, |endpoint| endpoint.push_outbound(bytes))
+    }
+
+    /// End the channel's session from this end. The close goes out once
+    /// everything pushed onto it has.
+    pub fn end_dial_session(&mut self) {
+        if let Some(endpoint) = self.endpoint.as_mut() {
+            endpoint.end_outbound_session();
+        }
     }
 
     /// Send whatever the outbound session now owes.

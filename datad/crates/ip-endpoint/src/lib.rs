@@ -88,6 +88,12 @@
 //! transport recorded it and re-sends it under RFC 6298's backoff, and the
 //! resolution runs while that timer is armed.
 //!
+//! What runs over it once it is up is a **byte stream**, exactly as the
+//! [`onboard`] port's is and for the same reason: the session is terminated
+//! somewhere else, so the whole of what this may do with a byte is move it. It
+//! composes nothing, reads nothing, and ends nothing the consumer above it has
+//! not ended — a stream having no length off which an end could be read.
+//!
 //! An ARP *reply* is therefore taken as well as an ARP request answered, and the
 //! cache's own three rules are what keep that from being a way to aim this
 //! node's outbound traffic: only a reply this end asked for is learned, a
@@ -113,10 +119,9 @@
 //! caller decides where a reply is composed — in the protection domain that runs
 //! this, a buffer it has just taken from a pool. Nothing here is allocated and
 //! nothing here is sized by anything a peer sends: the two connection tables,
-//! each connection's request slot, the one response staging buffer, the outbound
-//! session's request and answer and the onboarding stream's two directions are
-//! fixed arrays sized by the constants below, in [`http`], in [`outbound`] and
-//! in [`onboard`].
+//! each connection's request slot, the one response staging buffer, and the two
+//! byte streams' two directions each are fixed arrays sized by the constants
+//! below, in [`http`], in [`outbound`] and in [`onboard`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -739,24 +744,20 @@ impl Endpoint {
         self.outbound.as_ref()
     }
 
-    /// Open a connection to `destination` on `port`, carrying `request` and
-    /// keeping what comes back.
+    /// Open a connection to `destination` on `port`, over which the caller
+    /// above drives a byte stream.
     ///
-    /// Nothing leaves here: the next hop is chosen and the session recorded, and
-    /// [`poll_outbound`](Self::poll_outbound) is what puts a frame on the wire.
-    /// That split is what lets an open be refused for a reason of this node's own
-    /// — an unreachable destination, a request too long — before a peer has been
-    /// given the chance to say anything.
+    /// Nothing leaves here and nothing is carried: the next hop is chosen and
+    /// the session recorded, and [`poll_outbound`](Self::poll_outbound) is what
+    /// puts a frame on the wire. That split is what lets an open be refused for
+    /// a reason of this node's own — an unreachable destination, a session
+    /// already running — before a peer has been given the chance to say
+    /// anything.
     ///
     /// # Errors
-    /// [`OpenError`], for a session already running, a destination this port
-    /// cannot reach, or a request longer than the room for one.
-    pub fn open_outbound(
-        &mut self,
-        destination: Ipv4Address,
-        port: u16,
-        request: &[u8],
-    ) -> Result<(), OpenError> {
+    /// [`OpenError`], for a session already running or a destination this port
+    /// cannot reach.
+    pub fn open_outbound(&mut self, destination: Ipv4Address, port: u16) -> Result<(), OpenError> {
         if let Some(running) = self.outbound.as_ref() {
             OutboundCounters::bump(&mut self.outbound_counters.open_refused);
             return Err(OpenError::Busy {
@@ -771,16 +772,42 @@ impl Endpoint {
                 return Err(OpenError::Unroutable(refusal));
             }
         };
-        let session = match Session::new(destination, port, next_hop, request) {
-            Ok(session) => session,
-            Err(error) => {
-                OutboundCounters::bump(&mut self.outbound_counters.open_refused);
-                return Err(error);
-            }
-        };
-        self.outbound = Some(session);
+        self.outbound = Some(Session::new(destination, port, next_hop));
         OutboundCounters::bump(&mut self.outbound_counters.opened);
         Ok(())
+    }
+
+    /// Put `bytes` on the outbound stream, answering how many there was room
+    /// for.
+    ///
+    /// Fewer than offered is this end's own refusal and is counted as such: the
+    /// consumer above is another domain, and what its answer outgrew is the room
+    /// this end keeps for one. Zero where no session is running, which is a
+    /// consumer whose bytes arrived after the session they belonged to was gone.
+    pub fn push_outbound(&mut self, bytes: &[u8]) -> usize {
+        let Some(session) = self.outbound.as_mut() else {
+            OutboundCounters::add(&mut self.outbound_counters.refused, bytes.len());
+            return 0;
+        };
+        let (kept, refused) = session.push(bytes);
+        OutboundCounters::add(&mut self.outbound_counters.refused, refused);
+        kept
+    }
+
+    /// Drop the first `bytes` of the outbound session's received stream, which
+    /// the consumer above has taken.
+    pub fn consume_outbound(&mut self, bytes: usize) {
+        if let Some(session) = self.outbound.as_mut() {
+            session.consumed(bytes);
+        }
+    }
+
+    /// End the outbound session from this end. The close goes out once
+    /// everything the consumer answered with has.
+    pub fn end_outbound_session(&mut self) {
+        if let Some(session) = self.outbound.as_mut() {
+            session.end_session();
+        }
     }
 
     /// Forget a finished session, so another may be opened.
@@ -1124,7 +1151,7 @@ impl Endpoint {
         }
         match session.phase() {
             Phase::Resolving => self.resolve_outbound(now, out),
-            Phase::Dialling | Phase::Sending | Phase::Reading | Phase::Closing => {
+            Phase::Dialling | Phase::Established | Phase::Closing => {
                 self.advance_outbound(now, out)
             }
             // Unreachable: an ended phase left above. A value rather than an
@@ -1234,7 +1261,8 @@ impl Endpoint {
         }
     }
 
-    /// Carry a dialled session forward: send the request, read the answer, close.
+    /// Carry a dialled session forward: put what the consumer owes on the wire,
+    /// take what arrives, and close when this end has said it is over.
     fn advance_outbound(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
         let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
             return self.end_outbound(Ended::Lost, out);
@@ -1248,7 +1276,7 @@ impl Endpoint {
             // explains reaches the residual.
             let ended = self.outbound.as_ref().map_or(Ended::Lost, |session| {
                 if session.peer_closed() {
-                    Ended::Answered
+                    Ended::ClosedByPeer
                 } else {
                     session.ending()
                 }
@@ -1277,7 +1305,19 @@ impl Endpoint {
             // retransmission is what re-sends the `SYN`, and a segment composed
             // here would be a second one.
             State::SynSent | State::SynReceived => Polled::Idle,
-            State::Established | State::CloseWait => self.drive_outbound(now, path, out),
+            State::Established | State::CloseWait => {
+                // The handshake completed. Counted on the first pass that
+                // observes it and not on every pass after it: a session that
+                // came up is one session however many wakeups it then spans.
+                let first = self.outbound.as_mut().is_some_and(Session::note_handshaken);
+                if first {
+                    OutboundCounters::bump(&mut self.outbound_counters.established);
+                    if let Some(session) = self.outbound.as_mut() {
+                        session.enter(Phase::Established);
+                    }
+                }
+                self.drive_outbound(now, path, out)
+            }
             // This end has closed and owes nothing but the last acknowledgement,
             // which the transport composes on the segment that arrives.
             State::FinWait1
@@ -1294,8 +1334,14 @@ impl Endpoint {
         }
     }
 
-    /// Send whatever an established session owes: the rest of its request, then
-    /// its own close once the peer has finished.
+    /// Send whatever an established session owes, or close it.
+    ///
+    /// One segment per call, because `out` holds one. The close waits on the
+    /// outbound bytes: a `FIN` composed in front of them would end the session
+    /// before the last thing it had to say. **Nothing here ends a session
+    /// because the peer closed its half** — that is a half-close the transport
+    /// reports and the consumer above decides on, a stream having no length
+    /// this end could read an end off.
     fn drive_outbound(
         &mut self,
         now: Monotonic,
@@ -1305,65 +1351,22 @@ impl Endpoint {
         let Some(connection) = self.outbound.as_ref().and_then(Session::connection) else {
             return Polled::Idle;
         };
-        let request_out = self.outbound.as_ref().is_some_and(Session::request_out);
-        if !request_out {
-            let sent = {
-                let Self { outbound, tcp, .. } = self;
-                let Some(session) = outbound.as_ref() else {
-                    return Polled::Idle;
-                };
-                let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
-                    return Polled::Idle;
-                };
-                tcp.send(now, connection, session.unsent(), segment)
-            };
-            let Ok(sent) = sent else {
-                // The peer's window is closed or every record slot is taken.
-                // Neither is a failure and neither is answered by composing
-                // anything: an acknowledgement is what opens the window again.
-                return Polled::Idle;
-            };
-            self.outbound_counters.request_bytes = self
-                .outbound_counters
-                .request_bytes
-                .saturating_add(sent.bytes as u64);
-            // The oldest range the transport still holds, read straight after
-            // the first send: the handshake's `SYN` is acknowledged by the time
-            // a connection can carry data, so that range is the request's own
-            // beginning and nothing else.
-            let oldest = self
-                .tcp
-                .connection(connection)
-                .and_then(Connection::oldest_range);
-            if let Some(session) = self.outbound.as_mut() {
-                if let Some((sequence, _)) = oldest {
-                    session.note_base(sequence);
-                }
-                session.took(sent.bytes);
-                session.enter(if session.request_out() {
-                    Phase::Reading
-                } else {
-                    Phase::Sending
-                });
-            }
-            return match path {
-                Some(path) => Polled::Frame {
-                    len: self.frame_around(path, sent.len, out),
-                },
-                None => {
-                    OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
-                    Polled::Handled
-                }
-            };
+        // Before anything is composed, because the segment below carries the
+        // window: one set afterwards would tell the peer it may send bytes this
+        // end is still holding. The `SYN` carried the listening stack's own
+        // window — sized for a request slot — so the first pass here **raises**
+        // it to what this session really holds, which is the direction a window
+        // may move freely.
+        //
+        // Lossless: bounded by `RECEIVE_CAPACITY`.
+        let room = self.outbound.as_ref().map_or(0, Session::room);
+        self.tcp.set_receive_window(connection, room as u32);
+        if self.outbound.as_ref().is_some_and(Session::owes_bytes) {
+            return self.send_outbound(now, connection, path, out);
         }
-        // The request is out. This end closes once the peer has, which is what
-        // makes the exchange one request and one answer rather than a stream
-        // whose end nobody states.
-        let peer_closed = self.outbound.as_ref().is_some_and(Session::peer_closed);
-        if !peer_closed {
-            if let Some(session) = self.outbound.as_mut() {
-                session.enter(Phase::Reading);
-            }
+        let closing = self.outbound.as_ref().is_some_and(Session::closing);
+        let consumer_closed = self.outbound.as_ref().is_some_and(Session::consumer_closed);
+        if closing || !consumer_closed {
             return Polled::Idle;
         }
         let closed = {
@@ -1376,11 +1379,62 @@ impl Endpoint {
             return Polled::Idle;
         };
         if let Some(session) = self.outbound.as_mut() {
+            session.note_closing();
             session.enter(Phase::Closing);
         }
         match path {
             Some(path) => Polled::Frame {
                 len: self.frame_around(path, len, out),
+            },
+            None => {
+                OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
+                Polled::Handled
+            }
+        }
+    }
+
+    /// Hand the transport the next run of what the consumer answered with.
+    fn send_outbound(
+        &mut self,
+        now: Monotonic,
+        connection: ConnectionId,
+        path: Option<(MacAddress, Ipv4Address)>,
+        out: &mut [u8],
+    ) -> Polled {
+        let sent = {
+            let Self { outbound, tcp, .. } = self;
+            let Some(session) = outbound.as_ref() else {
+                return Polled::Idle;
+            };
+            let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..) else {
+                return Polled::Idle;
+            };
+            tcp.send(now, connection, session.unsent(), segment)
+        };
+        let Ok(sent) = sent else {
+            // The peer's window is closed or every record slot is taken.
+            // Neither is a failure and neither is answered by composing
+            // anything: an acknowledgement is what opens the window again.
+            return Polled::Idle;
+        };
+        OutboundCounters::add(&mut self.outbound_counters.sent, sent.bytes);
+        // The oldest range the transport still holds, read straight after the
+        // first send: the handshake's `SYN` is acknowledged by the time a
+        // connection can carry data, so that range is where this stream's byte
+        // zero sits and nothing else.
+        let oldest = self
+            .tcp
+            .connection(connection)
+            .and_then(Connection::oldest_range);
+        if let Some(session) = self.outbound.as_mut() {
+            if let Some((sequence, _)) = oldest {
+                session.note_base(sequence);
+            }
+            session.took(sent.bytes);
+        }
+        match path {
+            Some(path) => Polled::Frame {
+                len: self.frame_around(path, sent.len, out),
             },
             None => {
                 OutboundCounters::bump(&mut self.outbound_counters.dropped_unresolved);
@@ -1405,12 +1459,7 @@ impl Endpoint {
         if let Some(session) = self.outbound.as_mut() {
             session.enter(Phase::Ended(ended));
         }
-        let count = if ended.succeeded() {
-            &mut self.outbound_counters.answered
-        } else {
-            &mut self.outbound_counters.failed
-        };
-        OutboundCounters::bump(count);
+        OutboundCounters::bump(&mut self.outbound_counters.ended);
         released
     }
 
@@ -1821,14 +1870,8 @@ impl Endpoint {
             return;
         };
         let (kept, dropped) = session.take(data);
-        self.outbound_counters.answer_bytes = self
-            .outbound_counters
-            .answer_bytes
-            .saturating_add(kept as u64);
-        self.outbound_counters.answer_overflowed = self
-            .outbound_counters
-            .answer_overflowed
-            .saturating_add(dropped as u64);
+        OutboundCounters::add(&mut self.outbound_counters.received, kept);
+        OutboundCounters::add(&mut self.outbound_counters.overflowed, dropped);
     }
 
     /// Stamp the Ethernet and IPv4 headers in front of a segment already written at

@@ -1,6 +1,11 @@
 //! The outbound connection: this appliance reaching *out* of its addressed
 //! port, rather than answering on it.
 //!
+//! A **byte stream**, on the onboarding port's shape and for the same reason:
+//! what runs over this connection is a session another domain terminates, and
+//! the whole of what this may do with a byte is move it. It does not know what
+//! the bytes are, it composes none of them, and it reads none.
+//!
 //! # Adversary
 //!
 //! **The management-plane attacker**, and the whole of what is here is about the
@@ -20,15 +25,19 @@
 //!
 //! # What this holds and what it does not
 //!
-//! It holds the request, because a request is bytes the transport records a
-//! range of and asks for again — and it holds the answer, because bytes read off
-//! a peer have to land somewhere before a caller can judge them. Both are fixed
-//! arrays sized by a constant here, the shape every other buffer in this crate
-//! has. Neither can grow: a request longer than [`REQUEST_CAPACITY`] is refused
-//! at the open, and an answer past [`ANSWER_CAPACITY`] is counted and dropped
-//! rather than being allowed to displace what came before it.
+//! Two fixed arrays and nothing else. [`SEND_CAPACITY`] bytes of what the
+//! consumer above has answered with, because the transport owns no copy of a
+//! range it may ask for again; and [`RECEIVE_CAPACITY`] bytes of what the peer
+//! sent and the consumer has not taken, because a consumer is driven on a wakeup
+//! and bytes arrive on a frame. Neither grows and neither is sized by anything a
+//! peer sends: what does not fit is **counted and refused**, never dropped
+//! silently and never allowed to displace what came before it.
 //!
-//! What it does **not** hold is a segment, a retransmission copy, or a queue. A
+//! The receive window is kept equal to the room actually left, so a peer that
+//! keeps to the window cannot overflow the inbound array at all; the overflow
+//! count is what a peer that does not keep to it produces.
+//!
+//! What this does **not** hold is a segment, a retransmission copy, or a queue. A
 //! segment is composed into the caller's storage exactly as every reply in this
 //! crate is, and a segment that cannot be addressed is dropped rather than
 //! queued — the transport's own retransmission is what sends it again, and the
@@ -39,26 +48,38 @@ use net_headers::{Ipv4Address, MacAddress};
 
 use crate::route::{Hop, RouteRefusal};
 
-/// The longest request one session carries.
+/// Bytes the consumer has answered with and the transport has not finished
+/// with.
 ///
-/// Sized for the fixed first-party probe this appliance sends and not for a
-/// stream: a session that wanted more would be one holding a buffer somebody
-/// else's bytes decide the size of, which is the thing this crate does not do.
-pub const REQUEST_CAPACITY: usize = 64;
+/// It must outlast the send rather than the answer: the transport keeps no copy
+/// of a range it may ask for again, so these bytes are held until the peer has
+/// acknowledged them. Sized for the **records** a session over this connection
+/// composes and not for any fixed message — the largest one end of such a
+/// session sends in a single flight is a key-exchange greeting of about
+/// thirteen hundred bytes, and the room here is that with a whole flight's
+/// margin over it.
+pub const SEND_CAPACITY: usize = 2048;
 
-/// The most of a peer's answer one session keeps.
+/// Bytes read off the peer and held until the consumer takes them.
 ///
-/// Everything past it is counted and dropped. The alternative — taking the tail
-/// and dropping the head — would let a peer decide which of its own bytes this
-/// end judged, which is a choice no peer gets to make.
-pub const ANSWER_CAPACITY: usize = 256;
+/// Sized so the room left is always a window worth advertising and never so
+/// large that a peer can make this endpoint hold a page of its choosing: it is
+/// the staging area between one frame and one wakeup, not a reassembly buffer.
+/// The consumer reassembles, being the end that knows what the bytes are — and
+/// the largest single flight the far end of such a session sends is a few
+/// kilobytes, so a whole one lands before a wakeup has to have run.
+pub const RECEIVE_CAPACITY: usize = 4096;
 
 /// Why no session was opened.
 ///
-/// Every variant is about *this* end — a session already running, a destination
-/// this port cannot reach, a request longer than the room for one — because an
-/// open is refused before a peer has been given the chance to say anything. What
-/// a peer then does with the dial is an [`Ended`], never one of these.
+/// Both variants are about *this* end — a session already running, a destination
+/// this port cannot reach — because an open is refused before a peer has been
+/// given the chance to say anything. What a peer then does with the dial is an
+/// [`Ended`], never one of these.
+///
+/// Two rather than three: a session opens carrying nothing at all, so there is
+/// no length for this end to refuse. What the consumer then answers with is
+/// bounded by [`SEND_CAPACITY`] at the push and counted there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenError {
     /// A session is already running, and the destination it is running to is
@@ -68,10 +89,6 @@ pub enum OpenError {
     /// refusal, carried whole: it names this node's configuration or its choice
     /// of destination, and both are things an operator fixes.
     Unroutable(RouteRefusal),
-    /// A request longer than [`REQUEST_CAPACITY`]. Refused rather than truncated:
-    /// a request cut to fit is a different request, and the peer would answer the
-    /// one that was sent rather than the one that was meant.
-    RequestTooLong { len: usize },
 }
 
 /// How one session finished.
@@ -84,11 +101,18 @@ pub enum OpenError {
 /// way to act on it, which is worse, because a station that never answered, one
 /// that refused the port, and one that is not speaking TCP correctly send an
 /// operator to three different places.
+///
+/// None of them is a success. A session that came up is not an ending at all —
+/// it is a connection this end is still holding, reported as
+/// [`Phase::Established`] — and a stream the far end hung up on is
+/// [`Self::ClosedByPeer`], which is a cause like any other rather than the
+/// channel having worked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ended {
-    /// The peer answered and both halves closed. The answer is in
-    /// [`Session::answer`].
-    Answered,
+    /// The peer closed its half and the connection finished. Whatever the
+    /// session carried, the far end decided it was over — which for a channel
+    /// meant to persist is a thing to go and look at rather than a healthy end.
+    ClosedByPeer,
     /// Every request for the next hop's hardware address went unanswered, so no
     /// frame of this session could be addressed at all. Nothing on this link
     /// claims the next hop.
@@ -154,7 +178,7 @@ impl Ended {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Answered => "answered",
+            Self::ClosedByPeer => "closed_by_peer",
             Self::NextHopUnreachable => "next_hop_unreachable",
             Self::NoRoomToResolve => "no_room_to_resolve",
             Self::Unanswered => "unanswered",
@@ -165,12 +189,6 @@ impl Ended {
             Self::ConnectionAlreadyOpen => "connection_already_open",
             Self::SynDidNotFit => "syn_did_not_fit",
         }
-    }
-
-    /// Whether the session reached the far end and read what it said.
-    #[must_use]
-    pub const fn succeeded(self) -> bool {
-        matches!(self, Self::Answered)
     }
 }
 
@@ -212,22 +230,6 @@ impl DialFacts {
             resets_sent: 0,
         }
     }
-
-    /// This session's facts folded into a channel's running account of several.
-    ///
-    /// The channel spends more than one session, and what an operator reads is
-    /// the channel: every handshake a station ignored, and not the last
-    /// session's share of them. Reporting one session's would understate the
-    /// evidence by as many times as the channel had attempts.
-    #[must_use]
-    pub const fn joined(self, later: Self) -> Self {
-        Self {
-            syns: self.syns.saturating_add(later.syns),
-            answered: self.answered || later.answered,
-            resets_received: self.resets_received.saturating_add(later.resets_received),
-            resets_sent: self.resets_sent.saturating_add(later.resets_sent),
-        }
-    }
 }
 
 /// Where a session has got to.
@@ -244,10 +246,11 @@ pub enum Phase {
     Resolving,
     /// The `SYN` is out and the peer has not completed the handshake.
     Dialling,
-    /// The handshake completed and the request has not gone out whole.
-    Sending,
-    /// The request is out and the answer is coming back.
-    Reading,
+    /// The handshake completed and the connection carries the stream. One phase
+    /// and not a sending one beside a reading one: the two directions of a
+    /// stream run at once, and a session that had to be in one of them could
+    /// not read while it had something to say.
+    Established,
     /// This end has closed and is waiting for the connection to finish.
     Closing,
     Ended(Ended),
@@ -260,8 +263,7 @@ impl Phase {
         match self {
             Self::Resolving => "resolving",
             Self::Dialling => "dialling",
-            Self::Sending => "sending",
-            Self::Reading => "reading",
+            Self::Established => "established",
             Self::Closing => "closing",
             Self::Ended(_) => "ended",
         }
@@ -295,16 +297,24 @@ pub struct OutboundCounters {
     /// small number here is a resolution that ran while a timer was armed and a
     /// large one is a next hop that answers slowly or not at all.
     pub dropped_unresolved: u64,
-    /// Request bytes handed to the transport.
-    pub request_bytes: u64,
-    /// Answer bytes taken from a peer and kept.
-    pub answer_bytes: u64,
-    /// Answer bytes a peer sent past [`ANSWER_CAPACITY`], dropped.
-    pub answer_overflowed: u64,
-    /// Sessions that ended having read an answer.
-    pub answered: u64,
-    /// Sessions that ended without one, whatever ended them.
-    pub failed: u64,
+    /// Bytes the consumer answered with and the transport took.
+    pub sent: u64,
+    /// Bytes taken off a peer and held for the consumer.
+    pub received: u64,
+    /// Bytes a peer sent past the room left, refused. Unreachable while the
+    /// window is honoured, which is why a number here is a peer that ignored it
+    /// rather than an endpoint that ran out.
+    pub overflowed: u64,
+    /// Bytes the consumer answered with that there was no room for. **Ours**,
+    /// not the peer's: the consumer is another domain, and this is the count
+    /// that says its answer outgrew the room this end keeps for one.
+    pub refused: u64,
+    /// Sessions whose connection came up. Counted where the handshake completes
+    /// and not where the session ends, a channel that is still running having no
+    /// ending to be counted under.
+    pub established: u64,
+    /// Sessions that finished, whichever way they went.
+    pub ended: u64,
 }
 
 impl OutboundCounters {
@@ -315,16 +325,21 @@ impl OutboundCounters {
             open_refused: 0,
             dialled: 0,
             dropped_unresolved: 0,
-            request_bytes: 0,
-            answer_bytes: 0,
-            answer_overflowed: 0,
-            answered: 0,
-            failed: 0,
+            sent: 0,
+            received: 0,
+            overflowed: 0,
+            refused: 0,
+            established: 0,
+            ended: 0,
         }
     }
 
     pub(crate) fn bump(count: &mut u64) {
         *count = count.saturating_add(1);
+    }
+
+    pub(crate) fn add(count: &mut u64, by: usize) {
+        *count = count.saturating_add(by as u64);
     }
 }
 
@@ -337,7 +352,7 @@ impl OutboundCounters {
 /// already resolved and asks nothing. Attributing either to one session would be
 /// inventing the attribution, and it is what once made a channel report three
 /// replies to one request. What makes these the channel's evidence anyway is a
-/// subtraction: a caller reads them when the channel opens and again when it is
+/// subtraction: a caller reads them when an attempt opens and again when it is
 /// reported, and the difference is what the link did while it was running.
 ///
 /// Saturating and never reset, on [`OutboundCounters`]' terms.
@@ -392,11 +407,11 @@ impl Resolutions {
     }
 }
 
-/// One outbound connection, from the address it is to and the bytes it carries
-/// through to what it read back.
+/// One outbound connection, from the address it is to through to the bytes each
+/// way and which end finished it.
 ///
-/// Not `Copy`, and not by omission: it holds the request the transport may ask
-/// for again and the answer as it accumulates, so a copy would be a second,
+/// Not `Copy`, and not by omission: it holds the bytes the transport may ask for
+/// again and the bytes as they accumulate, so a copy would be a second,
 /// diverging account of one conversation.
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -414,20 +429,31 @@ pub struct Session {
     peer_mac: Option<MacAddress>,
     connection: Option<ConnectionId>,
     phase: Phase,
-    request: [u8; REQUEST_CAPACITY],
-    request_len: usize,
-    /// How much of the request the transport has taken. A window smaller than
-    /// the request is why this is a position rather than a flag.
+    outbound: [u8; SEND_CAPACITY],
+    outbound_len: usize,
+    /// How much of `outbound` the transport has taken. A window smaller than
+    /// what is held is why this is a position rather than a flag.
     sent: usize,
-    /// The sequence number the request's first byte occupies, learned from the
-    /// transport once it has taken one. It is what turns a range the transport
-    /// asks for again into an offset into the bytes held here — without it a
-    /// retransmission would be a guess, and a guess would put the wrong bytes on
-    /// the wire under a sequence number the peer would accept them at.
+    /// The sequence number the first byte the consumer answered with occupies,
+    /// learned from the transport once it has taken one. It is what turns a
+    /// range the transport asks for again into an offset into the bytes held
+    /// here — without it a retransmission would be a guess, and a guess would
+    /// put the wrong bytes on the wire under a sequence number the peer would
+    /// accept them at.
     base: Option<SeqNumber>,
-    answer: [u8; ANSWER_CAPACITY],
-    answered: usize,
+    inbound: [u8; RECEIVE_CAPACITY],
+    inbound_len: usize,
     peer_closed: bool,
+    /// The handshake completed at some point in this session's life. Recorded
+    /// once and never cleared, which is what makes it the event rather than the
+    /// state.
+    handshaken: bool,
+    /// The consumer has said the session is over. The close waits on the
+    /// outbound bytes: a `FIN` composed in front of them would end the session
+    /// before the last thing it had to say.
+    consumer_closed: bool,
+    /// A `FIN` has been composed, so nothing more is owed on this connection.
+    closing: bool,
     /// What this session's own frames did, which is what an operator reads
     /// beside the token when the channel does not come up.
     facts: DialFacts,
@@ -439,39 +465,31 @@ pub struct Session {
 }
 
 impl Session {
-    /// Begin a session to `destination` on `port`, through `next_hop`, carrying
-    /// `request`.
+    /// Begin a session to `destination` on `port`, through `next_hop`.
     ///
-    /// # Errors
-    /// [`OpenError::RequestTooLong`], for a request longer than the room for one.
-    pub(crate) fn new(
-        destination: Ipv4Address,
-        port: u16,
-        next_hop: Hop,
-        request: &[u8],
-    ) -> Result<Self, OpenError> {
-        let mut held = [0u8; REQUEST_CAPACITY];
-        let Some(room) = held.get_mut(..request.len()) else {
-            return Err(OpenError::RequestTooLong { len: request.len() });
-        };
-        room.copy_from_slice(request);
-        Ok(Self {
+    /// It carries nothing: a stream has no opening message, and what the
+    /// consumer above has to say is pushed once the connection is up.
+    pub(crate) const fn new(destination: Ipv4Address, port: u16, next_hop: Hop) -> Self {
+        Self {
             destination,
             port,
             next_hop,
             peer_mac: None,
             connection: None,
             phase: Phase::Resolving,
-            request: held,
-            request_len: request.len(),
+            outbound: [0; SEND_CAPACITY],
+            outbound_len: 0,
             sent: 0,
             base: None,
-            answer: [0; ANSWER_CAPACITY],
-            answered: 0,
+            inbound: [0; RECEIVE_CAPACITY],
+            inbound_len: 0,
             peer_closed: false,
+            handshaken: false,
+            consumer_closed: false,
+            closing: false,
             facts: DialFacts::new(),
             misacknowledged: None,
-        })
+        }
     }
 
     #[must_use]
@@ -524,33 +542,85 @@ impl Session {
         self.phase
     }
 
+    /// Whether the handshake has completed, so the stream may carry bytes.
+    ///
+    /// A fact this session recorded when it happened rather than one read back
+    /// off the phase: a phase says where the session is *now*, so a session that
+    /// came up and then closed would have to be inferred from the phases it is
+    /// no longer in — and a caller reporting "the channel came up" must be
+    /// reading the event and not a guess about it.
+    #[must_use]
+    pub const fn established(&self) -> bool {
+        self.handshaken
+    }
+
     #[must_use]
     pub const fn connection(&self) -> Option<ConnectionId> {
         self.connection
     }
 
-    /// What the peer said, as far as it was kept.
+    /// Bytes the peer sent that the consumer has not taken.
     #[must_use]
-    pub fn answer(&self) -> &[u8] {
-        self.answer.get(..self.answered).unwrap_or(&[])
+    pub fn received(&self) -> &[u8] {
+        self.inbound.get(..self.inbound_len).unwrap_or(&[])
     }
 
-    /// The request bytes the transport has not taken yet.
+    /// The room left for what the peer sends next, which is the window this end
+    /// advertises.
+    #[must_use]
+    pub const fn room(&self) -> usize {
+        RECEIVE_CAPACITY.saturating_sub(self.inbound_len)
+    }
+
+    /// Whether the peer has closed its half.
+    #[must_use]
+    pub const fn peer_closed(&self) -> bool {
+        self.peer_closed
+    }
+
+    /// Whether the consumer has ended the session.
+    #[must_use]
+    pub const fn consumer_closed(&self) -> bool {
+        self.consumer_closed
+    }
+
+    /// Whether anything the consumer answered with is still waiting for the
+    /// transport.
+    #[must_use]
+    pub const fn owes_bytes(&self) -> bool {
+        self.sent < self.outbound_len
+    }
+
+    /// Drop the first `bytes` the consumer has taken, keeping the rest.
+    ///
+    /// A copy inside one fixed array and bounded by it: the alternative is a
+    /// read position that grows until the array is full of bytes nobody wants,
+    /// which is the same overflow with a longer fuse.
+    pub fn consumed(&mut self, bytes: usize) {
+        let taken = bytes.min(self.inbound_len);
+        let left = self.inbound_len.saturating_sub(taken);
+        self.inbound.copy_within(taken..self.inbound_len, 0);
+        self.inbound_len = left;
+    }
+
+    /// The bytes the transport has not taken yet.
     pub(crate) fn unsent(&self) -> &[u8] {
-        self.request.get(self.sent..self.request_len).unwrap_or(&[])
+        self.outbound
+            .get(self.sent..self.outbound_len)
+            .unwrap_or(&[])
     }
 
-    /// The `len` request bytes at offset `at`, for a range the transport asks
-    /// for again. `None` where this session never sent them.
+    /// The `len` bytes at offset `at`, for a range the transport asks for
+    /// again. `None` where this session never sent them.
     pub(crate) fn range(&self, at: usize, len: usize) -> Option<&[u8]> {
         let end = at.checked_add(len)?;
         if end > self.sent {
             return None;
         }
-        self.request.get(at..end)
+        self.outbound.get(at..end)
     }
 
-    /// Where in the request `sequence` falls, or `None` for a number this
+    /// Where in the outbound bytes `sequence` falls, or `None` for a number this
     /// session never sent — which is what a range asked for before the first
     /// byte went out, or one past everything that did, is.
     pub(crate) fn offset_of(&self, sequence: SeqNumber) -> Option<usize> {
@@ -559,9 +629,9 @@ impl Session {
         (ahead < self.sent).then_some(ahead)
     }
 
-    /// Learn where the request's first byte sits in the connection's sequence
+    /// Learn where the first outbound byte sits in the connection's sequence
     /// space. Taken once: the transport reports the oldest range it still holds,
-    /// and after the first send that range *is* the request's beginning.
+    /// and after the first send that range *is* that byte's place.
     pub(crate) fn note_base(&mut self, sequence: SeqNumber) {
         if self.base.is_none() {
             self.base = Some(sequence);
@@ -615,26 +685,65 @@ impl Session {
         self.sent = self.sent.saturating_add(bytes);
     }
 
-    pub(crate) const fn request_out(&self) -> bool {
-        self.sent >= self.request_len
-    }
-
     pub(crate) fn enter(&mut self, phase: Phase) {
         self.phase = phase;
+    }
+
+    /// The handshake completed. Answers whether this is the first time, which is
+    /// what makes the caller's count one per session rather than one per pass.
+    pub(crate) fn note_handshaken(&mut self) -> bool {
+        let first = !self.handshaken;
+        self.handshaken = true;
+        first
     }
 
     pub(crate) fn note_peer_closed(&mut self) {
         self.peer_closed = true;
     }
 
-    pub(crate) const fn peer_closed(&self) -> bool {
-        self.peer_closed
+    pub(crate) const fn closing(&self) -> bool {
+        self.closing
+    }
+
+    pub(crate) fn note_closing(&mut self) {
+        self.closing = true;
+    }
+
+    /// Put `bytes` on the wire, answering how many there was room for.
+    ///
+    /// Fewer than offered is a refusal this end owns and counts: the caller
+    /// decides what to do about it, and every caller in this workspace ends the
+    /// session, a stream missing a run of its middle being no stream at all.
+    pub fn push(&mut self, bytes: &[u8]) -> (usize, usize) {
+        let held = self.outbound_len;
+        let Some(room) = self.outbound.get_mut(held..) else {
+            return (0, bytes.len());
+        };
+        let mut kept = 0usize;
+        for (cell, byte) in room.iter_mut().zip(bytes) {
+            *cell = *byte;
+            kept = kept.saturating_add(1);
+        }
+        self.outbound_len = held.saturating_add(kept);
+        (kept, bytes.len().saturating_sub(kept))
+    }
+
+    /// The consumer has finished with the session. The close goes out once
+    /// everything it answered with has.
+    pub fn end_session(&mut self) {
+        self.consumer_closed = true;
     }
 
     /// Take `data` off the peer, keeping what there is room for and reporting
     /// what there was not.
+    ///
+    /// Refused rather than truncated-and-forgotten: the count is what says a
+    /// peer sent past the window it was given, and the bytes that did fit are
+    /// the ones that arrived first, so the consumer reads a prefix of the stream
+    /// rather than a hole in the middle of one.
     pub(crate) fn take(&mut self, data: &[u8]) -> (usize, usize) {
-        let Some(room) = self.answer.get_mut(self.answered..) else {
+        let held = self.inbound_len;
+        let Some(room) = self.inbound.get_mut(held..) else {
             return (0, data.len());
         };
         let mut kept = 0usize;
@@ -642,7 +751,7 @@ impl Session {
             *cell = *byte;
             kept = kept.saturating_add(1);
         }
-        self.answered = self.answered.saturating_add(kept);
+        self.inbound_len = held.saturating_add(kept);
         (kept, data.len().saturating_sub(kept))
     }
 }

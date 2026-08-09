@@ -156,7 +156,8 @@ const DETAIL_ONBOARDING_INSTALLED: u8 = 40;
 const DETAIL_OWNERSHIP: u8 = 41;
 const DETAIL_DELEGATED_ANCHOR: u8 = 42;
 const DETAIL_PUBLISHED: u8 = 43;
-const DETAIL_COUNT: u8 = 44;
+const DETAIL_DIAL_RETRY: u8 = 44;
+const DETAIL_COUNT: u8 = 45;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -621,7 +622,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ONBOARDING_INSTALLED
                 | DETAIL_OWNERSHIP
                 | DETAIL_DELEGATED_ANCHOR
-                | DETAIL_PUBLISHED => {
+                | DETAIL_PUBLISHED
+                | DETAIL_DIAL_RETRY => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -867,6 +869,13 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // does not carry is one the record check reads and this one calls
         // unknown.
         DETAIL_ONBOARDING_PORT => None,
+        // The wait before the next attempt reads two words and ranges neither,
+        // on the onboarding port's terms exactly: both are spans in
+        // milliseconds, and every bit pattern of each is one the emitting
+        // domain's own schedule could have stated. Its own arm rather than the
+        // default for the same reason — a discriminant this model does not
+        // carry is one the record check reads and this one calls unknown.
+        DETAIL_DIAL_RETRY => None,
         // The ownership detail reads three words and ranges two, in the order
         // the ABI reads them: an address that is thirty-two bits wide wherever
         // IPv4 names one, and a port that is sixteen. The generation behind them
@@ -1559,6 +1568,18 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            (
+                "valid_domain_dial_retry",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DIAL_RETRY,
+                    // Two spans in milliseconds with nothing a rule can refuse,
+                    // so the accepted shape is reached only by drawing the
+                    // discriminant — and the two words differ, so a delay read
+                    // out of the bound's slot is visible rather than symmetric.
+                    operands: [1_500, 4_000, 0, 0],
+                    ..domain_record()
+                }),
+            ),
             // The delegation detail, which reads all four words as numbers.
             // Committed because it is the one detail whose *fourth* word is
             // deliberately not a flag: a seed here is what keeps the flag rule
@@ -2113,14 +2134,15 @@ mod tests {
         );
     }
 
-    /// The three records a failed channel adds after its outcome, and the fourth
-    /// an unacceptable acknowledgement adds after those: each reaches the decode
+    /// The records a failed attempt adds after its outcome — the route, the
+    /// refused replies, the segments, the wait before the next attempt, and the
+    /// sequence pair only a misacknowledgement produces: each reaches the decode
     /// in its accepted shape, and each is refused at the one boundary it has.
     ///
     /// Their reason for being seeds is the opposite of the dialled record's and
-    /// just as strong: two of the four can be refused for **nothing at all**, so
-    /// a cold run reaches them only by drawing their discriminant out of
-    /// twenty-five, and the render path over them would otherwise go unwalked.
+    /// just as strong: three of the five can be refused for **nothing at all**,
+    /// so a cold run reaches them only by drawing their discriminant, and the
+    /// render path over them would otherwise go unwalked.
     #[test]
     fn every_record_a_failed_channel_adds_reaches_the_decode_and_its_own_boundary() {
         for name in [
@@ -2128,6 +2150,7 @@ mod tests {
             "valid_domain_dial_unlearned",
             "valid_domain_dial_segments",
             "valid_domain_dial_sequence",
+            "valid_domain_dial_retry",
         ] {
             record_from_region(&seed(name))
                 .check()
@@ -2168,6 +2191,14 @@ mod tests {
                 })
             );
         }
+
+        // The wait, which has **no** boundary at all: both words are spans and
+        // every bit pattern of each is one the emitting domain's schedule could
+        // have stated, so the widest pair is accepted rather than refused.
+        let mut retry = record_from_region(&seed("valid_domain_dial_retry"));
+        assert_ne!(retry.operands[0], retry.operands[1]);
+        retry.operands = [u64::MAX, u64::MAX, 0, 0];
+        retry.check().expect("a span has no range to leave");
     }
 
     /// The four operand words a fingerprint occupies all survive the check, and

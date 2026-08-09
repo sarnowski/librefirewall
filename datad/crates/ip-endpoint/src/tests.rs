@@ -3706,16 +3706,15 @@ fn an_expired_body_ends_the_connection_with_a_reset() {
 
 use crate::neighbour::{ENTRY_LIFETIME, MAX_REQUESTS, NEIGHBOURS, REQUEST_TIMEOUT};
 use crate::outbound::{
-    ANSWER_CAPACITY, DialFacts, Ended, OpenError, Phase, REQUEST_CAPACITY as PROBE_ROOM,
-    Resolutions,
+    DialFacts, Ended, OpenError, Phase, RECEIVE_CAPACITY, Resolutions, SEND_CAPACITY,
 };
 use crate::route::{Hop, RouteRefusal, Via};
 
-/// The port the appliance dials, and the fixed probe it carries. Both stand in
-/// for the first-party pair a management channel is built on: neither is
-/// anything a peer chooses.
+/// The port the appliance dials, and a run of bytes the consumer above it hands
+/// down. Both stand in for the first-party pair a management channel is built
+/// on: neither is anything a peer chooses, and the crate reads neither.
 const PEER_PORT: u16 = 4433;
-const PROBE: &[u8] = b"librefirewall-probe";
+const GREETING: &[u8] = b"librefirewall-greeting";
 
 /// `base` plus `elapsed`, built through the one path a `Monotonic` is reachable
 /// by, so a test states an instant the way a caller of this crate would.
@@ -3810,12 +3809,12 @@ fn deliver(endpoint: &mut Endpoint, now: Monotonic, frame: &[u8]) -> Option<Vec<
 /// A whole session against a station that answers everything: the one path a
 /// management channel takes when nothing goes wrong.
 #[test]
-fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
+fn a_dial_asks_for_its_next_hop_and_carries_a_stream_once_the_answer_arrives() {
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
-        .expect("an on-link destination and a probe that fits");
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
     assert_eq!(
         endpoint.outbound().map(Session::phase),
         Some(Phase::Resolving)
@@ -3854,18 +3853,30 @@ fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
     assert!(flags.contains(lfw_tcp::Flags::SYN));
     assert!(!flags.contains(lfw_tcp::Flags::ACK));
 
-    // The handshake, then the probe, then the answer, then both closes.
+    // The handshake. The connection is then **up and held**: nothing is owed and
+    // nothing is composed, because a stream has no opening message and this end
+    // closes nothing the consumer above it has not ended.
     let synack = station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]);
     deliver(&mut endpoint, later, &synack);
-    let sent = pump(&mut endpoint, later);
-    assert_eq!(sent.len(), 1, "the probe goes out in one segment");
-    let (flags, _, payload) = station.read(&sent[0]);
-    assert!(flags.contains(lfw_tcp::Flags::ACK));
-    assert_eq!(payload, PROBE);
+    assert!(
+        pump(&mut endpoint, later).is_empty(),
+        "an established stream with nothing to say composes nothing"
+    );
     assert_eq!(
         endpoint.outbound().map(Session::phase),
-        Some(Phase::Reading)
+        Some(Phase::Established)
     );
+    assert_eq!(endpoint.outbound_counters().established, 1);
+    assert_eq!(endpoint.outbound_counters().ended, 0);
+
+    // What the consumer above hands down goes out, and what the station answers
+    // with is held for it to take.
+    assert_eq!(endpoint.push_outbound(GREETING), GREETING.len());
+    let sent = pump(&mut endpoint, later);
+    assert_eq!(sent.len(), 1, "the greeting goes out in one segment");
+    let (flags, _, payload) = station.read(&sent[0]);
+    assert!(flags.contains(lfw_tcp::Flags::ACK));
+    assert_eq!(payload, GREETING);
 
     let answer = b"librefirewall-answer";
     let reply = station.frame(
@@ -3875,10 +3886,23 @@ fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
         answer,
     );
     deliver(&mut endpoint, later, &reply);
-    assert_eq!(endpoint.outbound().map(Session::answer), Some(&answer[..]));
+    assert_eq!(
+        endpoint.outbound().map(Session::received),
+        Some(&answer[..])
+    );
+    // Taken once and gone: the consumer reads a prefix of the stream and says
+    // how much of it it took.
+    endpoint.consume_outbound(answer.len());
+    assert_eq!(endpoint.outbound().map(Session::received), Some(&[][..]));
 
-    // This end closes once the peer has, and the exchange ends where the peer's
-    // acknowledgement of that close arrives.
+    // The peer has hung up, and **this end closes only because the consumer
+    // above says so**: a stream has no length off which this crate could read
+    // an end for it.
+    assert!(
+        pump(&mut endpoint, later).is_empty(),
+        "a peer's half-close ends nothing on its own"
+    );
+    endpoint.end_outbound_session();
     let closing = pump(&mut endpoint, later);
     assert_eq!(closing.len(), 1);
     let (flags, _, _) = station.read(&closing[0]);
@@ -3889,20 +3913,44 @@ fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
 
     assert_eq!(
         endpoint.outbound().map(Session::phase),
-        Some(Phase::Ended(Ended::Answered))
+        Some(Phase::Ended(Ended::ClosedByPeer))
     );
-    assert_eq!(endpoint.outbound_counters().answered, 1);
-    assert_eq!(endpoint.outbound_counters().failed, 0);
-    assert_eq!(
-        endpoint.outbound_counters().request_bytes,
-        PROBE.len() as u64
-    );
-    assert_eq!(
-        endpoint.outbound_counters().answer_bytes,
-        answer.len() as u64
-    );
+    assert_eq!(endpoint.outbound_counters().ended, 1);
+    // The session came up once and is still recorded as having come up: the fact
+    // is the event rather than the phase, so an ending does not take it back and
+    // the passes in between do not count it again.
+    assert_eq!(endpoint.outbound_counters().established, 1);
+    assert_eq!(endpoint.outbound().map(Session::established), Some(true));
+    assert_eq!(endpoint.outbound_counters().sent, GREETING.len() as u64);
+    assert_eq!(endpoint.outbound_counters().received, answer.len() as u64);
     assert!(endpoint.close_outbound());
     assert!(endpoint.outbound().is_none());
+}
+
+/// The room this end keeps for what the consumer above it answers with is a
+/// bound of this appliance's own, and what outgrows it is **refused and
+/// counted** rather than silently cut: a stream missing a run of its middle is
+/// no stream at all, and the caller is told exactly how much it may still say.
+#[test]
+fn a_consumers_answer_past_the_room_for_one_is_refused_and_counted() {
+    let mut endpoint = endpoint();
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
+    let flood = vec![0xa5u8; SEND_CAPACITY + 64];
+    assert_eq!(endpoint.push_outbound(&flood), SEND_CAPACITY);
+    assert_eq!(endpoint.outbound_counters().refused, 64);
+    // And nothing more fits, the room being taken rather than reused.
+    assert_eq!(endpoint.push_outbound(b"more"), 0);
+    assert_eq!(endpoint.outbound_counters().refused, 68);
+
+    // A push with no session at all is refused whole rather than kept for one:
+    // a consumer whose bytes arrived after the session they belonged to was
+    // gone has nowhere to put them.
+    let mut idle = Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, Some(GATEWAY), secret())
+        .expect("a port that reaches its own link");
+    assert_eq!(idle.push_outbound(b"orphan"), 0);
+    assert_eq!(idle.outbound_counters().refused, 6);
 }
 
 /// A destination off this port's prefix is reached *through the gateway*: the
@@ -3912,7 +3960,7 @@ fn a_dial_asks_for_its_next_hop_and_carries_a_probe_once_the_answer_arrives() {
 fn a_destination_off_this_ports_prefix_is_asked_about_as_the_gateway() {
     let mut endpoint = endpoint();
     endpoint
-        .open_outbound(OFF_LINK, PEER_PORT, PROBE)
+        .open_outbound(OFF_LINK, PEER_PORT)
         .expect("a gateway is stated");
     assert_eq!(
         endpoint.outbound().map(Session::next_hop),
@@ -3945,7 +3993,7 @@ fn an_open_this_port_cannot_honour_is_refused_before_anything_is_composed() {
     let mut without = Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, None, secret())
         .expect("a port that reaches its own link");
     assert_eq!(
-        without.open_outbound(OFF_LINK, PEER_PORT, PROBE),
+        without.open_outbound(OFF_LINK, PEER_PORT),
         Err(OpenError::Unroutable(RouteRefusal::Unroutable))
     );
     assert_eq!(without.outbound_counters().open_refused, 1);
@@ -3954,32 +4002,23 @@ fn an_open_this_port_cannot_honour_is_refused_before_anything_is_composed() {
 
     let mut endpoint = endpoint();
     assert_eq!(
-        endpoint.open_outbound(OUR_ADDRESS, PEER_PORT, PROBE),
+        endpoint.open_outbound(OUR_ADDRESS, PEER_PORT),
         Err(OpenError::Unroutable(RouteRefusal::DestinationIsOurs))
     );
     assert_eq!(
-        endpoint.open_outbound(
-            Ipv4Address::from_octets([255, 255, 255, 255]),
-            PEER_PORT,
-            PROBE
-        ),
+        endpoint.open_outbound(Ipv4Address::from_octets([255, 255, 255, 255]), PEER_PORT),
         Err(OpenError::Unroutable(RouteRefusal::DestinationNotUnicast))
     );
-    let long = vec![0u8; PROBE_ROOM + 1];
-    assert_eq!(
-        endpoint.open_outbound(STATION_ADDRESS, PEER_PORT, &long),
-        Err(OpenError::RequestTooLong { len: long.len() })
-    );
     assert_eq!(endpoint.outbound_counters().opened, 0);
-    assert_eq!(endpoint.outbound_counters().open_refused, 3);
+    assert_eq!(endpoint.outbound_counters().open_refused, 2);
 
     // And a second open while one runs names the session that already exists,
     // so a caller that lost track of one does not start a second channel.
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("the first opens");
     assert_eq!(
-        endpoint.open_outbound(STATION_ADDRESS, PEER_PORT + 1, PROBE),
+        endpoint.open_outbound(STATION_ADDRESS, PEER_PORT + 1),
         Err(OpenError::Busy {
             destination: STATION_ADDRESS,
             port: PEER_PORT
@@ -3998,7 +4037,7 @@ fn an_open_this_port_cannot_honour_is_refused_before_anything_is_composed() {
 fn a_next_hop_nothing_answers_for_ends_the_session_naming_the_neighbour() {
     let mut endpoint = endpoint();
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     // One request per timeout, and the budget is this end's own.
     let mut asked = 0usize;
@@ -4013,7 +4052,7 @@ fn a_next_hop_nothing_answers_for_ends_the_session_naming_the_neighbour() {
         endpoint.outbound().map(Session::phase),
         Some(Phase::Ended(Ended::NextHopUnreachable))
     );
-    assert_eq!(endpoint.outbound_counters().failed, 1);
+    assert_eq!(endpoint.outbound_counters().ended, 1);
     // Nothing was ever put on the wire but the requests themselves: a segment
     // that could not be addressed was dropped rather than sent somewhere.
     assert!(endpoint.outbound_counters().dropped_unresolved >= 1);
@@ -4028,7 +4067,7 @@ fn a_next_hop_nothing_answers_for_ends_the_session_naming_the_neighbour() {
 fn a_reply_from_a_sender_the_frame_contradicts_is_never_learned() {
     let mut endpoint = endpoint();
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, at(0));
 
@@ -4084,14 +4123,21 @@ fn an_arp_reply_with_no_clock_is_refused_and_learns_nothing() {
     ));
 }
 
-/// A peer that answers past the room for one gets its head kept and its tail
-/// counted: which of its own bytes this end judges is not a peer's choice.
+/// The room this end keeps for a peer's bytes is a bound of this appliance's
+/// own, and **the window is what enforces it**: the window advertised is the
+/// room actually left, so a peer that keeps to it can fill the array and reach
+/// no further, and the transport refuses the rest out of window rather than
+/// letting it displace what came before it.
+///
+/// That is why the session's own overflow count stays at zero here: it is the
+/// guard behind the window rather than the mechanism, and a number in it would
+/// be a peer the transport had let past one.
 #[test]
-fn an_answer_past_the_room_for_one_keeps_the_head_and_counts_the_rest() {
+fn a_peer_filling_the_room_for_it_is_held_there_by_the_window_it_was_given() {
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, now);
     let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
@@ -4102,24 +4148,38 @@ fn an_answer_past_the_room_for_one_keeps_the_head_and_counts_the_rest() {
         now,
         &station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]),
     );
-    let sent = pump(&mut endpoint, now);
-    station.read(&sent[0]);
+    // The handshake alone composes nothing on a stream, so the window is set on
+    // the pass that follows it.
+    pump(&mut endpoint, now);
 
-    // More than the session keeps, in segments the transport will take.
-    let flood: Vec<u8> = (0..ANSWER_CAPACITY + 64).map(|byte| byte as u8).collect();
+    // More than the session keeps, in segments the transport will take, and the
+    // consumer above takes none of them.
+    let flood: Vec<u8> = (0..RECEIVE_CAPACITY + 64).map(|byte| byte as u8).collect();
     for chunk in flood.chunks(TCP_MSS as usize) {
         let frame = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), chunk);
         deliver(&mut endpoint, now, &frame);
         pump(&mut endpoint, now);
     }
-    let kept = endpoint.outbound().map(Session::answer).unwrap_or_default();
-    assert_eq!(kept.len(), ANSWER_CAPACITY);
-    assert_eq!(kept, &flood[..ANSWER_CAPACITY]);
+    let kept = endpoint
+        .outbound()
+        .map(Session::received)
+        .unwrap_or_default();
+    assert_eq!(kept.len(), RECEIVE_CAPACITY);
+    assert_eq!(kept, &flood[..RECEIVE_CAPACITY]);
     assert_eq!(
-        endpoint.outbound_counters().answer_bytes,
-        ANSWER_CAPACITY as u64
+        endpoint.outbound_counters().received,
+        RECEIVE_CAPACITY as u64
     );
-    assert!(endpoint.outbound_counters().answer_overflowed > 0);
+    // The room the window advertises is what is genuinely left, which by here is
+    // none at all — and the excess never reached the array to be dropped there,
+    // the transport having held the peer to the window it was given.
+    assert_eq!(endpoint.outbound().map(Session::room), Some(0));
+    assert_eq!(endpoint.outbound_counters().overflowed, 0);
+
+    // And the consumer taking a run of it opens the window again, which is what
+    // makes this a stream rather than a bucket.
+    endpoint.consume_outbound(1024);
+    assert_eq!(endpoint.outbound().map(Session::room), Some(1024));
 }
 
 /// Run an unanswered dial's whole retransmission budget out, answering with the
@@ -4157,7 +4217,7 @@ fn a_station_that_answers_nothing_ends_the_session_as_unanswered() {
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, now);
     resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
@@ -4198,7 +4258,7 @@ fn a_station_acknowledging_what_was_never_sent_ends_the_session_naming_both_numb
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, now);
     let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
@@ -4246,7 +4306,7 @@ fn a_reset_session_reports_the_reset_it_received_and_none_it_sent() {
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, now);
     let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
@@ -4278,7 +4338,7 @@ fn a_reset_session_reports_the_reset_it_received_and_none_it_sent() {
 fn an_unreachable_next_hop_reports_the_requests_it_spent_and_nothing_learned() {
     let mut endpoint = endpoint();
     endpoint
-        .open_outbound(OFF_LINK, PEER_PORT, PROBE)
+        .open_outbound(OFF_LINK, PEER_PORT)
         .expect("a gateway is stated");
     for step in 0..=u64::from(MAX_REQUESTS) {
         pump(&mut endpoint, after(at(0), times(REQUEST_TIMEOUT, step)));
@@ -4319,7 +4379,7 @@ fn the_replies_a_port_refused_are_counted_by_reason_and_read_as_a_difference() {
     assert_eq!(before, Resolutions::new());
 
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, at(0));
 
@@ -4351,45 +4411,40 @@ fn the_replies_a_port_refused_are_counted_by_reason_and_read_as_a_difference() {
     assert_eq!(before.since(after_two), Resolutions::new());
 }
 
-/// A channel spends more than one session, so what an operator reads is the sum
-/// — and `answered` is the one field that is an *any* rather than a total: a
-/// station that answered once and then went silent is a station that answered.
+/// The counts one attempt carries are **that attempt's own**, and a fresh
+/// session starts them from nothing.
 ///
-/// The resolution's counts are deliberately not here. An entry outlives the
-/// session that learned it, so a later session finds the next hop resolved and
-/// asks nothing — and summing per-session answers would report three replies to
-/// one request. Those are the port's, and are read as a difference instead.
+/// A channel spends one attempt after another and each is reported as itself, so
+/// nothing here folds: an attempt whose counts carried a previous attempt's
+/// share would report handshakes this session never composed. The resolution's
+/// counts are the port's for the same reason turned around — an entry outlives
+/// the session that learned it, so those are read as a difference across one
+/// attempt's life rather than summed.
 #[test]
-fn a_channels_sessions_fold_into_one_account() {
-    let first = DialFacts {
-        syns: 6,
-        answered: false,
-        resets_received: 0,
-        resets_sent: 0,
-    };
-    let second = DialFacts {
-        syns: 6,
-        answered: true,
-        resets_received: 1,
-        resets_sent: 3,
-    };
-    let joined = first.joined(second);
-    assert_eq!(joined.syns, 12);
-    assert!(joined.answered);
-    assert_eq!(joined.resets_received, 1);
-    assert_eq!(joined.resets_sent, 3);
-    // Empty is the identity, which is what lets a caller start from one.
-    assert_eq!(DialFacts::new().joined(first), first);
-    assert_eq!(first.joined(DialFacts::new()), first);
-    // And every field saturates rather than wrapping, so a channel a peer kept
-    // failing does not read as a small number.
-    let full = DialFacts {
-        syns: u64::MAX,
-        answered: true,
-        resets_received: u64::MAX,
-        resets_sent: u64::MAX,
-    };
-    assert_eq!(full.joined(full), full);
+fn each_attempts_facts_are_its_own_and_start_from_nothing() {
+    let mut endpoint = endpoint();
+    assert_eq!(
+        spend_a_session_on_an_unanswered_next_hop(&mut endpoint, at(0)),
+        Ended::NextHopUnreachable
+    );
+    // One handshake composed and dropped for want of an address, and nothing
+    // answered — this attempt's own account and no boot's.
+    let later = after(at(0), ENTRY_LIFETIME);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
+    let facts = endpoint.outbound().map(Session::facts).expect("a session");
+    assert_eq!(
+        facts,
+        DialFacts::new(),
+        "a fresh attempt begins with an empty account rather than the last one's"
+    );
+    for step in 0..=u64::from(MAX_REQUESTS) {
+        pump(&mut endpoint, after(later, times(REQUEST_TIMEOUT, step)));
+    }
+    let facts = endpoint.outbound().map(Session::facts).expect("a session");
+    assert_eq!(facts.syns, 1, "this attempt's handshake and not both");
+    assert!(!facts.answered);
 }
 
 /// A peer that resets ends the session under a reason of its own, and the port
@@ -4400,7 +4455,7 @@ fn a_reset_ends_the_session_and_leaves_the_port_answering() {
     let mut endpoint = endpoint();
     let now = at(0);
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, now);
     let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
@@ -4418,7 +4473,7 @@ fn a_reset_ends_the_session_and_leaves_the_port_answering() {
         endpoint.outbound().map(Session::phase),
         Some(Phase::Ended(Ended::ResetByPeer))
     );
-    assert_eq!(endpoint.outbound_counters().failed, 1);
+    assert_eq!(endpoint.outbound_counters().ended, 1);
 
     // The port is unchanged: an ARP request for its own address is still
     // answered, and a station can still open a connection to it.
@@ -4437,8 +4492,8 @@ fn a_reset_ends_the_session_and_leaves_the_port_answering() {
 /// the `SYN` composed beside them is dropped for want of an address.
 fn spend_a_session_on_an_unanswered_next_hop(endpoint: &mut Endpoint, base: Monotonic) -> Ended {
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
-        .expect("an on-link destination and a probe that fits");
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
     for step in 0..=u64::from(MAX_REQUESTS) {
         pump(endpoint, after(base, times(REQUEST_TIMEOUT, step)));
     }
@@ -4488,7 +4543,7 @@ fn a_session_that_ended_at_the_resolution_leaves_no_connection_behind() {
         2,
         "the second session opened a connection of its own"
     );
-    assert_eq!(endpoint.outbound_counters().failed, 2);
+    assert_eq!(endpoint.outbound_counters().ended, 2);
     assert_eq!(endpoint.outbound_counters().opened, 2);
     assert_eq!(
         endpoint.outbound_counters().open_refused,
@@ -4511,7 +4566,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
 
     let mut refused = endpoint();
     refused
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut refused, now);
     let syn = resolve_and_take_syn(&mut refused, now, STATION_MAC, STATION_ADDRESS);
@@ -4537,10 +4592,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
     assert!(refused.close_outbound());
     // And the four-tuple is free: a second dial to it opens rather than being
     // refused for a connection the first left behind.
-    assert_eq!(
-        refused.open_outbound(STATION_ADDRESS, PEER_PORT, PROBE),
-        Ok(())
-    );
+    assert_eq!(refused.open_outbound(STATION_ADDRESS, PEER_PORT), Ok(()));
     let redialled = pump(&mut refused, now);
     assert_eq!(redialled.len(), 1, "the next hop is known, so the SYN goes");
     let (flags, _, _) = Station::new(PEER_PORT, 0x7300_0000).read(&redialled[0]);
@@ -4554,7 +4606,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
 
     let mut answered = endpoint();
     answered
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut answered, now);
     let syn = resolve_and_take_syn(&mut answered, now, STATION_MAC, STATION_ADDRESS);
@@ -4565,8 +4617,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
         now,
         &station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]),
     );
-    let sent = pump(&mut answered, now);
-    station.read(&sent[0]);
+    pump(&mut answered, now);
     deliver(
         &mut answered,
         now,
@@ -4577,13 +4628,17 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
             b"answer",
         ),
     );
+    // The peer hung up; this end answers by ending the session, which is what
+    // puts its own close on the wire. A stream has no length that would let
+    // this crate decide that for the consumer above it.
+    answered.end_outbound_session();
     let closing = pump(&mut answered, now);
     station.read(&closing[0]);
     deliver(&mut answered, now, &station.frame(lfw_tcp::Flags::ACK, &[]));
     pump(&mut answered, now);
     assert_eq!(
         answered.outbound().map(Session::phase),
-        Some(Phase::Ended(Ended::Answered))
+        Some(Phase::Ended(Ended::ClosedByPeer))
     );
     assert_eq!(answered.connections(), 0);
     assert_eq!(answered.return_paths(), 0);
@@ -4593,10 +4648,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
         "a close both halves completed was ended again with a reset"
     );
     assert!(answered.close_outbound());
-    assert_eq!(
-        answered.open_outbound(STATION_ADDRESS, PEER_PORT, PROBE),
-        Ok(())
-    );
+    assert_eq!(answered.open_outbound(STATION_ADDRESS, PEER_PORT), Ok(()));
     assert_eq!(pump(&mut answered, now).len(), 1);
     assert_eq!(answered.tcp_counters().connections_dialled, 2);
     assert_eq!(
@@ -4614,7 +4666,7 @@ fn a_session_that_was_reset_and_one_that_closed_leave_no_connection_behind() {
 #[test]
 fn each_ending_and_each_phase_names_itself_distinctly() {
     let endings = [
-        Ended::Answered,
+        Ended::ClosedByPeer,
         Ended::NextHopUnreachable,
         Ended::NoRoomToResolve,
         Ended::Unanswered,
@@ -4637,10 +4689,11 @@ fn each_ending_and_each_phase_names_itself_distinctly() {
         names.iter().all(|name| !name.contains('-')),
         "a label value is underscored, a console token hyphenated"
     );
-    // The one ending an operator reads as the channel working, and the nine that
-    // are each a different thing to go and look at.
-    assert!(Ended::Answered.succeeded());
-    assert!(endings.iter().filter(|ended| ended.succeeded()).count() == 1);
+    // **None of the ten is a success**, and that is the shape rather than an
+    // omission: a channel that came up is a connection this end is still
+    // holding rather than a session that ended, so an ending is always a thing
+    // to go and look at — a far end that hung up on a channel meant to persist
+    // included.
     // The two numbers an unacceptable acknowledgement carries do not change what
     // it is called: the token names the fault and the numbers are the evidence
     // beside it.
@@ -4680,10 +4733,9 @@ fn each_ending_and_each_phase_names_itself_distinctly() {
     let phases = [
         Phase::Resolving,
         Phase::Dialling,
-        Phase::Sending,
-        Phase::Reading,
+        Phase::Established,
         Phase::Closing,
-        Phase::Ended(Ended::Answered),
+        Phase::Ended(Ended::ClosedByPeer),
     ];
     let mut names: Vec<&str> = phases.iter().map(|phase| phase.name()).collect();
     names.sort_unstable();
@@ -4721,11 +4773,11 @@ fn a_four_tuple_another_connection_holds_refuses_the_dial_and_opens_nothing() {
     deliver(&mut endpoint, now, &station.frame(lfw_tcp::Flags::ACK, &[]));
     assert_eq!(endpoint.connections(), 1);
 
-    // The open itself is not refused — the route is fine and the probe fits —
-    // so the refusal is the transport's, on the dial.
+    // The open itself is not refused — the route is fine — so the refusal is
+    // the transport's, on the dial.
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
-        .expect("an on-link destination and a probe that fits");
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
     let asked = pump(&mut endpoint, now);
     assert_eq!(asked.len(), 1, "the resolution goes out and nothing else");
     assert_eq!(
@@ -4740,7 +4792,7 @@ fn a_four_tuple_another_connection_holds_refuses_the_dial_and_opens_nothing() {
         ),
         "the session ends naming the connection that holds the four-tuple"
     );
-    assert_eq!(endpoint.outbound_counters().failed, 1);
+    assert_eq!(endpoint.outbound_counters().ended, 1);
     assert_eq!(endpoint.outbound_counters().dialled, 0);
 
     // The station's connection is untouched: a dial this end refused is not a
@@ -4761,7 +4813,7 @@ proptest! {
         let mut endpoint = endpoint();
         let now = at(0);
         endpoint
-            .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+            .open_outbound(STATION_ADDRESS, PEER_PORT)
             .expect("an on-link destination");
         pump(&mut endpoint, now);
         endpoint.handle(
@@ -4802,7 +4854,7 @@ proptest! {
     ) {
         let mut endpoint = endpoint();
         endpoint
-            .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+            .open_outbound(STATION_ADDRESS, PEER_PORT)
             .expect("an on-link destination");
         let mut clock = 0u64;
         for (index, frame) in frames.iter().enumerate() {
@@ -4824,9 +4876,9 @@ proptest! {
             }
             let phase = endpoint.outbound().map(Session::phase);
             prop_assert!(phase.is_some(), "a session nobody closed disappeared");
-            // A session that never reached a hardware address cannot have
-            // answered, and one that never dialled cannot be reading.
-            if matches!(phase, Some(Phase::Ended(Ended::Answered))) {
+            // A session that never reached a hardware address cannot have got
+            // as far as a peer closing its half.
+            if matches!(phase, Some(Phase::Ended(Ended::ClosedByPeer))) {
                 prop_assert_eq!(endpoint.neighbour_counters().learned, 1);
             }
             prop_assert!(endpoint.return_paths() <= endpoint.connections());
@@ -4857,7 +4909,7 @@ fn unsolicited_replies_cannot_fill_the_neighbour_table() {
     assert_eq!(endpoint.neighbour_counters().no_room, 0);
     // And a dial opened afterwards still finds room to ask.
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     let asked = pump(&mut endpoint, at(0));
     assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
@@ -4870,7 +4922,7 @@ fn unsolicited_replies_cannot_fill_the_neighbour_table() {
 fn a_resolved_entry_stops_being_an_answer_once_its_lifetime_runs_out() {
     let mut endpoint = endpoint();
     endpoint
-        .open_outbound(STATION_ADDRESS, PEER_PORT, PROBE)
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
         .expect("an on-link destination");
     pump(&mut endpoint, at(0));
     endpoint.handle(
