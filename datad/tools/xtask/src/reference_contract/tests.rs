@@ -753,12 +753,14 @@ fn a_stated_count_about_the_gate_is_held_to_the_list_it_is_about() {
     let scenarios = crate::qemu::SCENARIOS.len();
     let sound = format!(
         "The gate boots {scenarios} system scenarios, and the {} scenarios that reach the \
-         management port judge every surface. Coverage covers {} library crates, and the {} \
-         persistent fuzz targets the gate runs cover the untrusted parsers.",
+         management port judge every surface; {} scenarios boot a copy of an owned medium. \
+         Coverage covers {} library crates, and the {} persistent fuzz targets the gate runs \
+         cover the untrusted parsers.",
         crate::qemu::SCENARIOS
             .iter()
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
+        crate::qemu::copied_medium_scenario_count(),
         crate::host::library_crate_count(),
         crate::host::fuzz_target_count(),
     );
@@ -799,13 +801,15 @@ fn a_mention_that_states_no_number_is_left_alone() {
     let mixed = format!(
         "Every system scenario boots the release image. The gate boots {scenarios} system \
          scenarios in all, and the {} scenarios that reach the management port are scraped. \
-         Coverage runs over {} library crates, and the library crates are all `no_std`. The {} \
-         persistent fuzz targets the gate runs always build, and the persistent fuzz targets the \
-         gate runs are listed in one place.",
+         Most scenarios boot a copy of an owned medium, and {} scenarios boot a copy of an owned \
+         medium in this build. Coverage runs over {} library crates, and the library crates are \
+         all `no_std`. The {} persistent fuzz targets the gate runs always build, and the \
+         persistent fuzz targets the gate runs are listed in one place.",
         crate::qemu::SCENARIOS
             .iter()
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
+        crate::qemu::copied_medium_scenario_count(),
         crate::host::library_crate_count(),
         crate::host::fuzz_target_count(),
     );

@@ -22,10 +22,11 @@ applies the four edits a hop requires — both MACs, the TTL decrement, and the 
 as one operation that cannot be performed in part. `datad/crates/routing` holds the forwarding table and
 answers lookups against it — which interface a port has, which prefix covers a destination, which
 neighbour holds a MAC, which addresses are the appliance's own — and reaches no verdict itself.
-`datad/crates/pipeline` is the chain that does: link-layer admission first, then the forwarding decision,
-then the filter, each a concrete stage called in a fixed order, ending in a verdict that is either a
-forward out of a named port under a named MAC pair or one of thirteen named drop reasons, each with
-its own counter. The middle stage is no longer terminal: it attaches the egress port and the MAC
+`datad/crates/pipeline` is the chain that does: ownership first, then link-layer admission, then the
+forwarding decision, then the filter, each a concrete stage called in a fixed order, ending in a
+verdict that is either a forward out of a named port under a named MAC pair or one of fourteen named
+drop reasons, each with its own counter. The first stage is the one that reads nothing of the frame:
+it answers whether this appliance has an owner at all, and refuses everything while it does not. The middle stage is no longer terminal: it attaches the egress port and the MAC
 pair it worked out to the frame under inspection and defers, so the stage behind it can read where a
 frame *would* go without re-deriving it, and the forwarding verdict is composed once, at the end of
 the chain, out of a decision taken in the middle of it.
@@ -1325,10 +1326,12 @@ judges over every channel at once.
 
 **Missing.**
 
-- **The forwarder never reports its own outcome.** It emits `state=starting` and nothing further —
-  no `ready`, no failure — so the [console reference](../reference/console.md)'s "each stage
-  reporting healthy or the specific fault" holds for the driver, configuration, clock, management,
-  recorder and hardware-probe domains and not for the one that carries traffic. (The management domain gained a
+- **The forwarder reports no *failure* of its own.** It now emits `state=ready` at bring-up, carrying
+  whether this appliance has an owner — which is the first thing an operator holding a node that
+  carries nothing needs — so it is no longer silent about coming up. What it still has no path for is
+  a refusal: there is no fault it declines to start under, so the
+  [console reference](../reference/console.md)'s "each stage reporting healthy or the specific fault"
+  holds only in its healthy half for the domain that carries traffic. (The management domain gained a
   refusal path with its transport: it refuses to start at all when the hardware will not produce a
   per-boot secret for its sequence numbers, reports a published calibration it will not use without
   refusing to run, and — new with the recordings — reports an endpoint that could not register both
@@ -2879,15 +2882,60 @@ generation, and **every address the surface once had is gone** — the page, the
 and the route that took the package, offered the very package that was accepted. A close that a
 restart undid would satisfy everything the first boot asserts and nothing here.
 
+**And an appliance nobody owns now forwards nothing.** The domain that holds the identity publishes
+one word — owned, or not — into a region of its own, written at bring-up and again the instant an
+install commits, and the forwarding domain maps that word read-only and reads it on every wakeup. It
+is the first thing the packet chain asks and the only stage that reads nothing of the frame: while
+the word is not the one that means owned, every frame is refused under a drop reason of its own,
+counted per pipeline, carried into the capture with that reason on it, and named on the console at
+bring-up. So a node that carries nothing says *why* on the same three surfaces that explain every
+other refusal, rather than being a firewall whose traffic disappears.
+
+The reading is **latched**. The writer is a peer protection domain, and one that could clear the
+word would hold a switch over the whole dataplane — forwarding on, forwarding off, at whatever rate
+it liked. So the forwarding domain follows the one transition a boot can honestly carry, unowned to
+owned, and never the reverse; an appliance gives an owner up only by a factory reset, which is asked
+for on the medium and takes effect on the boot after it. The console says so at most twice per boot
+for the same reason: a peer rewriting the word cannot choose how many lines this domain writes.
+
+On the image, every boot states the word once and it is the word its medium carried — the domain
+that holds the identity publishes before the forwarding domain reads, on every one of the 31 boots.
+So the *transition* is exercised on the host and not on the image: the boot that installs a package
+does so as the last thing it does, after its own frames have been injected and decided, and it ends
+before the forwarding domain's next wakeup. What that leaves unproven on a booted node is the second
+record and the frames after it, not the latch itself — which is a property of a reader that the host
+suite drives through every ordering a peer can produce.
+
+The grant is one region, one writer, one reader, and no notification. The forwarder is woken by the
+frames it decides anyway, so a notify direction from the domain holding the private key to the
+dataplane would buy nothing and grant something. The read is withheld from the configuration domain
+as well, so ownership cannot become a table composed by the parser that reads an attacker's
+document, and from the management domain, which can already ask the store domain for the identity.
+
+The whole QEMU gate is arranged around it, at the cost of no extra boot. The scenario that onboards
+an appliance now runs **first**, and **19 scenarios boot a copy of an owned medium** — which is what
+a deployed appliance is: onboarded once, long ago, running ever since.
+They cannot onboard during their own boot instead, because an accepted package shuts the onboarding
+surface for good and so an install has to be the last thing a boot does. The scenarios that stay
+unowned are the ones whose subject that is: the six that exercise the onboarding surface, the three
+that mint, reload and reset an identity, and the node that refused its own document. Every boot,
+owned or not, is held to the word its medium carried against the word the forwarding domain printed —
+so a scenario cannot come to prove a forwarding contract against an appliance that was refusing
+everything, and the unowned boots show the refusal on the console and, where they scrape, in the
+exposition.
+
 **Missing.** **The configuration document a package carries is validated and not persisted**:
 committing it
 needs the ownership fact to reach the configuration domain, which is a change to a different
 handover, so an onboarded appliance still forwards under whatever the boot document said — including
 the appliance the gate now onboards, which takes the document in its package, holds it to every rule
-and then runs the one its own image carries. And
-**nothing fails closed on being unowned**: an appliance without an owner is supposed to forward
-nothing, and the ownership fact now reaches the domain that serves onboarding but not the domain that
-forwards. Those two are the whole of what stands between this phase and done. The rate limiter is proved on the
+and then runs the one its own image carries. That is the whole of what stands between this phase and
+done, and the phase that carries configuration over the channel is what builds it. One narrowing
+came with the fail-closed word: the boot that refuses its own document is now fail-closed on two
+counts at once — no owner and no committed generation — and the ownership refusal is reached first,
+so that boot no longer isolates the empty table as the thing stopping its frames. What it still holds
+exactly is the claim it is named for, which its console carries: the document was refused, the domain
+reported it, and nothing above generation 0 was ever committed. The rate limiter is proved on the
 host and not on the image — tripping it needs more sessions than a boot spends handshakes on, and
 what the image proves instead is that two other refusals reach two different tokens. What no scenario
 reaches is the port's behaviour **under a peer

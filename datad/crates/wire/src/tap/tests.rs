@@ -818,6 +818,7 @@ fn a_verdict_and_a_reason_that_disagree_are_refused() {
 #[test]
 fn every_drop_reason_round_trips_through_the_region() {
     let reasons = [
+        TapDropReason::Unowned,
         TapDropReason::UnconfiguredIngressPort,
         TapDropReason::InterfaceDisabled,
         TapDropReason::NotAddressedToUs,

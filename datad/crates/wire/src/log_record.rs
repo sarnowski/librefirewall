@@ -101,6 +101,13 @@ pub const LOG_ONBOARD_ROUTE_COUNT: u8 = 2;
 /// `lfw_log::OnboardRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
 pub const LOG_ONBOARD_REFUSAL_COUNT: u8 = 26;
 
+/// How many things an appliance's ownership may be — `lfw_log::Ownership::ALL`,
+/// on [`LOG_DIAL_OUTCOME_COUNT`]'s terms. A token rather than a flag, although
+/// the fact is a yes or a no: the console spells the same word the drop reason
+/// and the metric label spell, so an operator reading a node that forwards
+/// nothing meets one word on all three surfaces rather than a boolean on one.
+pub const LOG_OWNERSHIP_COUNT: u8 = 2;
+
 /// Code points of one kind an offer record carries —
 /// `lfw_log::MAX_OFFERED_POINTS`. Eight, which is [`LOG_OPERANDS`] halved:
 /// four sixteen-bit points ride in each of two words, most significant first,
@@ -276,6 +283,9 @@ pub enum LogDetailKind {
     /// so nothing else fits beside it.
     Adopted,
     AnchorFingerprint,
+    /// Whether the domain that decides frames believes this appliance has an
+    /// owner. Appended, never inserted, on [`Self::Identity`]'s terms.
+    Ownership,
 }
 
 impl LogDetailKind {
@@ -323,6 +333,7 @@ impl LogDetailKind {
             Self::Adopted => 38,
             Self::AnchorFingerprint => 39,
             Self::OnboardingInstalled => 40,
+            Self::Ownership => 41,
         }
     }
 
@@ -370,6 +381,7 @@ impl LogDetailKind {
             38 => Some(Self::Adopted),
             39 => Some(Self::AnchorFingerprint),
             40 => Some(Self::OnboardingInstalled),
+            41 => Some(Self::Ownership),
             _ => None,
         }
     }
@@ -1033,6 +1045,11 @@ impl LogRecord {
             Some(LogDetailKind::AnchorFingerprint) => CheckedDetail::AnchorFingerprint {
                 words: self.operands,
             },
+            // One token and nothing beside it, on `OnboardingEnded`'s terms: the
+            // fact is the whole record.
+            Some(LogDetailKind::Ownership) => CheckedDetail::Ownership {
+                ownership: ownership_token(self.operands[0])?,
+            },
         };
         Ok(CheckedBody::Domain {
             domain,
@@ -1096,6 +1113,13 @@ impl Default for LogRecord {
 /// caller's error for it. The bound is this ABI's, and a token inside it is
 /// still one the log crate may not map — the two questions are different and
 /// only the crate that owns the vocabulary answers the second.
+fn ownership_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_OWNERSHIP_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::OwnershipUnknown { ownership: raw }),
+    }
+}
+
 /// A primitive token carried in an operand word: it must name a member of the
 /// set, and it arrives as a `u64` because that is the width an operand has.
 fn primitive_token(raw: u64) -> Result<u8, LogRecordError> {
@@ -1726,6 +1750,11 @@ pub enum CheckedDetail {
     AnchorFingerprint {
         words: [u64; LOG_OPERANDS],
     },
+    /// Whether the domain that decides frames believes this appliance has an
+    /// owner.
+    Ownership {
+        ownership: u8,
+    },
 }
 
 /// When a [`LogRecord`] says it was emitted.
@@ -1801,6 +1830,9 @@ pub enum LogRecordError {
     },
     PrimitiveUnknown {
         primitive: u64,
+    },
+    OwnershipUnknown {
+        ownership: u64,
     },
     /// A protocol code point wider than the sixteen bits every TLS registry
     /// numbers one in.
@@ -1917,6 +1949,10 @@ impl fmt::Display for LogRecordError {
             Self::PrimitiveUnknown { primitive } => write!(
                 f,
                 "primitive token {primitive} is not below {LOG_PRIMITIVE_COUNT}"
+            ),
+            Self::OwnershipUnknown { ownership } => write!(
+                f,
+                "ownership token {ownership} is not below {LOG_OWNERSHIP_COUNT}"
             ),
             Self::CodePointTooWide { value } => {
                 write!(f, "protocol code point {value} does not fit sixteen bits")

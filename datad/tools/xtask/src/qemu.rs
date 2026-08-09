@@ -46,7 +46,7 @@ use std::{
     process::Command,
 };
 
-use lfw_log::{DialOutcome, OnboardEnd};
+use lfw_log::{DialOutcome, OnboardEnd, Ownership};
 
 use crate::{
     artifacts::DIST_DISK,
@@ -62,7 +62,8 @@ use crate::{
     },
     image, management_contract, metrics_contract,
     onboard_contract::{self, OnboardVerdict},
-    onboard_install_contract, onboard_request_contract, onboard_tls_contract, probe_contract,
+    onboard_install_contract, onboard_request_contract, onboard_tls_contract, ownership_contract,
+    probe_contract,
     recording_contract::{self, Download},
     stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
@@ -239,9 +240,15 @@ struct Bench {
     /// Whether this boot opens a session on the appliance's onboarding port, and
     /// how the station on this end of it behaves.
     onboard: OnboardContract,
-    /// Which store medium this boot attaches: a fresh one, or the one an earlier
-    /// boot of the same run minted an identity on — reset or not.
+    /// Which store medium this boot attaches: a fresh one, the one an earlier
+    /// boot of the same run minted an identity on — reset or not — or a copy of
+    /// one an earlier boot was onboarded on.
     store: StoreMedium,
+    /// Whether the appliance on that medium **has an owner**, which the scenario
+    /// table derives and the boot cannot: a node without one forwards nothing,
+    /// so this decides what the boot's own recordings can hold as well as what
+    /// its console must say.
+    owner: Ownership,
 }
 
 /// What a routed boot puts on its wires, as one value rather than four
@@ -256,6 +263,7 @@ pub(crate) struct ForwardBench {
     pub(crate) dial: DialContract,
     pub(crate) onboard: OnboardContract,
     pub(crate) store: StoreMedium,
+    pub(crate) owner: Ownership,
 }
 
 /// Whether a boot judges the connection the appliance *originates* out of its
@@ -622,22 +630,48 @@ impl OnboardContract {
 
 /// Which store medium a boot attaches at 00:06.0 — the appliance's own.
 ///
-/// A property of the scenario rather than of the run, on [`Accelerator`]'s terms:
-/// almost every boot wants a medium of its own, and two want the medium an earlier
-/// boot left. Making it a field is what lets the scenario table say which is
-/// which, and what keeps a pair readable as a pair.
+/// A property of the scenario rather than of the run, on [`Accelerator`]'s terms.
+/// It decides two things at once and they are worth separating. The first is
+/// whether the boot's *identity* is its own or an earlier boot's, which is what
+/// the store scenarios are about. The second is whether the appliance the boot
+/// brings up **has an owner** — and that one is not a subject at all for most of
+/// this table, it is a precondition: an unowned node forwards nothing, so a
+/// scenario about routing, filtering, tracking or the management channel has to
+/// boot a node somebody already onboarded, exactly as a deployed one would be.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoreMedium {
-    /// A fresh, zero-filled medium, so the boot mints an identity. Every scenario
-    /// whose subject is something else takes this: a medium carried between two
-    /// unrelated boots would let one pass on an identity another minted.
+    /// A fresh, zero-filled medium, so the boot mints an identity **and comes up
+    /// unowned**. Taken by every scenario whose subject is an appliance nobody has
+    /// taken yet — the onboarding surface, the identity a mint produces, and the
+    /// node that refused its own document — and by no other, a medium carried
+    /// between two unrelated boots letting one pass on an identity another minted.
     Fresh,
-    /// The medium the named scenario's *shipping* boot left behind.
+    /// The medium the named scenario's *shipping* boot left behind — the file
+    /// itself, not a copy of it.
     ///
     /// The source's shipping label rather than this run's, so a diagnostic re-run
     /// of the reloading scenario reads the same medium the shipping run judged.
     /// A reload writes nothing, so reading it twice is not a second commit.
+    ///
+    /// For the two boots whose claim *is* the medium, and for no others: sharing
+    /// one file is what makes "the identity survived" sayable and what would let
+    /// any third boot pass on state to a fourth.
     CarriedFrom(&'static str),
+    /// This boot's **own copy** of the medium the named scenario's shipping boot
+    /// left behind.
+    ///
+    /// What a deployed appliance is: onboarded once, long before, and running ever
+    /// since. Every scenario whose contract needs frames to cross takes this, and
+    /// the alternative — onboarding during its own boot — is not available, because
+    /// an install shuts the onboarding surface for good and so has to be the last
+    /// thing a boot does. A copy costs nothing and reorders nothing.
+    ///
+    /// A copy rather than [`Self::CarriedFrom`]'s shared file, because these boots
+    /// make no claim about the medium and several of them write to it. Nineteen
+    /// boots sharing one file would let one scenario's writes decide another's
+    /// verdict, which is precisely the coupling the recorder's fresh-per-boot disk
+    /// exists to prevent.
+    CopiedFrom(&'static str),
     /// The same medium, with a **factory-reset request** written onto one sector
     /// of it before the boot — which is the whole of how a reset is asked for,
     /// there being no channel operation, no configuration document and no console
@@ -904,10 +938,11 @@ pub(crate) struct Scenario {
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
     accelerator: Accelerator,
-    /// Which store medium this boot attaches. All but two scenarios take a fresh
-    /// one; the two that do not are what prove the appliance's identity survives a
-    /// reboot and is given up by a factory reset, both claims about a medium rather
-    /// than about a boot.
+    /// Which store medium this boot attaches, which decides both the identity it
+    /// comes up under and **whether it has an owner at all** — an appliance nobody
+    /// has onboarded forwards nothing, so this is a precondition of most of this
+    /// table rather than a subject of it. [`ownership_at_boot`] derives the second
+    /// answer from this field, so a scenario cannot state one and boot the other.
     store: StoreMedium,
 }
 
@@ -929,30 +964,47 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
 /// prose beside a list nothing compares it to is a number that goes stale with
 /// every stage green, which is the defect that check exists for.
 ///
-/// The list below numbers the first eight; the ones after them carry their reasons
+/// # The order, which is a dependency and not a preference
+///
+/// **onboarding-adopted comes first**, and everything about the order follows from
+/// that. It is the boot that gives an appliance an owner, and a node without one
+/// forwards nothing at all — so nineteen of the boots below copy the medium it
+/// leaves rather than booting an appliance that would refuse every frame they
+/// inject. The pair that reads one medium twice comes after the boot that writes
+/// it, for the same shape of reason. Both dependencies are checked before a single
+/// boot runs ([`check_media_order`]), so a table edit that reordered a pair is a
+/// verdict rather than an hour of boots ending in a puzzle.
+///
+/// The list below numbers the first nine; the ones after them carry their reasons
 /// beside the entries themselves, where a reader meets them.
 ///
-/// 1. **routed-forwarding** — the published disk, judged by the routed contract
+/// 1. **onboarding-adopted** — an appliance nobody owns is given an owner by this
+///    run's management server, over the surface it serves for exactly that. Its
+///    own contract is the install; what it additionally provides is the owned
+///    medium the nineteen scenarios that need frames to cross take copies of, and
+///    the *unowned* half of the ownership contract, its six probes being refused
+///    because at the moment they are injected nothing has taken this node.
+/// 2. **routed-forwarding** — the published disk, judged by the routed contract
 ///    alone. It is the regression guard: exactly the contract that existed
 ///    before configuration management, now stated between endpoints read out of
 ///    the document rather than written beside it, so a forwarding failure is
 ///    reported as a forwarding failure and nothing else.
-/// 2. **generation-swap** — the same disk, judged additionally by what it said:
+/// 3. **generation-swap** — the same disk, judged additionally by what it said:
 ///    the node comes up fail-closed on generation 0 and switches to generation
 ///    1, whose change records are the document's own diff, and its clock domain
 ///    establishes a time and reports the frequency it measured. A separate boot,
 ///    because a transcript that could only be read off a run whose traffic had
 ///    already passed would be silent in exactly the case it exists for — a node
 ///    that committed nothing and forwarded nothing.
-/// 3. **alternate-configuration** — a disk assembled from a second document
+/// 4. **alternate-configuration** — a disk assembled from a second document
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
-///    table would satisfy scenarios 1 and 2 and fail every probe here.
-/// 4. **metrics-endpoint**, 5. **metrics-endpoint-alternate** and
-///    6. **recording-download** — `curl` pulls every surface the endpoint serves
+///    table would satisfy scenarios 2 and 3 and fail every probe here.
+/// 5. **metrics-endpoint**, 6. **metrics-endpoint-alternate** and
+///    7. **recording-download** — `curl` pulls every surface the endpoint serves
 ///    through QEMU's own user-mode stack: `GET /metrics`, `GET /logs.pcapng` and
-///    `GET /capture.pcapng`. Scenarios 4 and 6 run against the published disk and
-///    5 against a disk built from the second document, and each is judged
+///    `GET /capture.pcapng`. Scenarios 5 and 7 run against the published disk and
+///    6 against a disk built from the second document, and each is judged
 ///    against *its own* document — which is what makes the interface info family
 ///    a checked statement about the running configuration, the two documents
 ///    sharing no identity, so a label the build carried rather than read would
@@ -965,7 +1017,7 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
 ///    recording that silently drops, a metric that double-counts and a tap that
 ///    loses a record are each invisible in the surface they occur in.
 ///
-/// 7. **policy-filter** and 8. **policy-filter-alternate** — the filter's own
+/// 8. **policy-filter** and 9. **policy-filter-alternate** — the filter's own
 ///    two, and the only two that inject a different probe set: one packet per
 ///    outcome the filter can reach, differing from each other in the UDP
 ///    destination port and in nothing else. One is forwarded because a rule
@@ -974,16 +1026,58 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
 ///    are held apart three ways — the wire (one delivery, two absences), the drop
 ///    reason, and the per-rule hit counter — and each scenario is judged against
 ///    its own document, whose policy names different ports under different rule
-///    ids. Two rather than one for scenario 5's reason: a counter labelled with a
+///    ids. Two rather than one for scenario 6's reason: a counter labelled with a
 ///    name the build carried, rather than one it read, would satisfy one and fail
 ///    the other.
 ///
-/// Every scenario but the last additionally injects frames into the dedicated
-/// management port and holds that port to carrying nothing back, whatever else it
-/// judges; the two that read the console also hold the management domain's own
-/// count to the frames and bytes injected. The last injects none, its subject
-/// being the accelerator rather than any contract the appliance owes.
+/// Every scenario but `cryptography-under-emulation` additionally injects frames
+/// into the dedicated management port and holds that port to carrying nothing
+/// back, whatever else it judges; the two that read the console also hold the
+/// management domain's own count to the frames and bytes injected. That one
+/// injects none, its subject being the accelerator rather than any contract the
+/// appliance owes.
+///
+/// And every one of them, whatever else it proves, is held to the ownership its
+/// medium carried ([`crate::ownership_contract`]) — the premise the forwarding
+/// half of each contract above rests on, stated by the appliance on the one
+/// surface a deployed node always has.
 pub(crate) const SCENARIOS: &[Scenario] = &[
+    // FIRST, and the position is load-bearing rather than a preference.
+    //
+    // This is the boot that gives an appliance an owner, and an owned appliance
+    // is what nineteen of the boots below need: a node no management plane has
+    // taken forwards nothing at all, so a routing, filtering, tracking or channel
+    // contract stated against an unowned one would be stated against a node that
+    // refuses every frame before it looks at it. They take copies of the medium
+    // this boot leaves, which costs the run no extra boot and puts each of them
+    // in the position a deployed appliance is actually in — onboarded once, long
+    // ago, and running ever since.
+    //
+    // They cannot each onboard during their own boot instead, and that is the
+    // reason this one is a source rather than a step every scenario repeats: an
+    // install shuts the onboarding surface for good, so the management server has
+    // to be the last client a boot runs. A boot that onboarded itself first would
+    // have to inject its dataplane traffic afterwards, which is a different loop
+    // from the one every other scenario runs.
+    Scenario {
+        name: "onboarding-adopted",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheOnboardingInstall,
+        management: ManagementRole::Client,
+        // The shipped six, every one of them owed a refusal: at the moment they
+        // are injected this appliance has no owner, the management server being
+        // the last thing this boot runs. That is not a weaker version of the
+        // routed contract — it is the other half of it, the same six frames the
+        // boots below watch cross an owned node.
+        traffic: Traffic::Unowned,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Onboards,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // Fresh, necessarily: the whole subject is an appliance that has never
+        // had an owner being given one.
+        store: StoreMedium::Fresh,
+    },
     Scenario {
         name: "routed-forwarding",
         document: image::CONFIGURATION_DOCUMENT,
@@ -994,7 +1088,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "generation-swap",
@@ -1006,7 +1100,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Judged,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "alternate-configuration",
@@ -1018,7 +1112,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "metrics-endpoint",
@@ -1034,7 +1128,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The same scrape against a disk built from the second document, and the
     // one thing the scenario above cannot show: that the identity the
@@ -1058,7 +1152,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The recording milestone's own scenario. It is no longer the only one
     // that pulls the recordings — every [`ManagementRole::Client`] scenario
@@ -1079,7 +1173,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The filter's own two scenarios, and the reason there are two of them
     // rather than one: the three outcomes have to be shown to follow from the
@@ -1103,7 +1197,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "policy-filter-alternate",
@@ -1115,7 +1209,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The one contract a stateless filter cannot meet, on both documents.
     //
@@ -1144,7 +1238,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "stateful-tracking-alternate",
@@ -1156,7 +1250,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The one thing a connection history needs that no other scenario can
     // produce: a conversation that **opens and closes**.
@@ -1214,7 +1308,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The landing that closed the model's one real hole, and the only scenario
     // that states what a policy commit did to the conversations the appliance
@@ -1254,7 +1348,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The scenario that proves an ICMP error the tracker RELATES to a live
     // conversation is still the filter's to decide — which is what keeps
@@ -1288,7 +1382,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "connection-lifecycle",
@@ -1300,7 +1394,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The one scenario that puts a **flood** across the appliance, and the only
     // one whose contract is about how much state a burst of traffic can make
@@ -1343,7 +1437,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The only scenario that boots a node onto **generation 0** — the fail-closed
     // empty configuration — and the only one whose contract is that the appliance
@@ -1370,18 +1464,35 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // endpoints and over the same ports, because this document's addressing is the
     // shipped one to the byte. That is what makes their absence attributable: the
     // identical traffic crosses on eleven other scenarios, and here nothing does —
-    // not for want of a route or an interface, but because no policy was ever
-    // committed for one to be admitted by.
+    // not for want of a route or an interface.
+    //
+    // WHAT THIS BOOT NO LONGER ISOLATES, stated because it is a real narrowing
+    // rather than a wording change. This node is in two fail-closed states at
+    // once: nobody has onboarded it, and it committed no generation. The
+    // ownership refusal is reached first, so the empty table is no longer what
+    // stops these frames — it would stop them, and this boot does not show it.
+    // What the boot still holds exactly is the claim its name is about and its
+    // console carries: the appliance REFUSED THE DOCUMENT ITS OWN IMAGE CARRIES,
+    // reported `config state=refused`, came up on generation 0 and committed
+    // nothing above it. Booting it owned would isolate the empty table again and
+    // would cost the run its only node that is fail-closed on both counts, which
+    // is the state a factory-fresh appliance is actually in.
     Scenario {
         name: "fail-closed-boot",
         document: image::DUPLICATE_RULE_ID_DOCUMENT,
         image: ImageUnderTest::BuiltForTheScenario,
         console: Console::JudgedOnARefusal,
         management: ManagementRole::Station,
+        // The shipped six, judged as absences by this boot's own contract rather
+        // than by the probe set: `BootContract::FailedClosed` is what decides how
+        // an absence reads here, and it names both reasons this node has.
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
+        // Fresh, so this is the whole fail-closed picture: an appliance out of the
+        // box has no owner and no committed configuration, and it must carry
+        // nothing under either.
         store: StoreMedium::Fresh,
     },
     // The only scenario that chooses its accelerator, and the only one whose
@@ -1551,7 +1662,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Misbehaves(DialMisbehaviour::SilentToTheDial),
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "dial-reset",
@@ -1563,7 +1674,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Misbehaves(DialMisbehaviour::ResetsTheDial),
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     Scenario {
         name: "dial-misacknowledged",
@@ -1575,7 +1686,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence),
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // And the one where nothing reaches a connection at all: the station answers
     // every resolution for an address nobody asked about, so nothing is learned
@@ -1595,7 +1706,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         dial: DialContract::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress),
         onboard: OnboardContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::Fresh,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
     // The three boots whose subject is the appliance's ONBOARDING PORT — the
     // second port its management endpoint listens on, which carries a byte
@@ -1633,7 +1744,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         image: ImageUnderTest::Published,
         console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
         management: ManagementRole::Station,
-        traffic: Traffic::Routed,
+        traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Completes),
         accelerator: Accelerator::WhateverTheMachineOffers,
@@ -1651,7 +1762,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         image: ImageUnderTest::Published,
         console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
         management: ManagementRole::Station,
-        traffic: Traffic::Routed,
+        traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Abandons),
         accelerator: Accelerator::WhateverTheMachineOffers,
@@ -1670,7 +1781,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         image: ImageUnderTest::Published,
         console: Console::JudgedOnTheOnboardingSessionAndThePortsCount,
         management: ManagementRole::Station,
-        traffic: Traffic::Routed,
+        traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Crowds),
         accelerator: Accelerator::WhateverTheMachineOffers,
@@ -1705,7 +1816,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         image: ImageUnderTest::Published,
         console: Console::JudgedOnTheOnboardingHandshakes,
         management: ManagementRole::Client,
-        traffic: Traffic::Routed,
+        traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Handshakes,
         accelerator: Accelerator::WhateverTheMachineOffers,
@@ -1740,7 +1851,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         image: ImageUnderTest::Published,
         console: Console::JudgedOnTheOnboardingRequests,
         management: ManagementRole::Client,
-        traffic: Traffic::Routed,
+        traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Requests,
         accelerator: Accelerator::WhateverTheMachineOffers,
@@ -1779,20 +1890,6 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // owner. A close that a restart undid satisfies everything the first boot
     // asserts and nothing here.
     Scenario {
-        name: "onboarding-adopted",
-        document: image::CONFIGURATION_DOCUMENT,
-        image: ImageUnderTest::Published,
-        console: Console::JudgedOnTheOnboardingInstall,
-        management: ManagementRole::Client,
-        traffic: Traffic::Routed,
-        dial: DialContract::Answered,
-        onboard: OnboardContract::Onboards,
-        accelerator: Accelerator::WhateverTheMachineOffers,
-        // Fresh, necessarily: the whole subject is an appliance that has never
-        // had an owner being given one.
-        store: StoreMedium::Fresh,
-    },
-    Scenario {
         name: "onboarding-owned",
         document: image::CONFIGURATION_DOCUMENT,
         image: ImageUnderTest::Published,
@@ -1827,6 +1924,7 @@ struct Observed {
 
 /// Boot every scenario in `scenarios` and answer what the run proved.
 fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> {
+    check_media_order(scenarios)?;
     let judged = scenarios
         .iter()
         .filter(|scenario| matches!(scenario.console, Console::Judged))
@@ -1852,7 +1950,12 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
     // correct in one scenario.
     let mut identities: Vec<(&str, store_contract::Identity)> = Vec::new();
     for scenario in scenarios {
-        match run_scenario(root, scenario, Run::Shipping) {
+        // What this boot's medium says about ownership, decided before the boot
+        // rather than read out of it: every forwarding contract below rests on
+        // it, so a run that derived it from the appliance's own answer could not
+        // catch the appliance being wrong.
+        let owner = ownership_at_boot(scenarios, scenario)?;
+        match run_scenario(root, scenario, Run::Shipping, owner) {
             Ok(observed) => {
                 if let Some(isn) = observed.management_tcp_isn {
                     sequence_numbers.push((scenario.name, isn));
@@ -1868,7 +1971,7 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
                     verdict,
                     &scenario_log(root, scenario, Run::Shipping),
                     &scenario_log(root, scenario, Run::Diagnostic),
-                    || run_scenario(root, scenario, Run::Diagnostic).map(|_| ()),
+                    || run_scenario(root, scenario, Run::Diagnostic, owner).map(|_| ()),
                 ));
             }
         }
@@ -1884,6 +1987,115 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         Run::Shipping.config(),
         describe_the_emulated_boots(scenarios, &accelerated),
     ))
+}
+
+/// How many scenarios boot their own copy of a medium some earlier boot was
+/// onboarded on.
+///
+/// Read as data by [`crate::reference_contract`] rather than restated in prose,
+/// because it is the premise the forwarding half of most of this table rests on:
+/// a scenario moved off a copied medium changes what the gate proves, and a
+/// sentence saying otherwise would go on reading correctly.
+pub(crate) fn copied_medium_scenario_count() -> usize {
+    SCENARIOS
+        .iter()
+        .filter(|scenario| matches!(scenario.store, StoreMedium::CopiedFrom(_)))
+        .count()
+}
+
+/// Whether the appliance a scenario boots **already has an owner** when it
+/// starts, derived from the medium it attaches rather than stated beside it.
+///
+/// Derived, because a field saying so would be a second statement of the same
+/// fact and the two would drift: a scenario switched from a fresh medium to a
+/// copied one would keep claiming what it no longer boots, and the claim is what
+/// every forwarding contract in this table rests on. Walking the chain instead
+/// means the table can only say one thing.
+///
+/// The chain has three ends. A fresh medium is an appliance that mints itself and
+/// so has no owner. A reset request is the one act that gives an owner up, and it
+/// takes effect on the boot that finds it — this one. Otherwise the answer is the
+/// source's, upgraded to owned where that source is the boot an install adopted:
+/// what a medium carries out of a boot is what the boot left on it.
+///
+/// # Errors
+/// A source no scenario in this table declares, and a source chain that returns
+/// to a scenario it already visited.
+fn ownership_at_boot(scenarios: &[Scenario], scenario: &Scenario) -> Result<Ownership, String> {
+    let mut at = scenario;
+    // Bounded by the table's own length, and by a value no scenario controls: a
+    // chain longer than the number of scenarios has visited one of them twice,
+    // which is a cycle. Unbounded, that is an xtask that never returns.
+    for _ in 0..=scenarios.len() {
+        let source = match at.store {
+            StoreMedium::Fresh | StoreMedium::ResetRequestedOn(_) => {
+                return Ok(Ownership::Unowned);
+            }
+            StoreMedium::CarriedFrom(source) | StoreMedium::CopiedFrom(source) => source,
+        };
+        let Some(found) = scenarios.iter().find(|other| other.name == source) else {
+            return Err(format!(
+                "system scenario {} takes the store medium the {source} boot left and this table \
+                 declares no scenario by that name, so the medium it boots is decided by whatever \
+                 file an earlier run happened to leave",
+                at.name
+            ));
+        };
+        // An install is the only thing that gives an appliance an owner, so a
+        // source that ran one leaves an owned medium whatever it started from.
+        if found.onboard.onboards() {
+            return Ok(Ownership::Owned);
+        }
+        at = found;
+    }
+    Err(format!(
+        "the store media the scenario table declares form a cycle reachable from {}, so no boot \
+         in it has a medium whose contents any scenario decides",
+        scenario.name
+    ))
+}
+
+/// Hold the scenario table's store media to being **declared before they are
+/// used**, before a single boot runs.
+///
+/// The disks themselves say this too — a source file that is not there names the
+/// boot that was to leave it — but they say it one boot in, after an image build
+/// and everything the table put ahead of the offender. Saying it here costs a
+/// walk of a fixed list and turns a table edit that reordered a pair into a
+/// verdict a reader gets immediately.
+///
+/// # Errors
+/// A source declared after the boot that takes its medium, or not at all.
+fn check_media_order(scenarios: &[Scenario]) -> Result<(), String> {
+    for (at, scenario) in scenarios.iter().enumerate() {
+        let (source, how) = match scenario.store {
+            StoreMedium::Fresh => continue,
+            StoreMedium::CarriedFrom(source) => (source, "carries"),
+            StoreMedium::CopiedFrom(source) => (source, "copies"),
+            StoreMedium::ResetRequestedOn(source) => (source, "requests a factory reset on"),
+        };
+        let found = scenarios
+            .iter()
+            .position(|other| other.name == source)
+            .ok_or_else(|| {
+                format!(
+                    "system scenario {} {how} the store medium the {source} boot leaves, and this \
+                     table declares no scenario by that name",
+                    scenario.name
+                )
+            })?;
+        if found >= at {
+            return Err(format!(
+                "system scenario {} {how} the store medium the {source} boot leaves, and {source} \
+                 is declared at position {} of this table against its own {}. The medium has to \
+                 exist before a boot can take it, so the source must come first",
+                scenario.name,
+                found + 1,
+                at + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Hold every boot that reloaded a medium to the boot that minted the identity on
@@ -1907,7 +2119,14 @@ fn judge_carried_media(
     let mut proved = Vec::new();
     for scenario in scenarios {
         let (source, reset) = match scenario.store {
-            StoreMedium::Fresh => continue,
+            // A copy makes no claim about the medium: the boot that took it is
+            // not stating that an identity survived anything, it is stating that
+            // an appliance somebody owns forwards. Holding a copy's identity to
+            // its source's would read as a persistence proof and would be
+            // satisfied by `std::fs::copy` rather than by the appliance. What
+            // these boots are held to instead is the forwarding domain's own
+            // ownership record, on every one of them.
+            StoreMedium::Fresh | StoreMedium::CopiedFrom(_) => continue,
             StoreMedium::CarriedFrom(source) => (source, false),
             StoreMedium::ResetRequestedOn(source) => (source, true),
         };
@@ -2073,7 +2292,12 @@ fn scenario_disk(root: &Path, scenario: &Scenario, run: Run) -> Result<PathBuf, 
     }
 }
 
-fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, String> {
+fn run_scenario(
+    root: &Path,
+    scenario: &Scenario,
+    run: Run,
+    owner: Ownership,
+) -> Result<Observed, String> {
     let name = scenario.name;
     let path = root.join(scenario.document);
     let document = fs::read(&path)
@@ -2091,13 +2315,15 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
 
     match scenario.console {
         Console::JudgedOnARefusal => {
-            return run_fail_closed_scenario(root, scenario, run, &disk, &document, &topology);
+            return run_fail_closed_scenario(
+                root, scenario, run, &disk, &document, &topology, owner,
+            );
         }
         Console::JudgedOnCryptographyAlone => {
-            return run_cryptography_scenario(root, scenario, run, &disk, &topology);
+            return run_cryptography_scenario(root, scenario, run, &disk, &topology, owner);
         }
         Console::JudgedOnTheStoredIdentityAlone => {
-            return run_store_scenario(root, scenario, run, &disk, &topology);
+            return run_store_scenario(root, scenario, run, &disk, &topology, owner);
         }
         // The dial-misbehaviour and onboarding boots run the ordinary path:
         // their routed contract is half of what they prove, so they are boots of
@@ -2138,6 +2364,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            owner,
         },
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -2209,7 +2436,7 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             }
-            let judged = judge_recordings(root, name, &booted, &topology, &log)
+            let judged = judge_recordings(root, name, &booted, &topology, &log, owner)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             println!("{judged}");
             append_evidence(
@@ -2408,8 +2635,14 @@ fn run_scenario(root: &Path, scenario: &Scenario, run: Run) -> Result<Observed, 
             )
         }
     };
+    // Whatever else this boot judged, it is held to the ownership its medium
+    // carried — the precondition every forwarding verdict above rests on, and the
+    // one an appliance states for itself on the only surface it always has.
+    let owned = ownership_contract::judge(&booted.serial, owner, &log)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}{judged}{scraped}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}; {owned}{judged}{scraped}); QEMU \
+         output is in {}",
         run.config(),
         booted.traffic.summary(),
         log.display()
@@ -2501,6 +2734,7 @@ fn run_cryptography_scenario(
     run: Run,
     disk: &Path,
     topology: &Topology,
+    owner: Ownership,
 ) -> Result<Observed, String> {
     let name = scenario.name;
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -2517,14 +2751,17 @@ fn run_cryptography_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            owner,
         },
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
     let log = scenario_log(root, scenario, run);
     let crypto = crypto_contract::judge(&booted.serial, &log, booted.hardware_accelerated)
         .map_err(|error| format!("scenario {name}: {error}"))?;
+    let owned = ownership_contract::judge(&booted.serial, owner, &log)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({crypto}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({crypto}; {owned}); QEMU output is in {}",
         run.config(),
         log.display()
     );
@@ -2552,6 +2789,7 @@ fn run_store_scenario(
     run: Run,
     disk: &Path,
     topology: &Topology,
+    owner: Ownership,
 ) -> Result<Observed, String> {
     let name = scenario.name;
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -2568,14 +2806,17 @@ fn run_store_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            owner,
         },
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
     let log = scenario_log(root, scenario, run);
     let identity = store_contract::judge(&booted.serial, &log)
         .map_err(|error| format!("scenario {name}: {error}"))?;
+    let owned = ownership_contract::judge(&booted.serial, owner, &log)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}; {owned}); QEMU output is in {}",
         run.config(),
         identity.summary(),
         log.display()
@@ -2606,20 +2847,31 @@ fn run_fail_closed_scenario(
     disk: &Path,
     document: &[u8],
     topology: &Topology,
+    owner: Ownership,
 ) -> Result<Observed, String> {
     let name = scenario.name;
     let transcript = crate::config_transcript::RefusedContract::from_document(document)
         .map_err(|error| format!("scenario {name}: {error}"))?;
     let log_name = format!("{}.log", scenario_run_label(name, run));
-    let booted = boot_and_fail_closed(root, disk, &log_name, topology, &transcript, scenario.store)
-        .map_err(|error| format!("scenario {name}: {error}"))?;
+    let booted = boot_and_fail_closed(
+        root,
+        disk,
+        &log_name,
+        topology,
+        &transcript,
+        scenario.store,
+        owner,
+    )
+    .map_err(|error| format!("scenario {name}: {error}"))?;
     // The table, which on this scenario is the evidence rather than the preamble:
     // every row is a probe the shipped document forwards, and every one of them
     // reads `refused`.
     print!("{}", booted.traffic.render());
     let log = scenario_log(root, scenario, run);
+    let owned = ownership_contract::judge(&booted.serial, owner, &log)
+        .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}; {}); QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}; {}; {owned}); QEMU output is in {}",
         run.config(),
         booted.traffic.summary(),
         transcript.summary(),
@@ -2651,6 +2903,7 @@ pub(crate) fn boot_and_forward(
         dial,
         onboard,
         store,
+        owner,
     } = bench;
     boot(
         root,
@@ -2668,6 +2921,7 @@ pub(crate) fn boot_and_forward(
             dial,
             onboard,
             store,
+            owner,
         },
     )
 }
@@ -2695,6 +2949,7 @@ fn judge_recordings(
     booted: &Booted,
     topology: &Topology,
     log: &Path,
+    owner: Ownership,
 ) -> Result<String, String> {
     // The events the probes oblige the connection history to hold, which is what
     // bounds it from below. Not the frame count: the log holds a record where the
@@ -2797,6 +3052,10 @@ fn judge_recordings(
             ports: topology.interfaces().len(),
         },
         &published,
+        // Whether this boot can have opened a conversation at all, taken from the
+        // medium the harness attached: an appliance nobody has onboarded carries
+        // nothing, so its history is legitimately empty and its capture is not.
+        matches!(owner, Ownership::Owned),
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
     evidence.push('\n');
@@ -2859,6 +3118,7 @@ pub(crate) fn boot_and_fail_closed(
     topology: &Topology,
     transcript: &crate::config_transcript::RefusedContract,
     store: StoreMedium,
+    owner: Ownership,
 ) -> Result<Booted, String> {
     boot(
         root,
@@ -2882,6 +3142,7 @@ pub(crate) fn boot_and_fail_closed(
             dial: DialContract::Answered,
             onboard: OnboardContract::Untouched,
             store,
+            owner,
         },
     )
 }
@@ -2913,7 +3174,10 @@ pub(crate) fn boot_and_halt(
             traffic: Traffic::Routed,
             dial: DialContract::Answered,
             onboard: OnboardContract::Untouched,
+            // A fresh medium, so the appliance on it has no owner — which decides
+            // nothing here: no slot boots, so no domain reads the word.
             store: StoreMedium::Fresh,
+            owner: Ownership::Unowned,
         },
     )
 }
@@ -2933,6 +3197,7 @@ fn boot(
         dial,
         onboard,
         store,
+        owner,
     } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
     // Whether this boot reads the recordings back follows from the backing
@@ -3071,8 +3336,14 @@ fn boot(
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {
+        // Whether this boot can have written a conversation history: an appliance
+        // no management plane has taken forwards nothing, so it opens no flow and
+        // its history extent is legitimately empty. Taken from the medium the
+        // harness attached rather than from the recording, which would be the
+        // recording judging itself.
+        let conversations = matches!(owner, Ownership::Owned);
         let on_disk = data
-            .judge_recordings()
+            .judge_recordings(conversations)
             .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
         println!("  data disk {run_label}: {on_disk}");
         append_evidence(
@@ -3233,13 +3504,20 @@ fn qemu_base(
 
     let acceleration = Acceleration::choose(accelerator);
     let data = DataDisk::create(root, run_label)?;
-    // The appliance's own medium, created fresh or carried from the boot that
-    // minted an identity on it. Which one is the scenario's decision, so a boot
-    // cannot accidentally inherit an identity it was meant to mint.
+    // The appliance's own medium: created fresh, carried from the boot that minted
+    // an identity on it, or copied from the boot that was given an owner. Which one
+    // is the scenario's decision, so a boot cannot accidentally inherit an identity
+    // it was meant to mint, nor forward under an owner it was meant to be without.
     let store = match store {
         StoreMedium::Fresh => StoreDisk::create(root, run_label)?,
         StoreMedium::CarriedFrom(source) => {
             StoreDisk::carried(root, &scenario_run_label(source, Run::Shipping))?
+        }
+        // The source's *shipping* label like the two around it, and this run's own
+        // label for the destination: a diagnostic re-run copies the same owned
+        // medium into a file of its own rather than over the shipping run's.
+        StoreMedium::CopiedFrom(source) => {
+            StoreDisk::copied(root, &scenario_run_label(source, Run::Shipping), run_label)?
         }
         // The request is written here, on the host side of the emulation, because
         // that is what the mechanism *is*: one sector of a medium somebody has in

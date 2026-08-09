@@ -51,8 +51,8 @@ const DIGEST_BYTES: usize = 32;
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Primitive, RejectReason,
-    TlsIncompatible, TlsRefusal, Value,
+    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership, Primitive,
+    RejectReason, TlsIncompatible, TlsRefusal, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -103,6 +103,7 @@ pub enum Vocabulary {
     TlsRefusal,
     OnboardRoute,
     OnboardRefusal,
+    Ownership,
 }
 
 impl Vocabulary {
@@ -127,6 +128,7 @@ impl Vocabulary {
             Self::TlsRefusal => TlsRefusal::ALL.len(),
             Self::OnboardRoute => OnboardRoute::ALL.len(),
             Self::OnboardRefusal => OnboardRefusal::ALL.len(),
+            Self::Ownership => Ownership::ALL.len(),
         }
     }
 
@@ -151,6 +153,7 @@ impl Vocabulary {
             Self::TlsRefusal => "TLS refusal",
             Self::OnboardRoute => "onboarding resource",
             Self::OnboardRefusal => "onboarding request refusal",
+            Self::Ownership => "ownership",
         }
     }
 }
@@ -192,6 +195,11 @@ fn variant<T: Copy, const N: usize>(
 /// the assertion at the foot of this file is what stops them.
 fn primitive_of(token: u8) -> Result<Primitive, DecodeError> {
     variant(Primitive::ALL, Vocabulary::Primitive, token)
+}
+
+/// An ownership token as the member it selects, on [`primitive_of`]'s terms.
+fn ownership_of(token: u8) -> Result<Ownership, DecodeError> {
+    variant(Ownership::ALL, Vocabulary::Ownership, token)
 }
 
 /// A dial outcome token as the member it selects, on [`primitive_of`]'s terms.
@@ -508,6 +516,10 @@ impl Event<Cause> {
                 DomainDetail::AnchorFingerprint(digest) => {
                     record.detail = LogDetailKind::AnchorFingerprint.to_bits();
                     record.operands = digest_words(digest);
+                }
+                DomainDetail::Ownership(ownership) => {
+                    record.detail = LogDetailKind::Ownership.to_bits();
+                    record.operands = [*ownership as u64, 0, 0, 0];
                 }
                 DomainDetail::Adopted {
                     destination,
@@ -885,6 +897,11 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
         CheckedDetail::AnchorFingerprint { words } => {
             DomainDetail::AnchorFingerprint(digest_bytes(words))
         }
+        // The token was ranged against the set when the record was checked, so
+        // what is left is naming the member it selected.
+        CheckedDetail::Ownership { ownership } => {
+            DomainDetail::Ownership(ownership_of(*ownership)?)
+        }
         // Total: `wire` ranged the address and the port, and a generation is a
         // position every bit pattern of which a record could stand at.
         CheckedDetail::Adopted {
@@ -1149,6 +1166,7 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     DomainDetail::Proved { primitive, vectors } => {
                         DomainDetail::Proved { primitive, vectors }
                     }
+                    DomainDetail::Ownership(ownership) => DomainDetail::Ownership(ownership),
                     DomainDetail::Session { version, suite } => {
                         DomainDetail::Session { version, suite }
                     }
@@ -1482,6 +1500,7 @@ const _: () = {
     assert!(TlsRefusal::ALL.len() == wire::LOG_TLS_REFUSAL_COUNT as usize);
     assert!(OnboardRoute::ALL.len() == wire::LOG_ONBOARD_ROUTE_COUNT as usize);
     assert!(OnboardRefusal::ALL.len() == wire::LOG_ONBOARD_REFUSAL_COUNT as usize);
+    assert!(Ownership::ALL.len() == wire::LOG_OWNERSHIP_COUNT as usize);
     assert!(crate::MAX_OFFERED_POINTS == wire::LOG_OFFERED_POINTS);
 
     assert!(crate::MAX_IDENTIFIER_LEN == wire::LOG_IDENTIFIER_BYTES);

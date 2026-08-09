@@ -1213,13 +1213,18 @@ impl TrafficReport {
                         Forwarding::UnderAPolicy => (Seen::Missing, "never came back".to_owned()),
                         // The row this boot is run to produce: the shipped
                         // document forwards this probe, and here it did not
-                        // cross — because no policy was ever committed for it to
-                        // be admitted by.
+                        // cross. Two things stop it and the node is in both
+                        // states at once — nobody has onboarded it, and it
+                        // committed no generation — so the row names both rather
+                        // than crediting the absence to whichever one a reader
+                        // happens to have in mind. Which of them the appliance
+                        // reached first is a question for its counters, and the
+                        // console says the ownership half outright.
                         Forwarding::NothingCommitted => (
                             Seen::Refused,
                             String::from(
-                                "the document this image carries forwards it, and this node \
-                                 committed no generation, so nothing admitted it",
+                                "the document this image carries forwards it, and this node has \
+                                 no owner and committed no generation, so nothing admitted it",
                             ),
                         ),
                         Forwarding::NotThisBootsSubject => (
@@ -1518,6 +1523,38 @@ fn probes(topology: &Topology) -> Result<Vec<Probe>, String> {
     ])
 }
 
+/// The shipped routed set, with every probe owed a refusal because the appliance
+/// has no owner.
+///
+/// Built from [`probes`] rather than beside it, which is the point: the frames an
+/// unowned appliance must refuse are *the same bytes* the owned one forwards, so a
+/// set written out here could drift into proving that some other traffic does not
+/// cross. What changes is the expectation, and it changes for all six — including
+/// the four the owned appliance also refuses, because under an unowned one they no
+/// longer reach the stage that names their reason. A TTL of 1 is not why this node
+/// dropped anything.
+///
+/// Every routed probe also loses its expected log event. A conversation is opened
+/// by a packet the appliance decided to carry, and this one carries none.
+///
+/// # Errors
+/// Whatever [`probes`] refuses the bench for.
+fn unowned_probes(topology: &Topology) -> Result<Vec<Probe>, String> {
+    /// One reason for all six, and it names the appliance rather than the frame —
+    /// which is what the refusal is. The wording is the operator's, not the
+    /// vocabulary's token: this string is what a reader of the traffic table sees.
+    const BECAUSE: &str =
+        "no management plane has onboarded this appliance, so it forwards nothing at all";
+    Ok(probes(topology)?
+        .into_iter()
+        .map(|probe| Probe {
+            expectation: Expectation::Dropped { because: BECAUSE },
+            event: None,
+            ..probe
+        })
+        .collect())
+}
+
 /// Which packets a boot injects into the two dataplane ports.
 ///
 /// Two sets rather than one grown by three, and that is the whole point: the
@@ -1615,6 +1652,23 @@ pub enum Traffic {
     /// reply is deferred past the burst, so what its delivery says is that the
     /// table still held the flow the flood had been arriving alongside.
     Flood,
+    /// The shipped routed set, injected into an appliance **nobody has
+    /// onboarded** — where every one of the six is refused and none crosses.
+    ///
+    /// The same six frames as [`Self::Routed`] on purpose, and that is the whole
+    /// experiment: two of them are the packets six other scenarios watch cross
+    /// this appliance, addressed between the same endpoints under the same
+    /// document, and here they do not. What separates the two runs is not the
+    /// traffic and not the policy — it is whether a management plane has taken
+    /// the node, which is the one precondition that sits in front of every other
+    /// decision the dataplane makes.
+    ///
+    /// So this is the negative half of ownership, stated the only way a negative
+    /// can be: with the positive alongside it, from the same bytes. A set of its
+    /// own rather than a flag on the routed one, because a probe set *is* the
+    /// experiment, and a table saying which set a boot injected is where a reader
+    /// finds out what the boot was asking.
+    Unowned,
 }
 
 impl Traffic {
@@ -1632,7 +1686,7 @@ impl Traffic {
     /// The checks are the only consumer, so it exists only in a test build: a
     /// production-visible list nothing reads would be dead code.
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Routed,
         Self::Policy,
         Self::Lifecycle,
@@ -1641,6 +1695,7 @@ impl Traffic {
         Self::Reconfiguration,
         Self::Revocation,
         Self::Related,
+        Self::Unowned,
     ];
 
     /// Where this set sits in [`Self::ALL`].
@@ -1658,6 +1713,7 @@ impl Traffic {
             Self::Reconfiguration => 5,
             Self::Revocation => 6,
             Self::Related => 7,
+            Self::Unowned => 8,
         }
     }
 
@@ -1673,7 +1729,12 @@ impl Traffic {
             Self::Reconfiguration => Some(crate::config_submission_contract::SUBMITTED),
             Self::Revocation => Some(crate::config_submission_contract::NARROWED),
             Self::Related => Some(crate::config_submission_contract::RELATED),
-            Self::Routed | Self::Policy | Self::Lifecycle | Self::Stateful | Self::Flood => None,
+            Self::Routed
+            | Self::Policy
+            | Self::Lifecycle
+            | Self::Stateful
+            | Self::Flood
+            | Self::Unowned => None,
         }
     }
 
@@ -1692,7 +1753,8 @@ impl Traffic {
             | Self::Stateful
             | Self::Flood
             | Self::Reconfiguration
-            | Self::Revocation => 0,
+            | Self::Revocation
+            | Self::Unowned => 0,
         }
     }
 
@@ -1751,6 +1813,16 @@ pub struct PolicyWitness {
     /// document never had — so a count taken from the built-around document alone
     /// would refuse a scrape that is exactly right.
     pub rules: usize,
+    /// Whether this boot's appliance had **no owner**, so nothing could be
+    /// forwarded and the cross-check that means anything is the refusal count.
+    ///
+    /// Its own flag rather than "forwarded nothing", because those are different
+    /// claims: a boot may forward nothing because its policy admitted nothing,
+    /// and then the zero is the filter's. Here the zero is the appliance's, every
+    /// frame having been settled in front of admission — so what the exposition
+    /// owes is a rise under one reason and a zero under every other, which is a
+    /// statement no forwarding number can make.
+    pub unowned: bool,
     /// Whether the boot ran **two** policies: one it booted with and one submitted
     /// over the management API while it ran.
     ///
@@ -1797,6 +1869,13 @@ fn injected_probes(
         // strong a statement as a rise and is only available from a set that
         // provokes neither.
         Traffic::Routed => (probes(topology)?, false, false, false),
+        // Neither of the filter's refusals, and for a stronger reason than the
+        // routed set's: on this boot the filter is never consulted at all. The
+        // ownership stage settles every frame in front of admission, so both
+        // counters must read zero and so must every other stage's — which is
+        // exactly the shape of the claim, an unowned appliance having no opinion
+        // about anybody's traffic.
+        Traffic::Unowned => (unowned_probes(topology)?, false, false, false),
         Traffic::Policy => (policy_probes(topology, policy), true, true, false),
         // The fallthrough, but not the dropping rule: the unsolicited packet
         // falls past every rule, and nothing in this set is addressed to the port
@@ -1843,6 +1922,7 @@ fn injected_probes(
             probed_an_established_flow: stateful
                 || matches!(traffic, Traffic::Revocation | Traffic::Flood),
             probed_mid_stream: stateful,
+            unowned: matches!(traffic, Traffic::Unowned),
             // The booted document's rules, plus whatever the submitted one adds.
             rules: topology.rule_ids().len() + traffic.rules_added(),
             reconfigured: matches!(
@@ -1857,7 +1937,8 @@ fn injected_probes(
                 | Traffic::Stateful
                 | Traffic::Reconfiguration
                 | Traffic::Revocation
-                | Traffic::Related => 0,
+                | Traffic::Related
+                | Traffic::Unowned => 0,
             },
         },
     ))

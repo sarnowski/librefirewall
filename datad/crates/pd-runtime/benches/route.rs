@@ -38,8 +38,8 @@ use net_headers::{
     UDP_HEADER_LEN,
 };
 use pd_runtime::{
-    Configuration, Descriptor, ForwardRings, Pool, PoolOwner, RING_SLOTS, ReturnRing, RingProducer,
-    RouteStage, Tracking, Verdict,
+    Configuration, Descriptor, ForwardRings, Ownership, Pool, PoolOwner, RING_SLOTS, ReturnRing,
+    RingProducer, RouteStage, Tracking, Verdict,
 };
 use pipeline::{Pipeline, PolicySweep, Rule, RuleAction, Ruleset};
 use routing::{Interface, Neighbour, PortId, Router};
@@ -289,6 +289,7 @@ fn measure(
                         &mut pipeline,
                         configuration,
                         &mut Tracking::new(&mut flows, Monotonic::BOOT),
+                        Ownership::Owned,
                         None,
                     ));
                     elapsed += started.elapsed();

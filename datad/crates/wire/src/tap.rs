@@ -181,7 +181,7 @@ pub const TAP_FLAGS_KNOWN: u32 = TAP_FLAG_OUTBOUND;
 /// reverse edge for good. [`TapDropReason`] mirrors that enum the way
 /// [`crate::LogRecord`] mirrors `lfw_log::Event` — as integers, in the source
 /// enum's declaration order, offset by one so zero can mean *no reason*.
-pub const TAP_DROP_REASON_COUNT: u32 = 25;
+pub const TAP_DROP_REASON_COUNT: u32 = 26;
 
 /// Bytes the system description reserves for one records region, derived rather
 /// than chosen: the fewest [`MAPPING_ALIGN`] pages that hold the type.
@@ -268,6 +268,7 @@ impl TapVerdict {
 /// enum's declaration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapDropReason {
+    Unowned,
     UnconfiguredIngressPort,
     InterfaceDisabled,
     NotAddressedToUs,
@@ -301,31 +302,32 @@ impl TapDropReason {
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
-            Self::UnconfiguredIngressPort => 1,
-            Self::InterfaceDisabled => 2,
-            Self::NotAddressedToUs => 3,
-            Self::VlanTagged => 4,
-            Self::MartianSource => 5,
-            Self::UnroutableDestination => 6,
-            Self::AddressedToThisRouter => 7,
-            Self::TtlExpired => 8,
-            Self::NoRoute => 9,
-            Self::EgressIsIngress => 10,
-            Self::NoNeighbour => 11,
-            Self::FlowUnsupportedProtocol => 12,
-            Self::FlowFragment => 13,
-            Self::FlowMalformed => 14,
-            Self::FlowInvalidFlags => 15,
-            Self::FlowMidStream => 16,
-            Self::FlowInvalidState => 17,
-            Self::FlowOutOfWindow => 18,
-            Self::FlowNoSuchFlow => 19,
-            Self::FlowQuotedInvalid => 20,
-            Self::FlowUnsupportedIcmp => 21,
-            Self::FlowTableFull => 22,
-            Self::FlowBucketFull => 23,
-            Self::PolicyDenied => 24,
-            Self::NoPolicyMatch => 25,
+            Self::Unowned => 1,
+            Self::UnconfiguredIngressPort => 2,
+            Self::InterfaceDisabled => 3,
+            Self::NotAddressedToUs => 4,
+            Self::VlanTagged => 5,
+            Self::MartianSource => 6,
+            Self::UnroutableDestination => 7,
+            Self::AddressedToThisRouter => 8,
+            Self::TtlExpired => 9,
+            Self::NoRoute => 10,
+            Self::EgressIsIngress => 11,
+            Self::NoNeighbour => 12,
+            Self::FlowUnsupportedProtocol => 13,
+            Self::FlowFragment => 14,
+            Self::FlowMalformed => 15,
+            Self::FlowInvalidFlags => 16,
+            Self::FlowMidStream => 17,
+            Self::FlowInvalidState => 18,
+            Self::FlowOutOfWindow => 19,
+            Self::FlowNoSuchFlow => 20,
+            Self::FlowQuotedInvalid => 21,
+            Self::FlowUnsupportedIcmp => 22,
+            Self::FlowTableFull => 23,
+            Self::FlowBucketFull => 24,
+            Self::PolicyDenied => 25,
+            Self::NoPolicyMatch => 26,
         }
     }
 
@@ -334,31 +336,32 @@ impl TapDropReason {
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
-            1 => Some(Self::UnconfiguredIngressPort),
-            2 => Some(Self::InterfaceDisabled),
-            3 => Some(Self::NotAddressedToUs),
-            4 => Some(Self::VlanTagged),
-            5 => Some(Self::MartianSource),
-            6 => Some(Self::UnroutableDestination),
-            7 => Some(Self::AddressedToThisRouter),
-            8 => Some(Self::TtlExpired),
-            9 => Some(Self::NoRoute),
-            10 => Some(Self::EgressIsIngress),
-            11 => Some(Self::NoNeighbour),
-            12 => Some(Self::FlowUnsupportedProtocol),
-            13 => Some(Self::FlowFragment),
-            14 => Some(Self::FlowMalformed),
-            15 => Some(Self::FlowInvalidFlags),
-            16 => Some(Self::FlowMidStream),
-            17 => Some(Self::FlowInvalidState),
-            18 => Some(Self::FlowOutOfWindow),
-            19 => Some(Self::FlowNoSuchFlow),
-            20 => Some(Self::FlowQuotedInvalid),
-            21 => Some(Self::FlowUnsupportedIcmp),
-            22 => Some(Self::FlowTableFull),
-            23 => Some(Self::FlowBucketFull),
-            24 => Some(Self::PolicyDenied),
-            25 => Some(Self::NoPolicyMatch),
+            1 => Some(Self::Unowned),
+            2 => Some(Self::UnconfiguredIngressPort),
+            3 => Some(Self::InterfaceDisabled),
+            4 => Some(Self::NotAddressedToUs),
+            5 => Some(Self::VlanTagged),
+            6 => Some(Self::MartianSource),
+            7 => Some(Self::UnroutableDestination),
+            8 => Some(Self::AddressedToThisRouter),
+            9 => Some(Self::TtlExpired),
+            10 => Some(Self::NoRoute),
+            11 => Some(Self::EgressIsIngress),
+            12 => Some(Self::NoNeighbour),
+            13 => Some(Self::FlowUnsupportedProtocol),
+            14 => Some(Self::FlowFragment),
+            15 => Some(Self::FlowMalformed),
+            16 => Some(Self::FlowInvalidFlags),
+            17 => Some(Self::FlowMidStream),
+            18 => Some(Self::FlowInvalidState),
+            19 => Some(Self::FlowOutOfWindow),
+            20 => Some(Self::FlowNoSuchFlow),
+            21 => Some(Self::FlowQuotedInvalid),
+            22 => Some(Self::FlowUnsupportedIcmp),
+            23 => Some(Self::FlowTableFull),
+            24 => Some(Self::FlowBucketFull),
+            25 => Some(Self::PolicyDenied),
+            26 => Some(Self::NoPolicyMatch),
             _ => None,
         }
     }

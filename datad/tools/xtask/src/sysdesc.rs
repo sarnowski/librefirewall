@@ -107,9 +107,9 @@ use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
     DOWNLOAD_REQUEST_REGION_SIZE, INSTALL_STAGING_REGION_SIZE, LOG_CONSUME_REGION_SIZE,
-    LOG_RECORDS_REGION_SIZE, RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE,
-    SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
-    TAP_RECORDS_REGION_SIZE,
+    LOG_RECORDS_REGION_SIZE, OWNERSHIP_REGION_SIZE, RELAY_REPLY_REGION_SIZE,
+    RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE,
+    TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -465,6 +465,18 @@ const FLOW_TABLE_WITHHELD: &str = "the forwarder is the ONLY domain that maps th
      undefined rather than merely contended, so this is not an isolation preference but the \
      premise of the borrow. It also carries no `phys_addr`, so no driver can be handed its \
      address and no device can reach it by DMA either";
+
+/// What the ownership word withholds, which is an authority rather than a
+/// mapping: exactly one domain may say this appliance has an owner.
+const OWNERSHIP_WITHHELD: &str = "the store domain is the ONLY writer of the word that decides \
+     whether this appliance forwards anything, and the forwarder the only reader. The write \
+     grant is withheld from every other domain including the forwarder itself, because a \
+     forwarder that could write it could onboard the appliance it decides traffic for; and the \
+     read grant is withheld from the domains that would otherwise be tempted to act on it — the \
+     configuration domain, so ownership cannot become a table composed by the parser that reads \
+     an attacker's document, and the management domain, so the domain facing the management-plane \
+     attacker cannot learn from a mapping what it can already learn by asking the store domain \
+     for the identity. No `phys_addr`, so no device reaches it by DMA either";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -935,6 +947,21 @@ const REGIONS: &[RegionRule] = &[
             read_only("store"),
         ],
         withheld: None,
+    },
+    // The ownership word: one writer, one reader, and no channel — the reader is
+    // woken by the frames it decides on, so it reads this on a wakeup it was
+    // going to have. As with `clock`, what this rule withholds is an authority
+    // and not a mapping, so the perms carry the argument and `withheld` states
+    // the exclusion the perms cannot.
+    RegionRule {
+        name: "owner",
+        size: ExpectedSize {
+            rust_name: "wire::OWNERSHIP_REGION_SIZE",
+            bytes: OWNERSHIP_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store"), read_only("forwarder")],
+        withheld: Some(OWNERSHIP_WITHHELD),
     },
     RegionRule {
         name: "cfgack",

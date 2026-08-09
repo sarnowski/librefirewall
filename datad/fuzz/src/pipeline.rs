@@ -91,7 +91,7 @@ use pd_runtime::{
     Pool, PoolOwner, RING_SLOTS, ReturnRing, RouteStage, Verdict, attach_region, buffer_paddr,
     descriptor_in_bounds,
 };
-use pipeline::{Pipeline, Rule, RuleAction, Ruleset, Tracking};
+use pipeline::{Ownership, Pipeline, Rule, RuleAction, Ruleset, Tracking};
 use routing::{Interface, Neighbour, PortId, Router};
 
 use crate::region::ZeroedRegion;
@@ -322,6 +322,13 @@ pub fn pipeline_harness(data: &[u8]) {
                     // fills — which is the fail-closed mode, and the one worth
                     // reaching here.
                     &mut Tracking::new(&mut flows, Monotonic::BOOT),
+                    // Owned, because this harness's adversary is the peer
+                    // driver and the network, and neither writes the ownership
+                    // word: it is the store domain's. An unowned appliance
+                    // settles every frame in front of the plumbing under test
+                    // here, so driving one would delete this harness's whole
+                    // subject rather than widen it.
+                    Ownership::Owned,
                     None,
                 );
                 // The table is bounded by its own capacity whatever the peer

@@ -122,6 +122,21 @@ fn record(snap_len: u32, id: u64, probe: usize, annotation: Annotation) -> Packe
     }
 }
 
+/// The annotation code for a refusal named by its token.
+///
+/// Derived rather than written, because the code *is* a position in
+/// [`DROP_REASONS`]: a reason added to the vocabulary shifts every code after it,
+/// and a fixture carrying the old number would go on passing while describing a
+/// different refusal. Naming the reason is what keeps these tests about the thing
+/// they say they are about.
+fn reason_code(name: &str) -> u8 {
+    let at = DROP_REASONS
+        .iter()
+        .position(|known| *known == name)
+        .unwrap_or_else(|| panic!("{name} is not a drop reason this build encodes"));
+    u8::try_from(at + 1).expect("the vocabulary fits a byte")
+}
+
 /// The exposition a sound run answers: enough forwarding and enough hits for
 /// every record the recordings hold.
 fn published() -> Published {
@@ -177,6 +192,7 @@ fn two_recordings_of_the_same_traffic_agree() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect("a sound pair");
     assert_eq!(agreement.paired, 4);
@@ -206,6 +222,7 @@ fn a_connection_history_shorter_than_the_capture_is_the_selection() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect("a selection is not a lost observation");
     assert_eq!(agreement.paired, 2);
@@ -225,6 +242,7 @@ fn a_connection_history_longer_than_the_capture_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a selection cannot be larger than what it selects from");
     assert!(error.contains("holds 4 record(s)"), "{error}");
@@ -244,6 +262,7 @@ fn an_unpaired_packet_id_is_a_finding_even_at_an_equal_count() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("an identity in the history and not the capture is fabrication");
     assert!(error.contains("does not pair"), "{error}");
@@ -278,6 +297,7 @@ fn a_history_record_naming_no_event_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a record for its own sake is the packet log this is not");
     assert!(
@@ -302,7 +322,7 @@ fn an_event_the_probes_oblige_and_the_history_lacks_is_a_finding() {
     {
         packet.annotation = Some(Annotation {
             verdict: VERDICT_DROPPED,
-            drop_reason: 16,
+            drop_reason: reason_code("flow_mid_stream"),
             event: EVENT_FLOW_REFUSED,
             classification: 0,
             flow_state: 0,
@@ -319,6 +339,7 @@ fn an_event_the_probes_oblige_and_the_history_lacks_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("the opening the probe had to cause is not in the history");
     assert!(
@@ -338,7 +359,7 @@ fn a_verdict_disagreeing_with_the_wire_is_a_finding() {
     if let Some(packet) = capture.packets.first_mut() {
         packet.annotation = Some(Annotation {
             verdict: VERDICT_DROPPED,
-            drop_reason: 24,
+            drop_reason: reason_code("policy_denied"),
             event: EVENT_POLICY_DENIED,
             ..opening(0, 0)
         });
@@ -350,6 +371,7 @@ fn a_verdict_disagreeing_with_the_wire_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("the harness watched that probe come back on the far port");
     assert!(error.contains("under verdict 1"), "{error}");
@@ -374,6 +396,7 @@ fn a_rule_the_exposition_credits_with_no_hit_is_a_finding() {
             }],
             ..published()
         },
+        true,
     )
     .expect_err("a record crediting a rule that never ran");
     assert!(error.contains("credits it with no hit"), "{error}");
@@ -389,8 +412,7 @@ fn a_refusal_the_exposition_never_counted_is_a_finding() {
     for packet in &mut capture.packets {
         packet.annotation = Some(Annotation {
             verdict: VERDICT_DROPPED,
-            // `flow_mid_stream`, the sixteenth reason this build encodes.
-            drop_reason: 16,
+            drop_reason: reason_code("flow_mid_stream"),
             event: EVENT_FLOW_REFUSED,
             classification: 0,
             flow_state: 0,
@@ -419,6 +441,7 @@ fn a_refusal_the_exposition_never_counted_is_a_finding() {
             drop_reasons,
             ..published()
         },
+        true,
     )
     .expect_err("four records of a refusal the appliance counted once");
     assert!(error.contains("refused as \"flow_mid_stream\""), "{error}");
@@ -452,6 +475,7 @@ fn a_close_with_no_matching_open_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a close naming a conversation nothing opened");
     assert!(error.contains("no earlier record opens it"), "{error}");
@@ -483,6 +507,7 @@ fn a_close_that_does_not_say_how_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a close must name a state a conversation does not leave");
     assert!(error.contains("does not say how"), "{error}");
@@ -523,6 +548,7 @@ fn an_advance_classified_new_or_naming_a_rule_is_a_finding() {
             &capture_surface(&capture, 4),
             &wire(&probes),
             &published(),
+            true,
         )
         .expect_err("an advance the filter is claimed to have decided");
         assert!(error.contains(clause), "{error}");
@@ -544,6 +570,7 @@ fn a_record_carrying_no_annotation_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a record without the decision is not evidence of one");
     assert!(
@@ -567,6 +594,7 @@ fn a_standard_verdict_option_disagreeing_with_the_annotation_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("two statements of one decision, disagreeing");
     assert!(error.contains("disagree about one decision"), "{error}");
@@ -594,6 +622,7 @@ fn a_packet_the_harness_never_injected_is_a_finding() {
         &capture_surface(&capture, 5),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a block matching no injected frame is fabrication");
     assert!(
@@ -626,6 +655,7 @@ fn a_packet_block_that_retained_no_byte_is_a_finding() {
         &capture_surface(&capture, 5),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("an empty capture is no prefix of anything");
     assert!(
@@ -665,6 +695,7 @@ fn a_log_capture_past_the_snap_length_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a log block keeping 200 bytes at a snap length of 128 is unclamped");
     assert!(error.contains("keeps 200 captured byte(s)"), "{error}");
@@ -713,6 +744,7 @@ fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way()
         &capture_surface(&capture, 1),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect("each sink keeping its own snap length of one frame is the contract");
     assert_eq!(agreement.probes_matched, 1);
@@ -740,6 +772,7 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("one ring under two names is one recording");
     assert!(
@@ -761,6 +794,7 @@ fn a_recording_holding_more_than_the_recorder_published_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("four blocks against two encoded records is fabrication");
     assert!(error.contains("answers 4 packet block(s)"), "{error}");
@@ -780,6 +814,7 @@ fn a_recording_holding_fewer_than_the_recorder_published_is_accepted() {
         &capture_surface(&capture, 9),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect("a staging buffer between the scrape and the download is not a finding");
 }
@@ -796,9 +831,70 @@ fn a_sink_publishing_no_record_proves_nothing() {
         &capture_surface(&capture, 0),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("zero against zero is not agreement");
     assert!(error.contains("no encoded record at all"), "{error}");
+}
+
+/// **A boot that carried nothing publishes no history, and only the history.** An
+/// appliance no management plane has taken forwards nothing, so it opens no
+/// conversation — but it decides every frame it is offered, so its capture is as
+/// full as any other boot's. The allowance is exactly that narrow: an empty
+/// capture on the same boot is still a recorder that never reached the medium.
+#[test]
+fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
+    let log = recording(LOG_SNAP, &[]);
+    // Every record a refusal, which is what an unowned appliance's capture holds:
+    // it decided every frame it was offered and carried none of them.
+    let mut capture = recording(CAPTURE_SNAP, SOUND);
+    for packet in &mut capture.packets {
+        // The verdict and its reason, and nothing else: the interface each record
+        // names is the port the frame arrived on and is unchanged by what was
+        // decided about it.
+        packet.annotation = packet.annotation.map(|annotation| Annotation {
+            verdict: VERDICT_DROPPED,
+            drop_reason: reason_code("unowned"),
+            event: 0,
+            classification: 0,
+            flow_state: 0,
+            flow_slot: 0,
+            flow_generation: 0,
+            rule: 0,
+            ..annotation
+        });
+        packet.verdict = Some(vec![VERDICT_KIND, VERDICT_DROPPED]);
+    }
+    let probes: Vec<Injected> = injected()
+        .into_iter()
+        .map(|injected| Injected {
+            verdict: VERDICT_DROPPED,
+            event: None,
+            ..injected
+        })
+        .collect();
+    judge(
+        &log_surface(&log, 0),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &published(),
+        false,
+    )
+    .expect("an appliance that carried nothing opened no conversation");
+
+    // The same boot with an empty capture: every frame was decided, so a recorder
+    // that encoded none of those decisions never reached the medium.
+    let empty = recording(CAPTURE_SNAP, &[]);
+    let error = judge(
+        &log_surface(&log, 0),
+        &capture_surface(&empty, 0),
+        &wire(&probes),
+        &published(),
+        false,
+    )
+    .expect_err("a refusal is a decision and owes a record");
+    assert!(error.contains("no encoded record at all"), "{error}");
+    assert!(error.contains("/capture.pcapng"), "{error}");
 }
 
 /// A probe the appliance decided on and no recording holds — the tap losing an
@@ -814,6 +910,7 @@ fn a_probe_missing_from_both_recordings_is_a_finding() {
         &capture_surface(&capture, 2),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("the second probe was injected and nothing recorded it");
     assert!(error.contains("probe routed-1-to-0"), "{error}");
@@ -835,6 +932,7 @@ fn a_packet_naming_an_interface_the_document_does_not_configure_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("interface 7 on a two-port bench resolves to nothing");
     assert!(error.contains("naming an interface outside"), "{error}");
@@ -854,6 +952,7 @@ fn a_prologue_short_of_the_documents_ports_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("one interface block for a two-port document is a short prologue");
     assert!(error.contains("declares 1 interface block(s)"), "{error}");
@@ -882,6 +981,7 @@ fn a_recording_spanning_two_sections_declares_a_prologue_in_each() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect("a second segment's prologue is a second interface table, not a stray one");
 }
@@ -901,6 +1001,7 @@ fn a_packet_with_no_identity_cannot_be_paired_and_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a block with no identity pairs with nothing");
     assert!(error.contains("no epb_packetid"), "{error}");
@@ -932,6 +1033,7 @@ fn every_disagreement_is_reported_not_only_the_first() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        true,
     )
     .expect_err("a pair broken several ways");
     assert!(error.contains("do not agree in 4 respect(s)"), "{error}");

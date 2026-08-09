@@ -57,7 +57,8 @@ use net_headers::{
     MacAddress, Protocol, TCP_HEADER_LEN, Transport, UDP_HEADER_LEN,
 };
 use pipeline::{
-    Configuration, DropReason, Inspection, Pipeline, Rule, RuleAction, Ruleset, Tracking, Verdict,
+    Configuration, DropReason, Inspection, Ownership, Pipeline, Rule, RuleAction, Ruleset,
+    Tracking, Verdict,
 };
 use routing::{Interface, Neighbour, PortId, Router};
 
@@ -199,6 +200,7 @@ fn verdicts_on_both_ports(bytes: &mut [u8]) -> [Verdict; 2] {
             &mut inspection,
             &Configuration::new(0, &ROUTER, &ALLOW_ALL),
             &mut Tracking::new(&mut flows, Monotonic::BOOT),
+            Ownership::Owned,
         )
     })
 }
@@ -226,6 +228,7 @@ fn the_filter_only_narrows(bytes: &mut [u8], ingress: PortId, permissive: Verdic
             &mut inspection,
             &Configuration::new(0, &ROUTER, rules),
             &mut Tracking::new(&mut flows, Monotonic::BOOT),
+            Ownership::Owned,
         );
         match permissive {
             // A frame the stages in front of the filter refused is refused for
@@ -457,6 +460,11 @@ pub fn frame_routing_harness(data: &[u8]) {
             &mut inspection,
             &Configuration::new(0, &ROUTER, &ALLOW_ALL),
             &mut Tracking::new(&mut flows, Monotonic::BOOT),
+            // Owned throughout: ownership is not the frame adversary's to
+            // choose — it is the store domain's word — and an unowned appliance
+            // refuses every frame before a header is read, which would make
+            // every property below vacuously true.
+            Ownership::Owned,
         );
         // The same frame under three narrower policies, before the rewrite the
         // permissive verdict authorises: the chain does not touch the bytes, so

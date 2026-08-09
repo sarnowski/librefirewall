@@ -70,8 +70,8 @@ pub use detail::{
 };
 pub use event::{
     ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Primitive, RejectReason,
-    TlsIncompatible, TlsRefusal, Value,
+    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership, Primitive,
+    RejectReason, TlsIncompatible, TlsRefusal, Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};

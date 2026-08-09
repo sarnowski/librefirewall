@@ -86,7 +86,7 @@ use wire::{
     LOG_DOMAIN_STATE_COUNT, LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES,
     LOG_NEXT_HOP_VIA_COUNT, LOG_OBJECT_KIND_COUNT, LOG_ONBOARD_END_COUNT,
     LOG_ONBOARD_OUTCOME_COUNT, LOG_ONBOARD_REFUSAL_COUNT, LOG_ONBOARD_ROUTE_COUNT,
-    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LOG_TLS_INCOMPATIBLE_COUNT,
+    LOG_OWNERSHIP_COUNT, LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LOG_TLS_INCOMPATIBLE_COUNT,
     LOG_TLS_REFUSAL_COUNT, LogRecord, LogRecordError, LogText, TextImage, ValueImage,
 };
 
@@ -111,8 +111,7 @@ const STAMP_UNSYNCHRONIZED: u8 = 0;
 const STAMP_UTC: u8 = 1;
 const STAMP_KIND_COUNT: u8 = 2;
 
-/// The thirty-five `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s
-/// terms.
+/// The `LogDetailKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const DETAIL_NONE: u8 = 0;
 const DETAIL_FEATURES: u8 = 1;
 const DETAIL_RECEIVE_POSTED: u8 = 2;
@@ -154,7 +153,8 @@ const DETAIL_ONBOARDING_THROTTLED: u8 = 37;
 const DETAIL_ADOPTED: u8 = 38;
 const DETAIL_ANCHOR_FINGERPRINT: u8 = 39;
 const DETAIL_ONBOARDING_INSTALLED: u8 = 40;
-const DETAIL_COUNT: u8 = 41;
+const DETAIL_OWNERSHIP: u8 = 41;
+const DETAIL_COUNT: u8 = 42;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -616,7 +616,8 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ONBOARDING_THROTTLED
                 | DETAIL_ADOPTED
                 | DETAIL_ANCHOR_FINGERPRINT
-                | DETAIL_ONBOARDING_INSTALLED => {
+                | DETAIL_ONBOARDING_INSTALLED
+                | DETAIL_OWNERSHIP => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -921,6 +922,16 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // One count and no token: every bit pattern of it is a length the
         // emitting domain could have accumulated, so there is nothing to range.
         DETAIL_ONBOARDING_INSTALLED => None,
+        // One token and nothing beside it: whether this appliance has an owner.
+        // Restated here as the range check it is, on `DETAIL_PROVED`'s terms —
+        // the harness never asks the code under test how many values the set
+        // has, or a vocabulary that grew a member would be judged against
+        // itself.
+        DETAIL_OWNERSHIP => (record.operands[0] >= u64::from(LOG_OWNERSHIP_COUNT)).then_some(
+            LogRecordError::OwnershipUnknown {
+                ownership: record.operands[0],
+            },
+        ),
         // And its sequence detail reads two, each thirty-two bits wide wherever
         // TCP names one — the peer's own claim included, which is ranged for
         // being rendered rather than for being believed. Left to right, so the

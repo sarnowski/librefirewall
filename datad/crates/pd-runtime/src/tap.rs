@@ -39,6 +39,7 @@ use wire::{
 #[must_use]
 pub const fn tap_drop_reason(reason: DropReason) -> TapDropReason {
     match reason {
+        DropReason::Unowned => TapDropReason::Unowned,
         DropReason::UnconfiguredIngressPort => TapDropReason::UnconfiguredIngressPort,
         DropReason::InterfaceDisabled => TapDropReason::InterfaceDisabled,
         DropReason::NotAddressedToUs => TapDropReason::NotAddressedToUs,

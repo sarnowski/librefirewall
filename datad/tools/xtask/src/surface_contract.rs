@@ -226,11 +226,18 @@ pub fn judge(
     capture: &Surface,
     wire: &Wire,
     published: &Published,
+    conversations: bool,
 ) -> Result<Agreement, String> {
     let mut found = Vec::new();
     found.extend(selection_differences(log, capture));
     for surface in [log, capture] {
-        found.extend(published_differences(surface));
+        // The history is the one surface a correct boot may leave empty, and only
+        // where nothing was carried: its records are conversations, and an
+        // appliance no management plane has taken opens none. The capture is not
+        // empty on such a boot — a refusal is a decision — so the allowance is
+        // this narrow deliberately.
+        let may_be_empty = !conversations && std::ptr::eq(surface, log);
+        found.extend(published_differences(surface, may_be_empty));
         found.extend(clamping_differences(surface));
         found.extend(interface_differences(surface, wire));
         found.extend(fabrication_differences(surface, wire));
@@ -863,7 +870,15 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
 /// harness that shared the vocabulary's own array could not tell a renamed
 /// variant from a correct file. The names themselves are held to the code by
 /// [`crate::reference_contract`], which reads them off the metrics chapter.
-pub const DROP_REASONS: [&str; 25] = [
+///
+/// What restating cannot carry is the *arithmetic*: this array is indexed by the
+/// annotation's own encoding, so a reason inserted anywhere but the end renames
+/// every record after it and a check comparing counts still passes. The length is
+/// therefore held to [`wire::TAP_DROP_REASON_COUNT`] below — the constant the
+/// encoding is derived from — which turns a silently shifted vocabulary into a
+/// build that does not compile.
+pub const DROP_REASONS: [&str; 26] = [
+    "unowned",
     "unconfigured_ingress_port",
     "interface_disabled",
     "not_addressed_to_us",
@@ -890,6 +905,13 @@ pub const DROP_REASONS: [&str; 25] = [
     "policy_denied",
     "no_policy_match",
 ];
+
+// The annotation carries a *position* in this vocabulary, so a reason added to
+// the appliance and not to this array does not shorten the list — it renames
+// every reason after the one that moved, and a recording then disagrees with an
+// exposition that is telling the truth. Comparing against the constant the
+// encoding itself is derived from is what makes that a compile error.
+const _: () = assert!(DROP_REASONS.len() == wire::TAP_DROP_REASON_COUNT as usize);
 
 /// How many times each `epb_packetid` appears. A multiset rather than a set: an
 /// identity is meant to be unique, so a duplicate is itself a disagreement and
@@ -930,7 +952,7 @@ fn identities(surface: &Surface) -> BTreeMap<u64, usize> {
 /// statement that is quietly wrong whenever either happens. Nothing legitimate
 /// makes it hold *more* — that direction is a recorder answering blocks it
 /// never encoded, which is exactly what this catches.
-fn published_differences(surface: &Surface) -> Vec<String> {
+fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
     let mut found = Vec::new();
     let held = surface.parsed.packets.len() as u64;
     if held > surface.published_records {
@@ -941,7 +963,7 @@ fn published_differences(surface: &Surface) -> Vec<String> {
             surface.target, surface.published_records,
         ));
     }
-    if surface.published_records == 0 {
+    if surface.published_records == 0 && !may_be_empty {
         found.push(format!(
             "the recorder publishes no encoded record at all for {}, so the count the recording \
              is compared against proves nothing about either",

@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ ownership=<owned|unowned>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -50,7 +50,7 @@ written waits forever:
 | domain | records it emits | tail |
 |---|---|---|
 | `config` | `starting`, then `ready` **or** `refused` | none |
-| `forwarder` | `starting` only | none |
+| `forwarder` | `starting`, then `ready` — and a second `ready` if the appliance is onboarded while it is running | the `ready` carries `ownership=`, which is whether this appliance may forward at all |
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
@@ -101,6 +101,17 @@ node: an operator holding a silent appliance still has only the external act.
 - `features=0x<hex>` — the feature bitmap the driver and its device settled on. Which bit means what
   is virtio's vocabulary and is deliberately not decoded here.
 - `rx-posted=<n>` — receive descriptors primed before the driver entered its poll loop, decimal.
+- `ownership=<owned|unowned>` — whether a management plane has taken this appliance, as the
+  forwarding domain reads it. **`unowned` means the appliance forwards nothing at all**: every frame
+  is refused under the drop reason of the same name and counted as
+  `librefirewall_route_drops_total{reason="unowned"}`, so the word here and the word on
+  [`/metrics`](metrics.md) are one word and not two things to line up. The forwarder states it once
+  at bring-up and again only if it is onboarded while running, which is the one transition a boot
+  can carry — an appliance loses an owner only by a
+  [factory reset](../design/updates.md#factory-reset), which takes effect on the boot after the one
+  that asks for it. A node that is *both* unowned and on generation 0 says so twice, once here and
+  once on `LFW-CFG`, because they are two different things for an operator to go and do: onboard the
+  appliance, and commit a document.
 - `tsc-hz=<n> utc=<rfc3339>` — what the clock domain established, which is the *source* of every
   other record's `time=` rather than another reading of it. `tsc-hz=` is the timestamp counter's
   measured frequency in hertz,

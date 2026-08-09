@@ -338,6 +338,7 @@ fn evaluate_on<const I: usize, const N: usize>(
         &mut inspection,
         &Configuration::new(GENERATION, table, &allow_all()),
         &mut Tracking::new(&mut table_of_flows, at(0)),
+        Ownership::Owned,
     )
 }
 
@@ -356,6 +357,107 @@ fn expect_drop_on<const I: usize, const N: usize>(
     reason: DropReason,
 ) {
     assert_eq!(evaluate_on(table, spec, ingress), Verdict::Drop(reason));
+}
+
+// ── Ownership, which is decided before anything about the frame is ─────────
+
+/// The chain, run over a frame at whatever ownership the caller names, so the
+/// two sides of the claim are one call apart.
+fn evaluate_owned(spec: &FrameSpec, ownership: Ownership) -> Verdict {
+    let table = router();
+    let rules = allow_all();
+    let mut bytes = spec.build();
+    let frame = Frame::parse(&mut bytes).expect("the spec builds a well-formed frame");
+    let mut inspection = Inspection::new(PORT0, frame);
+    let mut table_of_flows = flows();
+    Pipeline::new().evaluate(
+        &mut inspection,
+        &Configuration::new(GENERATION, &table, &rules),
+        &mut Tracking::new(&mut table_of_flows, at(0)),
+        ownership,
+    )
+}
+
+#[test]
+fn an_unowned_appliance_forwards_a_frame_it_would_otherwise_have_forwarded() {
+    let spec = FrameSpec::a_to_b();
+    assert_eq!(
+        evaluate_owned(&spec, Ownership::Owned),
+        Verdict::Forward {
+            egress: PORT1,
+            source: GATEWAY1_MAC,
+            destination: HOST_B_MAC,
+        },
+        "the fixture is a frame the rest of the chain admits, or nothing below is about ownership"
+    );
+    assert_eq!(
+        evaluate_owned(&spec, Ownership::Unowned),
+        Verdict::Drop(DropReason::Unowned),
+        "an appliance with no owner forwarded a frame"
+    );
+}
+
+/// The refusal is the appliance's and not the frame's, so it is the same for
+/// every frame — including the ones a later stage would have refused for a
+/// reason of its own. That is what makes the reason readable: a node whose
+/// traffic all vanishes says why once, rather than reporting whichever second
+/// thing happened to be wrong with each packet.
+#[test]
+fn an_unowned_appliance_names_ownership_and_not_the_frame() {
+    let cases = [
+        (
+            FrameSpec::a_to_b(),
+            "a frame that would have been forwarded",
+        ),
+        (
+            FrameSpec {
+                vlan: Some(0x0064),
+                ..FrameSpec::a_to_b()
+            },
+            "a frame admission would have refused",
+        ),
+        (
+            FrameSpec {
+                destination: Ipv4Address::from_octets([192, 0, 2, 9]),
+                ..FrameSpec::a_to_b()
+            },
+            "a frame routing would have refused",
+        ),
+        (
+            FrameSpec {
+                ttl: 1,
+                ..FrameSpec::a_to_b()
+            },
+            "a frame that could not survive the hop",
+        ),
+    ];
+    for (spec, what) in cases {
+        assert_eq!(
+            evaluate_owned(&spec, Ownership::Unowned),
+            Verdict::Drop(DropReason::Unowned),
+            "{what} was refused under some other reason"
+        );
+    }
+}
+
+/// The stage reads nothing of the frame, so it is testable without one — and
+/// this is the whole of what it does.
+#[test]
+fn the_ownership_stage_settles_exactly_while_unowned() {
+    assert_eq!(
+        OwnershipStage.evaluate(Ownership::Unowned),
+        Step::Settled(Verdict::Drop(DropReason::Unowned))
+    );
+    assert_eq!(OwnershipStage.evaluate(Ownership::Owned), Step::Continue);
+}
+
+/// The fail-closed default, stated as the type's own: a caller that has learned
+/// nothing has learned nothing that permits forwarding.
+#[test]
+fn ownership_defaults_to_unowned_and_is_built_from_the_regions_answer() {
+    assert_eq!(Ownership::default(), Ownership::Unowned);
+    assert_eq!(Ownership::of(false), Ownership::Unowned);
+    assert_eq!(Ownership::of(true), Ownership::Owned);
 }
 
 // ── The chain's own shape ───────────────────────────────────────────────────
@@ -462,7 +564,8 @@ fn a_default_pipeline_decides_as_a_new_one_does() {
         Pipeline::default().evaluate(
             &mut inspection,
             &configuration,
-            &mut Tracking::new(&mut table_of_flows, at(0))
+            &mut Tracking::new(&mut table_of_flows, at(0)),
+            Ownership::Owned,
         ),
         Verdict::Forward {
             egress: PORT1,
@@ -849,6 +952,7 @@ fn filter(rules: &Ruleset, spec: &FrameSpec) -> (Verdict, PolicyCounters) {
         &mut inspection,
         &Configuration::new(GENERATION, &table, rules),
         &mut Tracking::new(&mut table_of_flows, at(0)),
+        Ownership::Owned,
     );
     (verdict, *pipeline.policy_counters())
 }
@@ -877,6 +981,7 @@ fn filter_pair(
             &mut inspection,
             &configuration,
             &mut Tracking::new(&mut table_of_flows, at(0)),
+            Ownership::Owned,
         );
         assert!(
             matches!(verdict, Verdict::Forward { .. }),
@@ -890,6 +995,7 @@ fn filter_pair(
         &mut inspection,
         &configuration,
         &mut Tracking::new(&mut table_of_flows, at(1)),
+        Ownership::Owned,
     );
     (verdict, *pipeline.policy_counters())
 }
@@ -1327,6 +1433,7 @@ fn the_filter_counts_packets_and_datagram_bytes_by_verdict() {
             &mut inspection,
             &Configuration::new(GENERATION, &table, &permissive),
             &mut Tracking::new(&mut table_of_flows, at(0)),
+            Ownership::Owned,
         );
     }
     let counters = pipeline.policy_counters();
@@ -1560,6 +1667,7 @@ impl Bench {
             &mut inspection,
             &Configuration::new(GENERATION, &self.table, rules),
             &mut Tracking::new(&mut self.flows, at(self.nanos)),
+            Ownership::Owned,
         )
     }
 
@@ -1574,6 +1682,7 @@ impl Bench {
             &mut inspection,
             &Configuration::new(GENERATION, &self.table, rules),
             &mut Tracking::new(&mut self.flows, at(self.nanos)),
+            Ownership::Owned,
         );
         Decided {
             verdict,
@@ -1905,6 +2014,7 @@ fn a_mid_stream_segment_for_an_unknown_flow_is_refused() {
         &mut inspection,
         &Configuration::new(GENERATION, &bench.table, &permissive),
         &mut Tracking::new(&mut bench.flows, at(1_000)),
+        Ownership::Owned,
     );
     assert_eq!(verdict, Verdict::Drop(DropReason::FlowMidStream));
     assert_eq!(bench.counters().refused_mid_stream, 1);

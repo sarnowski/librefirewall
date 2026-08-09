@@ -250,9 +250,9 @@ use sel4_microkit::{
 };
 use virtio::pci::PciConfig;
 use wire::{
-    ClockCalibration, DeviceIdentity, InstallStaging, LogConsume, LogRecords, MAX_CERTIFICATE_LEN,
-    MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, SignDemand, SignOperation,
-    SignRefusal, SignReply, SignRequest, SignResponder, StagedArchive,
+    ApplianceOwnership, ClockCalibration, DeviceIdentity, InstallStaging, LogConsume, LogRecords,
+    MAX_CERTIFICATE_LEN, MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, SignDemand,
+    SignOperation, SignRefusal, SignReply, SignRequest, SignResponder, StagedArchive,
 };
 
 /// Bytes both copies of the state record occupy, and so the one transfer this
@@ -848,6 +848,7 @@ fn init() -> Store {
     // READ-ONLY: it is the asking domain's to fill and this domain's to read,
     // and the handle taken here has no store on it.
     let staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
+    let owner: &'static ApplianceOwnership = attach_region!(owner_vaddr: ApplianceOwnership);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     let outcome = bring_up(&sink, wall_seconds(&clock));
@@ -931,7 +932,16 @@ fn init() -> Store {
         faults,
         signing: StoreSigning::default(),
         installs: 0,
+        owner,
     };
+    // The one fact the dataplane needs off this medium, published before the
+    // shard and before a peer can ask for anything: the forwarding domain
+    // forwards nothing until it reads an owner here, so a boot that established
+    // an owned identity and did not say so would be a node that silently
+    // carried no traffic. A boot that established none publishes the negative,
+    // which is what the zeroed region already says and is stated anyway — the
+    // region's own reading and this domain's must not differ by an omission.
+    store.publish_ownership();
     // The shard as this boot established it, before a signature has been asked
     // for. It moves again on every wakeup that serves one, which is the change
     // this delegation makes to a shard that used to be written once.
@@ -1536,6 +1546,10 @@ struct Store {
     /// Installs served this boot, against [`INSTALLS_PER_BOOT`]. Saturating, so
     /// the equality that emits the one exhausted record holds exactly once.
     installs: u32,
+    /// The one region this domain writes that no request of a peer's is behind:
+    /// whether this appliance has an owner, which the forwarding domain maps
+    /// read-only and refuses every frame against until it says so.
+    owner: &'static ApplianceOwnership,
 }
 
 /// What one accepted package changed, as the two records an operator reads.
@@ -1548,6 +1562,16 @@ struct Installed {
 }
 
 impl Store {
+    /// State on the ownership region what this domain's own record says.
+    ///
+    /// Called at bring-up and again the instant an install commits, and nowhere
+    /// else: the two are the only moments the answer can change, an appliance
+    /// losing an owner only by a factory reset, which takes effect on the boot
+    /// after the one that asks for it.
+    fn publish_ownership(&self) {
+        self.owner.publish(self.identity.onboarded);
+    }
+
     /// Answer one demand, and exactly one: every path below consumes it, because
     /// a demand taken and dropped leaves the requester polling a sequence nothing
     /// will publish.
@@ -1711,6 +1735,10 @@ impl Store {
                 );
                 self.identity.onboarded = true;
                 self.identity.generation = installed.generation;
+                // After the record is durable and before the requester is told,
+                // so nothing can observe an appliance that has been told it is
+                // owned while the dataplane still refuses every frame.
+                self.publish_ownership();
                 self.responder.installed(demand);
             }
             Err(refusal) => {

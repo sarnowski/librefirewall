@@ -463,6 +463,21 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// Whether this appliance has an owner, as the domain that decides frames
+    /// believes it.
+    ///
+    /// The tokens are the ones the drop reason and the metric label already
+    /// spell, deliberately: a node that forwards nothing refuses every frame
+    /// under `unowned`, counts it under `unowned`, and says `unowned` on the
+    /// console, so an operator meets one word wherever they look rather than
+    /// three renderings of one fact to line up by hand.
+    Ownership {
+        Unowned => "unowned",
+        Owned => "owned",
+    }
+}
+
+closed_vocabulary! {
     /// The lifecycle points a domain reports. `Negotiated` sits between the
     /// other two because a device that answered and a device whose queues are
     /// primed are different failures to be looking at: one is a bring-up
@@ -777,6 +792,7 @@ mod tests {
     fn every_console_vocabulary_names_each_variant_once() {
         check_vocabulary!(Domain);
         check_vocabulary!(DomainState);
+        check_vocabulary!(Ownership);
         check_vocabulary!(ChangeKind);
         check_vocabulary!(ObjectKind);
         check_vocabulary!(Field);

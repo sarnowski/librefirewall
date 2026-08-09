@@ -1077,6 +1077,63 @@ pub fn judge(
     ))
 }
 
+/// Hold an unowned appliance's exposition to the one thing it can say about
+/// traffic: that it refused all of it, for the one reason that is about the
+/// appliance rather than about a frame.
+///
+/// **Both halves, and the zero is the stronger one.** The rise says the frames the
+/// harness injected were counted; the zeroes say nothing reached any later stage —
+/// no TTL was consulted, no route resolved, no rule matched — which is what
+/// "settled in front of admission" means and is the only place in this gate where
+/// it can be read. A node that refused these frames for want of a route would
+/// satisfy a check that only looked for the rise.
+///
+/// The rise is not held to a *number*. A probe owed a refusal is injected as often
+/// as the settle window allows, so how many times the appliance refused it is the
+/// harness's pacing rather than the appliance's contract — the same reason the
+/// filter's own refusal counters are asserted as whether and not as how many.
+///
+/// # Errors
+/// The verdict, naming the reason and what it reported.
+fn judge_unowned_refusals(exposition: &Exposition) -> Result<Vec<&Sample>, String> {
+    const UNOWNED: &str = "unowned";
+    let refused = |reason: &str| -> Result<u64, String> {
+        let series = exposition.select(ROUTE_DROPS, &[("reason", reason)]);
+        if series.is_empty() {
+            return Err(format!(
+                "{ROUTE_DROPS}{{reason={reason:?}}} carries no series, so an appliance that \
+                 refused everything cannot be told from one that refused nothing"
+            ));
+        }
+        Ok(series.iter().map(|sample| sample.value).sum())
+    };
+    if refused(UNOWNED)? == 0 {
+        return Err(format!(
+            "this boot's appliance has no owner and the harness injected frames it therefore had \
+             to refuse, and {ROUTE_DROPS}{{reason={UNOWNED:?}}} sums to zero across the \
+             pipelines. Either the frames never reached the forwarding domain, or it forwarded \
+             them — and a firewall that carries traffic for a management plane that has not \
+             taken it is the whole of what this reason exists to prevent"
+        ));
+    }
+    for reason in crate::surface_contract::DROP_REASONS {
+        if reason == UNOWNED {
+            continue;
+        }
+        let counted = refused(reason)?;
+        if counted != 0 {
+            return Err(format!(
+                "{ROUTE_DROPS}{{reason={reason:?}}} sums to {counted} on a boot whose appliance \
+                 has no owner. Ownership is settled in front of admission, routing, tracking and \
+                 the filter, so no frame can have reached the stage that names this reason — a \
+                 count here is a stage refusing in another stage's name, or an ownership check \
+                 that is not first"
+            ));
+        }
+    }
+    Ok(exposition.select(ROUTE_DROPS, &[("reason", UNOWNED)]))
+}
+
 /// Judge one scrape on its own: the head, the document, and the cross-check.
 ///
 /// # Errors
@@ -1175,6 +1232,7 @@ fn judge_one(
         ));
     }
     let forwarded: u64 = per_pipeline.iter().map(|sample| sample.value).sum();
+    let mut asserted: Vec<&Sample> = Vec::new();
     if forwarded != forwarded_frames {
         return Err(format!(
             "the appliance reports {forwarded} forwarded frames and the harness observed \
@@ -1186,14 +1244,44 @@ fn judge_one(
             render(&per_pipeline)
         ));
     }
-    if forwarded == 0 {
-        return Err(String::from(
-            "the appliance reports no forwarded frame and the harness observed none, so the \
-             cross-check compared two zeroes and proved nothing about either",
-        ));
+    // Two zeroes prove nothing about forwarding — unless forwarding nothing is the
+    // whole claim, which is what an appliance with no owner owes. Then the
+    // statement moves to the refusals, where it is a rise under one reason and a
+    // zero under all the others, and the two zeroes above are half of it: the
+    // appliance and the wire agree that nothing crossed.
+    if witness.unowned {
+        asserted.extend(judge_unowned_refusals(&exposition)?);
+    } else {
+        if forwarded == 0 {
+            return Err(String::from(
+                "the appliance reports no forwarded frame and the harness observed none, so the \
+                 cross-check compared two zeroes and proved nothing about either",
+            ));
+        }
+        // And the mirror of it on a boot that did carry traffic: this appliance
+        // has an owner, so the refusal that is about ownership must never have
+        // been reached. The latch is what makes that sayable — a reader that
+        // mirrored the word could be walked back to refusing mid-boot by the peer
+        // that writes it, and the frames after that would land here.
+        let ownership_refusals: u64 = exposition
+            .select(ROUTE_DROPS, &[("reason", "unowned")])
+            .iter()
+            .map(|sample| sample.value)
+            .sum();
+        if ownership_refusals != 0 {
+            return Err(format!(
+                "{ROUTE_DROPS}{{reason=\"unowned\"}} sums to {ownership_refusals} on a boot \
+                 whose appliance has an owner and which forwarded {forwarded} frame(s). The \
+                 forwarding domain latches the first owned reading it sees, so a refusal here is \
+                 either a frame decided before the domain that holds the identity had published \
+                 anything, or a reader that can be walked back to forwarding nothing by the peer \
+                 that writes the word"
+            ));
+        }
+        asserted.extend(exposition.select(ROUTE_DROPS, &[("reason", "unowned")]));
     }
 
-    let mut asserted: Vec<&Sample> = per_pipeline;
+    asserted.extend(per_pipeline);
     asserted.push(signatures);
     // Beside it, the same traffic seen from the drivers: the two dataplane
     // ports' transmit totals must sum to the same number, which is the same

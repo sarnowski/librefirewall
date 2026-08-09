@@ -27,8 +27,8 @@ use lfw_clock::UtcNanos;
 use net_headers::Ipv4Address;
 
 use crate::event::{
-    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Primitive,
-    TlsIncompatible, TlsRefusal,
+    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership,
+    Primitive, TlsIncompatible, TlsRefusal,
 };
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
@@ -624,6 +624,14 @@ pub enum DomainDetail<C = &'static str> {
         claimed: u32,
         expected: u32,
     },
+    /// Whether the domain that decides frames believes this appliance has an
+    /// owner — and so whether it is forwarding anything at all.
+    ///
+    /// One token and nothing beside it. What an operator needs from this record
+    /// is the word, and the word is the same one every frame this node refuses
+    /// is counted under; a count here would be a second, later reading of a
+    /// number the metrics surface already carries per reason.
+    Ownership(Ownership),
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

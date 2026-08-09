@@ -348,6 +348,15 @@ const STATED_COUNTS: &[StatedCount] = &[
                 .count()
         },
     },
+    // The boots that come up under an appliance somebody already owns. Held here
+    // because it is the premise every forwarding contract in that gate rests on
+    // and it is stated in prose beside a table nothing else compares it to: a
+    // scenario moved off a copied medium changes what the gate proves and would
+    // otherwise leave the sentence describing a run that no longer happens.
+    StatedCount {
+        phrase: "scenarios boot a copy of an owned medium",
+        count: crate::qemu::copied_medium_scenario_count,
+    },
     StatedCount {
         phrase: "library crates",
         count: crate::host::library_crate_count,

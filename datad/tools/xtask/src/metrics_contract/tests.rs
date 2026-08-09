@@ -358,6 +358,9 @@ fn witness() -> PolicyWitness {
         // rule added to it moves the fixture body and this together.
         rules: topology().rule_ids().len(),
         reconfigured: false,
+        // The fixture is an appliance that forwarded, so it has an owner: the
+        // unowned exposition is a different fixture with a different claim.
+        unowned: false,
         flooded_tuples: 0,
     }
 }
@@ -1181,6 +1184,46 @@ fn a_connection_turned_away_for_want_of_room_is_refused() {
             judge(&only(full), 9, witness(), &topology()).expect_err("a connection turned away");
         assert!(verdict.contains("want of room"), "{verdict}");
     }
+}
+
+/// **What an appliance with no owner owes the exposition**, both halves of it. A
+/// boot whose every frame was refused before admission has one reason risen and
+/// every other at zero, and each half fails on its own: a node that forwarded is
+/// caught by the first and a node that refused for want of a route by the second.
+#[test]
+fn an_unowned_appliance_is_held_to_one_reason_and_no_other() {
+    let drops = |unowned: u64, other: u64| {
+        let mut text = String::from(
+            "# HELP librefirewall_route_drops_total Drops.\n\
+             # TYPE librefirewall_route_drops_total counter\n",
+        );
+        for reason in crate::surface_contract::DROP_REASONS {
+            let value = if reason == "unowned" { unowned } else { other };
+            text.push_str(&format!(
+                "librefirewall_route_drops_total{{domain=\"forwarder\",pipeline=\"0\",\
+                 reason=\"{reason}\"}} {value}\n"
+            ));
+        }
+        text
+    };
+
+    let refusing = parse(&drops(6, 0)).expect("the exposition parses");
+    let asserted = judge_unowned_refusals(&refusing).expect("every frame refused as unowned");
+    assert!(!asserted.is_empty());
+
+    // Forwarded, or never reached: the reason this boot's whole contract rests on
+    // never moved.
+    let carried = parse(&drops(0, 0)).expect("the exposition parses");
+    let verdict = judge_unowned_refusals(&carried).expect_err("nothing was refused as unowned");
+    assert!(verdict.contains("sums to zero"), "{verdict}");
+
+    // Refused, but by a stage that cannot have seen the frame: ownership is
+    // settled in front of every other, so a later reason having moved says the
+    // check is not first.
+    let later = parse(&drops(6, 2)).expect("the exposition parses");
+    let verdict = judge_unowned_refusals(&later).expect_err("a later stage refused");
+    assert!(verdict.contains("sums to 2"), "{verdict}");
+    assert!(verdict.contains("in front of admission"), "{verdict}");
 }
 
 /// **The flooding witness, all three of its clauses.** Each is bent on its own, so

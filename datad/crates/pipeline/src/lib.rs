@@ -29,10 +29,22 @@
 //! answers [`Verdict`] outright, which makes "the chain always concludes" a fact
 //! about the types rather than a comment.
 //!
+//! # The appliance is asked about before the frame is
+//!
+//! [`OwnershipStage`] runs in front of everything and reads nothing of the
+//! frame. An appliance no management plane has taken forwards nothing at all —
+//! not because its policy is empty but because it has no policy to have — and
+//! that refusal is [`DropReason::Unowned`], counted and recorded like every
+//! other so a node that carries nothing says why on the surfaces that answer
+//! every other question. Placing it behind admission or routing would report
+//! the second thing wrong with such a node's situation and leave the first
+//! unsaid.
+//!
 //! # Where policy sits, and why it is last
 //!
-//! The chain is admission, then routing, then connection tracking, then policy,
-//! and the second one is the reason for the order. [`RoutingStage`] does not
+//! The chain is ownership, then admission, then routing, then connection
+//! tracking, then policy, and the third one is the reason for the rest of the
+//! order. [`RoutingStage`] does not
 //! settle a frame it can forward: it resolves the egress port and the next hop
 //! and *attaches* them to the [`Inspection`], deferring to what follows. So
 //! [`PolicyStage`] decides with the egress in hand, which is what makes a rule
@@ -117,6 +129,12 @@ use routing::{PortId, Router};
 /// aggregated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DropReason {
+    /// This appliance has no owner, so it forwards nothing. First in the
+    /// vocabulary because it is first in the chain: it is the one refusal that
+    /// is about the appliance rather than about the frame, and an unowned node
+    /// reporting a frame as unroutable would name the second thing wrong with
+    /// its situation.
+    Unowned,
     /// The ingress port has no configured interface, so the appliance has no
     /// address to route on behalf of.
     UnconfiguredIngressPort,
@@ -198,7 +216,8 @@ pub enum DropReason {
 impl DropReason {
     /// Every variant, so a counter table and a report can be built by iteration
     /// rather than by a list that drifts from the enum.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
+        Self::Unowned,
         Self::UnconfiguredIngressPort,
         Self::InterfaceDisabled,
         Self::NotAddressedToUs,
@@ -257,6 +276,7 @@ impl DropReason {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Unowned => "unowned",
             Self::UnconfiguredIngressPort => "unconfigured_ingress_port",
             Self::InterfaceDisabled => "interface_disabled",
             Self::NotAddressedToUs => "not_addressed_to_us",
@@ -576,6 +596,65 @@ impl<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize>
     #[must_use]
     pub const fn rules(&self) -> &'table Ruleset {
         self.rules
+    }
+}
+
+/// Whether this appliance has an owner, as the chain decides against it.
+///
+/// Two values and no third: a node either has been onboarded or has not, and
+/// there is no "unknown" for a stage to hold open — the domain that reads the
+/// fact out of the region it arrives in resolves an undecodable word to
+/// [`Self::Unowned`], because on a firewall the uncertain answer is the one that
+/// forwards nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ownership {
+    /// No management plane has taken this appliance. The state a node mints
+    /// itself into, and the default here for that reason: a caller that has
+    /// learned nothing has learned nothing that permits forwarding.
+    #[default]
+    Unowned,
+    Owned,
+}
+
+impl Ownership {
+    /// The fact as the region that carries it answers it.
+    ///
+    /// A `bool` crosses rather than this type because the region is `wire`'s and
+    /// `wire` reaches for no crate that decides anything; the judgement of which
+    /// bit patterns mean owned happens there, and what arrives is its total
+    /// answer.
+    #[must_use]
+    pub const fn of(owned: bool) -> Self {
+        if owned { Self::Owned } else { Self::Unowned }
+    }
+}
+
+/// Ownership: whether this appliance may forward at all.
+///
+/// **The one stage that reads nothing of the frame.** Every other stage answers
+/// a question about the packet in front of it; this one answers a question about
+/// the appliance, and answers it identically for every frame. It is a stage
+/// rather than a test inside [`Pipeline::evaluate`] because the chain's body is
+/// where the order of refusals is readable, and this refusal is first: a node no
+/// management plane has taken has no business deciding whose traffic may cross
+/// it, so nothing about the frame is worth asking.
+///
+/// It is first for a second reason, which is what makes it useful rather than
+/// merely correct. A frame refused here is counted under
+/// [`DropReason::Unowned`] and reaches the recording tap classified as such, so
+/// an operator watching an appliance that forwards nothing is told *why* by the
+/// same surfaces that name every other refusal — rather than reading a node
+/// whose traffic vanishes for no stated reason, which is the failure the drop
+/// vocabulary exists to prevent.
+pub struct OwnershipStage;
+
+impl OwnershipStage {
+    /// Settle every frame while the appliance is unowned, and defer otherwise.
+    pub fn evaluate(&mut self, ownership: Ownership) -> Step {
+        match ownership {
+            Ownership::Unowned => Step::Settled(Verdict::Drop(DropReason::Unowned)),
+            Ownership::Owned => Step::Continue,
+        }
     }
 }
 
@@ -1781,6 +1860,7 @@ impl Default for PolicySweep {
 /// two half-views that agree about nothing. So the pipeline is owned once, at
 /// the level that owns both directions, and lent to each of them per poll.
 pub struct Pipeline {
+    ownership: OwnershipStage,
     admission: AdmissionStage,
     routing: RoutingStage,
     connection: ConnectionStage,
@@ -1791,6 +1871,7 @@ impl Pipeline {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            ownership: OwnershipStage,
             admission: AdmissionStage,
             routing: RoutingStage,
             connection: ConnectionStage,
@@ -1824,7 +1905,14 @@ impl Pipeline {
         inspection: &mut Inspection<'_>,
         configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
         tracking: &mut Tracking<'_, FLOWS>,
+        ownership: Ownership,
     ) -> Verdict {
+        // First, and nothing behind it runs: an appliance no management plane
+        // has taken forwards nothing, whatever its configuration says and
+        // whatever the frame is.
+        if let Step::Settled(verdict) = self.ownership.evaluate(ownership) {
+            return verdict;
+        }
         if let Step::Settled(verdict) = self.admission.evaluate(inspection, configuration) {
             return verdict;
         }

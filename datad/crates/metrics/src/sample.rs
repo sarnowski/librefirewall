@@ -60,7 +60,8 @@ pub const PIPELINES: usize = 2;
 
 /// The pipeline's whole refusal vocabulary, in `pipeline::DropReason::ALL` order —
 /// which a test in `pd_runtime` holds this array to, name for name.
-pub const ROUTE_DROP_REASONS: [&str; 25] = [
+pub const ROUTE_DROP_REASONS: [&str; 26] = [
+    "unowned",
     "unconfigured_ingress_port",
     "interface_disabled",
     "not_addressed_to_us",
@@ -310,6 +311,10 @@ impl ForwarderSample {
         s(&FORWARDED_FRAMES, &[Label::new("pipeline", "0")]),
         s(
             &ROUTE_DROPS,
+            &[Label::new("pipeline", "0"), Label::new("reason", "unowned")],
+        ),
+        s(
+            &ROUTE_DROPS,
             &[
                 Label::new("pipeline", "0"),
                 Label::new("reason", "unconfigured_ingress_port"),
@@ -548,6 +553,10 @@ impl ForwarderSample {
         ),
         // Pipeline 1.
         s(&FORWARDED_FRAMES, &[Label::new("pipeline", "1")]),
+        s(
+            &ROUTE_DROPS,
+            &[Label::new("pipeline", "1"), Label::new("reason", "unowned")],
+        ),
         s(
             &ROUTE_DROPS,
             &[

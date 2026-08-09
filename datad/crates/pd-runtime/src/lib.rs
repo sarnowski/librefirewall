@@ -527,6 +527,7 @@ pub mod configuration;
 pub mod download;
 pub mod endpoint;
 pub mod handover;
+pub mod owner;
 pub mod relay;
 pub mod stats;
 pub mod tap;
@@ -560,7 +561,8 @@ pub use lfw_ip_endpoint::outbound::{
 };
 pub use lfw_ip_endpoint::route::{RouteRefusal, Via};
 pub use net_headers::Ipv4Address;
-pub use pipeline::{Configuration, PolicySweep, Tracking};
+pub use owner::{OwnershipChange, OwnershipWatch};
+pub use pipeline::{Configuration, Ownership, PolicySweep, Tracking};
 pub use relay::{
     ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered,
     DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Relay, RelayFailure, RelayPass, RelayReport,
@@ -577,9 +579,10 @@ pub use tap::{
     tap_flow, tap_flow_state, tap_outcome, tap_revoked_flow,
 };
 pub use wire::{
-    CLOCK_CALIBRATION_REGION_SIZE, CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE,
-    CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover, ConfigImage, ConfigReply,
-    ConfigRequest, MAX_DOCUMENT_BYTES, MAX_INTERFACES, MAX_NEIGHBOURS,
+    ApplianceOwnership, CLOCK_CALIBRATION_REGION_SIZE, CONFIG_REPLY_REGION_SIZE,
+    CONFIG_REQUEST_REGION_SIZE, CalibrationImage, ClockCalibration, ConfigAck, ConfigHandover,
+    ConfigImage, ConfigReply, ConfigRequest, MAX_DOCUMENT_BYTES, MAX_INTERFACES, MAX_NEIGHBOURS,
+    OWNERSHIP_REGION_SIZE,
 };
 
 /// Counts of the pool owner's untrusted-input rejections, which are otherwise
@@ -909,6 +912,7 @@ impl<'ring> RouteStage<'ring> {
         pipeline: &mut Pipeline,
         configuration: Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
         tracking: &mut Tracking<'_, FLOWS>,
+        ownership: Ownership,
         mut tap: Option<&mut Tap<'_>>,
     ) -> usize {
         let Self {
@@ -921,6 +925,10 @@ impl<'ring> RouteStage<'ring> {
             counters,
         } = self;
         counters.generation = configuration.generation();
+        let deciding = Deciding {
+            configuration,
+            ownership,
+        };
         let mut handed_on = 0;
         for descriptor in from.drain(DRAIN_LIMIT) {
             // Unconditionally, and before the buffer is touched: the descriptor
@@ -936,7 +944,7 @@ impl<'ring> RouteStage<'ring> {
                     (
                         decide(
                             pipeline,
-                            &configuration,
+                            &deciding,
                             tracking,
                             *ingress,
                             *egress,
@@ -1096,10 +1104,25 @@ impl Routed {
     }
 }
 
+/// What one wakeup decides under: the two facts other domains publish and this
+/// one is held to.
+///
+/// One value because they arrive together and are read together, and two fields
+/// rather than one because they come from different writers and mean different
+/// things — the tables the configuration domain committed, and whether the
+/// domain holding the identity says this appliance has an owner. Folding
+/// ownership into [`Configuration`] would make it something the domain that
+/// parses an attacker's document composes, which is exactly what it must not be.
+#[derive(Clone, Copy)]
+struct Deciding<'table, const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize> {
+    configuration: Configuration<'table, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    ownership: Ownership,
+}
+
 /// Parse one snapshotted frame and put it through the pipeline, untouched.
 fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS: usize>(
     pipeline: &mut Pipeline,
-    configuration: &Configuration<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
+    deciding: &Deciding<'_, MAX_INTERFACES, MAX_NEIGHBOURS>,
     tracking: &mut Tracking<'_, FLOWS>,
     ingress: PortId,
     egress: PortId,
@@ -1114,7 +1137,12 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS:
         }
     };
     let mut inspection = Inspection::new(ingress, frame);
-    let verdict = pipeline.evaluate(&mut inspection, configuration, tracking);
+    let verdict = pipeline.evaluate(
+        &mut inspection,
+        &deciding.configuration,
+        tracking,
+        deciding.ownership,
+    );
     // Composed while the inspection still exists, which is the whole reason the
     // decision travels out on [`Routed`]: the facts the chain attached — the
     // flow, the rule, the tracker's refusal — are gone the moment the borrow of
@@ -1126,7 +1154,7 @@ fn decide<const MAX_INTERFACES: usize, const MAX_NEIGHBOURS: usize, const FLOWS:
         &inspection,
         verdict,
         TapDirection::Inbound,
-        configuration.generation(),
+        deciding.configuration.generation(),
     );
     match verdict {
         pipeline::Verdict::Drop(reason) => {
@@ -1245,6 +1273,11 @@ mod tests {
     /// identical frame's second appearance `Established` and settle it in front
     /// of the filter. That behaviour belongs to `pipeline`'s own tests; here a
     /// fresh table keeps each case about the plumbing it names.
+    ///
+    /// Owned, on the same reasoning: an unowned appliance settles every frame
+    /// in front of the rings this macro's callers are about, so a case driven
+    /// under one would pass whatever the plumbing did. Ownership's own two sides
+    /// are `pipeline`'s and `owner`'s to state.
     macro_rules! poll {
         ($stage:expr, $pipeline:expr, $configuration:expr, $tap:expr) => {{
             let mut flows = ::std::boxed::Box::new($crate::ApplianceTestFlows::new());
@@ -1252,6 +1285,7 @@ mod tests {
                 $pipeline,
                 $configuration,
                 &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                $crate::Ownership::Owned,
                 $tap,
             )
         }};
@@ -2183,6 +2217,61 @@ mod tests {
         assert_eq!(owner.owned(), POOL_BUFFERS);
     }
 
+    /// The same frame, on an appliance no management plane has taken: the
+    /// buffer travels on so its owner gets it back, and the bytes in the pool
+    /// are the ones that arrived.
+    ///
+    /// The pool is what makes this worth stating through the plumbing rather
+    /// than in `pipeline` alone. A refusal that still rewrote the frame would
+    /// leave an unowned node putting its own MACs onto a buffer it then hands
+    /// back, and a verdict comparison would not see it.
+    #[test]
+    fn an_unowned_appliance_discards_a_routable_frame_and_leaves_the_pool_as_it_arrived() {
+        let r = Regions::new();
+        let mut owner = PoolOwner::attach(&r.returns);
+        let mut rx_in = r.rings.rx.producer();
+        let mut stage = RouteStage::attach(&r.rings, &r.pool, PORT0, PORT1);
+        let mut pipeline = Pipeline::new();
+        let mut tx_out = r.rings.tx.consumer();
+        let mut free_in = r.returns.free.producer();
+
+        let sent = FrameSpec::a_to_b().build();
+        receive(&r.pool, &mut owner, &mut rx_in, &sent).expect("a full pool has buffers");
+        let mut flows = Box::new(ApplianceTestFlows::new());
+        assert_eq!(
+            stage.poll(
+                &mut pipeline,
+                running(),
+                &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                Ownership::Unowned,
+                None,
+            ),
+            1,
+            "the descriptor must still travel on, or the buffer is lost to its owner"
+        );
+        assert_eq!(stage.counters().forwarded, 0);
+        assert_eq!(stage.counters().drops.get(DropReason::Unowned), 1);
+        assert_eq!(
+            stage.counters().drops.total(),
+            1,
+            "the refusal is ownership's and no other stage reached the frame"
+        );
+
+        let mut seen = 0;
+        transmit(&r.pool, &mut tx_out, &mut free_in, |descriptor, bytes| {
+            seen += 1;
+            assert_eq!(
+                Verdict::from_bits(descriptor.verdict),
+                Some(Verdict::Discard),
+                "an unowned appliance marked a frame for transmission"
+            );
+            assert_eq!(bytes, &sent[..], "a refused frame was rewritten");
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(owner.reclaim(), 1);
+        assert_eq!(owner.owned(), POOL_BUFFERS);
+    }
+
     #[test]
     fn a_forwarded_frame_is_rewritten_where_the_producer_published_it() {
         // The frame sits behind the device's own header, so the rewrite must
@@ -2576,19 +2665,24 @@ mod tests {
             ),
         ];
 
-        /// The four reasons no single frame reaches, because each needs the
-        /// table to already be in a particular condition: two need a flow this
-        /// frame is not the first packet of, and two need a table or a bucket
-        /// with no room left.
+        /// The five reasons no frame driven through this loop reaches. Four need
+        /// the table to already be in a particular condition — two need a flow
+        /// this frame is not the first packet of, and two need a table or a
+        /// bucket with no room left — and the fifth is not about the frame at
+        /// all: every poll here runs on an owned appliance, an unowned one
+        /// refusing whatever is put in front of it.
         ///
         /// They are excluded here and covered elsewhere rather than left
         /// unstated: `a_flow_state_refusal_still_hands_the_buffer_back` drives
-        /// the first two through this same stage across two polls, and the two
+        /// the first two through this same stage across two polls, the two
         /// capacity refusals are `lfw_flow`'s own property tests — the table's
-        /// capacity being that crate's subject and not this one's. What makes
-        /// the exclusion safe is that the buffer-return path below does not
-        /// branch on the reason at all: every `Verdict::Drop` takes one arm.
-        const NEEDS_A_PRIMED_TABLE: [DropReason; 4] = [
+        /// capacity being that crate's subject and not this one's — and
+        /// `an_unowned_appliance_discards_a_routable_frame_and_leaves_the_pool_as_it_arrived`
+        /// drives the last through this stage and asserts the same return. What
+        /// makes the exclusion safe is that the buffer-return path below does
+        /// not branch on the reason at all: every `Verdict::Drop` takes one arm.
+        const NEEDS_A_PRIMED_TABLE: [DropReason; 5] = [
+            DropReason::Unowned,
             DropReason::FlowInvalidState,
             DropReason::FlowOutOfWindow,
             DropReason::FlowTableFull,
@@ -2771,6 +2865,7 @@ mod tests {
                     &mut pipeline,
                     Configuration::new(1, &*ROUTER, &ALLOW_ALL),
                     &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    Ownership::Owned,
                     None,
                 ),
                 1,
@@ -2940,6 +3035,7 @@ mod tests {
                     &mut pipeline,
                     Configuration::new(1, &*ROUTER, &ALLOW_ALL),
                     &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    Ownership::Owned,
                     Some(&mut tap),
                 ),
                 1,
@@ -3032,6 +3128,7 @@ mod tests {
                     &mut pipeline,
                     Configuration::new(1, &*ROUTER, rules),
                     &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                    Ownership::Owned,
                     Some(&mut tap),
                 ),
                 1
@@ -3186,6 +3283,7 @@ mod tests {
                         &mut pipeline,
                         Configuration::new(1, &*ROUTER, rules),
                         &mut Tracking::new(&mut flows, lfw_clock::Monotonic::BOOT),
+                        Ownership::Owned,
                         Some(&mut tap),
                     ),
                     1

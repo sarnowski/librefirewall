@@ -562,6 +562,43 @@
          rather than a triple of zeroes. -->
     <memory_region name="clock" size="0x1000" />
 
+    <!-- WHETHER THIS APPLIANCE HAS AN OWNER: one word, one writer, one reader.
+
+         The store domain holds the appliance's identity and is the only thing
+         that can change whether a management plane has taken it — by minting on
+         a fresh medium, by reading the record back on a later boot, or by
+         committing an onboarding package. It maps this read-write. The forwarder
+         maps it read-only and refuses every frame while the word is not the one
+         that means owned, so an appliance nobody has onboarded forwards nothing.
+
+         WHY THE FORWARDER IS THE READER AND NOT THE CONFIGURATION DOMAIN. The
+         refusal is a dataplane verdict — counted per reason, recorded in the
+         capture, named on the console — so it belongs where every other verdict
+         is reached. Routing it through a configuration generation would make
+         "unowned" a table the configuration domain composes, which would put the
+         appliance's ownership behind the parser that reads an attacker's
+         document.
+
+         NO CHANNEL, and that is the whole reason this costs one region and no
+         notification. The forwarder is woken by every frame that arrives, so it
+         reads this word on a wakeup it was going to have; a notify direction from
+         the store domain to the forwarder would be a capability on the dataplane
+         granted to the domain that holds the private key, bought for a latency
+         nothing measures.
+
+         ONE WORD AND NO SEQLOCK, unlike `clock` above: a naturally aligned `u32`
+         store is one access, so there is no torn read for a counter to bracket.
+         Size is `wire::OWNERSHIP_REGION_SIZE`, its type's `size_of` rounded up to
+         the mapping granularity and held to it by `xtask::sysdesc` like every
+         constant here; four bytes round to one page, which is what a region costs
+         when a region is the unit of grant.
+
+         No phys_addr, on `clock`'s reasoning exactly — and the zeroing that
+         follows from it is load-bearing here rather than merely sound: a zeroed
+         word is not the owned token, so a forwarder that runs before the store
+         domain has published anything forwards nothing. -->
+    <memory_region name="owner" size="0x1000" />
+
     <!-- THE CAPTURE TAP, one region per direction, and the third handover in
          this system built the way the log ring and the configuration handover
          are.
@@ -1087,6 +1124,7 @@
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_008_000" perms="rw" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="owner" vaddr="0x3_00a_000" perms="r" cached="true" setvar_vaddr="owner_vaddr" />
         <map mr="flow_table" vaddr="0x8_000_000" perms="rw" cached="true" setvar_vaddr="flow_table_vaddr" />
         <map mr="log_forwarder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_forwarder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
@@ -1946,6 +1984,7 @@
         <map mr="sign_request" vaddr="0x7_000_000" perms="r" cached="true" setvar_vaddr="sign_request_vaddr" />
         <map mr="sign_reply" vaddr="0x7_100_000" perms="rw" cached="true" setvar_vaddr="sign_reply_vaddr" />
         <map mr="install_staging" vaddr="0x7_400_000" perms="r" cached="true" setvar_vaddr="install_staging_vaddr" />
+        <map mr="owner" vaddr="0x3_00a_000" perms="rw" cached="true" setvar_vaddr="owner_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar4" />
         <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
         <setvar symbol="io_paddr" region_paddr="blk2_io" />

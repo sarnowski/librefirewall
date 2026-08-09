@@ -76,14 +76,15 @@
 //! reader is done, which is why a [`CheckedConfig`] owns decoded values rather
 //! than borrowing.
 //!
-//! Four more objects of the same kind follow, all here because a region's
+//! Five more objects of the same kind follow, all here because a region's
 //! layout cannot be expressed in terms of the crate that reads it: the log
 //! transport, whose [`LogRecord`] is `lfw_log::Event` reduced to integers and
 //! whose two halves are one region per direction as the handover is;
-//! [`ClockCalibration`] under a seqlock; the recording tap [`TapRecords`] feeds;
-//! and the window a recording is downloaded through. Each decodes peer-written
-//! bytes first — the last step before a hostile writer reaches a serial
-//! line, or before those bytes reach a file offered as evidence.
+//! [`ClockCalibration`] under a seqlock; [`ApplianceOwnership`], which is one
+//! word and needs none; the recording tap [`TapRecords`] feeds; and the window a
+//! recording is downloaded through. Each decodes peer-written bytes first — the
+//! last step before a hostile writer reaches a serial line, or before those
+//! bytes reach a file offered as evidence.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -95,6 +96,7 @@ mod install;
 mod log_record;
 mod log_ring;
 mod log_slot;
+mod owner;
 mod relay;
 mod signing;
 mod submission;
@@ -123,15 +125,16 @@ pub use log_record::{
     LOG_CHANGE_KIND_COUNT, LOG_DIAL_OUTCOME_COUNT, LOG_DOMAIN_COUNT, LOG_DOMAIN_STATE_COUNT,
     LOG_FIELD_COUNT, LOG_GENERATION_OUTCOME_COUNT, LOG_IDENTIFIER_BYTES, LOG_NEXT_HOP_VIA_COUNT,
     LOG_OBJECT_KIND_COUNT, LOG_OFFERED_POINTS, LOG_ONBOARD_END_COUNT, LOG_ONBOARD_OUTCOME_COUNT,
-    LOG_ONBOARD_REFUSAL_COUNT, LOG_ONBOARD_ROUTE_COUNT, LOG_OPERANDS, LOG_PRIMITIVE_COUNT,
-    LOG_REJECT_REASON_COUNT, LOG_TLS_INCOMPATIBLE_COUNT, LOG_TLS_REFUSAL_COUNT, LogDetailKind,
-    LogKind, LogRecord, LogRecordError, LogStampKind, LogText, LogValueKind, TextFault, TextImage,
-    ValueImage,
+    LOG_ONBOARD_REFUSAL_COUNT, LOG_ONBOARD_ROUTE_COUNT, LOG_OPERANDS, LOG_OWNERSHIP_COUNT,
+    LOG_PRIMITIVE_COUNT, LOG_REJECT_REASON_COUNT, LOG_TLS_INCOMPATIBLE_COUNT,
+    LOG_TLS_REFUSAL_COUNT, LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind,
+    LogText, LogValueKind, TextFault, TextImage, ValueImage,
 };
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
     LogReader, LogRecords, LogRingFull, LogWriter,
 };
+pub use owner::{ApplianceOwnership, OWNED_TOKEN, OWNERSHIP_REGION_SIZE};
 pub use relay::{
     MAX_RELAY_PAYLOAD, PendingRelay, RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, RelayBusy,
     RelayDemand, RelayEnding, RelayFault, RelayOperation, RelayPoll, RelayRefusal, RelayReply,

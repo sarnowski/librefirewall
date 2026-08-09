@@ -32,19 +32,27 @@
 //! record announcing the attempt is present either way. Only the full sequence
 //! separates them.
 //!
-//! **That the chosen slot is healthy** is asserted by the system's real
-//! observable contract — a datagram routed between the two NIC ports in each
-//! direction — or, for the scenarios where nothing may boot, by its negative:
-//! nothing comes back off either port and GRUB's halt record is on the channel.
-//! Because a packet can only be routed after seL4 has started, and seL4 only
-//! starts after GRUB's last record, the record sequence is always complete by
-//! the time it is judged.
+//! **That the chosen slot is healthy** is asserted against the console every
+//! running domain writes and the six probes the system gate's regression set
+//! injects. The disk carries a factory-fresh store medium — which is what a disk
+//! under an A/B test has — so the appliance on it has no owner and forwards
+//! nothing: every probe is accounted for as a refusal, and what says the stack
+//! came up is what only a running seL4 can produce, the boot manager's slot
+//! record followed by each driver reporting a primed receive queue, the
+//! management domain reporting ready, and the forwarding domain reporting
+//! whether this appliance has an owner. For the scenarios where nothing may
+//! boot, the negative: nothing comes back off either port, none of those records
+//! exists, and GRUB's halt record is on the channel. Because no domain speaks
+//! before seL4 has started, and seL4 only starts after GRUB's last record, the
+//! record sequence is always complete by the time it is judged.
 
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
+
+use lfw_log::Ownership;
 
 use crate::{
     artifacts::DIST_DISK,
@@ -68,10 +76,32 @@ const HALT_RECORD: &str = "LFW-BOOT slot=none state=halted";
 
 /// How a scenario's boot must end.
 enum Outcome {
-    /// A slot boots and the appliance routes a datagram in each direction, so
-    /// "booted" means the whole stack came up — firmware, boot manager, seL4,
-    /// both NIC drivers and the routing stage — not merely that GRUB spoke.
-    Routes,
+    /// A slot boots and the appliance **comes up deciding traffic**, so "booted"
+    /// means the whole stack came up — firmware, boot manager, seL4, both NIC
+    /// drivers and the routing stage — not merely that GRUB spoke.
+    ///
+    /// It used to mean a datagram crossed in each direction, and it cannot: the
+    /// disk an A/B scenario boots carries a **factory-fresh store medium**, and
+    /// an appliance no management plane has taken forwards nothing at all. The
+    /// six probes still go out and every one of them is accounted for — as a
+    /// refusal, which is the correct behaviour of an unowned node and is what
+    /// this contract now states.
+    ///
+    /// What replaces the crossing as *positive* evidence is the console, and it
+    /// is not weaker on the point these scenarios are about. A halted slot runs
+    /// no seL4 at all, so it produces no boot-manager record naming a slot, no
+    /// driver reporting a primed receive queue, no management domain reporting
+    /// ready — and no forwarding domain reporting whether this appliance has an
+    /// owner, which is a statement from the very domain a crossing used to
+    /// exercise. Held to all of it, a boot that came up and one that did not stay
+    /// as far apart as they were.
+    ///
+    /// What is genuinely gone is end-to-end frame movement through the two NIC
+    /// drivers on these eight boots. Nineteen system scenarios state it on the
+    /// same image in the same gate, so it is re-proved rather than unproved; what
+    /// it is no longer proved *per A/B slot* is a real narrowing, and giving it
+    /// back would cost this run an onboarding boot of its own.
+    ComesUp,
     /// No slot is bootable: GRUB must reach its halt path and no injected
     /// packet may come back.
     Halts,
@@ -142,7 +172,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=A B", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=A state=confirmed"],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: None,
         },
         // 2. A staged, unconfirmed B is tried once and boots. The absence of
@@ -153,7 +183,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=B A", "A_OK=1", "A_TRY=0", "B_OK=0", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=B state=trying"],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: Some("B_TRY=1"),
         },
         // 3. A broken (signature-failing) pending B is rejected and the boot
@@ -168,7 +198,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
                 "LFW-BOOT slot=B state=rejected",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: Some("B_TRY=1"),
         },
         // 4. A pending B that was already tried but never confirmed (the
@@ -181,7 +211,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
                 "LFW-BOOT slot=B state=exhausted",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: None,
         },
         // 5. Once B is confirmed healthy (the update is committed), B boots
@@ -191,7 +221,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
             grubenv: GrubenvSeed::Entries(&["ORDER=B A", "A_OK=0", "A_TRY=0", "B_OK=1", "B_TRY=0"]),
             corrupt_slots: &[],
             records: &["LFW-BOOT slot=B state=confirmed"],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: None,
         },
         // 6. An ORDER naming a slot that does not exist is corrupt state, not
@@ -205,7 +235,7 @@ pub(crate) fn test_ab(root: &Path) -> Result<String, String> {
                 "LFW-BOOT slot=none state=bad-order",
                 "LFW-BOOT slot=A state=confirmed",
             ],
-            outcome: Outcome::Routes,
+            outcome: Outcome::ComesUp,
             expect_grubenv_after: None,
         },
         // 7. Both slots carry a broken payload: each is offered, rejected, and
@@ -301,7 +331,7 @@ fn run_scenario(
 
     let log_name = format!("ab-{name}{}.log", run.name_suffix());
     let booted = match scenario.outcome {
-        Outcome::Routes => {
+        Outcome::ComesUp => {
             boot_and_forward(
                 root,
                 &work,
@@ -310,10 +340,11 @@ fn run_scenario(
                 crate::qemu::ForwardBench {
                     management: ManagementBacking::Socket,
                     // The A/B scenarios are about which slot boots and what the
-                    // boot manager said, so every one of them injects the set
-                    // whose counts have not moved since before the filter
-                    // existed.
-                    traffic: Traffic::Routed,
+                    // boot manager said, so every one of them injects the same
+                    // six frames the system gate's regression set injects — owed
+                    // a refusal here, the medium below being factory-fresh and an
+                    // appliance nobody has onboarded forwarding nothing.
+                    traffic: Traffic::Unowned,
                     // The dial is answered and nothing is required of it: what
                     // these scenarios are about is which slot booted, and the
                     // channel the appliance opens is judged where its own
@@ -327,7 +358,11 @@ fn run_scenario(
                     // A fresh store medium: which slot boots says nothing about
                     // an identity, and a medium carried in from elsewhere would
                     // let one of these pass on an identity another boot minted.
+                    // It is also what makes this run standalone — a medium an
+                    // owner had been written onto could only come from a boot
+                    // some other gate command ran.
                     store: crate::qemu::StoreMedium::Fresh,
+                    owner: Ownership::Unowned,
                 },
             )
         }
@@ -360,7 +395,7 @@ fn run_scenario(
     // which of them ran. A halted scenario is a scenario nothing routed
     // through, so counting its traffic would only restate its name.
     let traffic = match scenario.outcome {
-        Outcome::Routes => format!(" ({})", booted.traffic.summary()),
+        Outcome::ComesUp => format!(" ({})", booted.traffic.summary()),
         Outcome::Halts => String::new(),
     };
     println!(

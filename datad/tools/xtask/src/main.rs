@@ -91,6 +91,7 @@ mod onboard_contract;
 mod onboard_install_contract;
 mod onboard_request_contract;
 mod onboard_tls_contract;
+mod ownership_contract;
 mod pins;
 mod probe_contract;
 mod qemu;
@@ -236,13 +237,14 @@ fn ci(root: &Path) -> Result<String, Box<dyn Error>> {
 /// There used to be. `ci` booted the debug image, so the release disk was
 /// booted exactly once — here — and the contracts asserted against it were this
 /// function's alone. Both of those contracts are now asserted inside `ci`,
-/// against the same release disk: the routed contract by every system and
-/// routing A/B scenario, and the `LFW-CFG` console transcript by two of the
-/// six system scenarios (`generation-swap` on the published disk and
-/// `alternate-configuration` on a second document's). Re-booting the release
-/// disk once more here, to re-assert a subset of what the six system and eight
-/// A/B scenarios just asserted, would cost an image build and a QEMU run and
-/// establish nothing.
+/// against the same release disk: the routed contract by every system scenario
+/// that boots an owned appliance, the same six frames accounted for as refusals
+/// by every A/B scenario that boots a factory-fresh one, and the `LFW-CFG`
+/// console transcript by two of the system scenarios (`generation-swap` on the
+/// published disk and `alternate-configuration` on a second document's).
+/// Re-booting the release disk once more here, to re-assert a subset of what the
+/// system and A/B scenarios just asserted, would cost an image build and a QEMU
+/// run and establish nothing.
 ///
 /// The emptying covers the whole of [`ci`], not a boot alone: assembly
 /// populates `dist/` partway through, so a failure after that point leaves an

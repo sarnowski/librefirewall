@@ -19,11 +19,25 @@
 //! dataplane port. All three are rejected by a counted drop rather than a fault,
 //! in `net_headers`, `pipeline` and `pd_runtime`.
 //!
+//! # An appliance with no owner forwards nothing
+//!
+//! One word, published by the domain that holds the identity and mapped
+//! read-only here, says whether a management plane has taken this appliance. A
+//! node that none has forwards nothing at all — every frame is refused under the
+//! pipeline's own ownership reason, so it is counted, recorded and named on the
+//! console like every other refusal rather than vanishing unexplained.
+//!
+//! The reading is latched by [`OwnershipWatch`] rather than mirrored: the
+//! writer is a peer, and one that could clear the word would hold a switch over
+//! the whole dataplane. So this domain follows the one transition a boot can
+//! honestly carry — being adopted while it runs — and never the reverse.
+//!
 //! # Constraints
 //!
 //! Two [`ForwardRings`] regions, the two [`Pool`]s they index, the two
-//! configuration regions, the capture tap, its own log ring and its own metric
-//! shard are the entire grant — no device capability, and of each pipeline not
+//! configuration regions, the ownership word, the capture tap, its own log ring
+//! and its own metric shard are the entire grant — no device capability, and of
+//! each pipeline not
 //! the `free` ring, on which a forged return would put a live DMA target back
 //! onto an owner's free stack. The pool is mapped because a routed frame's
 //! headers are rewritten in place, so a compromised forwarder can corrupt a
@@ -37,7 +51,9 @@
 //!
 //! The forwarding table arrives at run time, and generation 0 — no interfaces,
 //! nothing forwarded — is what this domain runs under until one does: the
-//! absence of policy rather than a default. What is compiled in is the
+//! absence of policy rather than a default. Ownership is the second such
+//! arrival and is independent of it: an unowned node with a committed
+//! generation forwards nothing, and so does an owned one still on generation 0. What is compiled in is the
 //! *wiring*, which the system description fixes at build time.
 //!
 //! Records go to a ring, not `debug_println!` — no `seL4_DebugPutChar` in the
@@ -75,13 +91,16 @@
 //! which the management domain maps read-only and renders into `GET /metrics`.
 //! The write is at the end of a wakeup and not per frame, off the hot path.
 
-use lfw_log::{Domain, DomainDetail, DomainState, Event, GenerationOutcome, RingSink, Sink};
+use lfw_log::{
+    Domain, DomainDetail, DomainState, Event, GenerationOutcome, Ownership, RingSink, Sink,
+};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    ApplianceFlowTable, ConfigAck, ConfigHandover, Configuration, ConfigurationSwitch,
-    ForwardRings, ForwarderCounters, MAX_INTERFACES, MAX_NEIGHBOURS, Offer, PdClock, PolicySweep,
-    Pool, Revocation, RouteStage, Tap, Tracking, attach_flow_table, attach_region, flow_sample,
-    forwarder_sample, log_sample, read_timestamp_counter,
+    ApplianceFlowTable, ApplianceOwnership, ConfigAck, ConfigHandover, Configuration,
+    ConfigurationSwitch, ForwardRings, ForwarderCounters, MAX_INTERFACES, MAX_NEIGHBOURS, Offer,
+    OwnershipChange, OwnershipWatch, PdClock, PolicySweep, Pool, Revocation, RouteStage, Tap,
+    Tracking, attach_flow_table, attach_region, flow_sample, forwarder_sample, log_sample,
+    read_timestamp_counter,
 };
 use pipeline::Pipeline;
 use routing::PortId;
@@ -111,6 +130,7 @@ fn init() -> Forwarder {
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let owner: &'static ApplianceOwnership = attach_region!(owner_vaddr: ApplianceOwnership);
     let tap_records: &'static TapRecords = attach_region!(tap_vaddr: TapRecords);
     let tap_consume: &'static TapConsume = attach_region!(tap_consume_vaddr: TapConsume);
     // The one region this domain owns outright, and the only one borrowed
@@ -141,6 +161,14 @@ fn init() -> Forwarder {
     // distinguishable from one that was never configured at all.
     sink.emit(&applied(0));
 
+    // And the other reason this domain may be forwarding nothing, read and said
+    // once at bring-up. The two are different things for an operator to go and
+    // do — commit a document, or onboard the appliance — and a node that is both
+    // says so twice rather than leaving one of them to be guessed at.
+    let mut ownership = OwnershipWatch::new();
+    ownership.poll(owner);
+    sink.emit(&ownership_record(ownership.ownership()));
+
     Forwarder {
         stages: [
             RouteStage::attach(fwd0, pool0, PORT0, PORT1),
@@ -151,11 +179,26 @@ fn init() -> Forwarder {
         sweep: PolicySweep::new(),
         flows,
         clock: PdClock::new(clock),
+        owner,
+        ownership,
         tap: Tap::attach(tap_records, tap_consume),
         handover,
         ack,
         stats,
         sink,
+    }
+}
+
+/// What this domain says about ownership: the word an operator reads on the
+/// console, in the same spelling the drop reason and the metric label carry.
+const fn ownership_record(ownership: pd_runtime::Ownership) -> Event {
+    Event::Domain {
+        domain: Domain::Forwarder,
+        state: DomainState::Ready,
+        detail: DomainDetail::Ownership(match ownership {
+            pd_runtime::Ownership::Unowned => Ownership::Unowned,
+            pd_runtime::Ownership::Owned => Ownership::Owned,
+        }),
     }
 }
 
@@ -181,6 +224,12 @@ struct Forwarder {
     /// against. Unclocked it reads the boot instant, under which nothing expires
     /// — the table fills and then refuses, which is fail-closed.
     clock: PdClock<'static>,
+    /// The word the domain holding the identity publishes, and this domain's
+    /// own latched reading of it. Read every wakeup, because the appliance can
+    /// be taken while this domain is running and the transition is the one thing
+    /// that changes what it forwards.
+    owner: &'static ApplianceOwnership,
+    ownership: OwnershipWatch,
     /// One per domain: a packet identity is per appliance.
     tap: Tap<'static>,
     handover: &'static ConfigHandover,
@@ -230,6 +279,14 @@ impl Handler for Forwarder {
                 CONFIG.notify();
             }
         }
+        // Before the drain, so a wakeup that carries the adoption also carries
+        // the first frames this appliance is allowed to forward. Exactly one
+        // record can come of it per boot: the reading is latched, so a peer that
+        // rewrites the word cannot choose how many lines this domain writes.
+        if self.ownership.poll(self.owner) == OwnershipChange::Adopted {
+            self.sink
+                .emit(&ownership_record(self.ownership.ownership()));
+        }
         if let Some(generation) = self.switch.take_commit(self.handover, self.ack) {
             self.sink.emit(&applied(generation));
             // Both tables have just been replaced, so every flow the previous
@@ -254,6 +311,7 @@ impl Handler for Forwarder {
                 &mut self.pipeline,
                 configuration,
                 &mut tracking,
+                self.ownership.ownership(),
                 Some(&mut self.tap),
             ));
         }

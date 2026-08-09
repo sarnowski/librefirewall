@@ -286,6 +286,10 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             }
             Ok(())
         }
+        // Whether this appliance has an owner, in the word the drop reason and
+        // the metric label already use for it. One field: what an operator does
+        // with this line is read the word.
+        DomainDetail::Ownership(ownership) => write!(cursor, " ownership={ownership}"),
         // Where an appliance that has just been given an owner will answer to,
         // and the generation the record saying so stands at. The address is
         // spelled as an address on `dial-destination=`'s terms.

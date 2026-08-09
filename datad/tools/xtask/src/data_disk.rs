@@ -50,7 +50,7 @@ use lfw_blk::{
     smoke::{WITNESS_SECTOR, witness_pattern},
 };
 use lfw_capture_ring::{SUPERBLOCK_BYTES, decode_superblock};
-use lfw_recorder::deck::{Deck, SEGMENT_BYTES};
+use lfw_recorder::deck::{Deck, LOG_START_SECTOR, SEGMENT_BYTES};
 
 use crate::recording_contract;
 
@@ -221,12 +221,20 @@ impl DataDisk {
     /// thing that notices is a process on the host side reading the file the
     /// guest wrote.
     ///
+    /// `conversations` says whether this boot opened one, which decides what the
+    /// **history** extent owes and nothing else. A conversation is opened by a
+    /// packet the appliance decided to carry, so a boot that carried none wrote
+    /// no history — and requiring a record there would turn the correct behaviour
+    /// of an appliance nobody has onboarded into a failure. The capture extent
+    /// owes its records either way: a refusal is a decision, and a boot that
+    /// refused everything decided as many times as one that forwarded.
+    ///
     /// # Errors
     /// A superblock that does not decode, one that claims nothing durable, an
-    /// extent whose payload segments hold no walkable pcapng, or one the walk
-    /// did not follow to exactly the byte the superblock's durable cursor
-    /// names.
-    pub(crate) fn judge_recordings(&self) -> Result<String, String> {
+    /// extent whose payload segments hold no walkable pcapng, one the walk did
+    /// not follow to exactly the byte the superblock's durable cursor names, or
+    /// an extent that holds no packet block where this boot owed one.
+    pub(crate) fn judge_recordings(&self, conversations: bool) -> Result<String, String> {
         let mut file = OpenOptions::new()
             .read(true)
             .open(&self.path)
@@ -329,7 +337,14 @@ impl DataDisk {
                     self.path.display()
                 ));
             }
-            if parsed.packets.is_empty() {
+            // The history extent alone may be legitimately empty, and only on a
+            // boot that carried nothing: its records are conversations, and an
+            // appliance that forwarded no packet opened none. Every other extent,
+            // and this one on every boot that did carry traffic, must hold a
+            // record — an empty extent is otherwise a recorder that never reached
+            // the medium, which looks exactly like a healthy node from here.
+            let may_be_empty = !conversations && start_sector == LOG_START_SECTOR;
+            if parsed.packets.is_empty() && !may_be_empty {
                 return Err(format!(
                     "the extent at sector {start_sector} parses and holds no packet block, so \
                      nothing was recorded on the medium\n  image: {}",
@@ -525,6 +540,71 @@ impl StoreDisk {
             path,
             erased_secret: None,
             live_secret: live,
+        })
+    }
+
+    /// A **copy** of the medium an earlier boot left, made for `run_label` alone,
+    /// for a scenario that needs an appliance somebody already owns rather than a
+    /// claim about the medium itself.
+    ///
+    /// # Why this is not [`Self::carried`]
+    ///
+    /// That one hands the boot the source's own file, because its whole subject is
+    /// one medium read twice and a copy would prove nothing about persistence.
+    /// This one exists for the opposite reason: an appliance in service was
+    /// onboarded once and has been running ever since, so nearly every scenario
+    /// wants to boot an owned node without its subject being ownership at all. Nine
+    /// teen boots taking the source's own file would be nineteen boots writing to
+    /// it, and a scenario could then pass on state a later one reads — the defect
+    /// the recorder's disk is created fresh to avoid. A copy per boot gives each
+    /// the same starting medium and lets none of them see another's writes.
+    ///
+    /// Nothing is read out of the bytes here, unlike the two above: neither claim
+    /// this medium supports is about its contents. That the copy really did carry
+    /// an owner is stated where an operator would state it — the forwarding
+    /// domain's own console record, which every boot is held to.
+    ///
+    /// # Errors
+    /// The source not being there, on [`Self::carried`]'s terms, and anything that
+    /// stops the copy being written.
+    pub(crate) fn copied(root: &Path, source_label: &str, run_label: &str) -> Result<Self, String> {
+        let from = Self::path_for(root, source_label);
+        if !from.exists() {
+            return Err(format!(
+                "the store medium {} is not there, and this boot needs the appliance the \
+                 {source_label} boot left owned. On a full run that means the two scenarios are \
+                 out of order — the boot that takes an owner must precede every boot that copies \
+                 it. On a diagnostic re-run of this scenario alone it is expected: the boot that \
+                 was onboarded is a different scenario and was not re-run, so run the pair",
+                from.display()
+            ));
+        }
+        let path = Self::path_for(root, run_label);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        // Refused rather than silently made a no-op: a scenario copying from
+        // itself would boot whatever its own previous run left, which is the one
+        // way this call can hand a boot a medium no source decided.
+        if path == from {
+            return Err(format!(
+                "the store medium {} is both the source and the destination of a copy, so this \
+                 boot would attach whatever its own previous run left rather than the medium \
+                 {source_label} left",
+                path.display()
+            ));
+        }
+        std::fs::copy(&from, &path)
+            .map_err(|error| format!("copy {} to {}: {error}", from.display(), path.display()))?;
+        Ok(Self {
+            path,
+            erased_secret: None,
+            // Not scanned for: this boot signs with the key it inherits like any
+            // owned appliance, and the console scan the reload path performs is
+            // that scenario's claim rather than a property of every boot that
+            // happens to carry a key.
+            live_secret: None,
         })
     }
 

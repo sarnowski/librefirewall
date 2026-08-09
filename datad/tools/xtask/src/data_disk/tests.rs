@@ -194,6 +194,19 @@ fn guest_records(disk: &DataDisk, extent: usize, writer: Cursor, payload: &[u8])
     file.sync_all().expect("flush");
 }
 
+/// Where each recording sits in [`Deck::extents`], named rather than indexed: the
+/// two extents owe different things on a boot that carried nothing, so a test
+/// about that difference must not turn on which of them `0` is.
+const HISTORY_EXTENT: usize = 0;
+const CAPTURE_EXTENT: usize = 1;
+
+// Which position each of them occupies is the deck's, so the two names above are
+// held to it rather than to this module's memory of it.
+const _: () = {
+    assert!(Deck::extents()[HISTORY_EXTENT].0 == lfw_recorder::deck::LOG_START_SECTOR);
+    assert!(Deck::extents()[CAPTURE_EXTENT].0 == lfw_recorder::deck::CAPTURE_START_SECTOR);
+};
+
 /// Both extents recorded the same way, which is what `judge_recordings` walks.
 fn both_extents_record(disk: &DataDisk, writer: Cursor, payload: &[u8]) {
     for extent in 0..Deck::extents().len() {
@@ -215,7 +228,7 @@ fn a_recording_walked_to_the_superblocks_durable_end_passes() {
         &payload,
     );
     let verdict = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect("both extents are recordings");
     assert!(verdict.contains("durable end at payload byte"), "{verdict}");
     assert!(verdict.contains("generation 7"), "{verdict}");
@@ -245,7 +258,7 @@ fn a_recording_the_walk_stops_short_of_the_durable_end_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect_err("the walk stopped before the superblock's end");
     assert!(error.contains("durable end at payload byte"), "{error}");
     assert!(
@@ -274,7 +287,7 @@ fn a_superblock_one_flush_behind_the_written_prefix_is_reported_and_not_refused(
         &payload,
     );
     let verdict = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect("a checkpoint behind the payload is the ordinary state");
     assert!(
         verdict.contains(&format!("durable end at payload byte {behind}")),
@@ -306,7 +319,7 @@ fn bytes_past_the_written_prefix_are_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect_err("bytes past the walkable prefix are not the recording");
     assert!(
         error.contains("holds a non-zero byte at payload offset"),
@@ -328,7 +341,7 @@ fn a_superblock_claiming_nothing_durable_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect_err("a cursor at zero says nothing reached the medium");
     assert!(
         error.contains("no byte of the recording is durable"),
@@ -336,12 +349,56 @@ fn a_superblock_claiming_nothing_durable_is_a_finding() {
     );
 }
 
+/// **A boot that carried nothing wrote no conversation history, and that is not a
+/// finding.** An appliance no management plane has taken forwards nothing, so it
+/// opens no flow — and requiring a record in the history extent would turn the
+/// correct behaviour of an unowned node into a failed gate. The capture extent
+/// still owes its records on such a boot, because a refusal is a decision.
+#[test]
+fn an_empty_history_is_allowed_only_where_no_conversation_was_carried() {
+    let scratch = Scratch::new("no-conversations");
+    let disk = DataDisk::create(&scratch.root, "no-conversations").expect("created");
+    // The history extent holds a recording with no packet block and the capture
+    // extent holds one with three, which is exactly the shape an unowned boot
+    // leaves: every frame was decided and none opened a conversation.
+    let carried = crate::recording_contract::tests::recording(3, 64);
+    let empty = crate::recording_contract::tests::recording(0, 64);
+    guest_records(
+        &disk,
+        HISTORY_EXTENT,
+        Cursor {
+            sequence: 0,
+            offset: empty.len(),
+        },
+        &empty,
+    );
+    guest_records(
+        &disk,
+        CAPTURE_EXTENT,
+        Cursor {
+            sequence: 0,
+            offset: carried.len(),
+        },
+        &carried,
+    );
+
+    let error = disk
+        .judge_recordings(true)
+        .expect_err("a boot that carried traffic owes a history");
+    assert!(error.contains("holds no packet block"), "{error}");
+
+    let verdict = disk
+        .judge_recordings(false)
+        .expect("a boot that carried nothing owes no history");
+    assert!(verdict.contains("packet block(s)"), "{verdict}");
+}
+
 #[test]
 fn an_extent_with_no_superblock_at_all_is_a_finding() {
     let scratch = Scratch::new("no-superblock");
     let disk = DataDisk::create(&scratch.root, "no-superblock").expect("created");
     let error = disk
-        .judge_recordings()
+        .judge_recordings(true)
         .expect_err("a zeroed extent carries no superblock");
     assert!(error.contains("no decodable superblock"), "{error}");
 }

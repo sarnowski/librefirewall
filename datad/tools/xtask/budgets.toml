@@ -71,12 +71,12 @@
 "crates/ip-endpoint/src/outbound.rs" = 0.4012
 "crates/ip-endpoint/src/route.rs" = 0.5247
 "crates/log/src/console.rs" = 0.5084
-"crates/log/src/detail.rs" = 0.5936
-"crates/log/src/event.rs" = 0.4698
+"crates/log/src/detail.rs" = 0.5970
+"crates/log/src/event.rs" = 0.4711
 "crates/log/src/identifier.rs" = 0.2775
 "crates/log/src/lib.rs" = 0.4110
-"crates/log/src/record.rs" = 0.1386
-"crates/log/src/render.rs" = 0.2237
+"crates/log/src/record.rs" = 0.1388
+"crates/log/src/render.rs" = 0.2277
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
 "crates/metrics/src/catalog.rs" = 0.1198
@@ -84,7 +84,7 @@
 "crates/metrics/src/lib.rs" = 0.5714
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
-"crates/metrics/src/sample.rs" = 0.0883
+"crates/metrics/src/sample.rs" = 0.0879
 "crates/net-headers/src/lib.rs" = 0.2154
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -106,11 +106,12 @@
 "crates/pd-runtime/src/download.rs" = 0.3947
 "crates/pd-runtime/src/endpoint.rs" = 0.4337
 "crates/pd-runtime/src/handover.rs" = 0.3569
-"crates/pd-runtime/src/lib.rs" = 0.5016
+"crates/pd-runtime/src/lib.rs" = 0.4992
+"crates/pd-runtime/src/owner.rs" = 0.5122
 "crates/pd-runtime/src/relay.rs" = 0.4180
 "crates/pd-runtime/src/stats.rs" = 0.2276
-"crates/pd-runtime/src/tap.rs" = 0.3727
-"crates/pipeline/src/lib.rs" = 0.4136
+"crates/pd-runtime/src/tap.rs" = 0.3717
+"crates/pipeline/src/lib.rs" = 0.4227
 "crates/queue/src/lib.rs" = 0.4260
 "crates/recorder/src/deck.rs" = 0.2770
 "crates/recorder/src/lib.rs" = 0.2326
@@ -151,14 +152,15 @@
 "crates/wire/src/download.rs" = 0.3633
 "crates/wire/src/image.rs" = 0.3106
 "crates/wire/src/install.rs" = 0.5164
-"crates/wire/src/lib.rs" = 0.2690
-"crates/wire/src/log_record.rs" = 0.2633
+"crates/wire/src/lib.rs" = 0.2691
+"crates/wire/src/log_record.rs" = 0.2640
 "crates/wire/src/log_ring.rs" = 0.4271
 "crates/wire/src/log_slot.rs" = 0.1088
+"crates/wire/src/owner.rs" = 0.5897
 "crates/wire/src/relay.rs" = 0.4034
 "crates/wire/src/signing.rs" = 0.3890
 "crates/wire/src/submission.rs" = 0.3286
-"crates/wire/src/tap.rs" = 0.3151
+"crates/wire/src/tap.rs" = 0.3146
 "crates/x509/src/der.rs" = 0.2609
 "crates/x509/src/lib.rs" = 0.6222
 "crates/x509/src/pem.rs" = 0.4051
@@ -174,13 +176,13 @@
 "pds/crypto/src/delegate.rs" = 0.5194
 "pds/crypto/src/main.rs" = 0.3957
 "pds/crypto/src/upload.rs" = 0.4205
-"pds/forwarder/src/main.rs" = 0.4667
+"pds/forwarder/src/main.rs" = 0.4752
 "pds/hardware-probe/src/main.rs" = 0.4226
 "pds/management/src/entropy.rs" = 0.6489
 "pds/management/src/main.rs" = 0.4453
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3034
-"pds/store/src/main.rs" = 0.4406
+"pds/store/src/main.rs" = 0.4441
 
 [unsafe-blocks]
 "crates/blk" = 8
