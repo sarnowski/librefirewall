@@ -2756,6 +2756,86 @@ reach is stated where it lives rather than assumed covered: no stream of bytes c
 with this end, the server's flight being bound to a key share and transcript that are fresh per
 session, so everything past the confirmation is the crate suite's to hold and is held there.
 
+**The framing above that client is built too, and nothing runs it either.** `lfw_channel` is the
+whole wire protocol of the [channel framing contract](../contracts/channel-framing.md) as a
+host-testable codec and nothing else: the eight-byte header — a big-endian payload length bounded at
+a mebibyte, a type byte, three reserved bytes that must be zero — the ten frames, both greetings, and
+the closed byte vocabularies inside the payloads. It has no transport under it and no session state
+above it. What it deliberately does **not** decide is *when* a frame is sent: there is no flush
+cadence, no acknowledgement timer, no backoff, no commit-confirm sequencing. Those are the session's,
+and a codec that guessed at them would be inventing behaviour the contract assigns elsewhere.
+
+**Both directions, from one crate.** The frames come both ways, so the codec is the protocol's rather
+than one end's: a `Side` parameter says whose frames a decoder reads and who an encoder writes as, and
+each refuses a frame the other end had no business with. That is what makes the encoder testable
+against the decoder — every frame this crate can compose is decoded back and held to the bytes it was
+written as — and it is also the direction table enforced from two sides rather than one.
+
+**A mebibyte arrives in record-sized pieces, so the decoder is incremental, and where the bytes are
+held is the design.** A frame is up to a mebibyte; the record layer below hands over tens of
+kibibytes at a time. So reassembly happens above that layer, in a buffer the **caller** owns: a
+`&mut [u8; MAX_FRAME_LEN]` borrowed for the decoder's whole life, exactly sized by the type, so there
+is no runtime length to check and no way to hand over one that is nearly big enough. A protection
+domain will place it where it places every other region of that order — its own static storage — and
+the crate owns no allocator and asks for none. It holds **one frame's worth and never two**, because
+the decoder takes no byte past the end of the frame it is assembling; a completed frame is handed out
+borrowed out of that buffer, and dropping it empties the buffer rather than copying a mebibyte down
+it.
+
+**Nothing behind a header this end will refuse is ever taken**, and that is the property that bounds
+the peer rather than merely bounding the buffer. The header checks are one function, and the decoder
+asks it both what a frame is and how many bytes to take — so a stated length past the mebibyte, an
+unknown type byte, a nonzero reserved byte, a frame from the wrong end, a first frame that is not the
+greeting, and a staged document past its own 64 KiB all cost **eight bytes**. A peer cannot pace this
+end into holding a mebibyte on the strength of a number it has already lost the connection over.
+
+**Thirteen refusals, one per rule broken.** A nonzero reserved byte (with which of the three), an
+unknown type byte, a length past the frame bound, a frame from the wrong end, a first frame that is
+not the greeting, a greeting naming another protocol version, a payload that is not the frame's shape
+— short of its fields, or with bytes trailing a frame that has nothing variable in it — a ring
+selector naming neither ring, a status byte naming no range status, a range answer that says there
+are no bytes and carries some, a staged document past its own bound, and a result line carrying a
+byte that is not printable ASCII. Each is a value of its own because a deployed appliance is
+diagnosed from its console alone and a token standing for several names none of them. A violation
+closes the connection and nothing else happens; the decoder answers it and nothing else afterwards,
+a stream whose framing is wrong having no next frame to find, and **never a panic** — every one is an
+ordinary return value on an ordinary path.
+
+**Two deliberate non-decisions, recorded rather than left to be discovered.** The validate-result
+line is held to being one line of printable ASCII and is **not parsed**: its fields are the
+configuration records' closed vocabulary, which lives with those records, and a parser here would be
+a second reading of a vocabulary this protocol exists not to duplicate. And a *second* greeting
+decodes: the contract binds the first frame in each direction and says nothing about a later one, so
+what to do with it belongs to the session. Both are tests rather than prose.
+
+**Held to the bytes, not to a second copy of the encoder.** A frame's header and payload are written
+out in the suite as literal numbers, so a field that moved, a length that became little-endian or a
+reserved byte that stopped being zero fails against a transcript. Every frame round-trips in the
+direction it travels through a decoder fed **one byte at a time**, so every field of every frame
+crosses a delivery boundary; a maximal frame is reassembled out of record-sized deliveries and the
+buffer is asserted never to hold more than one frame's worth; and there is one adversarial shape per
+refusal, composed byte by byte, plus one per way the encoder refuses a frame this end composed
+wrongly.
+
+**A persistent fuzz target drives it with arbitrary streams cut at arbitrary points**, in either
+direction, into an encoder buffer of an arbitrary size. Its strongest claim is not that nothing
+crashes but that **every frame decoded re-encodes to exactly the bytes it was decoded from** — which
+catches the whole class of decode/encode disagreement a test comparing a frame against a frame cannot
+see. It also holds the encoder inside a guarded buffer, holds a refused encode to having written
+nothing, and holds a violation to being final. Twenty-nine committed seeds — one per frame, one per
+rule, and three for the pacing — are **built by the harness's own code and held to the arm each one's
+name claims**, so a seed named for a rule that no longer reaches it fails rather than reading as
+coverage. What the target cannot reach is stated where it lives: four encoder refusals are frames
+*this end* composed wrongly, so no peer's stream produces one, and they are held in the crate's own
+suite instead.
+
+**Nothing runs any of it.** No protection domain reaches this crate, no console record says a frame
+was refused, no metric counts one, and no scenario drives a byte of it — the counting the contract
+asks of a violation belongs with the domain that has a metric to count into, and the console
+vocabulary with the domain that emits a record. What is missing above it is the session: which frame
+is sent when, the flush cadence and the acknowledgement cursors, the commit-confirm over a fresh
+connection, and the backoff between dials.
+
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two
 things. `GET /` is the page: no stylesheet, no script, no image, no font, because the page's whole
@@ -3138,8 +3218,9 @@ delivered anchor and matches the profile in every field.
 **Missing.** Everything the channel carries, and everything that comes after it.
 
 - **No channel listener and no pcapng decoder.** Nothing has ever connected to this server: there
-  is no ThousandIsland listener, no [framing](../contracts/channel-framing.md), and no decoder
-  tested against bytes the appliance's encoder produced. The telemetry schema and its writer
+  is no ThousandIsland listener, no [framing](../contracts/channel-framing.md) on this side of the
+  wire — the appliance now has a codec for the whole of it, and this server has none — and no
+  decoder tested against bytes the appliance's encoder produced. The telemetry schema and its writer
   therefore have **no producer** — they are exercised only by the suite.
 - **Online, offline and last seen do not exist**, and neither do the columns behind them; they
   arrive with the connection that establishes them.
@@ -3164,10 +3245,10 @@ is *done* currently sits.
 |---|---|---|
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
-| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 30 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
+| Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 31 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (31 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 16 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 29 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 30 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |

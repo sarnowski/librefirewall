@@ -69,6 +69,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "lfw-onboarding",
     "lfw-package",
     "lfw-store",
+    "lfw-channel",
     "xtask",
 ];
 
@@ -112,6 +113,7 @@ const LIBRARY_PACKAGES: &[&str] = &[
     "lfw-onboarding",
     "lfw-package",
     "lfw-store",
+    "lfw-channel",
 ];
 
 /// How many library crates carry the coverage floors.
@@ -194,6 +196,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "http_request",
     "onboarding_tls",
     "channel_tls",
+    "channel_frames",
     "metrics_render",
     "config_document",
     "config_submission",

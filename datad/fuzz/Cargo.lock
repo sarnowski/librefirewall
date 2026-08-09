@@ -398,6 +398,13 @@ name = "lfw-capture-ring"
 version = "0.1.0"
 
 [[package]]
+name = "lfw-channel"
+version = "0.1.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
 name = "lfw-clock"
 version = "0.1.0"
 
@@ -549,6 +556,7 @@ dependencies = [
  "config",
  "lfw-blk",
  "lfw-capture-ring",
+ "lfw-channel",
  "lfw-clock",
  "lfw-crypto",
  "lfw-flow",

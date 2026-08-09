@@ -75,6 +75,9 @@ cargo-fuzz = true
 #   lfw-pcapng      the block encoders those two write through: a frame's
 #                   length on the wire and an annotation's bytes are the
 #                   network's and a peer's, and both become a length field
+#   lfw-channel     the management channel's framing: every header, every stated
+#                   length and every payload field a management server composes,
+#                   arriving in whatever pieces it chooses
 [dependencies]
 libfuzzer-sys = "0.4.9"
 arbitrary = "1.4.1"
@@ -117,6 +120,10 @@ lfw-pcapng = { path = "../crates/pcapng" }
 # of them is what the appliance signs with.
 lfw-store = { path = "../crates/store" }
 lfw-tls = { path = "../crates/tls" }
+# The framing above that record layer. Its whole input is a management server's
+# byte stream and the pacing of it, and the frame it reassembles is the largest
+# object this appliance takes from a peer it has authenticated.
+lfw-channel = { path = "../crates/channel" }
 # The onboarding package reader. Its whole surface is a byte string an
 # unauthenticated peer uploaded, and it reaches `config` underneath, so the
 # target here drives one parser through another.
@@ -332,6 +339,13 @@ bench = false
 [[bin]]
 name = "channel_tls"
 path = "fuzz_targets/channel_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel_frames"
+path = "fuzz_targets/channel_frames.rs"
 test = false
 doc = false
 bench = false

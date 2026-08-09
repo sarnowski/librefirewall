@@ -30,6 +30,7 @@
 //! | [`store_state`] | `lfw_store`'s own state record read back off the medium: the two copies, the digest over each, and the identity decoded out of the one that wins | an attacker holding the disk, composing offline with this decoder's source in hand |
 //! | [`onboarding_tls`] | `lfw_tls`'s onboarding server: the record layer, the buffering either side of it, and the outcome it settles on | a management-plane attacker |
 //! | [`channel_tls`] | `lfw_tls`'s channel client: the same record layer dialling out, the anchor and the certificate a package delivered, and the outcome it settles on | a management-plane attacker, up to a compromised management server |
+//! | [`channel_frames`] | `lfw_channel`'s framing above that client: every header, length and payload field of the ten frames, reassembled out of deliveries the peer paces, and re-encoded back to the bytes it came from | a management-plane attacker, up to a compromised management server |
 //! | [`onboarding_surface`] | `lfw_onboarding`'s request surface: the head read out of a plaintext stream cut into arbitrary deliveries, the body handed on to an upload as it arrives, and the twenty-six ways a request is refused | a management-plane attacker |
 //! | [`onboarding_package`] | `lfw_package`'s uploaded archive: the ustar framing, the armour around the two certificates, the walk that finds the key one binds, the endpoint line, and the `config` reader under it | a management-plane attacker |
 //! | [`onboarding_install`] | `lfw_store`'s install path: a staged region, the length a peer claims about it, the whole package contract read a second time, and the one signature this appliance verifies for itself | a management-plane attacker **and** a byzantine neighbour PD |
@@ -137,6 +138,7 @@
 //! harness over the seeds. See `tools/xtask` (`fuzz`) for the exact fallback.
 
 pub mod blk;
+pub mod channel_frames;
 pub mod channel_tls;
 pub mod config_submission;
 pub mod document;
@@ -270,6 +272,10 @@ mod tests {
             crate::onboarding_tls::onboarding_tls_harness,
         ),
         ("channel_tls", crate::channel_tls::channel_tls_harness),
+        (
+            "channel_frames",
+            crate::channel_frames::channel_frames_harness,
+        ),
         (
             "metrics_render",
             crate::metrics_render::metrics_render_harness,

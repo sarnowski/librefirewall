@@ -31,6 +31,7 @@ members = [
     "crates/x509",
     "crates/tls",
     "crates/store",
+    "crates/channel",
     "pds/nic-driver",
     "pds/forwarder",
     "pds/config",

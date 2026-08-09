@@ -812,6 +812,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lfw-channel"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "wire",
+]
+
+[[package]]
 name = "lfw-clock"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,23 @@
+[package]
+# The management channel's framing: the frames themselves and the codec over
+# them, with no transport under it and no session state above it. `lfw-channel`
+# rather than `channel`, on the same split `crates/log` makes.
+name = "lfw-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# For one constant: the bound on a configuration document. A staged document is
+# read and refused by the same reader as any other configuration input, and that
+# reader's storage is a region of this size — so a second copy of the number here
+# would be a bound that could come to admit a frame whose document the next stage
+# must refuse. The dependency runs this way and never back: `wire` reaches for no
+# framing.
+wire = { path = "../wire" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
