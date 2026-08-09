@@ -94,7 +94,7 @@ use lfw_blk::{
     BAR_WINDOW_SIZE as BLK_BAR_WINDOW_SIZE, BLK_IO_REGION_SIZE,
     DMA_REGION_SIZE as BLK_DMA_REGION_SIZE,
 };
-use lfw_hpet::MMIO_REGION_SIZE;
+use lfw_hpet::{INTERRUPT_PIN as HPET_INTERRUPT_PIN, MMIO_REGION_SIZE};
 use lfw_metrics::{MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, STATS_REGION_SIZE};
 use lfw_rtc::{INDEX_PORT, PORT_COUNT as CMOS_PORT_COUNT};
 use nic_driver_core::bringup::{BAR_WINDOW_SIZE, VQ_REGION_SIZE};
@@ -1615,6 +1615,54 @@ const IO_PORTS: &[IoPortRule] = &[
     },
 ];
 
+/// What the clock domain's interrupt grant withholds, quoted into the finding
+/// that reports it moving.
+const TICK_IRQ_WITHHELD: &str = "an IRQHandler capability on ONE I/O APIC input and nothing \
+     beside it: this domain cannot mask another input, cannot route one, and holds no capability \
+     over the interrupt controller at all. It is also the whole of what can enter that domain \
+     after `init` — no protection domain in this system can raise it — so a pin that moved would \
+     be an interrupt delivered to a handler that programmed a different one, and a domain that is \
+     never woken again";
+
+/// One `<irq>` the description may declare: which domain may acknowledge which
+/// interrupt, on which input.
+///
+/// An interrupt grant is authority exactly as a `<map>` and an `<ioport>` are.
+/// It places an IRQHandler capability in the domain's CNode and binds the input
+/// to that domain's notification, so it decides both what may wake the domain
+/// and which input the kernel will let it acknowledge — and it is the only
+/// capability in this system that a *device* exercises rather than a domain.
+struct IrqRule {
+    domain: &'static str,
+    /// The `id` attribute. It shares its namespace with a `<channel>` end's
+    /// `id`, which is the whole reason it is keyed on here: a domain reaches
+    /// both through `Channel::new(id)`, so an interrupt and a peer's channel
+    /// numbered the same would be one slot with two meanings.
+    id: &'static str,
+    /// The I/O APIC input, against the constant the domain programs its timer
+    /// to drive. The two are one fact stated twice.
+    pin: ExpectedPort,
+    /// The delivery mode. Stated because it decides what the *handler* owes: an
+    /// edge-triggered input is lowered by the device itself, and a level one
+    /// obliges a write back to the device on every interrupt.
+    trigger: &'static str,
+    withheld: &'static str,
+}
+
+/// Every interrupt grant the description may declare. One row, and the count is
+/// the property rather than an accident: a second row is a second domain the
+/// hardware can enter, and adding one is a capability change to review.
+const IRQS: &[IrqRule] = &[IrqRule {
+    domain: "clock",
+    id: "0",
+    pin: ExpectedPort {
+        rust_name: "lfw_hpet::INTERRUPT_PIN",
+        value: HPET_INTERRUPT_PIN as u64,
+    },
+    trigger: "edge",
+    withheld: TICK_IRQ_WITHHELD,
+}];
+
 /// Every protection domain the description may declare. Exhaustive in both
 /// directions like the rest: the domain names are what [`RegionRule::mappers`]
 /// and [`CHANNEL_ENDS`] are written in, so a domain renamed here and not there
@@ -1835,6 +1883,23 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         id: "1",
         notification: Notification::MaySend,
     },
+    // The periodic wakeup, one-directional. The clock domain must be able to
+    // signal: it is the only domain hardware tells that an interval has
+    // elapsed, and the domain that owes the management channel's schedules has
+    // no clock of its own to be woken by. The management end may not signal
+    // back, for the reason beside it.
+    ChannelEnd {
+        domain: "clock",
+        id: "1",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "management",
+        id: "4",
+        notification: Notification::MayNotSend {
+            claim: MANAGEMENT_CHANNEL_ONE_WAY,
+        },
+    },
 ];
 
 /// One port's driver: the receive-pipeline region that port's frames arrive on,
@@ -1904,15 +1969,16 @@ fn port_drivers() -> Vec<PortDriverRule> {
 const RECEIVE_PIPELINE_SYMBOL: &str = "rx_fwd_vaddr";
 
 /// Every element type this module knows how to judge. An element outside it
-/// stops the gate rather than being skipped: `<irq>`, `<virtual_machine>` and
-/// `<vcpu>` are all authority grants, and one arriving unnoticed is precisely
-/// a capability change that must be looked at.
+/// stops the gate rather than being skipped: `<virtual_machine>` and `<vcpu>`
+/// are both authority grants, and one arriving unnoticed is precisely a
+/// capability change that must be looked at.
 ///
-/// `ioport` was the case that proved the point: it entered the description as a
-/// new capability class and stopped the gate here, unmodelled, rather than
-/// being granted quietly. Listing a tag is therefore only half of admitting it
-/// — [`IO_PORTS`] is the other half, and a tag listed with no table behind it
-/// would turn this check from a stop into a silence.
+/// `ioport` was the case that proved the point, and `irq` was the second: each
+/// entered the description as a new capability class and stopped the gate here,
+/// unmodelled, rather than being granted quietly. Listing a tag is therefore
+/// only half of admitting it — [`IO_PORTS`] and [`IRQS`] are the other half, and
+/// a tag listed with no table behind it would turn this check from a stop into a
+/// silence.
 const MODELLED_TAGS: &[&str] = &[
     "system",
     "memory_region",
@@ -1921,6 +1987,7 @@ const MODELLED_TAGS: &[&str] = &[
     "map",
     "setvar",
     "ioport",
+    "irq",
     "channel",
     "end",
 ];
@@ -1941,12 +2008,13 @@ pub(crate) fn check(root: &Path) -> Result<(), Error> {
         let tally =
             |tag: &str, noun| counted(elements.iter().filter(|e| e.tag == tag).count(), noun);
         println!(
-            "sysdesc: {} agrees with the code that holds it: {} granted by {}, {}, and {} — each \
-             sized, mapped and withheld as that code requires",
+            "sysdesc: {} agrees with the code that holds it: {} granted by {}, {}, {}, and {} — \
+             each sized, mapped and withheld as that code requires",
             path.display(),
             tally("memory_region", "memory region"),
             tally("map", "mapping"),
             tally("ioport", "I/O-port window"),
+            tally("irq", "interrupt"),
             tally("end", "channel end"),
         );
         return Ok(());
@@ -1982,7 +2050,9 @@ fn findings(elements: &[Element]) -> Vec<String> {
     let regions = check_regions(elements, &mut findings);
     check_maps(elements, &regions, domains_agree, &mut findings);
     check_io_ports(elements, domains_agree, &mut findings);
+    check_irqs(elements, domains_agree, &mut findings);
     check_channel_ends(elements, &mut findings);
+    check_channel_ids_are_disjoint(elements, &mut findings);
     check_port_drivers(elements, &mut findings);
     check_every_map_is_addressable(elements, &mut findings);
     findings
@@ -2521,6 +2591,135 @@ fn check_channel_ends(elements: &[Element], findings: &mut Vec<String>) {
                  loses the direction its grant was narrowed to",
                 end.domain, end.id
             ));
+        }
+    }
+}
+
+/// Every `<irq>` the description declares is one [`IRQS`] names, on the input
+/// and with the delivery mode it names — and every rule matches a grant.
+///
+/// [`check_io_ports`]' shape on the other capability class, and it is judged the
+/// same way and for the same reason: an interrupt handed to a domain decides
+/// what the hardware may wake, and one that moved to another input, another
+/// delivery mode or another domain is authority nobody reviewed.
+fn check_irqs(elements: &[Element], domains_agree: bool, findings: &mut Vec<String>) {
+    let mut held: Vec<(String, &str)> = Vec::new();
+    for element in elements.iter().filter(|e| e.tag == "irq") {
+        let domain = element.owner();
+        let Some(id) = required(element, "id", findings) else {
+            continue;
+        };
+        let site = format!("line {}: <irq id={id:?}> in {domain}", element.line);
+
+        if held
+            .iter()
+            .any(|(holder, seen)| *holder == domain && *seen == id)
+        {
+            findings.push(format!(
+                "{site} is a second interrupt under an id this domain already holds, and which \
+                 of the two Microkit binds to that notification bit is not something this gate \
+                 may assume"
+            ));
+        }
+        held.push((domain.clone(), id));
+
+        let Some(rule) = IRQS
+            .iter()
+            .find(|rule| rule.domain == domain && rule.id == id)
+        else {
+            findings.push(format!(
+                "{site} is an interrupt grant no rule in sysdesc.rs names, so the input it binds \
+                 to this domain is compared against nothing. An `<irq>` is what decides which \
+                 domain the hardware may enter and which input the kernel will let it \
+                 acknowledge — a capability change, reviewed and approved rather than merged. \
+                 Record it in IRQS once it is"
+            ));
+            continue;
+        };
+        check_irq_input(&site, rule, element, findings);
+    }
+
+    // As in [`check_io_ports`]: while the domain vocabularies disagree, every
+    // rule here would report a grant that vanished.
+    if !domains_agree {
+        return;
+    }
+    for rule in IRQS {
+        if !held
+            .iter()
+            .any(|(domain, id)| domain == rule.domain && *id == rule.id)
+        {
+            findings.push(format!(
+                "sysdesc.rs records {:?} as holding interrupt id {:?}, and the description \
+                 declares no such <irq>. Either the grant was dropped — and that domain arms a \
+                 timer whose interrupt reaches nobody, leaving every schedule in this appliance \
+                 waiting on traffic to advance — or the rule is stale and still judging a \
+                 topology this file left behind",
+                rule.domain, rule.id
+            ));
+        }
+    }
+}
+
+/// The input and delivery mode one `<irq>` grants, against the rule that admits
+/// them.
+///
+/// The pin because a grant on a different input is one the granted domain's own
+/// programming will never raise, and the trigger because it decides what the
+/// handler owes the device on every interrupt.
+fn check_irq_input(site: &str, rule: &IrqRule, element: &Element, findings: &mut Vec<String>) {
+    if let Some(raw) = required(element, "pin", findings) {
+        match parse_int(raw) {
+            Err(why) => findings.push(format!("{site} has pin={raw:?}, which {why}")),
+            Ok(value) if value != rule.pin.value => findings.push(format!(
+                "{site} grants pin={value} and {} is {}. The description and the domain state \
+                 one input between them — that domain programs its timer to drive the one it \
+                 compiled against — so a pin this file moved is an interrupt raised where \
+                 nothing is listening and a handler woken by nothing. What the grant as \
+                 approved withholds: {}",
+                rule.pin.rust_name, rule.pin.value, rule.withheld
+            )),
+            Ok(_) => {}
+        }
+    }
+    if let Some(trigger) = required(element, "trigger", findings)
+        && trigger != rule.trigger
+    {
+        findings.push(format!(
+            "{site} is {trigger:?}-triggered and sysdesc.rs records {:?}. The two modes oblige \
+             the handler differently — a level-triggered input stays asserted until the device \
+             is written back, and the domain that takes this one holds no path to write it — so \
+             a mode changed here is a node that takes one interrupt and never another",
+            rule.trigger
+        ));
+    }
+}
+
+/// No domain reaches an `<irq>` and a `<channel>` end through the same id.
+///
+/// Microkit gives a protection domain one notification word and one `Channel`
+/// namespace over it, so an interrupt and a peer's channel numbered alike are
+/// one bit with two meanings: the domain would acknowledge an interrupt it was
+/// never raised, or take a peer's signal for a timer. The two tables above judge
+/// each namespace separately and neither can see the collision, so it is checked
+/// here, across both.
+fn check_channel_ids_are_disjoint(elements: &[Element], findings: &mut Vec<String>) {
+    for irq in elements.iter().filter(|e| e.tag == "irq") {
+        let domain = irq.owner();
+        let Some(id) = irq.attribute("id") else {
+            continue;
+        };
+        for end in elements.iter().filter(|e| e.tag == "end") {
+            if end.attribute("pd") == Some(domain.as_str()) && end.attribute("id") == Some(id) {
+                findings.push(format!(
+                    "line {}: <irq id={id:?}> in {domain} and the <end> at line {} share one \
+                     channel id. A protection domain reaches both through `Channel::new({id})`, \
+                     so the interrupt and the peer's notification would be one bit — and the \
+                     domain would acknowledge an interrupt on a peer's signal, or take a peer's \
+                     signal for the passage of time",
+                    irq.line, end.line
+                ));
+            }
         }
     }
 }
@@ -3992,13 +4191,73 @@ mod tests {
     fn an_element_type_the_check_cannot_judge_is_reported() {
         let findings = findings_after(
             "<program_image path=\"forwarder.elf\" />",
-            "<program_image path=\"forwarder.elf\" />\n        <irq irq=\"11\" id=\"3\" />",
+            "<program_image path=\"forwarder.elf\" />\n        <virtual_machine name=\"vm\" />",
         );
         let finding = only_finding(&findings);
         assert!(
-            finding.contains("<irq>") && finding.contains("security change"),
+            finding.contains("<virtual_machine>") && finding.contains("security change"),
             "{finding}"
         );
+    }
+
+    /// An `<irq>` is a modelled tag now, so the stop it used to cause has to be
+    /// caused by the table instead: a grant no rule names is a domain the
+    /// hardware may enter that nothing compared.
+    #[test]
+    fn an_interrupt_grant_no_rule_names_is_reported() {
+        let findings = findings_after(
+            "<program_image path=\"forwarder.elf\" />",
+            "<program_image path=\"forwarder.elf\" />\n        \
+             <irq id=\"3\" ioapic=\"0\" pin=\"11\" vector=\"1\" trigger=\"edge\" polarity=\"high\" />",
+        );
+        let finding = only_finding(&findings);
+        assert!(
+            finding.contains("<irq id=\"3\"> in forwarder")
+                && finding.contains("no rule in sysdesc.rs names"),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_moved_to_another_input_is_reported() {
+        let findings = findings_after("pin=\"23\"", "pin=\"11\"");
+        let finding = only_finding(&findings);
+        assert!(
+            finding.contains("grants pin=11") && finding.contains("lfw_hpet::INTERRUPT_PIN"),
+            "{finding}"
+        );
+    }
+
+    /// The mode decides what the handler owes the device on every interrupt, and
+    /// the domain that takes this one holds no path to write the block back.
+    #[test]
+    fn an_interrupt_turned_level_triggered_is_reported() {
+        let findings = findings_after("trigger=\"edge\"", "trigger=\"level\"");
+        let finding = only_finding(&findings);
+        assert!(finding.contains("\"level\"-triggered"), "{finding}");
+    }
+
+    #[test]
+    fn a_withdrawn_interrupt_grant_is_reported() {
+        let findings = findings_after(
+            "        <irq id=\"0\" ioapic=\"0\" pin=\"23\" vector=\"0\" trigger=\"edge\" polarity=\"high\" />\n",
+            "",
+        );
+        let finding = only_finding(&findings);
+        assert!(
+            finding.contains("declares no such <irq>") && finding.contains("\"clock\""),
+            "{finding}"
+        );
+    }
+
+    /// One notification word, one namespace: an interrupt and a peer's channel
+    /// numbered alike are one bit with two meanings, and neither table above can
+    /// see it on its own.
+    #[test]
+    fn an_interrupt_sharing_a_channel_id_with_a_peer_is_reported() {
+        let findings = findings_after("<end pd=\"clock\" id=\"1\"", "<end pd=\"clock\" id=\"0\"");
+        let joined = findings.join("\n");
+        assert!(joined.contains("share one channel id"), "{joined}");
     }
 
     #[test]

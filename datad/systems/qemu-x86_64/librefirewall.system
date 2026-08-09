@@ -1198,13 +1198,64 @@
         <map mr="stats_config" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 
-    <!-- The clock domain: it establishes what time it is, once, and says so.
+    <!-- The clock domain: it establishes what time it is, says so, and from then
+         on announces that time has passed.
 
          It maps the HPET page, holds an I/O-port capability for the CMOS
          real-time clock, calibrates the timestamp counter against the timer
          whose rate is self-describing, reads the RTC once for an epoch to
-         anchor that counter to, publishes one record and parks. The protection
+         anchor that counter to, publishes one record, and arms one of the
+         block's comparators to raise an interrupt on a period. The protection
          domain is documented in pds/clock.
+
+         =================================================================
+         THE SYSTEM'S FIRST `<irq>`, AND ITS FIRST PERIODIC WAKEUP
+         =================================================================
+
+         Microkit provides no periodic wakeup, and until this row nothing in
+         this appliance had one: a protection domain was entered when a frame
+         arrived or when a peer signalled it, and a domain holding a deadline
+         and no traffic sat at that deadline for ever. That is exactly the shape
+         of every schedule the management channel owes — a reconnection backoff,
+         an acknowledgement cadence, a flush that owes a send once a second —
+         and a silent link is precisely the condition they exist for. So this
+         file now builds one out of the hardware it already grants: the domain
+         that maps the timer block programs a comparator and takes the interrupt
+         it raises.
+
+         WHAT THE `<irq>` GRANTS is one IRQHandler capability, on one I/O APIC
+         input. It is a new capability class in this system and it is the
+         narrowest instance of it: this domain may acknowledge that one input
+         and may do nothing else with it — it cannot mask another, cannot route
+         one, and holds no capability over the interrupt controller at all. The
+         input is `lfw_hpet::INTERRUPT_PIN`, and this row and that constant are
+         one fact stated twice: the domain programs the block to drive the pin
+         the grant names, so a pin changed here and not there is a domain armed
+         to raise an interrupt nothing delivers, which the build compares.
+
+         WHICH INPUT, AND WHY IT IS NOT AN ARBITRARY CHOICE. The input must be
+         one no other device drives. A shared one is an error nothing reports:
+         the handler counts another device's interrupts as its own and every
+         schedule built on the wakeup runs fast by whatever that device does.
+         Input 2 was tried and is wrong — it looks like the legacy controller's
+         cascade line and is where a PC-compatible platform delivers the
+         interval timer's, which turned a wakeup armed for ten a second into
+         thirty. The last input is granted instead, above every legacy line and
+         at the top of the block the PCI functions are assigned from. The
+         block's own routing capability decides whether it may drive that input
+         at all, and a block that says it may not is refused on the console
+         rather than programmed on the strength of nothing — and because
+         "no other device drives it" is a claim no register answers, the rate is
+         measured on the running image rather than argued here.
+
+         EDGE-TRIGGERED, and that is what keeps the wakeup free of device work:
+         the block raises the input and lowers it again by itself, so the
+         handler owes the kernel an acknowledgement and the device nothing. A
+         level-triggered timer would oblige a write to the block's
+         interrupt-status register on every tick — a register that domain cannot
+         even name.
+
+         WHAT IT COSTS THE DATAPLANE is stated where the priority is, below.
 
          =================================================================
          `<ioport>` IS NO LONGER A CAPABILITY CLASS ONE DOMAIN HOLDS ALONE
@@ -1261,20 +1312,24 @@
          on seL4's round-robin against three domains that never yield, for the
          whole of a calibration window it is trying to measure real time across.
          Above them it runs to completion and then blocks in the Microkit event
-         loop, where it costs nothing at all — it holds no channel, so nothing
-         can ever wake it again.
+         loop — where, now, exactly one thing can reach it.
 
-         Equal to the configuration domain rather than above it, because both
-         are run-once-then-block domains and neither can starve the other: each
-         leaves `init` for good. Adding a fourth priority level would state an
-         ordering between the two that nothing needs — no record either writes
-         depends on the other, and the console renders both whenever it gets to
-         them.
+         Equal to the configuration domain rather than above it. The
+         configuration domain leaves `init` for good and this one no longer
+         does, so the two can no longer starve each other only because neither
+         ever runs long: a tick is a fixed handful of instructions with no loop
+         in it, and a configuration commit is a bounded pass. Adding a fourth
+         priority level would state an ordering between the two that nothing
+         needs — no record either writes depends on the other, and the console
+         renders both whenever it gets to them.
 
-         What that priority does cost, named rather than left to be measured: a
+         What that priority costs, named rather than left to be measured: a
          calibration window is about a millisecond of real time during which
-         this domain preempts the dataplane. It happens once, at boot, before
-         any traffic exists.
+         this domain preempts the dataplane, once, at boot, before any traffic
+         exists — and after it, one preemption per tick period for the life of
+         the node, each of them that fixed handful plus the wakeup it hands to
+         the management domain. The period is `pds/clock`'s to choose and it
+         derives it there from the obligations that rest on it.
 
          It maps NO pool, NO dataplane ring, NO configuration region, NO ECAM
          page and NO BAR window, so a compromised clock reaches no frame, no NIC
@@ -1290,6 +1345,7 @@
     <protection_domain name="clock" priority="3" stack_size="0x4000">
         <program_image path="clock.elf" />
         <ioport id="0" addr="0x70" size="2" />
+        <irq id="0" ioapic="0" pin="23" vector="0" trigger="edge" polarity="high" />
         <map mr="hpet" vaddr="0x10_000_000" perms="rw" cached="false" setvar_vaddr="hpet_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="rw" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_clock" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
@@ -2070,11 +2126,14 @@
 
          PRIORITY 1, EQUAL TO THE DRIVERS, and that is a decision rather than a
          leftover. This domain never leaves `init` for the same reason the
-         drivers do not: Microkit has no periodic wakeup, and a `notified`-driven
-         console would have to return to the event loop after each activation,
-         so a boot transcript longer than the UART's 16-byte FIFO would stall
-         until some unrelated domain happened to log again — and the boot
-         transcript is the whole purpose of a console. It therefore busy-polls,
+         drivers do not: a `notified`-driven console would have to return to the
+         event loop after each activation, so a boot transcript longer than the
+         UART's 16-byte FIFO would stall until something happened to wake it
+         again — and the boot transcript is the whole purpose of a console. The
+         clock domain's tick does not answer that: it arrives on a period chosen
+         for the management channel's schedules, and a console carrying sixteen
+         bytes per tick would take minutes over a boot transcript. It therefore
+         busy-polls,
          which makes its priority a scheduling question rather than a
          formality. Above the drivers it would preempt the dataplane for as long
          as it held the CPU, and at 115200 baud a byte occupies the line for
@@ -2085,9 +2144,11 @@
          nothing on a notification path is delayed by it at all.
 
          The improvement, recorded rather than built: an interrupt-driven
-         transmitter, which would remove the polling entirely. It needs the
-         system's first `<irq>` — another new capability class — and is not
-         worth bundling into the change that introduces the first `<ioport>`. -->
+         transmitter, which would remove the polling entirely. What it needs is a
+         second `<irq>` — the serial controller's own transmitter-empty
+         interrupt, on an input this file does not grant — and a console that
+         returns to the event loop between bursts, which is a different domain
+         from this one rather than a flag on it. -->
     <protection_domain name="console" priority="1" stack_size="0x4000">
         <program_image path="console.elf" />
         <ioport id="0" addr="0x3f8" size="8" />
@@ -2334,6 +2395,50 @@
         <end pd="crypto" id="1" notify="true" />
     </channel>
 
+    <!-- THE PERIODIC WAKEUP, one-directional, and the only channel in this file
+         whose sender is not answering a peer but reporting the passage of time.
+
+         WHY IT EXISTS AT ALL. The management domain owes schedules that a silent
+         link cannot drive: it re-dials its management server on a bounded
+         exponential backoff, it flushes its upstream once a second while bytes
+         are waiting, and it answers an acknowledgement cadence. Every one of
+         those is a deadline, and until this row the only thing that entered that
+         domain was a frame — so an appliance whose management server disappeared
+         stopped being woken by exactly the event its backoff exists to survive.
+         The domain that maps the timer block is the only one that can be told by
+         hardware that an interval has elapsed, so it is the one that says so.
+
+         WHAT THE SEND CAPABILITY IS WORTH TO WHOEVER REACHES THE CLOCK DOMAIN:
+         a wakeup on the management domain at a rate they choose. That domain is
+         entered by every frame its port receives already, so this buys an
+         attacker who has taken the domain holding one MMIO page and two I/O
+         ports a thing the network beyond the management port hands out for free
+         — and it buys them nothing on the dataplane, which this row does not
+         touch. What it does NOT carry is a time: the notification has no payload
+         at all, and the management domain reads the calibration this domain
+         published and the counter itself. An instant sent alongside would be a
+         second statement of one fact, and the two would differ by however long
+         the signal took.
+
+         THE REVERSE DIRECTION IS REFUSED, and `notify="false"` on the management
+         end is what refuses it. A management domain able to signal the clock
+         domain would hold a wakeup capability on the domain that owns this
+         node's idea of time, granted to the domain that faces the
+         management-plane attacker — and it would consume nothing: the clock
+         domain is woken by its own interrupt and has no work a peer could ask
+         for. It is also the end that keeps `pds/nic-driver`'s claim true, the
+         management domain holding send capabilities on exactly two domains and
+         this being a third that is not one of them.
+
+         BOUNDED. A notification is a flag rather than a queue, so a period that
+         elapsed while the previous one was still being served is one wakeup and
+         not two waiting, and the management domain's answer to a wakeup is the
+         same bounded pass a frame provokes. -->
+    <channel>
+        <end pd="clock" id="1" notify="true" />
+        <end pd="management" id="4" notify="false" />
+    </channel>
+
     <!-- THE CONSOLE DOMAIN HAS NO CHANNEL AT ALL, IN EITHER DIRECTION, AND ITS
          ABSENCE IS A DECISION.
 
@@ -2357,8 +2462,10 @@
 
          When the console becomes interrupt-driven — the improvement recorded
          above it — the wakeup it needs is an `<irq>` from the controller, not a
-         notification from a writer: what a transmitter-empty interrupt says is
-         "the line can take more bytes", which is the thing the polling loop is
-         actually waiting for. A writer's notification would say only "a record
-         exists", which the cursor already says. -->
+         notification from a writer and not the clock domain's tick: what a
+         transmitter-empty interrupt says is "the line can take more bytes",
+         which is the thing the polling loop is actually waiting for. A writer's
+         notification would say only "a record exists", which the cursor already
+         says, and a tick would say only that time has passed, which tells this
+         domain nothing about the one register it is waiting on. -->
 </system>

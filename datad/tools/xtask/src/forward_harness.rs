@@ -306,44 +306,6 @@ const IMPOSTOR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x63];
 /// the right one could be wrong in the same direction as the code under test.
 const UNSENT_ACKNOWLEDGEMENT: u32 = 0x1234_5678;
 
-/// How many opaque frames the station will put on the wire to keep the appliance
-/// awake while a dial it has answered is outstanding.
-///
-/// The appliance is woken by frames arriving and by nothing else — it holds no
-/// timer interrupt and no send capability on the domain that would wake it — so
-/// a transport timer of its own fires only on a pass some frame provoked. A
-/// station that answered the resolution and then went quiet would be waiting on
-/// a `SYN` the appliance cannot send, so it goes on speaking until the dial
-/// moves. Bounded rather than open-ended, and each nudge is released against the
-/// console's own count exactly as every other management frame is, so this is a
-/// number of frames rather than a length of time.
-const DIAL_NUDGE_LIMIT: usize = 256;
-
-/// The same budget for a station that misbehaves for the whole of a channel.
-///
-/// A dial nothing answers is not crossed in one gap but carried through the
-/// appliance's entire retransmission budget, three times over — every one of
-/// those timers fires only on a pass a frame provoked, so the nudging runs for
-/// the whole of the channel rather than for the moment before its `SYN`. The
-/// number is what that costs at [`DIAL_NUDGE_INTERVAL`], with room over: it
-/// still bounds the harness by a count of frames, and a station that spent it
-/// without the channel being decided has found a node that never gives up.
-const DIAL_NUDGE_LIMIT_WHILE_MISBEHAVING: usize = 1024;
-
-/// The shortest gap between two nudges.
-///
-/// A cadence rather than a contract, on [`REINJECT_INTERVAL`]'s terms: what the
-/// scenarios state is what the appliance decided and after how many attempts,
-/// and nothing here is asserted against a duration. What it buys is that a
-/// channel carried by nudging costs hundreds of frames rather than thousands —
-/// the deadlines being woken are the transport's own backoff, whose shortest is
-/// a second.
-const DIAL_NUDGE_INTERVAL: Duration = Duration::from_millis(250);
-
-/// The length of a nudge frame: the shortest of the opaque ones, so keeping the
-/// port awake costs the wire as little as it can.
-const DIAL_NUDGE_LEN: usize = 60;
-
 /// How many times the station will answer a fresh resolution or a fresh
 /// connection before it calls the appliance broken.
 ///
@@ -425,30 +387,24 @@ const ONBOARD_PAYLOAD: &[u8] = &[
     0x4c, 0x46, 0x57, 0x2d, 0x4f, 0x4e, 0x42, 0x44, // ten bytes of its random
 ];
 
-/// Wakeups a boot spends waiting for the appliance to finish reporting the
-/// handshakes real clients drew out of it.
+/// Passes a boot spends *watching* for the appliance to finish reporting the
+/// handshakes real clients drew out of it, and the gap between two of them.
 ///
-/// [`ONBOARD_NUDGE_LIMIT`]'s reasoning with a different wakeup: there is no
-/// station on this wire to put a frame on it, so what wakes the domain is a
-/// request on the port's *other* surface, which the appliance answers and which
-/// costs the run a scrape it discards. Far more than a healthy boot needs — the
-/// records are usually there on the first look — because the cost of being
-/// wrong is asymmetric: a few spare requests against a run that reports a
-/// domain as silent when it was one wakeup from speaking.
-const ONBOARD_HANDSHAKE_NUDGES: usize = 256;
-
-/// Frames the onboarding station will spend keeping the port awake while it
-/// waits for the appliance to finish a session and report it.
+/// It is a wait and not a prod, which is the whole difference from the station's
+/// budget below: this boot has no station on the wire, and it used to spend
+/// requests on the port's other surface to run the pass that writes the last
+/// account. The clock domain's tick runs that pass now, so the requests bought
+/// nothing — and they cost something, each one drawing a console record out of
+/// the endpoint and pressing a log ring that a 115200-baud console drains far
+/// more slowly than a domain can fill it. A dropped record is how the second half
+/// of a session's account goes missing, which is a failure of this harness's own
+/// making.
 ///
-/// [`DIAL_NUDGE_LIMIT`]'s reasoning on the other port. A session is carried by
-/// two domains and a relay between them, and the management domain holds no
-/// timer interrupt: every pass that advances the handover runs on a wakeup, and
-/// the last of them — the pass that closes the account and writes the console
-/// record — has no frame of its own to provoke it once the connection is gone.
-/// So the station goes on speaking until the records appear, bounded by a number
-/// of frames rather than a length of time, so an emulated run and an accelerated
-/// one spend the same budget.
-const ONBOARD_NUDGE_LIMIT: usize = 512;
+/// Far more polls than a healthy boot needs, because the cost of being wrong is
+/// asymmetric: a few spare seconds against a run that reports a domain as silent
+/// when it was one pass from speaking.
+const ONBOARD_REPORT_POLLS: usize = 256;
+const ONBOARD_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How many segments the onboarding station will accept on one connection before
 /// it calls the appliance broken.
@@ -3871,14 +3827,6 @@ impl DialMisbehaviour {
         matches!(self, Self::AcknowledgesTheWrongSequence)
     }
 
-    /// How many opaque frames this station may spend keeping the port awake.
-    const fn nudge_limit(self) -> usize {
-        match self {
-            Self::Answers => DIAL_NUDGE_LIMIT,
-            _ => DIAL_NUDGE_LIMIT_WHILE_MISBEHAVING,
-        }
-    }
-
     /// How many `SYN`s this station will answer before it calls the appliance
     /// broken.
     const fn dial_limit(self) -> usize {
@@ -3950,9 +3898,6 @@ struct DialStation {
     /// What the station owes the wire, composed as each step is judged and put
     /// on it by the caller against the console's own count.
     owed: VecDeque<Vec<u8>>,
-    /// Opaque frames spent keeping the appliance awake while the dial was
-    /// outstanding, bounded by [`DIAL_NUDGE_LIMIT`].
-    nudges: usize,
     /// Resolutions asked for and connections opened, each bounded by
     /// [`DIAL_RESTART_LIMIT`].
     ///
@@ -3977,7 +3922,6 @@ impl DialStation {
             expect: 0,
             probe: Vec::new(),
             owed: VecDeque::new(),
-            nudges: 0,
             resolutions: 0,
             dials: 0,
         }
@@ -4002,31 +3946,13 @@ impl DialStation {
             .map(|isn| (UNSENT_ACKNOWLEDGEMENT, isn.wrapping_add(1)))
     }
 
-    /// Whether the appliance is waiting on a timer of its own that only a frame
-    /// can run.
-    ///
-    /// Two shapes of the same gap. On a station that answers, it is the moment
-    /// between the resolution and the `SYN`: that segment was composed before
-    /// the next hop resolved and dropped for want of an address, so what re-sends
-    /// it is the transport's own retransmission. On one that misbehaves, the
-    /// whole channel is that gap — every backoff the appliance spends on a `SYN`
-    /// nothing answers, and every request the neighbour cache re-sends, runs on a
-    /// pass some frame provoked. So the nudging goes on until the channel is
-    /// decided, bounded by this station's own frame budget.
-    fn awaiting_the_dial(&self) -> bool {
-        match self.misbehaviour {
-            DialMisbehaviour::Answers => self.step == DialStep::Resolved,
-            _ => true,
-        }
-    }
-
     /// What this station has seen, as a clause for a verdict.
     fn seen(&self) -> String {
         format!(
             "the station is {:?}; the appliance's own dial is at {:?} and still owes {}; it \
              dialled from port {} with initial sequence {}, opened {} connection(s) after {} \
-             resolution(s) and reset {} of them, {} probe bytes have arrived, and the station \
-             spent {} frames keeping the port awake",
+             resolution(s) and reset {} of them, and {} probe bytes have arrived — with this \
+             station having put nothing on the wire to carry any of it",
             self.misbehaviour,
             self.step,
             self.step.outstanding(),
@@ -4037,8 +3963,7 @@ impl DialStation {
             self.dials,
             self.resolutions,
             self.resets,
-            self.probe.len(),
-            self.nudges
+            self.probe.len()
         )
     }
 }
@@ -4195,9 +4120,6 @@ struct OnboardStation {
     /// What this station owes the wire, composed as each segment is judged and
     /// put on it by the caller against the console's own count.
     owed: VecDeque<Vec<u8>>,
-    /// Opaque frames spent keeping the port awake while the appliance finishes a
-    /// session and reports it, bounded by [`ONBOARD_NUDGE_LIMIT`].
-    nudges: usize,
 }
 
 impl OnboardStation {
@@ -4213,7 +4135,6 @@ impl OnboardStation {
             crowded: false,
             crowd_answers: 0,
             owed: VecDeque::new(),
-            nudges: 0,
         }
     }
 
@@ -4250,18 +4171,6 @@ impl OnboardStation {
         !self.behaviour.opens() || self.step.finished()
     }
 
-    /// Whether the appliance is owed frames to run the passes that finish a
-    /// session and report it.
-    ///
-    /// True from the open until the station has nothing left on the wire. Every
-    /// pass that advances the handover runs on a wakeup, and the two domains wake
-    /// each other over the relay — but the pass that closes the account has no
-    /// frame of its own once the connection is gone, and this domain holds no
-    /// timer interrupt.
-    fn awaiting_the_port(&self) -> bool {
-        self.behaviour.opens() && self.step != OnboardStep::Unopened
-    }
-
     /// What this station has seen, as a clause for a verdict.
     fn seen(&self) -> String {
         if !self.behaviour.opens() {
@@ -4271,8 +4180,8 @@ impl OnboardStation {
             "the onboarding station is {:?}; its connection is at {:?} and still owes {}; it \
              opened from port {ONBOARD_STATION_PORT} and the appliance answered with initial \
              sequence {}, {} payload byte(s) went out, {} segment(s) came back, the second \
-             connection was {}opened and drew {} answer(s), and the station spent {} frames \
-             keeping the port awake",
+             connection was {}opened and drew {} answer(s) — with this station having put nothing \
+             on the wire to carry any of it",
             self.behaviour,
             self.step,
             self.step.outstanding(),
@@ -4281,8 +4190,7 @@ impl OnboardStation {
             self.delivered,
             self.segments,
             if self.crowded { "" } else { "not " },
-            self.crowd_answers,
-            self.nudges
+            self.crowd_answers
         )
     }
 
@@ -4295,7 +4203,6 @@ impl OnboardStation {
             crowded: self.crowded,
             crowd_answers: self.crowd_answers,
             segments: self.segments,
-            nudges: self.nudges,
         }
     }
 }
@@ -4344,7 +4251,6 @@ pub struct OnboardAccount {
     pub crowded: bool,
     pub crowd_answers: usize,
     pub segments: usize,
-    pub nudges: usize,
 }
 
 impl OnboardAccount {
@@ -4353,7 +4259,7 @@ impl OnboardAccount {
         format!(
             "  answered   onboarding-session    station->mgmt  {}:{ONBOARD_STATION_PORT} -> \
              {}:{}  station {:?}  {} payload byte(s) delivered, {} segment(s) back, second \
-             connection {}, {} nudge(s) spent",
+             connection {}",
             ipv4(port.station),
             ipv4(port.address),
             pd_runtime::ONBOARDING_PORT,
@@ -4364,8 +4270,7 @@ impl OnboardAccount {
                 format!("opened and answered {} time(s)", self.crowd_answers)
             } else {
                 String::from("not opened")
-            },
-            self.nudges
+            }
         )
     }
 }
@@ -5443,7 +5348,7 @@ impl ManagementProbe {
         format!(
             "  refused    tcp-dial              mgmt->station  {}:{} -> {}:{DIAL_PORT}  \
              station {:?}  {} resolution(s) answered, {} SYN(s) seen, {} reset(s) from the \
-             appliance, {} nudge(s) spent",
+             appliance, and no frame injected to carry it",
             ipv4(self.port.address),
             station
                 .peer_port
@@ -5452,8 +5357,7 @@ impl ManagementProbe {
             station.misbehaviour,
             station.resolutions,
             station.dials,
-            station.resets,
-            station.nudges
+            station.resets
         )
     }
 
@@ -6090,6 +5994,18 @@ pub struct Booted {
     /// a routed run that reached its verdict answered both, the wait for them
     /// being what ends it.
     pub management_replies: Vec<String>,
+    /// When this run's QEMU process was started, on the host's clock.
+    ///
+    /// It is an **upper bound on the appliance's uptime** and it is here for the
+    /// one question that needs one: whether the appliance's periodic wakeup is
+    /// arriving faster than it was armed for, which is what an interrupt input
+    /// shared with another device looks like. A bound rather than a
+    /// measurement, and deliberately the loose direction — firmware, the boot
+    /// manager and the kernel all run before the domain arms anything, so the
+    /// real uptime is shorter and a count under this bound proves nothing on
+    /// its own. What it catches is a count that could not have been produced by
+    /// this timer in the time the machine has existed.
+    pub started_at: Instant,
     /// What `curl` got out of the management endpoint, on the one scenario that
     /// points it at one: two consecutive scrapes, because a scrape cannot carry
     /// the response it is (`crate::metrics_contract`). Empty on every
@@ -6397,11 +6313,6 @@ fn run_boot(
         // the port to have acknowledged everything ahead of it.
         let mut client_pending: VecDeque<Vec<u8>> = VecDeque::new();
         let mut last_management_inject = Instant::now();
-        // The station's own send cadence for the frames it spends keeping the
-        // port awake. A rate rather than a deadline: nothing is judged against
-        // it, and what it decides is how many frames a channel carried by
-        // nudging costs.
-        let mut last_nudge = Instant::now();
         inject_probes(&mut endpoints, &probes, |probe| {
             probe.wave == wave && !probe.waits()
         });
@@ -7005,9 +6916,7 @@ fn run_boot(
                         // itself would prove only that the appliance agrees with
                         // the appliance.
                         if test.onboard.handshakes() {
-                            let driven = onboard_tls_contract::drive(onboard_port, || {
-                                onboard_tls_contract::nudge(host_port)
-                            });
+                            let driven = onboard_tls_contract::drive(onboard_port);
                             match driven {
                                 Ok(made) => handshakes = made,
                                 Err(verdict) => {
@@ -7023,28 +6932,33 @@ fn run_boot(
                             // gone, so a run that stopped when the last client
                             // exited would kill the guest mid-record and report
                             // a domain that was about to speak as one that never
-                            // did. Bounded by a number of wakeups rather than by
-                            // a length of time, so an emulated boot and an
-                            // accelerated one spend the same budget.
+                            // did.
+                            //
+                            // WAITED FOR RATHER THAN PROVOKED. This loop used to
+                            // spend requests on the port's other surface, because
+                            // nothing else would run that pass; the clock domain's
+                            // tick runs it now. Requests here are not merely
+                            // unnecessary, they are harmful: each one draws a
+                            // console record out of the endpoint, and a domain
+                            // whose log ring fills faster than a 115200-baud
+                            // console drains it DROPS records — including the
+                            // second of the two a session's account is written as.
+                            // So the wait watches the observable and puts nothing
+                            // on the wire.
                             let mut reported = false;
-                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                            for _ in 0..ONBOARD_REPORT_POLLS {
                                 drain(&serial_receiver, &mut output);
                                 if onboard_tls_contract::reported(&output) {
                                     reported = true;
                                     break;
                                 }
-                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
+                                thread::sleep(ONBOARD_REPORT_POLL_INTERVAL);
                             }
                             drain(&serial_receiver, &mut output);
                             if !reported && !onboard_tls_contract::reported(&output) {
                                 break 'run Err(format!(
                                     "the appliance had not finished reporting the handshakes this \
-                                     boot drove after {ONBOARD_HANDSHAKE_NUDGES} wakeups. A \
+                                     boot drove after {ONBOARD_REPORT_POLLS} passes. A \
                                      session's account is written on the pass that ends it, so \
                                      this is a domain that stopped answering the relay rather \
                                      than one that had nothing to say; see {}",
@@ -7074,12 +6988,8 @@ fn run_boot(
                                 }
                             };
                             let into = log_path.parent().unwrap_or(Path::new("."));
-                            let driven = onboard_request_contract::drive(
-                                onboard_port,
-                                &fingerprint,
-                                into,
-                                || onboard_tls_contract::nudge(host_port),
-                            );
+                            let driven =
+                                onboard_request_contract::drive(onboard_port, &fingerprint, into);
                             match driven {
                                 Ok(made) => requests = made,
                                 Err(verdict) => {
@@ -7094,24 +7004,19 @@ fn run_boot(
                             // written on the pass that decided it, which runs
                             // after the client's connection is gone.
                             let mut reported = false;
-                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                            for _ in 0..ONBOARD_REPORT_POLLS {
                                 drain(&serial_receiver, &mut output);
                                 if onboard_request_contract::reported(&output) {
                                     reported = true;
                                     break;
                                 }
-                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
+                                thread::sleep(ONBOARD_REPORT_POLL_INTERVAL);
                             }
                             drain(&serial_receiver, &mut output);
                             if !reported && !onboard_request_contract::reported(&output) {
                                 break 'run Err(format!(
                                     "the appliance had not finished reporting the requests this \
-                                     boot made after {ONBOARD_HANDSHAKE_NUDGES} wakeups. A \
+                                     boot made after {ONBOARD_REPORT_POLLS} passes. A \
                                      request's record is written on the pass that decided it, so \
                                      this is a domain that stopped answering the relay rather \
                                      than one that had nothing to say; see {}",
@@ -7153,15 +7058,9 @@ fn run_boot(
                                     &fingerprint,
                                     &device,
                                     into,
-                                    || onboard_tls_contract::nudge(host_port),
                                 )
                             } else {
-                                onboard_install_contract::revisit(
-                                    onboard_port,
-                                    &fingerprint,
-                                    into,
-                                    || onboard_tls_contract::nudge(host_port),
-                                )
+                                onboard_install_contract::revisit(onboard_port, &fingerprint, into)
                             };
                             let driven = match driven {
                                 Ok(made) => made,
@@ -7178,25 +7077,20 @@ fn run_boot(
                             // is a second ring behind the one answering the
                             // client.
                             let mut reported = false;
-                            for _ in 0..ONBOARD_HANDSHAKE_NUDGES {
+                            for _ in 0..ONBOARD_REPORT_POLLS {
                                 drain(&serial_receiver, &mut output);
                                 if driven.reported(&output) {
                                     reported = true;
                                     break;
                                 }
-                                if let Err(verdict) = onboard_tls_contract::nudge(host_port) {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
+                                thread::sleep(ONBOARD_REPORT_POLL_INTERVAL);
                             }
                             drain(&serial_receiver, &mut output);
                             if !reported && !driven.reported(&output) {
                                 break 'run Err(format!(
                                     "the appliance had not finished accounting for what this \
                                      run's management server did after \
-                                     {ONBOARD_HANDSHAKE_NUDGES} wakeups. A request's record is \
+                                     {ONBOARD_REPORT_POLLS} passes. A request's record is \
                                      written on the pass that decided it and an install's on the \
                                      domain that made it durable, so this is a domain that \
                                      stopped answering rather than one that had nothing to say; \
@@ -7368,49 +7262,18 @@ fn run_boot(
                     ),
                 });
             }
-            // The gap on this wire the appliance cannot cross unprompted. Its
-            // `SYN` was composed before the next hop resolved and dropped for
-            // want of an address, so what re-sends it is the transport's own
-            // retransmission — a timer that only runs on a pass some frame
-            // provoked, this domain holding no timer interrupt and no way to
-            // wake itself. A station that answered the resolution and fell
-            // silent would be waiting on a segment the appliance cannot send, so
-            // it goes on speaking until the dial moves.
+            // NOTHING IS INJECTED TO CARRY THE DIAL, AND THAT IS THE CONTRACT.
+            // A station that answers the resolution and then falls silent used
+            // to leave the appliance waiting on a `SYN` it could not re-send:
+            // its transport's retransmission ran only on a pass some frame
+            // provoked, and this harness had to keep speaking to provoke one.
+            // The clock domain now wakes the management domain on a period, so
+            // every backoff of an unanswered `SYN` and every re-ask of an
+            // unanswered resolution runs on the appliance's own time. The
+            // station therefore says nothing at all while a dial is outstanding,
+            // and a channel that still decides is a channel the appliance
+            // carried by itself.
             //
-            // On a station that misbehaves the whole channel is that gap: every
-            // backoff of an unanswered `SYN` and every re-ask of an unanswered
-            // resolution runs on a pass a frame provoked, so the nudging runs
-            // until the appliance has decided the channel and said so.
-            //
-            // The frame is an opaque one: the endpoint counts it and answers
-            // nothing, so nudging perturbs no reply contract, and it is released
-            // against the console's own count exactly as every other management
-            // frame is. Bounded by a NUMBER OF FRAMES rather than by a length of
-            // time, so a run under emulation and one on hardware spend the same
-            // budget on it; the interval below is this station's send cadence and
-            // nothing is ever asserted against it.
-            // Never while the frames the probe owes are still going out. Those
-            // are chunked to what the port's pipeline provably holds and each
-            // chunk waits for the console to report the one before it; a nudge
-            // slipped in beside them is a frame past that bound, and a frame put
-            // on a wire with no receive buffer posted for it is lost rather than
-            // queued. One lost frame is not a lost frame: the console's count is
-            // an equality, so the run would wait out the report grace on every
-            // frame after it and the appliance's own timers would fire before the
-            // harness answered them.
-            if test.dial.nudges()
-                && settling_since.is_some()
-                && last_nudge.elapsed() >= DIAL_NUDGE_INTERVAL
-                && !dial_contract::reported(&output)
-                && let Some(wire) = management.as_mut()
-                && wire.station.awaiting_the_dial()
-                && client_pending.is_empty()
-                && wire.station.nudges < wire.station.misbehaviour.nudge_limit()
-            {
-                last_nudge = Instant::now();
-                wire.station.nudges = wire.station.nudges.saturating_add(1);
-                client_pending.push_back(management_frame(&management_probe.port, DIAL_NUDGE_LEN));
-            }
             // The onboarding session, opened once the client's own exchange on
             // this wire has closed.
             //
@@ -7429,24 +7292,16 @@ fn run_boot(
                     client_pending.push_back(next);
                 }
             }
-            // And the same gap on the same wire, for the same reason: a session
-            // is carried by two domains over a relay between them, every pass
-            // that advances it runs on a wakeup, and the pass that closes the
-            // account has no frame of its own once the connection is gone. So
-            // the station goes on speaking until the appliance has reported the
-            // session — an observable — bounded by its own frame budget. Never
-            // beside a frame already queued, on the nudge above's terms.
-            if let Some(wire) = management.as_mut()
-                && wire.onboard.awaiting_the_port()
-                && last_nudge.elapsed() >= DIAL_NUDGE_INTERVAL
-                && !onboard_contract::reported(&output)
-                && client_pending.is_empty()
-                && wire.onboard.nudges < ONBOARD_NUDGE_LIMIT
-            {
-                last_nudge = Instant::now();
-                wire.onboard.nudges = wire.onboard.nudges.saturating_add(1);
-                client_pending.push_back(management_frame(&management_probe.port, DIAL_NUDGE_LEN));
-            }
+            // NOTHING IS INJECTED TO CARRY A SESSION EITHER, on the dial's
+            // terms and with one more of its own. The pass that closes a
+            // session's account has no frame of its own once the connection is
+            // gone, and the clock domain's tick runs it now. Frames sent to
+            // provoke it were not merely unnecessary: every one draws a console
+            // record out of the endpoint, and a domain whose log ring fills
+            // faster than a 115200-baud console drains it DROPS records —
+            // including the second of the two a session's account is written as,
+            // which is a failure of this harness's own making. So this station
+            // falls silent once its session is open and waits for the records.
             // One queued client frame per pass, and only once the port has
             // reported every frame ahead of it — the burst gate applied to the
             // exchange, so no two frames are ever in flight to a driver that may
@@ -7563,6 +7418,7 @@ fn run_boot(
     stderr_result?;
     frame_reader_result?;
     Ok(Booted {
+        started_at: start,
         serial: output,
         hardware_accelerated: test.hardware_accelerated,
         traffic,
@@ -11139,7 +10995,7 @@ mod tcp_client_tests {
         assert!(station.owed.is_empty());
         assert_eq!(station.step, OnboardStep::Unopened);
         assert!(station.completed());
-        assert!(!station.awaiting_the_port());
+
         assert!(station.seen().contains("opens no onboarding session"));
     }
 }

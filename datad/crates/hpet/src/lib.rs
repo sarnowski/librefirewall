@@ -65,14 +65,18 @@
 //!   counts *down* from a divisor at a rate this crate would have to hard-code
 //!   because the part does not state it. The HPET is a plain memory region and
 //!   states its own rate, so it costs one `<memory_region>` and no assumption.
-//! * **A comparator-driven interrupt** instead of the polled wait below. It is
-//!   the right end state and would remove the polling entirely, but it would
-//!   introduce the system's first IRQ and a new capability class — a change to
-//!   the capability topology, not to a driver.
-//! * **Programming any comparator at all.** Only the main counter is read, so
-//!   the timer block's comparators, their routing, and `NUM_TIM_CAP` are never
-//!   touched and nothing here reports them: an accessor for a field no caller
-//!   acts on would be surface without a purpose.
+//! * **A comparator-driven interrupt for the calibration wait below.** The wait
+//!   is one bounded span at boot and the polling that serves it costs the
+//!   dataplane that span once; an interrupt would cost the same span and a
+//!   round trip through the kernel. [`Hpet::arm_periodic`] programs a comparator
+//!   for the periodic wakeup, which is a different job: it has no span to wait
+//!   out and there is nothing to poll for.
+//! * **Reading `NUM_TIM_CAP`.** The field states the comparator count less one,
+//!   so every value it can take names a block that has the one comparator
+//!   [`Hpet::arm_periodic`] programs, and a block whose timer registers answer
+//!   nothing is refused by the capability and read-back checks there rather
+//!   than by a count it also chose. An accessor for a field no caller could act
+//!   on would be surface without a purpose.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -179,15 +183,105 @@ const COUNTER_CLK_PERIOD_SHIFT: u32 = 32;
 /// General Configuration bit 0, `ENABLE_CNF`: set, the main counter runs.
 const ENABLE_CNF: u64 = 1 << 0;
 
+/// The I/O APIC input this crate routes the periodic wakeup to.
+///
+/// Platform topology, exactly as [`MMIO_BASE`] is, and a constant for the same
+/// reason: the interrupt a protection domain may receive is granted by an
+/// `<irq>` element of the Microkit system description at build time, so a pin
+/// chosen at run time is one no statically granted capability could carry. The
+/// grant and this constant are one fact stated twice, and the build compares
+/// them.
+///
+/// **The input has to be one no other device drives, and that is a stronger
+/// requirement than it looks.** Two things decide it, and only the first is
+/// checkable here: the block's own routing capability says which inputs this
+/// timer may drive at all, and a bit outside it is refused by
+/// [`TimerError::RouteUnavailable`] rather than programmed. What no register
+/// says is whether something *else* is already wired to the input, and a shared
+/// one is not an error anywhere — it is a handler counting another device's
+/// interrupts as its own, and every schedule built on it running fast by
+/// whatever that device does.
+///
+/// This is not hypothetical. Input 2 was the obvious choice and is the wrong
+/// one: it looks like the legacy interrupt controller's cascade line, and on a
+/// PC-compatible platform it is where the interval timer's own line is
+/// delivered — so a wakeup armed for ten a second arrived thirty times a
+/// second. The last input is chosen instead: it is above every line the legacy
+/// devices occupy and at the top of the block the PCI functions are assigned
+/// from, so it is the input this appliance's own devices are furthest from ever
+/// being given.
+///
+/// "Furthest from" is not "cannot be", so the rate is *measured* rather than
+/// argued: the wakeups the appliance reports are counted on the running image
+/// against the interval they were armed for, and an input shared with anything
+/// shows up there as a count above what the period names.
+pub const INTERRUPT_PIN: u8 = 23;
+
+/// Timer 0 Configuration and Capability bit 1, `TN_INT_TYPE_CNF`: set, the
+/// timer drives its input as a level; clear, as an edge. Cleared by
+/// [`Hpet::arm_periodic`], which is what leaves the block with nothing to
+/// acknowledge — a level would stay asserted until the interrupt-status
+/// register were written back, and every wakeup would cost a second device
+/// access on a domain that otherwise touches no register at all.
+const TN_INT_TYPE_CNF: u64 = 1 << 1;
+
+/// Timer 0 Configuration and Capability bit 2, `TN_INT_ENB_CNF`: set, the timer
+/// raises its input when the comparator matches.
+const TN_INT_ENB_CNF: u64 = 1 << 2;
+
+/// Timer 0 Configuration and Capability bit 3, `TN_TYPE_CNF`: set, the
+/// comparator re-arms itself by its accumulator after every match.
+const TN_TYPE_CNF: u64 = 1 << 3;
+
+/// Timer 0 Configuration and Capability bit 4, `TN_PER_INT_CAP`, read-only: set
+/// for a comparator that can re-arm itself.
+const TN_PER_INT_CAP: u64 = 1 << 4;
+
+/// Timer 0 Configuration and Capability bit 6, `TN_VAL_SET_CNF`: set, the next
+/// write to the comparator lands in the accumulator rather than only in the
+/// comparator. It clears itself, so nothing reads it back.
+const TN_VAL_SET_CNF: u64 = 1 << 6;
+
+/// Timer 0 Configuration and Capability bit 8, `TN_32MODE_CNF`: set, a 64-bit
+/// comparator is operated as a 32-bit one. Cleared by [`Hpet::arm_periodic`]:
+/// the counter this crate accepts is 64 bits wide and the comparator is
+/// compared against the whole of it.
+const TN_32MODE_CNF: u64 = 1 << 8;
+
+/// Bit position and width of Timer 0 Configuration and Capability bits 13:9,
+/// `TN_INT_ROUTE_CNF` — which I/O APIC input the timer drives.
+const TN_INT_ROUTE_SHIFT: u32 = 9;
+const TN_INT_ROUTE_MASK: u64 = 0x1F << TN_INT_ROUTE_SHIFT;
+
+/// Bit position of Timer 0 Configuration and Capability bits 63:32,
+/// `TN_INT_ROUTE_CAP`, read-only — a bitmap of the inputs this timer may be
+/// routed to.
+const TN_INT_ROUTE_CAP_SHIFT: u32 = 32;
+
+// A pin outside the five bits the routing field holds could not be written at
+// all, and one this crate could not check the capability bitmap for would be
+// programmed on the strength of nothing.
+const _: () = assert!((INTERRUPT_PIN as u64) << TN_INT_ROUTE_SHIFT & !TN_INT_ROUTE_MASK == 0);
+
+/// The most ticks a periodic accumulator is armed with here.
+///
+/// The comparator is 64 bits wide and this is 31, which is a deliberate margin
+/// rather than a limit of the part: an accumulator above the low half is a
+/// value some implementations of this block take only 32 bits of, and a period
+/// silently truncated to its low half is a wakeup at a rate nobody chose. At
+/// the slowest counter the specification admits it is still over three minutes,
+/// which is longer than any wakeup period this appliance has a use for.
+pub const MAX_PERIODIC_TICKS: u64 = (1 << 31) - 1;
+
 /// One addressable register of the block, named by the offset it sits at within
 /// the granted [`MMIO_LENGTH`] bytes.
 ///
 /// It is also the whole of what [`HpetMmio`] accepts, so an offset outside the
 /// block is unrepresentable rather than rejected: nothing validates a bound
-/// here because nothing can name a value that would fail one. Only the three
-/// registers this crate uses are declared, so the timer comparators and their
-/// configuration — which lie in the same granted region — cannot be addressed
-/// at all.
+/// here because nothing can name a value that would fail one. Only the five
+/// registers this crate uses are declared, so every comparator but the first —
+/// and the interrupt-status register, which an edge-driven timer leaves nothing
+/// in — cannot be addressed at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(usize)]
 pub enum Register {
@@ -200,12 +294,24 @@ pub enum Register {
     /// Offset 0x0F0. Main Counter Value — the free-running count
     /// [`Hpet::wait_ticks`] measures.
     MainCounter = 0x0F0,
+    /// Offset 0x100. Timer 0 Configuration and Capability: what the comparator
+    /// may do, and what it is told to do.
+    Timer0Configuration = 0x100,
+    /// Offset 0x108. Timer 0 Comparator Value, and — while `TN_VAL_SET_CNF`
+    /// stands — the accumulator a periodic comparator re-arms itself by.
+    Timer0Comparator = 0x108,
 }
 
 impl Register {
     /// Every register this crate can address, so an [`HpetMmio`] proving its
     /// authority spans the whole demand enumerates it rather than restating it.
-    pub const ALL: [Self; 3] = [Self::Capabilities, Self::Configuration, Self::MainCounter];
+    pub const ALL: [Self; 5] = [
+        Self::Capabilities,
+        Self::Configuration,
+        Self::MainCounter,
+        Self::Timer0Configuration,
+        Self::Timer0Comparator,
+    ];
 
     /// This register's offset from the base of the block.
     ///
@@ -225,6 +331,8 @@ impl Register {
 const _: () = assert!(Register::Capabilities.offset() == 0x000);
 const _: () = assert!(Register::Configuration.offset() == 0x010);
 const _: () = assert!(Register::MainCounter.offset() == 0x0F0);
+const _: () = assert!(Register::Timer0Configuration.offset() == 0x100);
+const _: () = assert!(Register::Timer0Comparator.offset() == 0x108);
 
 // Every access is one aligned 64-bit quantity wholly inside the block, and the
 // block is wholly inside one page — which is what makes a single
@@ -244,7 +352,18 @@ const _: () = assert!(
         .offset()
         .is_multiple_of(size_of::<u64>())
 );
+const _: () = assert!(
+    Register::Timer0Configuration
+        .offset()
+        .is_multiple_of(size_of::<u64>())
+);
+const _: () = assert!(
+    Register::Timer0Comparator
+        .offset()
+        .is_multiple_of(size_of::<u64>())
+);
 const _: () = assert!(Register::MainCounter.offset() + size_of::<u64>() <= MMIO_LENGTH);
+const _: () = assert!(Register::Timer0Comparator.offset() + size_of::<u64>() <= MMIO_LENGTH);
 const _: () = assert!(MMIO_BASE.is_multiple_of(MMIO_LENGTH));
 const _: () = assert!(MMIO_BASE % PAGE_SIZE + MMIO_LENGTH <= PAGE_SIZE);
 // One page and not two, the line above having put the whole block inside one.
@@ -252,9 +371,9 @@ const _: () = assert!(MMIO_REGION_SIZE == PAGE_SIZE);
 
 /// Aligned 64-bit access to the block's registers.
 ///
-/// `read_u64` takes `&self` because reading any of the three is free of effect
-/// on the part: unlike a UART's receive buffer, the main counter does not pop
-/// and the capabilities register does not clear.
+/// `read_u64` takes `&self` because reading any of the five is free of effect
+/// on the part: unlike a UART's receive buffer, the main counter does not pop,
+/// the capabilities register does not clear, and neither does a comparator.
 pub trait HpetMmio {
     fn read_u64(&self, register: Register) -> u64;
 
@@ -307,6 +426,47 @@ pub enum HpetError {
     /// admits, and refused rather than truncated because a silently shortened
     /// calibration window is one whose result is wrong without saying so.
     DurationTooLong { nanoseconds: u64 },
+}
+
+/// Why the block would not carry a periodic wakeup.
+///
+/// Separate from [`HpetError`] because the two are answered differently and by
+/// different callers: an [`HpetError`] means no time was established at all,
+/// and one of these means a time was established and nothing will announce that
+/// it has moved on. A caller that folded them would have one refusal for a node
+/// that cannot tell the time and a node that can.
+///
+/// Every variant carries what the block answered, on [`HpetError`]'s terms: a
+/// comparator that cannot re-arm itself, one that cannot drive the input this
+/// build was granted, and one that dropped what was written to it are three
+/// different parts to go and look at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerError {
+    /// `TN_PER_INT_CAP` is clear: the comparator does not re-arm itself, so a
+    /// wakeup on a period would have to be re-armed from the interrupt it
+    /// raised — a device write on every tick, and a tick lost for good the
+    /// first time the counter passed the new value before the write landed.
+    NotPeriodicCapable { configuration: u64 },
+    /// `TN_INT_ROUTE_CAP` does not include [`INTERRUPT_PIN`], so the input this
+    /// build holds a capability for is one this timer cannot drive. The bitmap
+    /// is carried whole: which inputs it *does* offer is the whole of what an
+    /// operator would act on.
+    RouteUnavailable { route_cap: u32 },
+    /// The span names fewer than one tick of this counter. A periodic
+    /// accumulator of zero re-arms the comparator on the value it just matched,
+    /// which is a wakeup with no interval between one and the next.
+    PeriodTooShort { nanoseconds: u64 },
+    /// The span names more ticks than [`MAX_PERIODIC_TICKS`] admits, carrying
+    /// the exact count. `u128` rather than `u64`: the product may leave `u64`
+    /// for a block claiming a period near a femtosecond, and narrowing it for
+    /// the report would print a plausible count for the very value the bound
+    /// exists to refuse.
+    PeriodTooLong { ticks: u128 },
+    /// The configuration register did not read back as armed — the enable, the
+    /// periodic mode, or the routing did not stay written — so no interrupt
+    /// will be raised and the whole word is carried to say which part of it the
+    /// block dropped.
+    NotArmed { read_back: u64 },
 }
 
 /// A `COUNTER_CLK_PERIOD` the specification's band admits, and the frequency it
@@ -506,12 +666,102 @@ impl<M: HpetMmio> Hpet<M> {
         }
         Ok(ticks as u64)
     }
+
+    /// Program comparator 0 to raise [`INTERRUPT_PIN`] once every `period`, for
+    /// ever, and report the accumulator it was armed with.
+    ///
+    /// This is the whole of the appliance's periodic wakeup: a protection
+    /// domain holding the matching `<irq>` is entered once per period and
+    /// nothing else in the system has to run for that to keep happening. It is
+    /// the only thing here that writes a comparator, and it writes one exactly
+    /// once — a caller that armed it twice would be re-arming a running timer
+    /// from a counter reading taken after it started, which drops one interval
+    /// on every call.
+    ///
+    /// **Edge-driven, and that is what makes the tick free of device work.**
+    /// `TN_INT_TYPE_CNF` is cleared, so the block raises the input and lowers it
+    /// again without waiting to be told, and the interrupt-status register — the
+    /// one a level-driven timer obliges its handler to write back — stays a
+    /// register this crate cannot even name. What the handler owes is the
+    /// kernel's own acknowledgement and nothing on the device at all.
+    ///
+    /// The sequence is the specification's: the configuration word first with
+    /// `TN_VAL_SET_CNF` standing, then the comparator with the absolute count of
+    /// the first match, then the comparator again with the interval between
+    /// matches. The second write is what the accumulator takes, and the block
+    /// clears `TN_VAL_SET_CNF` itself.
+    ///
+    /// Six accesses and no loop, on [`probe`](Self::probe)'s terms: every
+    /// question is answered by the first read of the register that answers it.
+    /// A refusal leaves the block wherever the failing step left it — before any
+    /// write where the capability checks refuse, and with a comparator armed to
+    /// drive an input the read-back says it did not take where the last one
+    /// does. Neither is a state to unwind: the interrupt this domain holds is
+    /// the only one that input has a handler for.
+    pub fn arm_periodic(&mut self, period: Duration) -> Result<u64, TimerError> {
+        let configuration = self.mmio.read_u64(Register::Timer0Configuration);
+        if configuration & TN_PER_INT_CAP == 0 {
+            return Err(TimerError::NotPeriodicCapable { configuration });
+        }
+        // Narrowing to the field the specification defines, so a block that set
+        // a bit below it cannot make an input look routable.
+        let route_cap = (configuration >> TN_INT_ROUTE_CAP_SHIFT) as u32;
+        if route_cap & (1 << INTERRUPT_PIN) == 0 {
+            return Err(TimerError::RouteUnavailable { route_cap });
+        }
+
+        let nanoseconds = period.as_nanos();
+        // `ticks_for`'s arithmetic, widened for the same reason and ranged
+        // against this crate's own bound rather than against `u64`.
+        let ticks = (nanoseconds as u128 * FEMTOSECONDS_PER_NANOSECOND as u128)
+            / u128::from(self.period.femtoseconds);
+        if ticks == 0 {
+            return Err(TimerError::PeriodTooShort { nanoseconds });
+        }
+        if ticks > MAX_PERIODIC_TICKS as u128 {
+            return Err(TimerError::PeriodTooLong { ticks });
+        }
+        let ticks = ticks as u64;
+
+        // Read-modify-write, as the general configuration is written: every bit
+        // this crate does not name selects behaviour it has no basis to choose,
+        // and the four fields it does name are cleared before they are set so a
+        // routing or a mode the firmware left behind cannot survive underneath
+        // the one being programmed.
+        let armed = (configuration
+            & !(TN_INT_TYPE_CNF | TN_TYPE_CNF | TN_32MODE_CNF | TN_INT_ROUTE_MASK))
+            | TN_INT_ENB_CNF
+            | TN_TYPE_CNF
+            | TN_VAL_SET_CNF
+            | ((INTERRUPT_PIN as u64) << TN_INT_ROUTE_SHIFT);
+        self.mmio.write_u64(Register::Timer0Configuration, armed);
+        // The first match, one interval from now. Wrapping, on `wait_ticks`'s
+        // terms: a sum that crosses the top of `u64` is the counter value the
+        // comparator will match, and the block compares the whole width.
+        let first = self
+            .mmio
+            .read_u64(Register::MainCounter)
+            .wrapping_add(ticks);
+        self.mmio.write_u64(Register::Timer0Comparator, first);
+        self.mmio.write_u64(Register::Timer0Comparator, ticks);
+
+        let read_back = self.mmio.read_u64(Register::Timer0Configuration);
+        let wanted = TN_INT_ENB_CNF | TN_TYPE_CNF | ((INTERRUPT_PIN as u64) << TN_INT_ROUTE_SHIFT);
+        if read_back & (TN_INT_ENB_CNF | TN_TYPE_CNF | TN_INT_TYPE_CNF | TN_INT_ROUTE_MASK)
+            != wanted
+        {
+            return Err(TimerError::NotArmed { read_back });
+        }
+        Ok(ticks)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_device::{CRYSTAL_PERIOD_FEMTOSECONDS, FakeHpet, Log, Op, capabilities_word};
+    use crate::fake_device::{
+        CONFORMING_ROUTE_CAP, CRYSTAL_PERIOD_FEMTOSECONDS, FakeHpet, Log, Op, capabilities_word,
+    };
     use lfw_clock::{CalibrationError, MIN_PLAUSIBLE_TSC_HZ, calibrate};
     use proptest::prelude::*;
     use std::vec;
@@ -578,6 +828,8 @@ mod tests {
         assert_eq!(Register::Capabilities.offset(), 0x000);
         assert_eq!(Register::Configuration.offset(), 0x010);
         assert_eq!(Register::MainCounter.offset(), 0x0F0);
+        assert_eq!(Register::Timer0Configuration.offset(), 0x100);
+        assert_eq!(Register::Timer0Comparator.offset(), 0x108);
     }
 
     #[test]
@@ -591,15 +843,19 @@ mod tests {
             Register::Capabilities,
             Register::Configuration,
             Register::MainCounter,
+            Register::Timer0Configuration,
+            Register::Timer0Comparator,
         ] {
             let listed = match register {
-                Register::Capabilities | Register::Configuration | Register::MainCounter => {
-                    Register::ALL.contains(&register)
-                }
+                Register::Capabilities
+                | Register::Configuration
+                | Register::MainCounter
+                | Register::Timer0Configuration
+                | Register::Timer0Comparator => Register::ALL.contains(&register),
             };
             assert!(listed, "{register:?} is missing from Register::ALL");
         }
-        assert_eq!(Register::ALL.len(), 3);
+        assert_eq!(Register::ALL.len(), 5);
     }
 
     #[test]
@@ -1002,6 +1258,191 @@ mod tests {
         );
     }
 
+    /// Arm a fake that accepts the sequence and hand back the log of the arming
+    /// alone, the probe's own operations having been taken first.
+    fn armed(device: FakeHpet, period: Duration) -> (Log, Result<u64, TimerError>) {
+        let log = device.log();
+        let mut hpet = Hpet::probe(device).expect("the fake accepts the sequence");
+        log.take();
+        let outcome = hpet.arm_periodic(period);
+        (log, outcome)
+    }
+
+    #[test]
+    fn arming_writes_the_specification_sequence_and_nothing_else() {
+        // A conforming block's counter advances one tick per read, and the
+        // probe has already made three of them, so the reading the first match
+        // is computed from is the fourth.
+        let period = Duration::from_millis(100);
+        let (log, outcome) = armed(FakeHpet::conforming(), period);
+        // The count is the same widened quotient the crate computes, taken from
+        // the period the fake claims rather than restated as a literal.
+        let expected = (u128::from(period.as_nanos()) * u128::from(FEMTOSECONDS_PER_NANOSECOND)
+            / u128::from(CRYSTAL_PERIOD_FEMTOSECONDS)) as u64;
+        assert_eq!(outcome, Ok(expected));
+
+        let ops = log.ops();
+        assert_eq!(ops.len(), 6, "{ops:?}");
+        // The order is the contract: capability read, configuration write with
+        // the set bit standing, the counter, both comparator writes, read back.
+        assert!(matches!(
+            ops[0],
+            Op::Read {
+                register: Register::Timer0Configuration,
+                ..
+            }
+        ));
+        let Op::Write {
+            register: Register::Timer0Configuration,
+            value: armed_word,
+        } = ops[1]
+        else {
+            panic!("the second access arms the timer: {ops:?}");
+        };
+        assert_ne!(armed_word & TN_INT_ENB_CNF, 0);
+        assert_ne!(armed_word & TN_TYPE_CNF, 0);
+        assert_ne!(armed_word & TN_VAL_SET_CNF, 0);
+        // Edge-driven and 64-bit, which is what leaves the handler nothing to
+        // write back to the part.
+        assert_eq!(armed_word & TN_INT_TYPE_CNF, 0);
+        assert_eq!(armed_word & TN_32MODE_CNF, 0);
+        assert_eq!(
+            (armed_word & TN_INT_ROUTE_MASK) >> TN_INT_ROUTE_SHIFT,
+            u64::from(INTERRUPT_PIN)
+        );
+
+        let Op::Read {
+            register: Register::MainCounter,
+            value: counter,
+        } = ops[2]
+        else {
+            panic!("the first match is computed from a counter reading: {ops:?}");
+        };
+        assert_eq!(
+            ops[3],
+            Op::Write {
+                register: Register::Timer0Comparator,
+                value: counter.wrapping_add(expected),
+            },
+            "the first match is one interval from the reading taken"
+        );
+        assert_eq!(
+            ops[4],
+            Op::Write {
+                register: Register::Timer0Comparator,
+                value: expected,
+            },
+            "the accumulator is the interval itself"
+        );
+        assert!(
+            matches!(
+                ops[5],
+                Op::Read {
+                    register: Register::Timer0Configuration,
+                    ..
+                }
+            ),
+            "the arming is confirmed by reading it back: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_comparator_that_cannot_re_arm_itself_is_refused_before_anything_is_written() {
+        let (log, outcome) = armed(
+            FakeHpet::conforming().without_periodic_capability(),
+            Duration::from_millis(100),
+        );
+        let configuration = u64::from(CONFORMING_ROUTE_CAP) << TN_INT_ROUTE_CAP_SHIFT;
+        assert_eq!(
+            outcome,
+            Err(TimerError::NotPeriodicCapable { configuration })
+        );
+        // Nothing written: a block that said it cannot do this is left as the
+        // firmware left it.
+        assert!(
+            log.ops().iter().all(|op| matches!(op, Op::Read { .. })),
+            "{:?}",
+            log.ops()
+        );
+    }
+
+    #[test]
+    fn a_comparator_that_cannot_drive_the_granted_input_is_refused_with_the_ones_it_offers() {
+        // Every input but the one this build holds a capability for.
+        let route_cap = !(1u32 << INTERRUPT_PIN);
+        let (log, outcome) = armed(
+            FakeHpet::conforming().routable_to(route_cap),
+            Duration::from_millis(100),
+        );
+        assert_eq!(outcome, Err(TimerError::RouteUnavailable { route_cap }));
+        assert!(
+            log.ops().iter().all(|op| matches!(op, Op::Read { .. })),
+            "{:?}",
+            log.ops()
+        );
+    }
+
+    #[test]
+    fn a_period_below_one_tick_and_one_past_the_bound_are_separate_refusals() {
+        assert_eq!(
+            armed(FakeHpet::conforming(), Duration::from_nanos(0)).1,
+            Err(TimerError::PeriodTooShort { nanoseconds: 0 })
+        );
+        // A block claiming a period of one femtosecond turns a hundred
+        // milliseconds into 10^14 ticks, three orders past the bound.
+        let period = Duration::from_millis(100);
+        let ticks = u128::from(period.as_nanos()) * u128::from(FEMTOSECONDS_PER_NANOSECOND);
+        assert_eq!(
+            armed(FakeHpet::conforming().with_period(1), period).1,
+            Err(TimerError::PeriodTooLong { ticks })
+        );
+        // And the boundary itself: the largest count that still arms.
+        let at_bound = MAX_PERIODIC_TICKS;
+        let nanos = at_bound * u64::from(CRYSTAL_PERIOD_FEMTOSECONDS) / FEMTOSECONDS_PER_NANOSECOND;
+        let outcome = armed(FakeHpet::conforming(), Duration::from_nanos(nanos)).1;
+        assert!(
+            matches!(outcome, Ok(ticks) if ticks <= MAX_PERIODIC_TICKS),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_block_that_drops_the_arming_bits_is_refused_with_the_word_it_kept() {
+        let (_, outcome) = armed(
+            FakeHpet::conforming().refusing_arming(),
+            Duration::from_millis(100),
+        );
+        let Err(TimerError::NotArmed { read_back }) = outcome else {
+            panic!("a block that never arms must refuse: {outcome:?}");
+        };
+        // The routing and the mode were taken and the enable was not, which is
+        // exactly what the whole word is carried to say.
+        assert_eq!(read_back & TN_INT_ENB_CNF, 0);
+        assert_eq!(
+            (read_back & TN_INT_ROUTE_MASK) >> TN_INT_ROUTE_SHIFT,
+            u64::from(INTERRUPT_PIN)
+        );
+    }
+
+    #[test]
+    fn each_way_an_arming_can_fail_reaches_an_operator_as_its_own_error() {
+        // Five distinct causes must not collapse into one line.
+        let period = Duration::from_millis(100);
+        let refusals = [
+            armed(FakeHpet::conforming().without_periodic_capability(), period).1,
+            armed(FakeHpet::conforming().routable_to(0), period).1,
+            armed(FakeHpet::conforming(), Duration::from_nanos(0)).1,
+            armed(FakeHpet::conforming().with_period(1), period).1,
+            armed(FakeHpet::conforming().refusing_arming(), period).1,
+        ];
+        for (index, outcome) in refusals.iter().enumerate() {
+            assert!(outcome.is_err(), "refusal {index} must be an error");
+            for other in refusals.iter().skip(index + 1) {
+                assert_ne!(outcome, other);
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -1140,33 +1581,62 @@ mod tests {
             }
         }
 
-        /// The one register this crate ever writes is the configuration
-        /// register — on any path, for any device answers.
+        /// The two registers this crate never writes stay unwritten — on any
+        /// path, for any device answers.
         ///
         /// [`HpetMmio`] takes a [`Register`], so *which* offsets can be reached
         /// is a question the type answers and no test can restate. What it does
-        /// not answer is which of the three may be written: a write to the main
+        /// not answer is which of the five may be written: a write to the main
         /// counter would reset the very quantity being measured, and one to the
         /// read-only capabilities register would be meaningless. Both are
         /// expressible, so both are excluded here rather than by construction.
         #[test]
-        fn no_path_writes_any_register_but_the_configuration(
+        fn no_path_writes_a_register_the_part_does_not_take(
             capabilities in any::<u64>(),
+            timer_configuration in any::<u64>(),
             answers in prop::collection::vec(any::<u64>(), 1..16),
             ticks in 0..8u64,
+            period_nanos in 0..2_000_000_000u64,
         ) {
             let device = FakeHpet::conforming()
                 .with_capabilities(capabilities)
+                .with_timer_configuration(timer_configuration)
                 .answering_counter(answers);
             let log = device.log();
-            if let Ok(hpet) = Hpet::probe(device) {
+            if let Ok(mut hpet) = Hpet::probe(device) {
                 let _ = hpet.wait_ticks(ticks);
                 let _ = hpet.counter();
+                let _ = hpet.arm_periodic(Duration::from_nanos(period_nanos));
             }
             for op in log.ops() {
                 if let Op::Write { register, .. } = op {
-                    prop_assert_eq!(register, Register::Configuration);
+                    prop_assert!(matches!(
+                        register,
+                        Register::Configuration
+                            | Register::Timer0Configuration
+                            | Register::Timer0Comparator
+                    ));
                 }
+            }
+        }
+
+        /// Arming terminates and either arms or refuses, whatever the block
+        /// answers — the property the domain that calls it needs, since a boot
+        /// that hung here would take the appliance's own console with it.
+        #[test]
+        fn arming_a_wholly_arbitrary_block_always_terminates(
+            answers in prop::collection::vec(any::<u64>(), 1..16),
+            period_nanos in 0..2_000_000_000u64,
+        ) {
+            let device = FakeHpet::conforming().answering(answers);
+            let log = device.log();
+            if let Ok(mut hpet) = Hpet::probe(device) {
+                let before = log.len();
+                let _ = hpet.arm_periodic(Duration::from_nanos(period_nanos));
+                // Six accesses at most and no loop: the bound is the sequence
+                // itself, so a block that answers nothing truthfully still
+                // costs a fixed number of device accesses.
+                prop_assert!(log.len() - before <= 6);
             }
         }
     }

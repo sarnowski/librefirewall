@@ -597,6 +597,14 @@ pub const CLOCK_FREQUENCY_HERTZ: Metric = metric(
     "The timestamp counter frequency this node measured at boot; 0 before it did.",
 );
 
+pub const CLOCK_TICKS: Metric = metric(
+    "librefirewall_clock_ticks_total",
+    Kind::Counter,
+    "Periodic wakeups this domain's timer has raised and it has passed on. It stands still on a \
+     node whose timer could not be armed, which is the node whose schedules only advance when a \
+     frame arrives.",
+);
+
 // ── The hardware probe ──────────────────────────────────────────────────────
 
 pub const HARDWARE_PROBE_PROVEN: Metric = metric(
@@ -1117,6 +1125,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &CLOCK_GENERATION,
     &CLOCK_CALIBRATIONS_REFUSED,
     &CLOCK_FREQUENCY_HERTZ,
+    &CLOCK_TICKS,
     &HARDWARE_PROBE_PROVEN,
     &HARDWARE_PROBE_ITERATIONS,
     &HARDWARE_PROBE_PREEMPTIONS,

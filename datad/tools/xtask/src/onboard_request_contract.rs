@@ -242,9 +242,10 @@ pub(crate) fn identity(serial: &[u8]) -> Result<(String, String), String> {
 /// Run every attempt against the forwarded port, nudging the appliance between
 /// them.
 ///
-/// `nudge` is called after each attempt for [`crate::onboard_tls_contract`]'s
-/// reason: the domain that carries a session holds no timer, and the pass that
-/// writes a session's account runs after the client's connection is gone.
+/// [`crate::onboard_tls_contract::settle`] is called after each attempt for its
+/// reason: the pass that writes a request's account runs after the client's
+/// connection is gone, and nothing is put on the wire to provoke it — the
+/// appliance's own periodic wakeup runs it.
 ///
 /// # Errors
 /// A client that could not be run at all, which is the harness's own failure
@@ -253,14 +254,13 @@ pub(crate) fn drive(
     onboard_port: u16,
     fingerprint: &str,
     into: &Path,
-    mut nudge: impl FnMut() -> Result<(), String>,
 ) -> Result<Vec<Attempt>, String> {
     let pin = pinned(fingerprint)?;
     let mut attempts = Vec::new();
     for (index, ask) in ASKS.iter().enumerate() {
         attempts.push(fetch(ask, index, onboard_port, &pin, into)?);
-        nudge()?;
-        nudge()?;
+        crate::onboard_tls_contract::settle();
+        crate::onboard_tls_contract::settle();
     }
     Ok(attempts)
 }

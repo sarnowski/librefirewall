@@ -1015,6 +1015,7 @@ fn colons(mac: [u8; 6]) -> String {
 /// The verdict, naming the field and the two values.
 pub fn judge(
     scrapes: &[Scrape],
+    booted_for: Duration,
     forwarded_frames: u64,
     witness: PolicyWitness,
     topology: &Topology,
@@ -1071,9 +1072,73 @@ pub fn judge(
             refused.value
         ));
     }
+    let ticks = judge_ticks(booted_for, first, second)?;
     Ok(format!(
-        "{judged}\n{}",
+        "{judged}\n{}\n  {ticks}",
         render(&[requests, ok, bytes, refused])
+    ))
+}
+
+/// The appliance's periodic wakeup, judged from the outside.
+///
+/// **The counter being non-zero is the load-bearing half.** Nothing in this
+/// system asks the clock domain for anything — it is woken by its own timer and
+/// by nothing else — so a count above zero is a wakeup that happened on time
+/// rather than on traffic, which is the whole property the schedules built on it
+/// depend upon. A node whose timer could not be armed reports zero for ever, and
+/// says why on its console.
+///
+/// **The ceiling beside it is what catches a shared interrupt input**, which is
+/// a fault no other surface shows: the handler counts another device's
+/// interrupts as its own, every schedule runs fast by whatever that device does,
+/// and nothing anywhere is in an error state. It was found exactly this way, on
+/// an input that looked free and carried the platform's interval timer. The
+/// count is held against the time since QEMU started — an upper bound on the
+/// appliance's uptime — so it costs the run nothing and asserts only in the
+/// direction where an honest appliance has no headroom at all: a periodic
+/// comparator cannot fire faster than the accumulator it was armed with.
+///
+/// The two scrapes are taken back to back, so nothing is stated about the
+/// difference between them: at ten wakeups a second and a gap of milliseconds,
+/// a counter that has not moved is an appliance behaving perfectly.
+fn judge_ticks(booted_for: Duration, first: &Scrape, second: &Scrape) -> Result<String, String> {
+    let before = one(&parse(&first.body)?, "librefirewall_clock_ticks_total", &[])?.value;
+    let after = one(
+        &parse(&second.body)?,
+        "librefirewall_clock_ticks_total",
+        &[],
+    )?
+    .value;
+    if after < before {
+        return Err(format!(
+            "the periodic wakeup counted {after} on the second scrape and {before} on the first, \
+             so a counter that only rises went backwards"
+        ));
+    }
+    if after == 0 {
+        return Err(String::from(
+            "the appliance reports no periodic wakeup at all, so nothing is waking the domain \
+             that holds this node's schedules: its reconnection backoff, its acknowledgement \
+             cadence and its upstream flush would all advance only when a frame happened to \
+             arrive. The clock domain's console record says whether it could arm its timer",
+        ));
+    }
+    let ceiling = booted_for.as_secs() * pd_runtime::TICKS_PER_SECOND;
+    if after > ceiling {
+        return Err(format!(
+            "the appliance reports {after} periodic wakeup(s) and its timer is armed for {} a \
+             second, so {ceiling} is every wakeup it could have taken in the {:.1}s this machine \
+             has existed — firmware and boot included. A count above that is an interrupt input \
+             shared with another device, whose interrupts this appliance is taking for its own",
+            pd_runtime::TICKS_PER_SECOND,
+            booted_for.as_secs_f64()
+        ));
+    }
+    Ok(format!(
+        "the periodic wakeup reports {after} against a ceiling of {ceiling} for {:.1}s of machine \
+         lifetime at {} a second",
+        booted_for.as_secs_f64(),
+        pd_runtime::TICKS_PER_SECOND
     ))
 }
 

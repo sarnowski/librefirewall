@@ -24,11 +24,55 @@
 //! # Why a region rather than an IPC
 //!
 //! There is no message to send. A channel to the clock domain would put a round
-//! trip on the path of every record and hand a wakeup capability to seven
-//! domains over a domain that runs once and parks; the system description says
-//! what the read grant does and does not give instead.
+//! trip on the path of every record and hand a wakeup capability to nine domains
+//! over the domain that owns this node's idea of time; the system description
+//! says what the read grant does and does not give instead. The one channel that
+//! domain does hold runs the other way and carries no time at all — see
+//! [`TICK_PERIOD`].
 
-use lfw_clock::{Calibration, Monotonic, Ticks};
+use lfw_clock::{Calibration, Duration, Monotonic, Ticks};
+
+/// How often the clock domain wakes the management domain.
+///
+/// It lives here rather than in either domain because two components state it
+/// and neither may guess the other's: the domain that arms the timer, and the
+/// build's own check that the wakeups a booted appliance reports are arriving at
+/// the rate it was armed for. A second copy would let one of the two be right
+/// about a period the other was not using.
+///
+/// **A hundred milliseconds, derived from the obligations that rest on it.** The
+/// tightest is the management channel's upstream flush, which owes a send once a
+/// second whenever bytes are waiting; a deadline carried by a wakeup on a period
+/// is reached at most one period late, so this interval *is* the resolution of
+/// every schedule built on it, and a tenth of the tightest obligation is the
+/// accuracy those schedules are worth. The coarser two are met with room over:
+/// the acknowledgement cadence answers every five seconds, and the reconnection
+/// backoff opens at a second.
+///
+/// What the backoff loses is worth stating rather than leaving to be discovered.
+/// Its delay is drawn uniformly below a bound, and a wakeup on a period quantises
+/// that draw — ten distinct instants across the first bound, twenty across the
+/// second, three thousand at the five-minute cap. So a fleet's redials spread
+/// further with every attempt, and the attempt where the spread is narrowest is
+/// the one where the fleet is least likely to have been disconnected in step to
+/// begin with.
+///
+/// What it costs is one preemption of the dataplane per interval — the clock
+/// domain runs above the forwarder — plus the wakeup it hands on. Ten a second,
+/// each of them a fixed handful of instructions. A shorter interval buys
+/// resolution nothing asks for and charges for it on every second the appliance
+/// forwards.
+pub const TICK_PERIOD: Duration = Duration::from_millis(100);
+
+// A period of zero would arm a comparator that re-fires on the value it just
+// matched, and one that does not divide a second makes every rate stated
+// against it an approximation nobody chose.
+const _: () = assert!(TICK_PERIOD.as_nanos() > 0);
+const _: () = assert!(lfw_clock::NANOS_PER_SECOND.is_multiple_of(TICK_PERIOD.as_nanos()));
+
+/// Wakeups a second [`TICK_PERIOD`] names — the rate a consumer compares an
+/// observed count against.
+pub const TICKS_PER_SECOND: u64 = lfw_clock::NANOS_PER_SECOND / TICK_PERIOD.as_nanos();
 use lfw_log::Stamp;
 use wire::ClockCalibration;
 

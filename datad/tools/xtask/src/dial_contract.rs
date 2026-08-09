@@ -158,15 +158,37 @@ pub(crate) struct DialVerdict {
     pub account: Option<DialAccount>,
 }
 
-/// Whether the appliance has decided the channel and said so.
+/// Whether the appliance has decided the channel and said **all** of what that
+/// decision owes.
 ///
 /// The observable a boot with a misbehaving station waits on. Such a boot never
 /// sees a channel close — that is what makes it the boot it is — so what says
-/// the appliance has finished is its own record, which is an event rather than a
+/// the appliance has finished is its own records, which are events rather than a
 /// duration.
+///
+/// **The whole set and not the first of it.** A failed channel reports the
+/// outcome and then the three records that place it, and the domain emits them
+/// in one pass — but a console renders a ring at 115200 baud, so a run that
+/// stopped at the outcome could kill the emulator with the evidence still in the
+/// UART and then fail for want of the very records the appliance had already
+/// written. Waiting on the last of them is waiting on the observable this
+/// contract is about to judge.
 pub(crate) fn reported(serial: &[u8]) -> bool {
     let text = String::from_utf8_lossy(serial);
-    !records(&text).is_empty()
+    let [record] = records(&text)[..] else {
+        return false;
+    };
+    // Which record the appliance emits last is decided by the outcome, and the
+    // three cases are the three shapes of the report: a channel that came up
+    // places no fault and owes nothing further, one that failed places it in
+    // three more records, and one a station misacknowledged adds the pair it
+    // claimed after those.
+    let last = match value(record, OUTCOME) {
+        Some(token) if token == DialOutcome::Answered.name() => return true,
+        Some(token) if token == DialOutcome::UnacceptableAcknowledgement.name() => ACKNOWLEDGED,
+        _ => SYNS,
+    };
+    !ours_carrying(&text, last).is_empty()
 }
 
 /// Judge the appliance's record of its dialled channel against what the station
@@ -492,6 +514,14 @@ mod tests {
         )
     }
 
+    /// The fifth record, which only a misacknowledged channel adds.
+    fn acknowledged(claimed: u32, expected: u32) -> String {
+        format!(
+            "LFW-PD domain=management state=ready dial-acknowledged={claimed} \
+             dial-expected={expected}\r\n"
+        )
+    }
+
     fn dialled(destination: &str, port: u16, attempts: u64, outcome: &str) -> String {
         format!(
             "LFW-PD domain=management state=ready dial-destination={destination} \
@@ -604,11 +634,35 @@ mod tests {
         assert!(!reported(capture.as_bytes()));
     }
 
+    /// A failed channel is not reported until the records that place it have
+    /// arrived too — the property that keeps a run from killing the emulator
+    /// with its own evidence still in the UART.
     #[test]
-    fn a_record_is_reported_only_once_the_appliance_has_decided_the_channel() {
+    fn a_failed_channel_is_reported_only_once_its_evidence_has_arrived_as_well() {
         assert!(!reported(booted().as_bytes()));
+        let outcome_alone = booted() + &dialled("10.0.2.2", 4433, 3, "next-hop-unreachable");
+        assert!(!reported(outcome_alone.as_bytes()));
+        assert!(reported((outcome_alone + &placed()).as_bytes()));
+    }
+
+    /// A channel that came up owes none of them, so its outcome record is the
+    /// whole of what there is to wait for.
+    #[test]
+    fn a_channel_that_came_up_is_reported_by_its_outcome_alone() {
         assert!(reported(
-            (booted() + &dialled("10.0.2.2", 4433, 3, "next-hop-unreachable")).as_bytes()
+            (booted() + &dialled("10.0.2.2", 4433, 1, "answered")).as_bytes()
+        ));
+    }
+
+    /// A misacknowledged channel adds a fifth record after the three, so the
+    /// three are not the whole of what to wait for on that one outcome.
+    #[test]
+    fn a_misacknowledged_channel_is_reported_only_once_its_pair_has_arrived() {
+        let placed =
+            booted() + &dialled("10.0.2.2", 4433, 3, "unacceptable-acknowledgement") + &placed();
+        assert!(!reported(placed.as_bytes()));
+        assert!(reported(
+            (placed + &acknowledged(0x1234_5678, 99)).as_bytes()
         ));
     }
 

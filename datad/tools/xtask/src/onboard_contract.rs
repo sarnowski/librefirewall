@@ -488,7 +488,6 @@ mod tests {
             crowded: matches!(behaviour, OnboardBehaviour::Crowds),
             crowd_answers: 0,
             segments: 3,
-            nudges: 7,
         }
     }
 

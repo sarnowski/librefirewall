@@ -191,9 +191,10 @@ impl Onboarded {
 
 /// Play the management server against an appliance that has never met one.
 ///
-/// `nudge` is called between attempts on [`crate::onboard_tls_contract`]'s
-/// terms: the domain that carries a session holds no timer, and the pass that
-/// writes a request's account runs after the client's connection is gone.
+/// [`crate::onboard_tls_contract::settle`] is called between attempts on its
+/// terms: the pass that writes a request's account runs after the client's
+/// connection is gone, and an install's own account is written by a second
+/// domain behind it — neither is provoked, both are waited for.
 ///
 /// # Errors
 /// A tool that would not run, a request the appliance would not serve, or a
@@ -206,7 +207,6 @@ pub(crate) fn onboard(
     fingerprint: &str,
     device: &str,
     into: &Path,
-    mut nudge: impl FnMut() -> Result<(), String>,
 ) -> Result<Onboarded, String> {
     let pin = pinned(fingerprint)?;
     let mut attempts = Vec::new();
@@ -221,8 +221,8 @@ pub(crate) fn onboard(
     let fetched = run(&request, 0, onboard_port, &pin, into)?;
     let subject = issue_to(root, into, &fetched, device)?;
     attempts.push(fetched);
-    nudge()?;
-    nudge()?;
+    crate::onboard_tls_contract::settle();
+    crate::onboard_tls_contract::settle();
 
     let anchor_fingerprint = anchor_fingerprint(root, into)?;
     let (package, package_len) = compose(root, into)?;
@@ -289,8 +289,8 @@ pub(crate) fn onboard(
     .enumerate()
     {
         attempts.push(run(&ask, index + 1, onboard_port, &pin, into)?);
-        nudge()?;
-        nudge()?;
+        crate::onboard_tls_contract::settle();
+        crate::onboard_tls_contract::settle();
     }
 
     Ok(Onboarded {
@@ -319,7 +319,6 @@ pub(crate) fn revisit(
     onboard_port: u16,
     fingerprint: &str,
     into: &Path,
-    mut nudge: impl FnMut() -> Result<(), String>,
 ) -> Result<Onboarded, String> {
     let pin = pinned(fingerprint)?;
     let package = into.join(ADOPTION_PACKAGE);
@@ -368,8 +367,8 @@ pub(crate) fn revisit(
     .enumerate()
     {
         attempts.push(run(&ask, index, onboard_port, &pin, into)?);
-        nudge()?;
-        nudge()?;
+        crate::onboard_tls_contract::settle();
+        crate::onboard_tls_contract::settle();
     }
     Ok(Onboarded {
         attempts,

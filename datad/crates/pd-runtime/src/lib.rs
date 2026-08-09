@@ -532,7 +532,7 @@ pub mod relay;
 pub mod stats;
 pub mod tap;
 
-pub use clock::{PdClock, read_timestamp_counter};
+pub use clock::{PdClock, TICK_PERIOD, TICKS_PER_SECOND, read_timestamp_counter};
 pub use configuration::{CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Submissions};
 pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
 pub use endpoint::{

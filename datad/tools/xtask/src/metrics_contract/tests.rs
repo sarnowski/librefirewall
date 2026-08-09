@@ -256,6 +256,16 @@ fn body(forwarded: (u64, u64), transmitted: (u64, u64)) -> String {
     text.push_str("librefirewall_clock_frequency_hertz{domain=\"clock\"} 1000000000\n");
     family(
         &mut text,
+        "librefirewall_clock_ticks_total",
+        "counter",
+        "Wakeups.",
+    );
+    // A count that has moved, because the contract's load-bearing half is that
+    // it moves; the fixture pair is microseconds apart, so no rate is stated
+    // over it and the second scrape carries the higher number.
+    text.push_str("librefirewall_clock_ticks_total{domain=\"clock\"} 100\n");
+    family(
+        &mut text,
         "librefirewall_block_capacity_sectors",
         "gauge",
         "Sectors.",
@@ -378,6 +388,12 @@ fn routed_witness() -> PolicyWitness {
 /// The bench the shipped document describes, which is what the info series are
 /// judged against. Read from the file rather than restated, exactly as the
 /// scenario does.
+/// How long the machine the fixtures stand for has existed, for the ceiling the
+/// contract holds the wakeup count against. A minute is far more than any
+/// fixture's count needs, so no case here is about the ceiling; the one that is
+/// states its own.
+const BOOTED_FOR: Duration = Duration::from_secs(60);
+
 fn topology() -> Topology {
     Topology::read(std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -411,11 +427,17 @@ fn pair() -> Vec<Scrape> {
 }
 
 /// A first scrape's body, bent into what the endpoint reports on the second:
-/// two requests seen, one 200 already sent.
+/// two requests seen, one 200 already sent, and a periodic wakeup count that has
+/// moved — which it always has, the two scrapes being a boot apart on an
+/// appliance whose timer runs whatever else is happening.
 fn second(text: String) -> String {
     text.replace(
         "librefirewall_http_requests_total{domain=\"management\"} 1",
         "librefirewall_http_requests_total{domain=\"management\"} 2",
+    )
+    .replace(
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 100",
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 140",
     )
 }
 
@@ -434,7 +456,8 @@ fn both(text: String) -> Vec<Scrape> {
 
 #[test]
 fn a_well_formed_scrape_that_agrees_with_the_wire_is_accepted() {
-    let judged = judge(&pair(), 9, witness(), &topology()).expect("the contract is met");
+    let judged =
+        judge(&pair(), BOOTED_FOR, 9, witness(), &topology()).expect("the contract is met");
     assert!(
         judged.contains("9 forwarded frames reported and 9 observed"),
         "{judged}"
@@ -456,7 +479,7 @@ fn a_well_formed_scrape_that_agrees_with_the_wire_is_accepted() {
 /// failure however well formed the document is.
 #[test]
 fn a_forwarded_count_that_disagrees_with_the_wire_is_refused() {
-    let verdict = judge(&pair(), 8, witness(), &topology())
+    let verdict = judge(&pair(), BOOTED_FOR, 8, witness(), &topology())
         .expect_err("nine reported against eight observed");
     assert!(verdict.contains("reports 9 forwarded frames"), "{verdict}");
     assert!(verdict.contains("observed 8"), "{verdict}");
@@ -466,8 +489,14 @@ fn a_forwarded_count_that_disagrees_with_the_wire_is_refused() {
 /// Two zeroes agree, and prove nothing.
 #[test]
 fn a_boot_that_forwarded_nothing_is_refused_rather_than_trivially_satisfied() {
-    let verdict =
-        judge(&only(body((0, 0), (0, 0))), 0, witness(), &topology()).expect_err("nothing moved");
+    let verdict = judge(
+        &only(body((0, 0), (0, 0))),
+        BOOTED_FOR,
+        0,
+        witness(),
+        &topology(),
+    )
+    .expect_err("nothing moved");
     assert!(verdict.contains("compared two zeroes"), "{verdict}");
 }
 
@@ -480,7 +509,7 @@ fn a_pre_summed_forwarded_total_is_refused() {
         "librefirewall_forwarded_frames_total{domain=\"forwarder\",pipeline=\"1\"} 0\n",
         "",
     );
-    let verdict = judge(&only(text), 9, witness(), &topology())
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("one series where there are two pipelines");
     assert!(verdict.contains("no-total rule"), "{verdict}");
 }
@@ -489,8 +518,14 @@ fn a_pre_summed_forwarded_total_is_refused() {
 /// the forwarder and its two drivers is its own finding.
 #[test]
 fn drivers_that_disagree_with_the_forwarder_are_refused() {
-    let verdict =
-        judge(&only(body((5, 4), (4, 4))), 9, witness(), &topology()).expect_err("a driver short");
+    let verdict = judge(
+        &only(body((5, 4), (4, 4))),
+        BOOTED_FOR,
+        9,
+        witness(),
+        &topology(),
+    )
+    .expect_err("a driver short");
     assert!(verdict.contains("8 transmitted frames"), "{verdict}");
 }
 
@@ -501,6 +536,7 @@ fn every_header_field_of_the_contract_is_compared() {
     assert!(
         judge(
             &[wrong_type, scrape_of(second(body((5, 4), (4, 5))))],
+            BOOTED_FOR,
             9,
             witness(),
             &topology()
@@ -514,6 +550,7 @@ fn every_header_field_of_the_contract_is_compared() {
     assert!(
         judge(
             &[wrong_length, scrape_of(second(body((5, 4), (4, 5))))],
+            BOOTED_FOR,
             9,
             witness(),
             &topology()
@@ -527,6 +564,7 @@ fn every_header_field_of_the_contract_is_compared() {
     assert!(
         judge(
             &[keep_alive, scrape_of(second(body((5, 4), (4, 5))))],
+            BOOTED_FOR,
             9,
             witness(),
             &topology()
@@ -540,6 +578,7 @@ fn every_header_field_of_the_contract_is_compared() {
     assert!(
         judge(
             &[refused, scrape_of(second(body((5, 4), (4, 5))))],
+            BOOTED_FOR,
             9,
             witness(),
             &topology()
@@ -555,7 +594,8 @@ fn a_missing_family_names_the_subsystem_that_is_not_reaching_the_endpoint() {
         "# HELP librefirewall_uart_bytes_written_total Bytes.\n# TYPE librefirewall_uart_bytes_written_total counter\n",
         "",
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no UART family");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("no UART family");
     assert!(
         verdict.contains("librefirewall_uart_bytes_written_total"),
         "{verdict}"
@@ -565,7 +605,8 @@ fn a_missing_family_names_the_subsystem_that_is_not_reaching_the_endpoint() {
 #[test]
 fn a_shard_that_is_not_published_is_named_by_its_domain() {
     let text = body((5, 4), (4, 5)).replace("domain=\"clock\"", "domain=\"forwarder\"");
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no clock shard");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("no clock shard");
     assert!(verdict.contains("domain=\"clock\""), "{verdict}");
 }
 
@@ -578,8 +619,8 @@ fn a_store_shard_that_never_republished_after_a_signature_is_refused() {
             "librefirewall_store_signatures_total{domain=\"store\"} 2",
             &format!("librefirewall_store_signatures_total{{domain=\"store\"}} {value}"),
         );
-        let verdict =
-            judge(&only(text), 9, witness(), &topology()).expect_err("an unmoved store tally");
+        let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
+            .expect_err("an unmoved store tally");
         assert!(verdict.contains("at least two signatures"), "{verdict}");
     }
 }
@@ -606,8 +647,14 @@ fn a_body_that_is_not_exposition_is_refused_by_the_parser() {
         ("", "no sample at all"),
     ];
     for (text, expected) in cases {
-        let verdict = judge(&only((*text).to_owned()), 1, witness(), &topology())
-            .expect_err(&format!("{text:?} is not an exposition"));
+        let verdict = judge(
+            &only((*text).to_owned()),
+            BOOTED_FOR,
+            1,
+            witness(),
+            &topology(),
+        )
+        .expect_err(&format!("{text:?} is not an exposition"));
         assert!(verdict.contains(expected), "{text:?}: {verdict}");
     }
 }
@@ -621,7 +668,7 @@ fn label_order_is_not_part_of_the_contract() {
         "librefirewall_forwarded_frames_total{domain=\"forwarder\",pipeline=\"0\"} 5",
         "librefirewall_forwarded_frames_total{pipeline=\"0\",domain=\"forwarder\"} 5",
     );
-    judge(&only(text), 9, witness(), &topology())
+    judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect("the same series, written the other way round");
 }
 
@@ -634,7 +681,8 @@ fn an_endpoint_that_reports_no_request_it_just_answered_is_refused() {
         "librefirewall_http_requests_total{domain=\"management\"} 1",
         "librefirewall_http_requests_total{domain=\"management\"} 0",
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no request counted");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("no request counted");
     assert!(verdict.contains("no HTTP request"), "{verdict}");
 }
 
@@ -644,7 +692,7 @@ fn an_endpoint_that_reports_no_request_it_just_answered_is_refused() {
 fn a_second_scrape_that_does_not_report_the_first_is_refused() {
     // The request the first scrape made is not in the second's account.
     let stuck = vec![healthy(), healthy()];
-    let verdict = judge(&stuck, 9, witness(), &topology())
+    let verdict = judge(&stuck, BOOTED_FOR, 9, witness(), &topology())
         .expect_err("one request reported after two were made");
     assert!(verdict.contains("reports 1 HTTP requests"), "{verdict}");
 
@@ -653,8 +701,14 @@ fn a_second_scrape_that_does_not_report_the_first_is_refused() {
         "librefirewall_http_responses_total{domain=\"management\",status=\"200\"} 1",
         "librefirewall_http_responses_total{domain=\"management\",status=\"200\"} 0",
     );
-    let verdict = judge(&[healthy(), scrape_of(text)], 9, witness(), &topology())
-        .expect_err("no 200 counted after one was sent");
+    let verdict = judge(
+        &[healthy(), scrape_of(text)],
+        BOOTED_FOR,
+        9,
+        witness(),
+        &topology(),
+    )
+    .expect_err("no 200 counted after one was sent");
     assert!(verdict.contains("no 200 response"), "{verdict}");
 
     // Nor are the bytes it carried.
@@ -662,8 +716,14 @@ fn a_second_scrape_that_does_not_report_the_first_is_refused() {
         "librefirewall_http_response_bytes_total{domain=\"management\"} 25000",
         "librefirewall_http_response_bytes_total{domain=\"management\"} 1",
     );
-    let verdict = judge(&[healthy(), scrape_of(text)], 9, witness(), &topology())
-        .expect_err("a response of one byte");
+    let verdict = judge(
+        &[healthy(), scrape_of(text)],
+        BOOTED_FOR,
+        9,
+        witness(),
+        &topology(),
+    )
+    .expect_err("a response of one byte");
     assert!(verdict.contains("response bytes"), "{verdict}");
 }
 
@@ -677,18 +737,61 @@ fn a_node_that_refused_a_scrape_for_want_of_its_staging_buffer_is_refused() {
         "librefirewall_http_responses_total{domain=\"management\",status=\"503\"} 0",
         "librefirewall_http_responses_total{domain=\"management\",status=\"503\"} 1",
     );
-    let verdict = judge(&[healthy(), scrape_of(text)], 9, witness(), &topology())
-        .expect_err("a refused scrape");
+    let verdict = judge(
+        &[healthy(), scrape_of(text)],
+        BOOTED_FOR,
+        9,
+        witness(),
+        &topology(),
+    )
+    .expect_err("a refused scrape");
     assert!(verdict.contains("staging buffer"), "{verdict}");
+}
+
+/// A node whose timer never armed reports zero for ever, and the schedules the
+/// wakeup exists for would then only advance when a frame happened to arrive.
+#[test]
+fn an_appliance_reporting_no_periodic_wakeup_at_all_is_refused() {
+    let stopped = body((5, 4), (4, 5)).replace(
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 100",
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 0",
+    );
+    let pair = vec![scrape_of(stopped.clone()), scrape_of(second(stopped))];
+    let verdict =
+        judge(&pair, BOOTED_FOR, 9, witness(), &topology()).expect_err("a timer that never ran");
+    assert!(verdict.contains("no periodic wakeup at all"), "{verdict}");
+}
+
+/// The fault that chose the interrupt input this appliance uses: a second device
+/// on the same line, whose interrupts the handler counts as its own. Nothing is
+/// in an error state anywhere — only the count is impossible for the time the
+/// machine has existed.
+#[test]
+fn more_wakeups_than_the_machine_has_existed_for_is_refused() {
+    // Ten seconds of machine against a count that would need a hundred.
+    let shared = body((5, 4), (4, 5)).replace(
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 100",
+        "librefirewall_clock_ticks_total{domain=\"clock\"} 1000",
+    );
+    let pair = vec![scrape_of(shared.clone()), scrape_of(second(shared))];
+    let verdict = judge(&pair, Duration::from_secs(10), 9, witness(), &topology())
+        .expect_err("an input shared with another device");
+    assert!(verdict.contains("shared with another device"), "{verdict}");
+    // And the same count is accepted where the machine has existed long enough
+    // for this timer to have produced it, which is what keeps the ceiling a
+    // bound rather than a second statement of the period.
+    judge(&pair, Duration::from_secs(200), 9, witness(), &topology())
+        .expect("a count this timer could have produced");
 }
 
 /// The contract is stated over two scrapes, so a scenario that took some other
 /// number says so rather than judging whichever one it has.
 #[test]
 fn a_run_that_did_not_take_two_scrapes_is_refused() {
-    let verdict = judge(&[healthy()], 9, witness(), &topology()).expect_err("one scrape");
+    let verdict =
+        judge(&[healthy()], BOOTED_FOR, 9, witness(), &topology()).expect_err("one scrape");
     assert!(verdict.contains("took 1 scrapes"), "{verdict}");
-    let verdict = judge(&[], 9, witness(), &topology()).expect_err("no scrape");
+    let verdict = judge(&[], BOOTED_FOR, 9, witness(), &topology()).expect_err("no scrape");
     assert!(verdict.contains("took 0 scrapes"), "{verdict}");
 }
 
@@ -703,7 +806,8 @@ fn a_transport_that_reports_no_segment_it_just_carried_is_refused() {
         "librefirewall_tcp_segments_total{domain=\"management\",service=\"http\",\
          direction=\"received\"} 0",
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("no segment counted");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("no segment counted");
     assert!(verdict.contains("no segment received"), "{verdict}");
 }
 
@@ -734,7 +838,7 @@ fn an_info_label_that_disagrees_with_the_document_is_refused() {
         ),
     ] {
         let text = body((5, 4), (4, 5)).replacen(from, to, 1);
-        let verdict = judge(&only(text), 9, witness(), &topology())
+        let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
             .expect_err("a label the document does not contain");
         assert!(
             verdict.contains(expected),
@@ -757,7 +861,7 @@ fn an_info_series_under_the_wrong_domain_is_refused() {
         &format!("{INTERFACE_INFO}{{domain=\"nic_driver0\""),
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology())
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("two series under one domain, one missing");
     assert!(verdict.contains(INTERFACE_INFO), "{verdict}");
 }
@@ -774,7 +878,8 @@ fn a_missing_or_duplicated_info_series_is_refused() {
         .to_owned();
 
     let without = full.replacen(&format!("{management_line}\n"), "", 1);
-    let verdict = judge(&only(without), 9, witness(), &topology()).expect_err("a port unreported");
+    let verdict = judge(&only(without), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("a port unreported");
     assert!(verdict.contains("cardinality of this family"), "{verdict}");
 
     let twice = full.replacen(
@@ -782,8 +887,8 @@ fn a_missing_or_duplicated_info_series_is_refused() {
         &format!("{management_line}\n{management_line}\n"),
         1,
     );
-    let verdict =
-        judge(&only(twice), 9, witness(), &topology()).expect_err("a port reported twice");
+    let verdict = judge(&only(twice), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("a port reported twice");
     assert!(verdict.contains("reported twice"), "{verdict}");
 }
 
@@ -796,7 +901,8 @@ fn an_info_series_carrying_a_label_the_contract_does_not_name_is_refused() {
         "interface=\"dataplane-0\",enabled=\"true\"",
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("an undeclared label");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("an undeclared label");
     assert!(verdict.contains("the contract is"), "{verdict}");
 }
 
@@ -809,7 +915,8 @@ fn an_info_series_whose_value_is_not_one_is_refused() {
         "mac=\"52:54:00:12:34:50\"} 0",
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("a value that is not 1");
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("a value that is not 1");
     assert!(verdict.contains("always 1"), "{verdict}");
 }
 
@@ -824,7 +931,7 @@ fn a_scrape_matching_one_document_is_refused_against_another() {
         "/scenarios/alternate-addressing.xml"
     )))
     .expect("the alternate document describes a bench");
-    let verdict = judge(&pair(), 9, witness(), &alternate)
+    let verdict = judge(&pair(), BOOTED_FOR, 9, witness(), &alternate)
         .expect_err("the shipped document's labels against the alternate document");
     assert!(verdict.contains("configuration document"), "{verdict}");
 }
@@ -839,7 +946,7 @@ fn a_rule_hit_count_that_disagrees_with_the_wire_is_refused() {
         &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 8"),
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology())
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("eight hits against nine forwarded frames");
     assert!(verdict.contains("probe-forward"), "{verdict}");
     assert!(verdict.contains("observed coming back"), "{verdict}");
@@ -851,7 +958,7 @@ fn a_rule_hit_count_that_disagrees_with_the_wire_is_refused() {
         &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-blocked\"}} 0"),
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology())
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("a rule crediting itself with none of the denials the pipeline counted");
     assert!(verdict.contains("probe-blocked"), "{verdict}");
     assert!(verdict.contains("count them in two places"), "{verdict}");
@@ -866,8 +973,8 @@ fn two_rules_counters_are_not_interchangeable() {
         .replace("rule=\"probe-forward\"", "rule=\"swapped\"")
         .replace("rule=\"probe-blocked\"", "rule=\"probe-forward\"")
         .replace("rule=\"swapped\"", "rule=\"probe-blocked\"");
-    let verdict =
-        judge(&only(text), 9, witness(), &topology()).expect_err("the two counters transposed");
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("the two counters transposed");
     assert!(verdict.contains("wrong rule's traffic"), "{verdict}");
 }
 
@@ -879,7 +986,8 @@ fn a_rule_series_the_document_declares_no_rule_for_is_refused() {
     text.push_str(&format!(
         "{RULE_HITS}{{domain=\"forwarder\",rule=\"invented\"}} 0\n"
     ));
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("a third rule series");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("a third rule series");
     assert!(verdict.contains("whole cardinality"), "{verdict}");
 
     // And the other direction: a rule the document declares that reaches no
@@ -889,7 +997,8 @@ fn a_rule_series_the_document_declares_no_rule_for_is_refused() {
         "",
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("a rule with no series");
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("a rule with no series");
     assert!(verdict.contains("whole cardinality"), "{verdict}");
 }
 
@@ -902,7 +1011,8 @@ fn a_rule_series_carrying_an_extra_label_is_refused() {
         "rule=\"probe-forward\",pipeline=\"0\"}",
         1,
     );
-    let verdict = judge(&only(text), 9, witness(), &topology()).expect_err("an extra dimension");
+    let verdict =
+        judge(&only(text), BOOTED_FOR, 9, witness(), &topology()).expect_err("an extra dimension");
     assert!(verdict.contains("the contract is"), "{verdict}");
 }
 
@@ -926,8 +1036,8 @@ fn a_policy_total_that_disagrees_with_the_wire_is_refused() {
         ),
     ] {
         let text = body((5, 4), (4, 5)).replacen(&from, &to, 1);
-        let verdict =
-            judge(&only(text), 9, witness(), &topology()).expect_err("a total that disagrees");
+        let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
+            .expect_err("a total that disagrees");
         assert!(verdict.contains(expected), "{verdict}");
     }
 }
@@ -959,7 +1069,7 @@ fn the_two_refusal_reasons_are_held_apart() {
             "rule=\"probe-blocked\"} 3",
             1,
         );
-    let verdict = judge(&only(text), 9, witness(), &topology())
+    let verdict = judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("the fallthrough's refusal credited to a rule");
     assert!(verdict.contains("no_policy_match"), "{verdict}");
     assert!(
@@ -974,7 +1084,7 @@ fn the_two_refusal_reasons_are_held_apart() {
 /// is not consulted for.
 #[test]
 fn a_filter_refusal_no_probe_could_have_caused_is_refused() {
-    let verdict = judge(&pair(), 9, routed_witness(), &topology())
+    let verdict = judge(&pair(), BOOTED_FOR, 9, routed_witness(), &topology())
         .expect_err("a policy denial on a boot that injected nothing the filter refuses");
     assert!(verdict.contains("nobody put on the wire"), "{verdict}");
 
@@ -1004,7 +1114,7 @@ fn a_filter_refusal_no_probe_could_have_caused_is_refused() {
             &format!("{POLICY_PACKETS}{{domain=\"forwarder\",verdict=\"denied\"}} 0"),
             1,
         );
-    judge(&both(quiet), 9, routed_witness(), &topology())
+    judge(&both(quiet), BOOTED_FOR, 9, routed_witness(), &topology())
         .expect("a boot whose six probes the filter was consulted for exactly twice");
 }
 
@@ -1024,7 +1134,7 @@ fn a_refusal_counted_on_the_other_pipeline_still_sums() {
             "pipeline=\"1\",reason=\"policy_denied\"} 2",
             1,
         );
-    judge(&only(text), 9, witness(), &topology())
+    judge(&only(text), BOOTED_FOR, 9, witness(), &topology())
         .expect("the same two refusals, counted on the other direction of the same dataplane");
 }
 
@@ -1049,6 +1159,7 @@ fn a_boot_that_changed_its_policy_is_judged_on_the_sum_of_its_rules() {
     // against nine plus two matches.
     let judged = judge(
         &only(body((5, 4), (4, 5))),
+        BOOTED_FOR,
         9,
         reconfigured_witness(),
         &topology(),
@@ -1072,12 +1183,13 @@ fn a_boot_that_changed_its_policy_is_judged_on_the_sum_of_its_rules() {
         );
     judge(
         &only(swapped.clone()),
+        BOOTED_FOR,
         9,
         reconfigured_witness(),
         &topology(),
     )
     .expect("the sum is unchanged by which rule matched");
-    let verdict = judge(&only(swapped), 9, witness(), &topology())
+    let verdict = judge(&only(swapped), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("the per-rule statement is not available across a policy change");
     assert!(verdict.contains("probe-forward"), "{verdict}");
 
@@ -1088,8 +1200,14 @@ fn a_boot_that_changed_its_policy_is_judged_on_the_sum_of_its_rules() {
         &format!("{RULE_HITS}{{domain=\"forwarder\",rule=\"probe-forward\"}} 7"),
         1,
     );
-    let verdict = judge(&only(short), 9, reconfigured_witness(), &topology())
-        .expect_err("nine matches short of eleven");
+    let verdict = judge(
+        &only(short),
+        BOOTED_FOR,
+        9,
+        reconfigured_witness(),
+        &topology(),
+    )
+    .expect_err("nine matches short of eleven");
     assert!(verdict.contains("matches between them"), "{verdict}");
     assert!(verdict.contains("two policies"), "{verdict}");
 }
@@ -1124,7 +1242,7 @@ fn an_opening_the_table_neither_holds_nor_accounts_for_is_refused() {
         &ended("withdrawn", FIXTURE_WITHDRAWN),
         &ended("withdrawn", FIXTURE_WITHDRAWN - 1),
     );
-    let verdict = judge(&only(leaked), 9, witness(), &topology())
+    let verdict = judge(&only(leaked), BOOTED_FOR, 9, witness(), &topology())
         .expect_err("one opening is neither held nor ended");
     assert!(verdict.contains("slot leaked"), "{verdict}");
 }
@@ -1137,8 +1255,8 @@ fn a_slot_the_table_gave_back_twice_is_refused() {
         &ended("withdrawn", FIXTURE_WITHDRAWN),
         &ended("withdrawn", FIXTURE_WITHDRAWN + 1),
     );
-    let verdict =
-        judge(&only(doubled), 9, witness(), &topology()).expect_err("a slot returned twice");
+    let verdict = judge(&only(doubled), BOOTED_FOR, 9, witness(), &topology())
+        .expect_err("a slot returned twice");
     assert!(verdict.contains("returned twice"), "{verdict}");
 }
 
@@ -1155,7 +1273,8 @@ fn an_eviction_is_refused_on_a_bench_that_cannot_have_needed_one() {
             &ended("withdrawn", FIXTURE_WITHDRAWN - 1),
         )
         .replace(&ended("evicted", 0), &ended("evicted", 1));
-    let verdict = judge(&only(evicted), 9, witness(), &topology()).expect_err("an eviction");
+    let verdict =
+        judge(&only(evicted), BOOTED_FOR, 9, witness(), &topology()).expect_err("an eviction");
     assert!(verdict.contains("taken back to"), "{verdict}");
 }
 
@@ -1180,8 +1299,8 @@ fn a_connection_turned_away_for_want_of_room_is_refused() {
                     FIXTURE_OPENINGS + 1
                 ),
             );
-        let verdict =
-            judge(&only(full), 9, witness(), &topology()).expect_err("a connection turned away");
+        let verdict = judge(&only(full), BOOTED_FOR, 9, witness(), &topology())
+            .expect_err("a connection turned away");
         assert!(verdict.contains("want of room"), "{verdict}");
     }
 }
@@ -1238,8 +1357,14 @@ fn a_flood_is_held_to_reaching_the_table_and_leaving_it_bounded() {
     // The fixture is a bench nothing flooded, so a witness claiming a burst larger
     // than every opening it reports fails on the first clause: the burst never
     // reached the table, and every statement below it would be about a quiet bench.
-    let verdict = judge(&pair(), 9, flooding(FIXTURE_OPENINGS + 1), &topology())
-        .expect_err("the witness claims a burst larger than the openings reported");
+    let verdict = judge(
+        &pair(),
+        BOOTED_FOR,
+        9,
+        flooding(FIXTURE_OPENINGS + 1),
+        &topology(),
+    )
+    .expect_err("the witness claims a burst larger than the openings reported");
     assert!(verdict.contains("did not reach the table"), "{verdict}");
 
     // The second clause, on a body whose identity still closes: the table is
@@ -1260,17 +1385,17 @@ fn a_flood_is_held_to_reaching_the_table_and_leaving_it_bounded() {
             &ended("withdrawn", FIXTURE_WITHDRAWN - 4),
         );
     // Eight, so the seven withdrawals the body reports do not cover the burst.
-    let verdict = judge(&only(kept.clone()), 9, flooding(8), &topology())
+    let verdict = judge(&only(kept.clone()), BOOTED_FOR, 9, flooding(8), &topology())
         .expect_err("the flood's openings were not given back");
     assert!(verdict.contains("must be given back"), "{verdict}");
 
     // The third: the same table against a smaller burst, so the withdrawals cover
     // it and what is left is an occupancy as large as the flood.
-    let verdict = judge(&only(kept), 9, flooding(4), &topology())
+    let verdict = judge(&only(kept), BOOTED_FOR, 9, flooding(4), &topology())
         .expect_err("the table holds as many flows as the flood opened");
     assert!(verdict.contains("staying bounded"), "{verdict}");
 
     // And the passing shape: openings the table gave back beside the one
     // conversation it keeps, which is what the flood scenario's own scrape is.
-    judge(&pair(), 9, flooding(4), &topology()).expect("a flood the table absorbed");
+    judge(&pair(), BOOTED_FOR, 9, flooding(4), &topology()).expect("a flood the table absorbed");
 }

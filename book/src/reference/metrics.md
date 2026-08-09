@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-122 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 461 counter and gauge series from the 12 shards,
+123 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 462 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 99 784 bytes — a worst case computed from
+declares, and the document they render into is bounded at 100 136 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -468,6 +468,7 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 | `librefirewall_clock_calibrations_refused_total` | counter | `management` | — | Published calibrations this domain would not use. |
 | `librefirewall_clock_frequency_hertz` | gauge | `clock` | — | The timestamp counter frequency this node measured at boot; 0 before it did. |
 | `librefirewall_clock_generation` | gauge | `management` | — | The calibration generation this domain converts counter readings with; 0 is none. |
+| `librefirewall_clock_ticks_total` | counter | `clock` | — | Periodic wakeups this domain's timer has raised and it has passed on. It stands still on a node whose timer could not be armed, which is the node whose schedules only advance when a frame arrives. |
 | `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
 | `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. **Only the forwarder carries `applied`**: the management port's endpoint reads a committed image for its own address and never applies one, so it reports `refused` alone. |
 | `librefirewall_configuration_reads_total` | counter | `config` | — | Times the running configuration document was read out of this node. |

@@ -104,6 +104,13 @@ emitted before the calibration exists carry the token `unsynchronized` rather th
 is **not** a trusted time source — see the status table below and its
 [detail](developers/status-detail.md#trusted-time-source).
 
+That domain is also the appliance's **only source of periodic wakeups**. Nothing else here is
+entered by the passage of time: a domain is woken by a frame or by a peer, so one holding a deadline
+on a silent link would wait at it for ever — and that is exactly the situation the management
+channel's reconnection backoff exists for. So the clock domain arms one of the timer's comparators
+and hands each interrupt on to the domain that dials, which is what lets a schedule advance on time
+rather than on traffic.
+
 A recorder domain owns the appliance's **block device** and turns the traffic into a durable
 record. It brings a virtio-blk device up, proves the path to the medium by reading a sector and
 writing a recognisable one back, and then writes **two pcapng recordings** onto that device, and

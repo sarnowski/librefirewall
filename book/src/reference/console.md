@@ -562,7 +562,7 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 25 the `clock` domain raises, 19 the `management` domain raises, 39
+`nic-driver` domain raises, 30 the `clock` domain raises, 19 the `management` domain raises, 39
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 140 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
@@ -602,18 +602,30 @@ the rest are the driver's bring-up tree.
 | queues and doorbells | `transmit-queue-absent` (offered, required), `virtqueue-region-unusable` (paddr), `queue-absent` (index), `queue-too-small` (device maximum, required), `doorbell-outside-bar` (slot end, BAR size — or BAR size alone where the offset overflowed), `doorbell-misaligned` (offset) |
 
 **`clock`.** Grouped by the stage that refused, which the token's own prefix names: `cmos-ioport-`
-the port capability, `hpet-` the reference timer, `tsc-` the measurement made against it, `rtc-` the
-real-time clock, and `epoch-` the conversion of its answer. `signalled=` is **always `false`** on
-this domain: it says whether a device was told to stop, and neither of these two has a stop to be
-told — a refusal leaves the timer running exactly as the firmware left it and the register file
-untouched. Where a refusal has more numbers than the line's two, the bound constants of the crate
-that raised it (`COUNTER_POLL_LIMIT`, `UIP_POLL_LIMIT`, `SNAPSHOT_ATTEMPTS`) are what is left out,
-being known without being transmitted.
+the port capability, `hpet-` the reference timer, `hpet-timer-` the periodic wakeup it is asked to
+raise, `tsc-` the measurement made against it, `rtc-` the real-time clock, and `epoch-` the
+conversion of its answer. `signalled=` is **always `false`** on this domain: it says whether a
+device was told to stop, and neither of these two has a stop to be told — a refusal leaves the timer
+running exactly as the firmware left it and the register file untouched. Where a refusal has more
+numbers than the line's two, the bound constants of the crate that raised it (`COUNTER_POLL_LIMIT`,
+`UIP_POLL_LIMIT`, `SNAPSHOT_ATTEMPTS`) are what is left out, being known without being transmitted.
+
+One of the seven groups below rides on a **`state=ready`** record and the rest on **`state=refused`**,
+and the difference is the whole of what it means. Every other token here says this node established
+no time at all. The five `hpet-timer-` tokens say the opposite: the time was established and published,
+and only the *wakeup* is missing. What that costs is that this appliance's timed obligations — the
+management channel's reconnection backoff, its acknowledgement cadence, its once-a-second upstream
+flush — advance only when a frame happens to arrive, so a node whose management server goes silent
+stops re-dialling until something else wakes it. It keeps forwarding, keeps answering its management
+port, and keeps timestamping. Read one of these as "this node's schedules are driven by traffic
+rather than by time"; `librefirewall_clock_ticks_total` standing still is the same fact on the
+metrics surface.
 
 | group | tokens |
 |---|---|
 | the port capability (no `detail=` beyond the pair) | `cmos-ioport-refused` (refused port, seL4 error code) |
 | the timer block | `hpet-not-present` (capabilities word), `hpet-implausible-clock-period` (femtoseconds), `hpet-counter-too-narrow` (capabilities word), `hpet-not-enabled` (configuration readback), `hpet-counter-stalled` (the value it kept answering), `hpet-counter-too-slow` (observed, wanted), `hpet-duration-too-long` (nanoseconds) |
+| the periodic wakeup (a `ready` record; the node is clocked and only its schedules are) | `hpet-timer-not-periodic` (timer configuration word), `hpet-timer-route-unavailable` (the inputs the timer offers, the input this build holds), `hpet-timer-period-too-short` (nanoseconds), `hpet-timer-period-too-long` (ticks the period names, the most a comparator is armed with), `hpet-timer-not-armed` (timer configuration readback) |
 | the measurement | `tsc-no-ticks-elapsed`, `hpet-no-reference-interval`, `tsc-implausibly-slow` (derived hertz), `tsc-implausibly-fast` (derived hertz, saturated at `0xffffffffffffffff` where the quotient exceeds 64 bits) |
 | the real-time clock | `rtc-update-never-completed` (status A), `rtc-snapshots-never-agreed`, `rtc-not-binary-coded-decimal` (CMOS index, value), `rtc-hour-outside-twelve-hour-range` (hour, PM flag), `rtc-implausible-year` (year, century register) |
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |

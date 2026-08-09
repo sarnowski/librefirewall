@@ -1,13 +1,16 @@
 #![no_main]
 #![no_std]
 
-//! Clock protection domain: it establishes what time it is, once, and says so.
+//! Clock protection domain: it establishes what time it is, says so, and from
+//! then on announces that time has passed.
 //!
-//! Four steps, in one `init` that never runs again: probe the HPET and start
+//! Five steps, in one `init` that never runs again: probe the HPET and start
 //! its counter, measure the timestamp counter against it, read the CMOS
-//! real-time clock for an epoch to anchor that counter to, and publish one
-//! record stating the frequency it measured and the instant it established.
-//! Then it parks.
+//! real-time clock for an epoch to anchor that counter to, publish one record
+//! stating the frequency it measured and the instant it established, and arm
+//! one of the block's comparators to raise an interrupt on a period. After that
+//! it does one thing, for ever: on each of those interrupts it acknowledges the
+//! kernel and signals the management domain.
 //!
 //! # Adversary
 //!
@@ -54,18 +57,57 @@
 //! domain, works in both — and the ring is a zeroed region the moment it is
 //! mapped, so a record written here survives until the console comes up.
 //!
-//! # Priority 3, and one millisecond of it
+//! # It is the only domain that can know time has passed, so it is the one that
+//! # says so
 //!
-//! The system description sets it and explains it. What matters here is the
-//! consequence: this domain preempts the dataplane for the length of one
-//! calibration window, once, at boot. [`CALIBRATION_WINDOW`] is what that costs.
+//! Nothing in this appliance is woken by the passage of time. A protection
+//! domain is entered when a frame arrives or when a peer signals it, so a domain
+//! holding a deadline and no traffic sits at that deadline for ever — and the
+//! management channel's every schedule is exactly that shape: a reconnection
+//! backoff, an acknowledgement cadence, a flush that owes a send once a second.
+//! A silent link produces no frame, which is precisely the condition those
+//! schedules exist for.
 //!
-//! # No channel, in either direction
+//! This domain maps the timer block, so it is the only one that can be told by
+//! hardware that an interval has elapsed. [`TICK_PERIOD`] is the interval it
+//! asks for, and what it does with the answer is signal the domain that has an
+//! obligation time creates. **The signal carries nothing.** The receiver maps
+//! the calibration this domain published and reads the timestamp counter itself,
+//! so an instant sent alongside would be a second statement of one fact, and the
+//! two would differ by however long the signal took.
 //!
-//! This domain holds no notification capability and none is held on it. It runs
-//! to completion in `init` and then blocks in the Microkit event loop, where
-//! nothing can reach it. [`Clock::notified`] exists only because [`Handler`]
-//! requires it.
+//! # A tick costs a constant, and one that arrives early costs nothing
+//!
+//! [`Clock::notified`] acknowledges, counts, signals and publishes: no loop, no
+//! device access, and nothing whose length depends on anything. It cannot fall
+//! behind either, and that is the kernel's doing rather than this file's — an
+//! interrupt stays masked until it is acknowledged, and a notification is a flag
+//! rather than a queue, so a period that elapsed while the previous one was
+//! being served is one wakeup and not two waiting.
+//!
+//! # A node that cannot be woken still forwards, and still says so
+//!
+//! Arming can fail — a comparator that cannot re-arm itself, one that cannot
+//! drive the interrupt this build holds, one that drops what is written to it.
+//! It is reported as a refusal on a `ready` record and nothing else happens: the
+//! calibration stands, the dataplane forwards, and the management domain is
+//! woken by frames exactly as it was before this domain gained a timer. Failing
+//! closed would be an appliance that stops forwarding because a timer chip is
+//! absent, which is a worse node than one whose schedules are coarse.
+//!
+//! # Priority 3, and what it now costs
+//!
+//! The system description sets it and explains it. The consequence used to be
+//! one calibration window at boot; it is now that plus one preemption of the
+//! dataplane every [`TICK_PERIOD`], each of them the constant above.
+//! [`CALIBRATION_WINDOW`] is what the first costs.
+//!
+//! # Two channels, and neither is a way in
+//!
+//! [`TICK`] is an interrupt, not a peer: no domain in this system can raise it,
+//! and the only thing that arrives on it is the block this domain programmed.
+//! [`MANAGEMENT`] is a send capability and nothing holds one on this domain, so
+//! the event loop below has no sender but the timer.
 
 mod cmos;
 mod hpet_mmio;
@@ -75,13 +117,23 @@ use hpet_mmio::HpetPage;
 use lfw_clock::{
     Calibration, CalibrationError, CivilTimeError, Duration, NANOS_PER_SECOND, calibrate,
 };
-use lfw_hpet::{Hpet, HpetError, WORST_CASE_SERVICEABLE_WAIT};
+use lfw_hpet::{Hpet, HpetError, MAX_PERIODIC_TICKS, TimerError, WORST_CASE_SERVICEABLE_WAIT};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::{ClockSample, StatsShard};
 use lfw_rtc::{Rtc, RtcError};
-use pd_runtime::{PdClock, attach_region, log_sample, read_timestamp_counter};
-use sel4_microkit::{ChannelSet, Handler, Infallible, protection_domain};
+use pd_runtime::{PdClock, TICK_PERIOD, attach_region, log_sample, read_timestamp_counter};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{CalibrationImage, ClockCalibration, LogConsume, LogRecords};
+
+/// The interrupt the timer block raises, and the only thing that can enter this
+/// domain after `init`. It is an `<irq>` rather than a peer's channel: no
+/// protection domain in this system can raise it.
+const TICK: Channel = Channel::new(0);
+
+/// The management domain, and the one send capability this domain holds. It
+/// blocks in the Microkit event loop and reads no clock of its own, so an
+/// interval that elapsed is invisible to it until it is woken.
+const MANAGEMENT: Channel = Channel::new(1);
 
 /// How long the timestamp counter is measured against the reference timer.
 ///
@@ -99,6 +151,16 @@ const CALIBRATION_WINDOW: Duration = Duration::from_millis(1);
 // headroom — a millisecond against a hundred — asserted rather than argued.
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() <= WORST_CASE_SERVICEABLE_WAIT.as_nanos());
 const _: () = assert!(CALIBRATION_WINDOW.as_nanos() > 0);
+
+// The interval `pd_runtime` chose has to be one a periodic comparator can
+// actually be armed with on the slowest counter the block's specification
+// admits, and that bound is `lfw_hpet`'s to state rather than this domain's to
+// assume: a hundred milliseconds of a 10 MHz counter is a million ticks against
+// a bound of two thousand million. Asserted here because this is the domain
+// that arms it.
+const _: () = assert!(
+    TICK_PERIOD.as_nanos() / (NANOS_PER_SECOND / lfw_hpet::MIN_FREQUENCY_HZ) <= MAX_PERIODIC_TICKS
+);
 
 /// This domain's lifecycle record.
 fn announce(sink: &dyn Sink, state: DomainState, detail: DomainDetail) {
@@ -251,6 +313,41 @@ fn calibration_refusal(error: CalibrationError) -> Refusal {
     }
 }
 
+/// The periodic wakeup's refusals, in the vocabulary a console line speaks.
+///
+/// Its own function beside the three above because what it reports is a
+/// different outcome: those three end with no time established, and every one of
+/// these leaves the node clocked, forwarding and answering its port — and only
+/// its schedules coarse. Which is why they ride on a `ready` record.
+fn timer_refusal(error: TimerError) -> Refusal {
+    match error {
+        TimerError::NotPeriodicCapable { configuration } => {
+            refusal("hpet-timer-not-periodic", RefusalDetail::One(configuration))
+        }
+        // The pin beside the bitmap: the bitmap alone says which inputs the
+        // block offers and not which one this build asked it for.
+        TimerError::RouteUnavailable { route_cap } => refusal(
+            "hpet-timer-route-unavailable",
+            RefusalDetail::Two(u64::from(route_cap), u64::from(lfw_hpet::INTERRUPT_PIN)),
+        ),
+        TimerError::PeriodTooShort { nanoseconds } => refusal(
+            "hpet-timer-period-too-short",
+            RefusalDetail::One(nanoseconds),
+        ),
+        // Saturating, on `tsc-implausibly-fast`'s terms: the count reaching this
+        // variant may itself exceed `u64`, and a saturated number says what the
+        // exact one would — far past the bound. The bound travels beside it,
+        // because a count with nothing to compare it against is unreadable.
+        TimerError::PeriodTooLong { ticks } => refusal(
+            "hpet-timer-period-too-long",
+            RefusalDetail::Two(u64::try_from(ticks).unwrap_or(u64::MAX), MAX_PERIODIC_TICKS),
+        ),
+        TimerError::NotArmed { read_back } => {
+            refusal("hpet-timer-not-armed", RefusalDetail::One(read_back))
+        }
+    }
+}
+
 /// The real-time clock's refusals. `polls` and `attempts` are
 /// `lfw_rtc::UIP_POLL_LIMIT` and `SNAPSHOT_ATTEMPTS`, constants of that crate,
 /// so neither is transmitted.
@@ -336,8 +433,9 @@ fn init() -> Clock {
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     let mut frequency_hertz = 0;
+    let mut ticking = false;
     match establish() {
-        Ok(calibration) => {
+        Ok(Started { calibration, tick }) => {
             // The instant as of now rather than the anchor itself, which is
             // what makes this line evidence of the whole chain: it is the RTC's
             // epoch advanced by the counter, under the frequency just measured,
@@ -359,6 +457,18 @@ fn init() -> Clock {
                 boot_unix_nanos: calibration.boot_unix_nanos(),
             });
             frequency_hertz = calibration.tsc_hz().get();
+            // After the calibration and its record, so a node that established
+            // a time says so before it says anything about its wakeups — and
+            // so an operator reading a refusal here knows the two are separate
+            // facts about one boot.
+            match tick {
+                Ok(_) => ticking = true,
+                Err(error) => announce(
+                    &sink,
+                    DomainState::Ready,
+                    DomainDetail::Refusal(timer_refusal(error)),
+                ),
+            }
         }
         Err(error) => {
             // The whole reason, not a summary: with no shell and no CLI
@@ -370,27 +480,43 @@ fn init() -> Clock {
             );
         }
     }
-    // Last, and once: this domain runs to completion and parks with no channel
-    // to wake it, so its shard is written here and never moves again — which is
-    // correct, its counters not moving either. A refusal leaves the frequency at
-    // zero, which is what "this node measured nothing" reads as.
-    stats.publish(
-        &ClockSample {
-            frequency_hertz,
-            log: log_sample(sink.dropped(), sink.refused()),
-        }
-        .values(),
-    );
-    Clock
+    // The last record this domain will ever emit, and so the last change its log
+    // counts will ever take: everything after this point is a tick, and a tick
+    // says nothing. A refusal leaves the frequency at zero, which is what "this
+    // node measured nothing" reads as.
+    let sample = ClockSample {
+        frequency_hertz,
+        ticks: 0,
+        log: log_sample(sink.dropped(), sink.refused()),
+    };
+    stats.publish(&sample.values());
+    if ticking {
+        Clock::Ticking(Ticking { stats, sample })
+    } else {
+        Clock::Parked
+    }
 }
 
-/// Measure the counter, read the epoch, and anchor one to the other.
-fn establish() -> Result<Calibration, StartupError> {
+/// What one boot of this domain established: a time, and either a periodic
+/// wakeup or the reason there is none.
+///
+/// The two travel together because they are made together and reported
+/// together, and separating them would let a caller publish one without ever
+/// looking at the other.
+struct Started {
+    calibration: Calibration,
+    /// The accumulator the comparator was armed with, or why it was not.
+    tick: Result<u64, TimerError>,
+}
+
+/// Measure the counter, read the epoch, anchor one to the other, and arm the
+/// wakeup.
+fn establish() -> Result<Started, StartupError> {
     // Claimed before the timer is touched, so a domain whose port grant is
     // wrong refuses without having started a counter it cannot report on.
     let port = Cmos::claim().map_err(StartupError::Port)?;
 
-    let hpet = Hpet::probe(HpetPage::map())?;
+    let mut hpet = Hpet::probe(HpetPage::map())?;
     let window = hpet.ticks_for(CALIBRATION_WINDOW)?;
 
     // The two counters are read around the same wait, so both deltas cover one
@@ -429,20 +555,70 @@ fn establish() -> Result<Calibration, StartupError> {
     let boot_unix_nanos = unix_seconds
         .checked_mul(NANOS_PER_SECOND)
         .ok_or(StartupError::EpochOutOfRange { unix_seconds })?;
-    Ok(Calibration::new(tsc_hz, anchor, boot_unix_nanos))
+
+    // Last, and after the anchor: arming spends device accesses of its own, and
+    // a reading taken before them and paired with an instant read after them
+    // would date this node by however long the block took to answer. It is also
+    // the one step whose failure is not this function's to refuse — a node with
+    // a time and no wakeup is a node, and a node with no time is not.
+    let tick = hpet.arm_periodic(TICK_PERIOD);
+
+    Ok(Started {
+        calibration: Calibration::new(tsc_hz, anchor, boot_unix_nanos),
+        tick,
+    })
 }
 
-/// Returned by `init` in every case: this domain runs once and then parks in
-/// the Microkit event loop, whether it established a time or refused to.
-struct Clock;
+/// What this domain does for the rest of the boot.
+///
+/// Two states rather than a flag, because the difference is what the event loop
+/// does: a parked domain has no shard to move and must not be woken into
+/// pretending it has one. Nothing can wake it either — a domain that could not
+/// arm its comparator holds an interrupt the block will never raise.
+enum Clock {
+    Ticking(Ticking),
+    /// A domain with no wakeup: it established a time and could not arm one, or
+    /// it refused and has no time to keep. Its shard was published in `init` and
+    /// nothing will move it.
+    Parked,
+}
+
+/// The whole of what a tick touches.
+struct Ticking {
+    stats: &'static StatsShard,
+    /// Republished on every tick. Every field but the count was fixed in `init`
+    /// — this domain emits no record after it — so the shard is carried whole
+    /// rather than recomposed from parts that cannot change.
+    sample: ClockSample,
+}
 
 impl Handler for Clock {
     type Error = Infallible;
 
-    /// Unreachable by capability: nothing in this system holds a notification
-    /// capability on this domain, so the event loop it parks in has no sender.
-    /// It exists because [`Handler`] requires it; see the crate header.
+    /// One period has elapsed: tell the kernel, count it, wake the domain that
+    /// has a deadline, and publish.
+    ///
+    /// The channel is not inspected. This domain has exactly one thing that can
+    /// enter it and the kernel names it in `channels`, so comparing the two
+    /// would be this domain checking the kernel's arithmetic against a constant
+    /// of its own — and a wakeup on any other channel is one no capability in
+    /// this system can produce.
+    ///
+    /// The acknowledgement comes first so the next period is not spent masked,
+    /// and the signal before the shard so a scrape never overtakes the wakeup it
+    /// is evidence of.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
+        let Self::Ticking(ticking) = self else {
+            return Ok(());
+        };
+        // Infallible in practice and not by type: the only error this can carry
+        // is a capability this domain was not granted, which is a build fact
+        // rather than a run-time condition, and a domain that stopped
+        // acknowledging would stop being woken — which the count says.
+        let _ = TICK.irq_ack();
+        ticking.sample.ticks = ticking.sample.ticks.saturating_add(1);
+        MANAGEMENT.notify();
+        ticking.stats.publish(&ticking.sample.values());
         Ok(())
     }
 }

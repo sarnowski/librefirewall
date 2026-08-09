@@ -55,7 +55,19 @@
 //! knows a submitted document has arrived — but the channel carries *submissions*
 //! and not the commit protocol: this domain still reads the committed generation
 //! from `cfg` and takes no part in releasing one. So a commit somebody else
-//! provoked still reaches it only when the next frame or the next answer wakes it.
+//! provoked still reaches it only when something wakes it.
+//!
+//! # It is woken by frames and by the passage of time
+//!
+//! Every deadline this domain holds — a retransmission, a reaping, and one day a
+//! reconnection backoff and an acknowledgement cadence — is judged on a pass, and
+//! a pass happens when this domain is woken. A silent link produces no frame, so
+//! until the clock domain gained a timer those deadlines could not be reached at
+//! all on the one condition they exist for. That domain now signals this one on a
+//! period. **The signal carries nothing and is not distinguished from any other
+//! wakeup**: a pass asks its questions of the regions rather than of whatever
+//! woke it, and a tick that carried an instant would be a second source of the
+//! one fact `RDTSC` and the calibration already answer.
 //!
 //! # Two instructions, and why they are here rather than in a crate
 //!
@@ -66,9 +78,10 @@
 //!
 //! * **`RDTSC`**, once per wakeup. It is what makes a `Monotonic` out of the
 //!   calibration this domain reads, and every transport timer is stated against
-//!   one. There is no IPC for a timestamp and there is no timer interrupt: a
-//!   reading costs one instruction, and asking another domain for one would cost a
-//!   round trip on the path of every frame.
+//!   one. There is no IPC for a timestamp: a reading costs one instruction, and
+//!   asking another domain for one would cost a round trip on the path of every
+//!   frame. The clock domain's tick says that time has passed and deliberately
+//!   says nothing about *what* time it is, for that reason.
 //! * **`RDRAND`**, once at start-up, for the secret the transport's initial
 //!   sequence numbers are derived from (`entropy`). A predictable sequence number
 //!   is an off-path injection primitive against the very attacker this port
@@ -790,10 +803,17 @@ impl Handler for Management {
     /// first, because a frame answered under the generation and the calibration
     /// that arrived with it is a frame answered correctly.
     ///
-    /// A refused domain does nothing at all here. It holds no stage, and nothing
-    /// in this system can wake it in any case — the driver's notification is the
-    /// only capability held on this domain, and a domain that refused is one that
-    /// will never answer a frame.
+    /// **`channels` is deliberately unread.** Four things can wake this domain
+    /// now — the driver, the recorder, the configuration domain and the clock
+    /// domain's tick — and the pass is the same for all four, because none of
+    /// them says anything a region does not. A tick that provoked a different
+    /// pass from a frame would be a second code path over the same state, and
+    /// the deadlines it exists to reach are exactly the ones a frame's pass
+    /// judges.
+    ///
+    /// A refused domain does nothing at all here. It holds no stage, and a
+    /// domain that refused is one that will never answer a frame however it is
+    /// woken.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         let Self::Running(running) = self else {
             return Ok(());

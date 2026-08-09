@@ -151,63 +151,45 @@ pub struct Attempt {
     owed: OnboardOutcome,
 }
 
-/// Wake the appliance once, as cheaply as a wakeup can be had.
+/// Let the appliance run the pass that ends a session and writes its account.
 ///
-/// A connection opened and closed on the port's *other* surface, carrying no
-/// request: the domain that owns the network has no timer, so what advances the
-/// pass that ends a session and writes its account is a frame arriving, and this
-/// is the fewest frames that produce one. **Cheapness is the property, not an
-/// optimization** — the obvious wakeup is a request, and a request pulls tens of
-/// thousands of bytes whose every drain writes a console record of its own, which
-/// overruns the bounded log ring and drops exactly the records this boot is
-/// waiting for.
-pub(crate) fn nudge(host_port: u16) -> Result<(), String> {
-    let address: SocketAddr = format!("127.0.0.1:{host_port}")
-        .parse()
-        .map_err(|error| format!("address the management forward: {error}"))?;
-    let stream = TcpStream::connect_timeout(&address, CLIENT_TIMEOUT)
-        .map_err(|error| format!("wake the appliance on 127.0.0.1:{host_port}: {error}"))?;
-    // Both directions, so the appliance sees the end of the stream rather than
-    // holding a connection this run will not come back to.
-    let _ = stream.shutdown(Shutdown::Both);
-    // A pass per wakeup, and the passes are what is being waited for: without
-    // this the loop spends its whole budget faster than the guest can answer one
-    // of them.
+/// **A wait, not a prod, and that is the change this exists to record.** The
+/// domain that carries a session used to hold no timer: every pass that advanced
+/// the handover ran on a frame arriving, and the pass that ends a session had no
+/// frame of its own once the client's connection was gone — so this harness had
+/// to open a connection on the port's other surface to provoke one. The clock
+/// domain wakes that domain on a period now, so the traffic bought nothing, and
+/// it cost something real: every frame draws a console record, and a domain whose
+/// log ring fills faster than a 115200-baud console drains it drops records —
+/// including the second of the two a session's account is written as.
+pub(crate) fn settle() {
     std::thread::sleep(SETTLE);
-    Ok(())
 }
 
-/// How long one wakeup is given to produce its pass.
-const SETTLE: Duration = Duration::from_millis(50);
+/// How long one pass is given to happen. Two ticks of the appliance's own
+/// periodic wakeup, so a wait spans one whatever the boot is doing.
+const SETTLE: Duration = Duration::from_millis(200);
 
-/// Run every client against the forwarded port, nudging the appliance between
-/// them.
+/// Run every client against the forwarded port, letting the appliance settle
+/// between them.
 ///
-/// `nudge` is called after each attempt because the domain that carries a
-/// session holds no timer: every pass that advances the handover runs on a
-/// wakeup, and the pass that ends a session and writes its record has no frame
-/// of its own once the client's connection is gone. The caller supplies traffic
-/// the port answers; this decides when it is needed.
+/// [`settle`] is called after each attempt because a session's last handover and
+/// the pass that publishes its account both happen after the client's connection
+/// is gone, and a client that opened the next connection before both had run
+/// would leave two sessions racing for one slot. Nothing is put on the wire to
+/// make them happen — the appliance's own periodic wakeup does that.
 ///
 /// # Errors
 /// A client that could not be run at all, which is the harness's own failure
 /// rather than the appliance's.
-pub(crate) fn drive(
-    onboard_port: u16,
-    mut nudge: impl FnMut() -> Result<(), String>,
-) -> Result<Vec<Attempt>, String> {
+pub(crate) fn drive(onboard_port: u16) -> Result<Vec<Attempt>, String> {
     let mut attempts = Vec::new();
     for client in CLIENTS {
         attempts.push(match client.arguments {
             Some(arguments) => speak_tls(&client, arguments, onboard_port)?,
             None => say_nothing(&client, onboard_port)?,
         });
-        // Twice: the first wakeup carries the session's last handover and the
-        // second the pass that publishes its account, and a client that opened
-        // the next connection before both had run would leave two sessions
-        // racing for one slot.
-        nudge()?;
-        nudge()?;
+        settle();
     }
     Ok(attempts)
 }

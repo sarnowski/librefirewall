@@ -277,6 +277,14 @@ pub(crate) struct ForwardBench {
 /// dials a first-party constant, so an image whose management prefix does not
 /// contain it reaches the station and is right to refuse what it says back, its
 /// own addressing rules putting that address off-link.
+/// **No boot injects a frame to carry a dial.** A station that answers the
+/// resolution and then falls silent used to leave the appliance sitting on a
+/// `SYN` its own retransmission could not re-send, because nothing woke the
+/// domain that holds that timer; the harness spoke to it until the channel
+/// moved. The clock domain now wakes that domain on a period, so every backoff
+/// and every re-ask runs on the appliance's own time and the stations below say
+/// nothing at all while a dial is outstanding. A channel that still decides is
+/// one the appliance carried by itself, which is what these scenarios now prove.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialContract {
     /// The dial is answered and nothing is required of it. Every scenario whose
@@ -308,14 +316,6 @@ impl DialContract {
             Self::Answered | Self::Judged => DialMisbehaviour::Answers,
             Self::Misbehaves(misbehaviour) => misbehaviour,
         }
-    }
-
-    /// Whether this boot spends frames keeping the port awake while its dial is
-    /// outstanding. Only a boot that judges the channel needs to: everywhere else
-    /// the dial is answered and left unasserted, so a channel that stalls costs
-    /// the run nothing.
-    pub(crate) const fn nudges(self) -> bool {
-        !matches!(self, Self::Answered)
     }
 
     /// Whether this boot's station leaves the appliance's `SYN` unanswered, and
@@ -2457,6 +2457,7 @@ fn run_scenario(
         ManagementRole::Client => {
             let judged = metrics_contract::judge(
                 &booted.scrapes,
+                booted.started_at.elapsed(),
                 booted.dataplane_frames,
                 booted.policy,
                 &topology,

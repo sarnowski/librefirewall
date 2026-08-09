@@ -1133,9 +1133,11 @@ claims.
   an `unchanged` outcome rather than a new version.
 - **No commit-confirm, and now it is a real gap rather than an unreachable one.** The
   candidate/commit half of the [configuration design](../design/configuration.md)'s transaction model
-  exists; the confirm half does not, and it cannot be built here yet: an automatic revert needs a
-  deadline, and the configuration domain holds no timer and no interrupt — the clock domain publishes
-  an instant, not a wakeup. What has changed is the stakes. Until a document could be submitted there
+  exists; the confirm half does not. What was missing until now was the mechanism: an automatic
+  revert needs a deadline, and the configuration domain holds no timer and no interrupt. The clock
+  domain's periodic wakeup is that mechanism, and it currently reaches only the management domain —
+  giving the confirm half a way to be built rather than building it. What has changed besides is the
+  stakes. Until a document could be submitted there
   was no management channel to sever, so commit-confirm protected nothing; now a document that
   validates and moves the management address is a document that locks an operator out of the node it
   was committed on, with nothing to undo it.
@@ -1214,9 +1216,10 @@ quietly reuse slots the console never rendered. Sixteen regions, 160 KiB, one pa
 eight writing domains; no writer maps another writer's, and the console — which writes no ring of
 its own — maps every records half read-only and every consume half read-write.
 
-The console busy-polls and never leaves `init`, exactly as the NIC drivers do — Microkit has no
-periodic wakeup, so a `notified`-driven console would stall a boot transcript longer than the
-16-byte FIFO until some unrelated domain happened to log again. Its priority is 1, *equal* to the
+The console busy-polls and never leaves `init`, exactly as the NIC drivers do: a `notified`-driven
+console would stall a boot transcript longer than the 16-byte FIFO until something woke it again,
+and the clock domain's tick does not answer that — it arrives on a period chosen for the management
+channel's schedules, and sixteen bytes per tick would take minutes over a boot transcript. Its priority is 1, *equal* to the
 drivers rather than above them, so a 115200-baud write cannot preempt the dataplane. Attention is
 shared round-robin with a rotating start and at most eight records taken from any one ring per pass,
 both constants of this build: a domain that fills its ring faster than the line drains costs the
@@ -1856,7 +1859,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 25 console cause tokens and parks. Two of the 31 system scenarios assert that record
+one of 30 console cause tokens. Two of the 31 system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -1876,9 +1879,39 @@ publishes *after* the record that states what it measured. The same two scenario
 of this against the release image: that every record carries the field in one of its two forms, that
 every instant is inside the RTC reader's year band, that no domain goes back to `unsynchronized`
 after stamping, and that no domain's instants go backwards. The one-way transition is a fact about
-*this* clock domain — it publishes once and parks — and not a property of the field: a reader
-re-reads the region on every question by design, and answers `unsynchronized` again for a
+*this* clock domain — it publishes exactly once and never again — and not a property of the field: a
+reader re-reads the region on every question by design, and answers `unsynchronized` again for a
 calibration that is torn under the read or outside the band it accepts, having refused it.
+
+**The clock domain is also this appliance's only source of periodic wakeups, and the management
+domain is its only consumer.** Nothing else in the system is entered by the passage of time: a
+protection domain is woken by a frame or by a peer's signal, so a domain holding a deadline and no
+traffic sits at it for ever — which is the shape of every schedule the management channel owes, and a
+silent link is precisely what those schedules exist for. So the clock domain arms one of the HPET's
+comparators for a **100 ms period** and takes the interrupt it raises: the system's first and only
+`<irq>`, on I/O APIC input 23, edge-triggered so the handler owes the device nothing. The input is
+chosen rather than convenient: a shared one is a handler counting another device's interrupts as its
+own, and input 2 — the obvious choice — is where a PC-compatible platform delivers the interval
+timer's line, which turned a wakeup armed for ten a second into thirty. Each interrupt
+is acknowledged, counted into `librefirewall_clock_ticks_total`, and passed on as a bare
+notification to the management domain — bare because that domain maps the calibration and reads the
+counter itself, so an instant sent alongside would be a second statement of one fact. The period is
+derived from the tightest obligation resting on it, the channel's once-a-second upstream flush, at a
+tenth of it; what it costs is ten preemptions of the dataplane per second, each a fixed handful of
+instructions. Arming can fail — a comparator that will not re-arm itself, one that cannot drive the
+granted input, one that drops what is written to it — and the node then keeps its time, keeps
+forwarding and keeps answering its port, with the refusal on a `ready` record and the tick counter
+standing still. The gate proves the wakeup two ways. The four boots whose management server misbehaves now watch the
+appliance retransmit its dial and give up **with the harness injecting no frames at all**, which
+before this existed it could not do — the boot whose station goes silent fell from 854 injected
+frames to 138, and every one of the 138 is the traffic that boot was always about. The onboarding
+boots went the same way, and the run that made the case did it by failing: an injected frame draws a
+console record out of the endpoint, a log ring that fills faster than a 115200-baud console drains
+it drops records, and the second of the two records a session's account is written as went missing.
+The crutch had become the defect. And every scraped
+boot holds the counter to the period: it must have moved between the two scrapes, and where they are
+more than two seconds apart the count is held to a band around what the interval names — which is
+what catches an interrupt input shared with another device, the fault that chose input 23.
 
 **Missing** — and it is everything the word *trusted* covers:
 
@@ -1902,7 +1935,8 @@ calibration that is torn under the read or outside the band it accepts, having r
   management domain alone; the other eight writing domains publish no such series (see the
   [metrics reference](../reference/metrics.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
-  never corrected; there is no timer, no interrupt, and no second reading to drift against.
+  never corrected, and the periodic wakeup does not change that: it announces that an interval has
+  passed and carries no reading, so there is still no second measurement to drift against.
 - **Single-core assumption.** The calibration is a reading of one core's counter, with no check that
   the counter is invariant and no per-core anchoring — neither of which matters on the single vCPU
   this system runs on and both of which would on any multicore variant.
@@ -1941,19 +1975,33 @@ are one per direction and their perms are the argument — the forwarder maps th
 publisher maps the acknowledgement read-only, so it cannot forge the consent that releases its own
 generation.
 
-Five notification channels. The three driver channels are granted in **one direction only** — a driver
-may signal its consumer, and that consumer's send capability on the driver does not exist rather
-than merely going unexercised. The recorder's channel to the management domain is one-directional
-too, and in the opposite sense: the recorder may announce a download window, and the management
-domain may not signal back, because the recorder busy-polls its request region and a send capability
-it does not need is one it must not hold. The fifth, between the configuration domain and the
-forwarder, is the one granted in **both**, and stated as a decision at both ends rather than
-inherited from Microkit's default: the offer/acknowledge handover has a step in each direction and
-neither end can infer the other's. The forwarder therefore holds exactly one send capability in
-the whole system, on the configuration domain alone, and the management domain holds none at all.
-The console holds none in either direction — it never reaches the event loop, so a notification on
-it would be authority granted for nothing. Zero IRQs. The capability grant is machine-checkable in
-the Microkit capability/memory report the build generates.
+Nine notification channels, eighteen ends, and every direction stated as a decision rather than
+inherited from Microkit's default. The three driver channels are granted in **one direction only** —
+a driver may signal its consumer, and that consumer's send capability on the driver does not exist
+rather than merely going unexercised. The recorder's channel to the management domain is
+one-directional too, and in the opposite sense: the recorder may announce a download window, and the
+management domain may not signal back, because the recorder busy-polls its request region and a send
+capability it does not need is one it must not hold. The signing delegation is one-directional for a
+sharper reason still: the store domain, which holds the appliance's private key, holds no send
+capability anywhere in this system. The **clock domain's periodic wakeup** is the newest and is
+one-directional as well — the clock domain may signal the management domain, and the management
+domain may not signal back, because a domain that could would hold a wakeup capability on the owner
+of this node's idea of time, granted to the domain that faces the management-plane attacker. Three
+are granted in **both** directions and each earns it: the configuration domain and the forwarder,
+whose offer/acknowledge handover has a step in each direction neither end can infer; the management
+and configuration domains, over which a submitted document travels; and the management and
+cryptography domains, over which a TLS session's bytes do. The forwarder therefore holds exactly one
+send capability in the whole system, on the configuration domain alone, and the management domain
+holds exactly two, on the configuration and cryptography domains — the clock's channel and the
+recorder's and the driver's are ends it may not send on. The console holds none in either direction
+— it never reaches the event loop, so a notification on it would be authority granted for nothing.
+
+**One IRQ**, and it is the system's first: the clock domain holds an IRQHandler capability on I/O
+APIC input 23, edge-triggered, which is the interrupt its own periodic comparator raises. It is the
+narrowest instance of the class — one input, acknowledge and nothing else, no authority over the
+interrupt controller — and it is the only thing in this system that a *device* can use to enter a
+domain. The capability grant is machine-checkable in the Microkit capability/memory report the build
+generates, and every part of it above is compared against the code by `sysdesc::check`.
 
 Two **`<ioport>` grants**, on two domains, and they are the whole of the system's port authority.
 Neither of the two instructions the management domain reads is one: `RDTSC` and `RDRAND` are
@@ -1972,8 +2020,9 @@ compromise of either reaches no frame, no NIC and no configuration.
 
 The management domain's grant is its own port's two pipelines, the configuration and calibration
 regions **read-only**, and its own log ring; what it withholds is the whole of the port isolation: no
-dataplane region of any kind, no ECAM page, no BAR window, no virtqueue, no I/O port and no
-acknowledgement region. Of the six pipeline regions the receive **pool** is read-only — a frame this
+dataplane region of any kind, no ECAM page, no BAR window, no virtqueue, no I/O port, no interrupt
+and no acknowledgement region — the periodic wakeup it now depends on arrives as a notification from
+the domain that does hold the timer, and never as a device it could reach itself. Of the six pipeline regions the receive **pool** is read-only — a frame this
 appliance was sent is parsed and never altered — while the transmit pool is read-write, because a
 reply is a frame this domain originates into a buffer it owns. The two read-only grants are the
 argument in each case: a domain that could write `cfg` would rewrite the addressing it is about to be

@@ -22,12 +22,24 @@ use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::vec::Vec;
 
-use crate::{COUNT_SIZE_CAP, COUNTER_CLK_PERIOD_SHIFT, ENABLE_CNF, HpetMmio, Register};
+use crate::{
+    COUNT_SIZE_CAP, COUNTER_CLK_PERIOD_SHIFT, ENABLE_CNF, HpetMmio, INTERRUPT_PIN, Register,
+    TN_INT_ENB_CNF, TN_INT_ROUTE_CAP_SHIFT, TN_PER_INT_CAP, TN_TYPE_CNF,
+};
 
 /// The period of the 14.31818 MHz crystal a PC-compatible chipset derives its
 /// HPET from, in femtoseconds — what [`FakeHpet::conforming`] reports, and what
 /// a test reads an expected frequency or tick count off.
 pub(crate) const CRYSTAL_PERIOD_FEMTOSECONDS: u32 = 69_841_279;
+
+/// The inputs [`FakeHpet::conforming`]'s comparator says it may drive: the one
+/// this crate routes to, and a handful around it, so a test that widens or
+/// narrows the bitmap states a change rather than the whole of it.
+pub(crate) const CONFORMING_ROUTE_CAP: u32 = 0x00ff_0004;
+
+// The baseline block must offer the input the crate under test asks for, or
+// every arming test would be exercising the refusal instead of the sequence.
+const _: () = assert!(CONFORMING_ROUTE_CAP & (1 << INTERRUPT_PIN) != 0);
 
 /// One access this crate made to the block, in the order it made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +103,16 @@ pub(crate) struct FakeHpet {
     /// Whether a write to the configuration register latches [`ENABLE_CNF`]. A
     /// block that drops it is one whose counter never runs.
     accepts_enable: bool,
+    /// What Timer 0's Configuration and Capability register holds, and answers:
+    /// the read-only capability bits a block chooses, and whatever the crate
+    /// under test wrote into the rest.
+    timer_configuration: u64,
+    /// Whether a write to that register latches the bits that arm it. A block
+    /// that drops them is one whose comparator never raises an input.
+    accepts_arming: bool,
+    /// What Timer 0's Comparator register holds. Written twice by an arming and
+    /// read by nothing, so it exists for the log to carry both values.
+    timer_comparator: u64,
     /// The first reading of the main counter.
     counter_base: u64,
     /// Ticks the counter advances per read; zero is a counter that never moves.
@@ -115,6 +137,10 @@ impl FakeHpet {
             capabilities: capabilities_word(1, true, CRYSTAL_PERIOD_FEMTOSECONDS),
             configuration: 0,
             accepts_enable: true,
+            timer_configuration: TN_PER_INT_CAP
+                | (u64::from(CONFORMING_ROUTE_CAP) << TN_INT_ROUTE_CAP_SHIFT),
+            accepts_arming: true,
+            timer_comparator: 0,
             counter_base: 0,
             ticks_per_read: 1,
             counter_reads: Cell::new(0),
@@ -160,6 +186,34 @@ impl FakeHpet {
     /// the counter is never started.
     pub(crate) fn refusing_enable(mut self) -> Self {
         self.accepts_enable = false;
+        self
+    }
+
+    /// Hold this Timer 0 Configuration and Capability word before the arming
+    /// touches it — any word at all, including one no conforming part could
+    /// produce.
+    pub(crate) fn with_timer_configuration(mut self, configuration: u64) -> Self {
+        self.timer_configuration = configuration;
+        self
+    }
+
+    /// Claim a comparator that cannot re-arm itself.
+    pub(crate) fn without_periodic_capability(mut self) -> Self {
+        self.timer_configuration &= !TN_PER_INT_CAP;
+        self
+    }
+
+    /// Claim this set of routable inputs, leaving the rest of the word alone.
+    pub(crate) fn routable_to(mut self, route_cap: u32) -> Self {
+        self.timer_configuration &= u64::from(u32::MAX);
+        self.timer_configuration |= u64::from(route_cap) << TN_INT_ROUTE_CAP_SHIFT;
+        self
+    }
+
+    /// Drop the bits that arm the comparator from every write to its
+    /// configuration register, so no input is ever raised.
+    pub(crate) fn refusing_arming(mut self) -> Self {
+        self.accepts_arming = false;
         self
     }
 
@@ -219,6 +273,8 @@ impl FakeHpet {
             Register::Capabilities => self.capabilities,
             Register::Configuration => self.configuration,
             Register::MainCounter => self.counter_answer(),
+            Register::Timer0Configuration => self.timer_configuration,
+            Register::Timer0Comparator => self.timer_comparator,
         }
     }
 
@@ -244,17 +300,35 @@ impl HpetMmio for FakeHpet {
 
     fn write_u64(&mut self, register: Register, value: u64) {
         self.log.record(Op::Write { register, value });
-        // Only the configuration register latches: a write to the read-only
-        // capabilities register, or to the main counter, is dropped exactly as
-        // the part drops one it does not take. That the crate under test never
-        // makes either write is asserted by
-        // `no_path_writes_any_register_but_the_configuration`.
-        if register == Register::Configuration {
-            self.configuration = if self.accepts_enable {
-                value
-            } else {
-                value & !ENABLE_CNF
-            };
+        // Three registers latch: a write to the read-only capabilities
+        // register, or to the main counter, is dropped exactly as the part
+        // drops one it does not take. That the crate under test never makes
+        // either write is asserted by
+        // `no_path_writes_a_register_the_part_does_not_take`.
+        match register {
+            Register::Configuration => {
+                self.configuration = if self.accepts_enable {
+                    value
+                } else {
+                    value & !ENABLE_CNF
+                };
+            }
+            // The read-only capability bits are the part's and survive whatever
+            // is written over them, which is what lets a refusing block keep
+            // claiming it could have been armed.
+            Register::Timer0Configuration => {
+                const READ_ONLY: u64 =
+                    TN_PER_INT_CAP | ((u32::MAX as u64) << TN_INT_ROUTE_CAP_SHIFT);
+                let taken = if self.accepts_arming {
+                    value
+                } else {
+                    value & !(TN_INT_ENB_CNF | TN_TYPE_CNF)
+                };
+                self.timer_configuration =
+                    (self.timer_configuration & READ_ONLY) | (taken & !READ_ONLY);
+            }
+            Register::Timer0Comparator => self.timer_comparator = value,
+            Register::Capabilities | Register::MainCounter => {}
         }
     }
 }
