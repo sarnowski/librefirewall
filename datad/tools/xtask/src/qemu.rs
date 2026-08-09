@@ -955,6 +955,70 @@ pub(crate) fn test_system(root: &Path) -> Result<String, String> {
     run_scenarios(root, SCENARIOS)
 }
 
+/// The scenario whose boot leaves behind a medium an appliance has been
+/// onboarded on.
+///
+/// Named rather than left as a literal because two things need the same answer:
+/// the boot a suite runs to *get* an owned medium, and the source a
+/// [`StoreMedium::CopiedFrom`] names to take a copy of one. A caller outside this
+/// module states the name once and gets both.
+pub(crate) const OWNED_MEDIUM_SOURCE: &str = "onboarding-adopted";
+
+/// Boot the scenario that gives an appliance an owner, for a run that needs an
+/// owned medium of its own.
+///
+/// The A/B run is the caller, and it needs one for the reason nineteen scenarios
+/// in the table above do: a node no management plane has taken refuses every
+/// frame before it looks at it, so a suite whose subject is that **slot selection
+/// yields a working appliance** cannot state that against an unowned one. A
+/// firewall that came up carrying nothing is not a working firewall, and a
+/// dataplane broken by whatever the machinery selected would satisfy a contract
+/// that only asked whether the stack started.
+///
+/// Its scenarios cannot each onboard during their own boot, for the reason the
+/// table's cannot: an accepted package shuts the onboarding surface for good, so
+/// the management server has to be the last client a boot runs, and a boot that
+/// onboarded itself first would inject its traffic afterwards — a different loop
+/// from the one every scenario runs.
+///
+/// **This boot rather than a second definition of one.** There is one way an
+/// appliance changes hands, and a suite that restated it would be proving its own
+/// restatement rather than the appliance; running the scenario that already
+/// states it also means the medium is judged on the way out — the install held to
+/// the package contract, the store domain's own account of the identity it now
+/// carries — instead of being a file some boot happened to leave. What it costs
+/// the caller is one boot.
+///
+/// # Errors
+/// The scenario not being declared in [`SCENARIOS`], and anything the boot
+/// itself fails — with the diagnostic re-run every shipping failure gets.
+pub(crate) fn boot_the_owned_medium_source(root: &Path) -> Result<(), String> {
+    let scenario = SCENARIOS
+        .iter()
+        .find(|scenario| scenario.name == OWNED_MEDIUM_SOURCE)
+        .ok_or_else(|| {
+            format!(
+                "{OWNED_MEDIUM_SOURCE} is the boot that leaves a medium an appliance has been \
+                 onboarded on, and the scenario table declares none by that name, so a run asking \
+                 for an owned medium has nothing to boot"
+            )
+        })?;
+    // Derived from the medium it attaches like every other boot's, rather than
+    // stated here: this one starts from a fresh medium and so comes up unowned,
+    // and it is the install it runs that leaves an owner behind.
+    let owner = ownership_at_boot(SCENARIOS, scenario)?;
+    if let Err(verdict) = run_scenario(root, scenario, Run::Shipping, owner) {
+        return Err(diagnose::after_shipping_failure(
+            &format!("system scenario {}", scenario.name),
+            verdict,
+            &scenario_log(root, scenario, Run::Shipping),
+            &scenario_log(root, scenario, Run::Diagnostic),
+            || run_scenario(root, scenario, Run::Diagnostic, owner).map(|_| ()),
+        ));
+    }
+    Ok(())
+}
+
 /// Every system scenario the gate boots, in the order it boots them.
 ///
 /// A module constant rather than a local, so the two counts the status pages

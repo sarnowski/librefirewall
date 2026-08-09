@@ -41,7 +41,8 @@ make coverage             # measure host-crate line coverage and print the per-c
 make bench                # run the performance benchmarks
 make fuzz                 # run the seed smoke tests, build every fuzz target, exercise each briefly
 make test-system          # boot the QEMU system scenarios on the release image
-make test-ab              # boot the A/B state-machine scenarios on the release image
+make test-ab              # onboard an appliance, then boot the A/B state-machine scenarios on the
+                          #   release image and hold each booted slot to forwarding across it
 make ci                   # the complete gate: both fast gates, fuzz, release image, system and A/B,
                           #   then the debug image, assembled and never booted
 make release              # run the full gate, then keep `datad/dist/` only if it proved what it holds
