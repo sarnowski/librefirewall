@@ -330,6 +330,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "channel_tls"
+path = "fuzz_targets/channel_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "onboarding_package"
 path = "fuzz_targets/onboarding_package.rs"
 test = false

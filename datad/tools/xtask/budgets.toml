@@ -79,7 +79,7 @@
 "crates/log/src/render.rs" = 0.2277
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
-"crates/metrics/src/catalog.rs" = 0.1198
+"crates/metrics/src/catalog.rs" = 0.1191
 "crates/metrics/src/interfaces.rs" = 0.3625
 "crates/metrics/src/lib.rs" = 0.5714
 "crates/metrics/src/render.rs" = 0.2878
@@ -106,7 +106,7 @@
 "crates/pd-runtime/src/download.rs" = 0.3947
 "crates/pd-runtime/src/endpoint.rs" = 0.4337
 "crates/pd-runtime/src/handover.rs" = 0.3569
-"crates/pd-runtime/src/lib.rs" = 0.4992
+"crates/pd-runtime/src/lib.rs" = 0.4976
 "crates/pd-runtime/src/owner.rs" = 0.5122
 "crates/pd-runtime/src/relay.rs" = 0.4180
 "crates/pd-runtime/src/stats.rs" = 0.2276
@@ -133,12 +133,13 @@
 "crates/tcp/src/seq.rs" = 0.3786
 "crates/tls/src/arena.rs" = 0.3945
 "crates/tls/src/chain.rs" = 0.6121
+"crates/tls/src/client.rs" = 0.4076
 "crates/tls/src/identity.rs" = 0.2699
 "crates/tls/src/kx.rs" = 0.2071
-"crates/tls/src/lib.rs" = 0.6591
+"crates/tls/src/lib.rs" = 0.6796
 "crates/tls/src/provider.rs" = 0.3097
-"crates/tls/src/server.rs" = 0.2944
-"crates/tls/src/session.rs" = 0.2584
+"crates/tls/src/server.rs" = 0.2972
+"crates/tls/src/session.rs" = 0.2729
 "crates/tls/src/sign.rs" = 0.3256
 "crates/tls/src/suite.rs" = 0.1498
 "crates/tls/src/verify.rs" = 0.3396
@@ -168,7 +169,7 @@
 "crates/x509/src/time.rs" = 0.2625
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
-"pds/clock/src/main.rs" = 0.4839
+"pds/clock/src/main.rs" = 0.4663
 "pds/config/src/main.rs" = 0.4016
 "pds/console/src/com1.rs" = 0.6400
 "pds/console/src/main.rs" = 0.4926

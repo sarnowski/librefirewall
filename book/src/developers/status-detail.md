@@ -2396,7 +2396,9 @@ and the PKCS#10 request, over a first-party bounded DER writer. It emits and nev
 
 `lfw-tls` is the rustls crypto provider — hash, MAC, the key schedule over it, the record-layer
 AEAD, the hybrid key exchange, the one signature algorithm — plus the bounded arena's bookkeeping
-and a session driver over rustls' unbuffered API. It contains no `unsafe` at all.
+and three drivers over rustls' unbuffered API: the session that proves both halves against each
+other in one call, the incremental onboarding server, and the incremental channel client. It
+contains no `unsafe` at all.
 
 `pds/crypto` gates the part on `CPUID`, re-runs all 154 vectors against the code as compiled for
 the SIMD target, measures each primitive (per byte where it has a length, per operation where it
@@ -2699,6 +2701,60 @@ against the ones the client printed, and the certificate's subject against the d
 **store** domain printed on the same boot, which is one appliance's name reaching a peer over a wire
 and no single surface can state it. The successful handshake goes first, so the three failures after
 it are sessions on a port that has already carried one.
+
+**The channel's client half is built beside it, and nothing runs it.** `lfw_tls::ChannelClient` is
+the onboarding server's sibling: the same incremental shape — bytes in a delivery at a time, bytes
+back into the room the wire has, the session held across calls — over the same provider, the same
+bounded arena and the same key delegation. What differs is which way the trust runs. It presents the
+device certificate a management authority issued and signs the handshake through the domain that
+holds the key; it validates the server against **one delivered anchor and nothing else**, with no
+system roots and no second authority, and holds that certificate to the **address literal it
+dialled** rather than to a name, so nothing a resolver said enters the decision. Resumption is off:
+the channel is one long-lived session, so a ticket would be state kept on a peer's behalf in a
+bounded region to shorten a handshake that happens once a boot.
+
+**The outcome vocabulary is twelve values, and two of them exist only on this end.** Ten mirror the
+server's — the three code points a handshake settled on, a peer that answered nothing, one that left
+part way, the fatal alert a peer sent, the library's own incompatibility discriminant, a peer that
+broke the protocol, this end's refusal as the library's error variant, the arena short of a phase's
+reserve, a direction that outgrew what it holds, and neither end able to progress. The two that are
+only a client's are the two an operator here needs most, because only this end validates a peer
+against an anchor somebody delivered to it: **the anchor refusing the server's certificate**, which
+carries *which way* it refused — an issuer it cannot reach, a signature that does not check, a
+certificate outside its window, one that does not name the address dialled — and **an anchor no
+verifier can be built over at all**, which is a fault in what was installed rather than in what the
+peer presented, and sends an operator somewhere else entirely.
+
+**Which end judged what is the whole of how the vocabulary is cut.** This appliance's verdict on the
+server is the certificate variant. The server's verdict on *this appliance* arrives as the fatal
+alert it sent and in no other form, TLS 1.3 having no message by which a server says a client
+certificate was accepted — so the registry code point is the entire fact, and an unknown authority
+(48), a certificate that would not parse (42) and one refused for a reason of the server's own (46)
+are three numbers rather than one token. That absence is also why **a completed handshake is
+reported only once the peer has spoken on the session**: a TLS 1.3 client finishes a flight before
+its certificate has been judged, so reporting the three code points at that moment would put
+`established` on the console for exactly the appliance a management server is refusing.
+
+**Host-tested against a real management server, arm by arm.** A rustls server over this appliance's
+own provider, holding the endpoint certificate the delivered anchor issued and authenticating the
+appliance against that same anchor, drives a whole mutually-authenticated handshake and an
+application-data round trip through the very interface a protection domain will use, then closes;
+the delegated signer is held to exactly one call, and the certificate the server saw is held to the
+device certificate byte for byte. Real servers also drive both shapes of anchor mismatch, a
+certificate issued for another address, one outside its validity, all three refusal alerts, a peer
+that answers nothing, one that stops mid-flight, and three things a peer that *did* authenticate can
+then do. Two arms cannot be driven by a rustls server at all — this appliance's provider carries one
+version, one suite and one group, so a server built over it can select nothing else — and are
+written out as the server hello such a peer puts on the wire. `Stalled` is driven by neither: it is
+the two-shot encode and the per-turn state bound giving up, and no input reaches either.
+
+**A persistent fuzz target drives it with arbitrary streams cut into arbitrary deliveries**, into an
+answer buffer of an arbitrary size, over an arena an arbitrary amount of which is already spoken
+for, and with the anchor or the certificate replaced by the input — neither being this appliance's
+own to get right, both arriving over a delegation from a package a peer uploaded. What it cannot
+reach is stated where it lives rather than assumed covered: no stream of bytes completes a handshake
+with this end, the server's flight being bound to a key share and transcript that are fresh per
+session, so everything past the confirmation is the crate suite's to hold and is held there.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two
@@ -3015,7 +3071,11 @@ crowding refusal as a counter, though the counter now exists: the boot that crow
 station of the harness's own on the management wire, and a scrape needs QEMU's user-mode stack on
 that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
 states, and the counter is read by hand. The management domain's own dial is
-a separate thing and still carries ten bytes of first-party probe and no protocol at all. The session is proved
+a separate thing and still carries ten bytes of first-party probe and no protocol at all — and the
+channel client that will run over it, though built and host-tested, is reached by **no protection
+domain**: no booted image has run a channel handshake, no console record says how one ended, no
+scenario drives one, and the anchor it validates against is passed in by its caller rather than
+delivered to the domain that would open one. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,
 standing in for a management server and an anchor this appliance has never seen. SHA-NI stays unreachable for the reason the [status page](../status.md) records.
@@ -3107,7 +3167,7 @@ is *done* currently sits.
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 30 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
 | QEMU end-to-end gate (31 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 16 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 28 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 29 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |

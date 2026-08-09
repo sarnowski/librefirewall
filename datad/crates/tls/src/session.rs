@@ -44,6 +44,45 @@ pub const STEP_RESERVE: usize = 256 * 1024;
 /// not fit.
 pub(crate) const WIRE_CHUNK: usize = 4096;
 
+/// Bytes of one direction one incremental end will hold at once.
+///
+/// Two maximal TLS records. One is the most a peer can make an end buffer
+/// before the library either consumes it or refuses the length in its header,
+/// and the second is the room a delivery that lands while a record is still
+/// half-assembled needs. Past it the session is refused rather than the buffer
+/// grown: the region every one of these allocates from is fixed, and a buffer a
+/// peer paces is exactly the thing that must not be.
+///
+/// It is the record layer's bound and not a protocol's. What the channel's
+/// framing carries above it is reassembled by the framing's owner out of as
+/// many records as it takes, so a frame larger than this is not a session this
+/// bound refuses.
+pub const HELD_MAX: usize = 2 * (5 + (1 << 14) + 256);
+
+/// What one turn of an incremental end produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Turn {
+    /// Bytes written into the front of the caller's buffer.
+    pub sent: usize,
+    /// Whether the session is over **and** everything it owed the wire has
+    /// gone. A session with an alert still queued is not finished, because the
+    /// peer is owed the reason.
+    pub finished: bool,
+}
+
+/// The three code points a completed handshake settled on, as the protocol
+/// registries number them.
+///
+/// Either end's, both ends settling on the same three: the appliance reports
+/// them where it answered a client and where it dialled a server, and an
+/// operator compares them against the same registries either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Established {
+    pub version: u16,
+    pub suite: u16,
+    pub group: u16,
+}
+
 /// Turns of the pump before a session is called stalled. A liveness bound and
 /// not a protocol constant: a handshake is a dozen records, and what this
 /// exists to stop is the shape where neither side can progress.
@@ -507,6 +546,80 @@ pub(crate) fn encrypt_error(error: EncryptError) -> Room {
         EncryptError::InsufficientSize(needed) => Room::Needed(needed.required_size),
         other => Room::Failed(rustls::Error::General(format!("{other:?}"))),
     }
+}
+
+/// Why an incremental end stopped writing what the library produced.
+///
+/// The two ends answer in vocabularies of their own, so this carries the fact
+/// and each maps it — the alternative being one of the two outcome enums
+/// reaching the other end's code, which is how a token belonging to one surface
+/// arrives on the other.
+pub(crate) enum Held {
+    /// The buffer would have had to hold this many bytes.
+    Backlogged(usize),
+    /// The library would not produce the record.
+    Refused(rustls::Error),
+    /// Two attempts at the room the library asked for, and it still did not
+    /// fit.
+    Stalled,
+}
+
+/// Append `bytes`, or answer what the buffer would have had to hold.
+pub(crate) fn absorb(into: &mut Vec<u8>, bytes: &[u8]) -> Result<(), usize> {
+    let held = into.len().saturating_add(bytes.len());
+    if held > HELD_MAX {
+        return Err(held);
+    }
+    into.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Drop the first `bytes` of `buffer`.
+pub(crate) fn drop_front(buffer: &mut Vec<u8>, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let len = buffer.len();
+    let bytes = bytes.min(len);
+    buffer.copy_within(bytes.., 0);
+    buffer.truncate(len.saturating_sub(bytes));
+}
+
+/// Append what `write` produces to `buffer`, offering it more room where it
+/// says how much it needs. One retry and not a search, because the library
+/// reports the exact size.
+pub(crate) fn encode_into(
+    buffer: &mut Vec<u8>,
+    mut write: impl FnMut(&mut [u8]) -> Result<usize, Room>,
+) -> Result<(), Held> {
+    let mut room = WIRE_CHUNK;
+    for _ in 0..2 {
+        let at = buffer.len();
+        let end = at.saturating_add(room);
+        if end > HELD_MAX {
+            return Err(Held::Backlogged(end));
+        }
+        buffer.resize(end, 0);
+        let produced = match buffer.get_mut(at..) {
+            Some(scratch) => write(scratch),
+            None => return Err(Held::Stalled),
+        };
+        match produced {
+            Ok(len) => {
+                buffer.truncate(at.saturating_add(len).min(end));
+                return Ok(());
+            }
+            Err(Room::Needed(needed)) => {
+                buffer.truncate(at);
+                room = needed;
+            }
+            Err(Room::Failed(error)) => {
+                buffer.truncate(at);
+                return Err(Held::Refused(error));
+            }
+        }
+    }
+    Err(Held::Stalled)
 }
 
 /// Append what `write` produces to `wire`, offering it more room where it says

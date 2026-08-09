@@ -16,19 +16,12 @@ use rustls::{
 use crate::{
     arena::{ArenaExhausted, Bump},
     provider::Clock,
-    session::{MAX_STATES, Room, WIRE_CHUNK, encode_error, encrypt_error, headroom},
+    session::{
+        Established, HELD_MAX, Held, MAX_STATES, Turn, absorb, drop_front, encode_error,
+        encode_into, encrypt_error, headroom,
+    },
     sign::{EcdsaP256SigningKey, SignOperation},
 };
-
-/// Bytes of one direction this server will hold at once.
-///
-/// Two maximal TLS records. One is the most a peer can make this end buffer
-/// before the library either consumes it or refuses the length in its header,
-/// and the second is the room a delivery that lands while a record is still
-/// half-assembled needs. Past it the session is refused rather than the buffer
-/// grown: the region every one of these allocates from is fixed, and a buffer
-/// an unauthenticated peer paces is exactly the thing that must not be.
-pub const HELD_MAX: usize = 2 * (5 + (1 << 14) + 256);
 
 /// Code points of one kind kept out of a client's offer.
 ///
@@ -92,15 +85,6 @@ impl Offered {
 pub struct PeerOffer {
     pub suites: Offered,
     pub groups: Offered,
-}
-
-/// The three code points a completed handshake settled on, as the protocol
-/// registries number them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Established {
-    pub version: u16,
-    pub suite: u16,
-    pub group: u16,
 }
 
 /// How one onboarding handshake ended.
@@ -344,17 +328,6 @@ fn refusal(error: &Error) -> TlsRefusal {
         Error::Other(_) => TlsRefusal::Other,
         _ => TlsRefusal::Unrecognized,
     }
-}
-
-/// What one turn of the server produced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Turn {
-    /// Bytes written into the front of the caller's buffer.
-    pub sent: usize,
-    /// Whether the session is over **and** everything it owed the wire has
-    /// gone. A session with an alert still queued is not finished, because the
-    /// peer is owed the reason.
-    pub finished: bool,
 }
 
 /// The onboarding server: one TLS 1.3 session, driven a delivery at a time.
@@ -603,7 +576,8 @@ impl<'arena> OnboardingServer<'arena> {
                         settle = encode_into(outgoing, |room| {
                             encoder.encode(room).map_err(encode_error)
                         })
-                        .err();
+                        .err()
+                        .map(stopped);
                     }
                     Ok(ConnectionState::TransmitTlsData(transmit)) => transmit.done(),
                     Ok(ConnectionState::WriteTraffic(mut writer)) => {
@@ -614,7 +588,8 @@ impl<'arena> OnboardingServer<'arena> {
                                 settle = encode_into(outgoing, |room| {
                                     writer.queue_close_notify(room).map_err(encrypt_error)
                                 })
-                                .err();
+                                .err()
+                                .map(stopped);
                             } else {
                                 blocked = true;
                             }
@@ -623,7 +598,8 @@ impl<'arena> OnboardingServer<'arena> {
                             settle = encode_into(outgoing, |room| {
                                 writer.encrypt(&payload, room).map_err(encrypt_error)
                             })
-                            .err();
+                            .err()
+                            .map(stopped);
                         }
                     }
                     Ok(ConnectionState::ReadTraffic(mut traffic)) => {
@@ -778,70 +754,21 @@ fn settled(error: Error, capture: &Capture) -> ServerOutcome {
     }
 }
 
+/// A write this end could not finish, as this end reports it.
+fn stopped(held: Held) -> ServerOutcome {
+    match held {
+        Held::Backlogged(held) => ServerOutcome::Backlogged { held },
+        Held::Refused(error) => ServerOutcome::Refused(error),
+        Held::Stalled => ServerOutcome::Stalled,
+    }
+}
+
 /// Whether an incompatibility is one the client's own offer explains.
 const fn nothing_in_common(incompatible: &PeerIncompatible) -> bool {
     matches!(
         incompatible,
         PeerIncompatible::NoCipherSuitesInCommon | PeerIncompatible::NoKxGroupsInCommon
     )
-}
-
-/// Append `bytes`, or answer what the buffer would have had to hold.
-fn absorb(into: &mut Vec<u8>, bytes: &[u8]) -> Result<(), usize> {
-    let held = into.len().saturating_add(bytes.len());
-    if held > HELD_MAX {
-        return Err(held);
-    }
-    into.extend_from_slice(bytes);
-    Ok(())
-}
-
-/// Drop the first `bytes` of `buffer`.
-fn drop_front(buffer: &mut Vec<u8>, bytes: usize) {
-    if bytes == 0 {
-        return;
-    }
-    let len = buffer.len();
-    let bytes = bytes.min(len);
-    buffer.copy_within(bytes.., 0);
-    buffer.truncate(len.saturating_sub(bytes));
-}
-
-/// Append what `write` produces to `buffer`, offering it more room where it
-/// says how much it needs. One retry and not a search, because the library
-/// reports the exact size.
-fn encode_into(
-    buffer: &mut Vec<u8>,
-    mut write: impl FnMut(&mut [u8]) -> Result<usize, Room>,
-) -> Result<(), ServerOutcome> {
-    let mut room = WIRE_CHUNK;
-    for _ in 0..2 {
-        let at = buffer.len();
-        let end = at.saturating_add(room);
-        if end > HELD_MAX {
-            return Err(ServerOutcome::Backlogged { held: end });
-        }
-        buffer.resize(end, 0);
-        let produced = match buffer.get_mut(at..) {
-            Some(scratch) => write(scratch),
-            None => return Err(ServerOutcome::Stalled),
-        };
-        match produced {
-            Ok(len) => {
-                buffer.truncate(at.saturating_add(len).min(end));
-                return Ok(());
-            }
-            Err(Room::Needed(needed)) => {
-                buffer.truncate(at);
-                room = needed;
-            }
-            Err(Room::Failed(error)) => {
-                buffer.truncate(at);
-                return Err(ServerOutcome::Refused(error));
-            }
-        }
-    }
-    Err(ServerOutcome::Stalled)
 }
 
 /// The certificate this appliance presents, and the record of what the client

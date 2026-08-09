@@ -651,12 +651,14 @@ use rustls::{
 use crate::{Established, HELD_MAX, Identity, OnboardingServer, ServerOutcome, Turn};
 use lfw_x509::CertificateKind;
 
-/// What one delivery off the relay may carry, and what one answer may fill.
+/// What one delivery off the wire may carry, and what one answer may fill.
 ///
 /// The transport's own two numbers, restated here because this crate does not
-/// depend on the crate that owns them: what a test must not do is hand the
-/// server a run larger than the wire ever will, because that is the pacing the
-/// bounds are about.
+/// depend on the crate that owns them: what a test must not do is hand an
+/// incremental end a run larger than the wire ever will, because that is the
+/// pacing the bounds are about. The same two serve the channel client below —
+/// its transport is a different one with the same shape, and a bound this crate
+/// does not own is a bound it may not state twice.
 const DELIVERY: usize = 4096;
 const ANSWER: usize = 4096;
 
@@ -1695,6 +1697,1160 @@ fn a_real_client_gets_the_page_and_the_request_over_the_session() {
     assert!(answered.contains(core::str::from_utf8(FINGERPRINT).expect("ascii")));
     assert!(answered.contains(&format!("Content-Length: {bytes}\r\n")));
     assert_eq!(arena.refusals(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The channel client, against a real server and against servers that are not
+// one
+// ---------------------------------------------------------------------------
+
+use rustls::{
+    CertificateError, PeerMisbehaved, RootCertStore, ServerConfig,
+    client::danger::HandshakeSignatureValid as ClientSignatureValid,
+    server::{
+        UnbufferedServerConnection, WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
+    sign::{CertifiedKey, SingleCertAndKey},
+};
+
+use crate::{ChannelClient, ClientOutcome};
+
+/// The address the delivered endpoint certificate names and the appliance
+/// dials. A literal and not a name, because that is what the channel's contract
+/// fixes: no resolver enters the trust decision.
+const ENDPOINT: [u8; 4] = [127, 0, 0, 1];
+const ENDPOINT_NAME: &[u8] = b"127.0.0.1";
+
+/// The three names a management authority issues under.
+const AUTHORITY: &[u8] = b"librefirewall management";
+const DEVICE: &[u8] = b"00000000000000000000000000000001";
+
+/// What a configuration package installs, and the key half the store domain
+/// keeps: the trust anchor this appliance validates its server against, the
+/// device certificate it presents, a capability over the key inside it, and —
+/// standing in for a management server nobody here runs — the endpoint
+/// certificate that server presents and the authority that issued both.
+struct Owned {
+    anchor: Vec<u8>,
+    device: Vec<u8>,
+    signer: std::sync::Arc<Counting>,
+    endpoint: std::sync::Arc<CertifiedKey>,
+}
+
+/// One management authority, and everything it issued.
+///
+/// Three things are parameters and each is an arm below. `named` and `address`
+/// are separated because an endpoint certificate issued for one address and
+/// dialled at another is a real failure of the channel. `authority` is
+/// separated because *how* a wrong anchor is wrong depends on it: two
+/// authorities sharing a name are told apart by a signature that does not
+/// check, and two with different names by there being no path at all — which
+/// are two different discriminants and two different things to go and look at.
+fn installed(fill: u8, address: [u8; 4], named: &[u8], authority: &[u8]) -> Owned {
+    let seconds = i64::try_from(NOW).unwrap_or(i64::MAX);
+    let authority_name = authority;
+    let authority = Identity::self_signed(
+        entropy(fill),
+        seconds,
+        CertificateKind::ManagementCa,
+        authority_name,
+    )
+    .expect("an authority");
+    let endpoint = Identity::issued_by(
+        &authority,
+        entropy(fill.wrapping_add(1)),
+        seconds,
+        CertificateKind::ChannelEndpoint { address },
+        named,
+        authority_name,
+    )
+    .expect("an endpoint certificate");
+    let device = Identity::issued_by(
+        &authority,
+        entropy(fill.wrapping_add(2)),
+        seconds,
+        CertificateKind::Device,
+        DEVICE,
+        authority_name,
+    )
+    .expect("a device certificate");
+    let device_certificate = device.certificate().to_vec();
+    let endpoint_key = std::sync::Arc::new(CertifiedKey::new(
+        std::vec![CertificateDer::from(endpoint.certificate().to_vec())],
+        std::sync::Arc::new(EcdsaP256SigningKey::new(std::sync::Arc::new(
+            LocalKey::new(endpoint.into_key()),
+        ))),
+    ));
+    Owned {
+        anchor: authority.certificate().to_vec(),
+        device: device_certificate,
+        signer: std::sync::Arc::new(Counting {
+            inner: LocalKey::new(device.into_key()),
+            calls: Mutex::new(0),
+        }),
+        endpoint: endpoint_key,
+    }
+}
+
+/// A management server the appliance would meet: a real rustls server driven by
+/// hand, presenting the endpoint certificate and authenticating the appliance
+/// against whichever authority it was given.
+struct Server {
+    connection: UnbufferedServerConnection,
+    incoming: Vec<u8>,
+    received: Vec<u8>,
+    pending: Vec<u8>,
+    closing: bool,
+    closed: bool,
+    handshaked: bool,
+    /// What the server refused, where it did.
+    refused: Option<rustls::Error>,
+}
+
+/// How a management server judges the certificate this appliance presents.
+enum Judging {
+    /// The adopted validator over one authority — the real decision, and how a
+    /// server that was issued a different authority's material refuses.
+    Anchor(Vec<u8>),
+    /// A verifier that refuses under a stated cause, which is how an alert code
+    /// point the adopted validator does not produce is reached at all.
+    Refusing(CertificateError),
+}
+
+impl Server {
+    fn new(fill: u8, key: std::sync::Arc<CertifiedKey>, judging: Judging) -> Self {
+        let source = entropy(fill);
+        let shared = std::sync::Arc::new(provider(source));
+        let clock: std::sync::Arc<dyn TimeProvider> = std::sync::Arc::new(Clock::at(NOW));
+        let verifier: std::sync::Arc<dyn ClientCertVerifier> = match judging {
+            Judging::Anchor(anchor) => {
+                let mut anchors = RootCertStore::empty();
+                anchors
+                    .add(CertificateDer::from(anchor))
+                    .expect("an authority certificate");
+                WebPkiClientVerifier::builder_with_provider(
+                    std::sync::Arc::new(anchors),
+                    std::sync::Arc::clone(&shared),
+                )
+                .build()
+                .expect("a client verifier")
+            }
+            Judging::Refusing(cause) => std::sync::Arc::new(Refusing {
+                cause,
+                algorithms: shared.signature_verification_algorithms,
+            }),
+        };
+        let mut config = ServerConfig::builder_with_details(std::sync::Arc::clone(&shared), clock)
+            .with_protocol_versions(&[&TLS13])
+            .expect("one version")
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(std::sync::Arc::new(SingleCertAndKey::from((*key).clone())));
+        config.send_tls13_tickets = 0;
+        Self {
+            connection: UnbufferedServerConnection::new(std::sync::Arc::new(config))
+                .expect("a server"),
+            incoming: Vec::new(),
+            received: Vec::new(),
+            pending: Vec::new(),
+            closing: false,
+            closed: false,
+            handshaked: false,
+            refused: None,
+        }
+    }
+
+    /// Drive until it needs bytes, answering what it produced for the wire.
+    fn turn(&mut self) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut faulted = false;
+        for _ in 0..64 {
+            let UnbufferedStatus { discard, state } =
+                self.connection.process_tls_records(&mut self.incoming);
+            let mut blocked = false;
+            match state {
+                Err(error) => {
+                    self.refused.get_or_insert(error);
+                    blocked = faulted;
+                    faulted = true;
+                }
+                Ok(ConnectionState::EncodeTlsData(mut encoder)) => {
+                    room(&mut wire, |out| {
+                        encoder.encode(out).map_err(|error| match error {
+                            EncodeError::InsufficientSize(needed) => needed.required_size,
+                            other => panic!("the server could not encode: {other:?}"),
+                        })
+                    });
+                }
+                Ok(ConnectionState::TransmitTlsData(transmit)) => transmit.done(),
+                Ok(ConnectionState::WriteTraffic(mut writer)) => {
+                    self.handshaked = true;
+                    if self.pending.is_empty() {
+                        if self.closing && !self.closed {
+                            self.closed = true;
+                            room(&mut wire, |out| {
+                                writer.queue_close_notify(out).map_err(insufficient)
+                            });
+                        } else {
+                            blocked = true;
+                        }
+                    } else {
+                        let payload = core::mem::take(&mut self.pending);
+                        room(&mut wire, |out| {
+                            writer.encrypt(&payload, out).map_err(insufficient)
+                        });
+                    }
+                }
+                Ok(ConnectionState::ReadTraffic(mut traffic)) => {
+                    while let Some(record) = traffic.next_record() {
+                        self.received
+                            .extend_from_slice(record.expect("a decryptable record").payload);
+                    }
+                }
+                // A peer that said goodbye is answered with goodbye, which is
+                // what a real management server does and what the client under
+                // test needs to see to call a session finished.
+                Ok(ConnectionState::PeerClosed) => self.closing = true,
+                Ok(_) => blocked = true,
+            }
+            if discard > 0 {
+                self.incoming.drain(..discard.min(self.incoming.len()));
+            }
+            if blocked {
+                break;
+            }
+        }
+        wire
+    }
+
+    /// The end-entity certificate the appliance presented, as this server saw
+    /// it.
+    fn peer(&self) -> Option<Vec<u8>> {
+        self.connection
+            .peer_certificates()
+            .and_then(<[CertificateDer<'_>]>::first)
+            .map(|certificate| certificate.as_ref().to_vec())
+    }
+}
+
+/// A client-certificate verifier that says no under a stated cause.
+///
+/// The adopted validator produces four of the alert code points a server can
+/// refuse an appliance with and not the fifth, so a server that refuses under a
+/// cause of its own is how the remaining one is put on the wire at all. It
+/// exists to drive this appliance's *reading* of an alert, and it makes no
+/// decision this appliance relies on.
+#[derive(Debug)]
+struct Refusing {
+    cause: CertificateError,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ClientCertVerifier for Refusing {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(self.cause.clone()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<ClientSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<ClientSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        std::vec![SignatureScheme::ECDSA_NISTP256_SHA256]
+    }
+}
+
+/// The two ends over a transport with the wire's shape: the client speaks
+/// first, a bounded answer at a time, and what comes back reaches it a bounded
+/// delivery at a time.
+struct Channel<'arena> {
+    client: ChannelClient<'arena>,
+    server: Server,
+    /// Whether the server answers what it hears.
+    echo: bool,
+    /// What the client has put on the wire and the server has not taken.
+    out: Vec<u8>,
+    /// Everything the client ever put on the wire.
+    spoken: Vec<u8>,
+}
+
+impl Channel<'_> {
+    /// Take whatever the client owes the wire, an answer at a time.
+    fn poll(&mut self) {
+        for _ in 0..16 {
+            let mut answer = [0_u8; ANSWER];
+            let turn = self.client.advance(&[], &mut answer);
+            self.out
+                .extend_from_slice(answer.get(..turn.sent).unwrap_or_default());
+            if turn.sent == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Hand `bytes` to the client a delivery at a time, keeping what it answers.
+    fn deliver(&mut self, bytes: &[u8]) -> Turn {
+        let mut last = Turn::default();
+        let mut deliveries: Vec<&[u8]> = bytes.chunks(DELIVERY).collect();
+        if deliveries.is_empty() {
+            deliveries.push(&[]);
+        }
+        for delivery in deliveries {
+            let mut answer = [0_u8; ANSWER];
+            last = self.client.advance(delivery, &mut answer);
+            self.out
+                .extend_from_slice(answer.get(..last.sent).unwrap_or_default());
+        }
+        last
+    }
+
+    /// One round: the client speaks, the server hears all of it and answers,
+    /// and the answer goes back a delivery at a time.
+    fn round(&mut self) -> Turn {
+        self.poll();
+        let spoken = core::mem::take(&mut self.out);
+        self.spoken.extend_from_slice(&spoken);
+        self.server.incoming.extend_from_slice(&spoken);
+        let mut back = self.server.turn();
+        if self.echo && !self.server.received.is_empty() {
+            let said = core::mem::take(&mut self.server.received);
+            self.server.pending.extend_from_slice(&said);
+            back.extend_from_slice(&self.server.turn());
+        }
+        self.deliver(&back)
+    }
+
+    /// Rounds until the client is finished, or until the bound says neither end
+    /// is going anywhere.
+    fn settle(&mut self) -> Turn {
+        let mut last = Turn::default();
+        for _ in 0..8 {
+            last = self.round();
+            if last.finished {
+                break;
+            }
+        }
+        last
+    }
+}
+
+/// A channel client opened the way the cryptography domain will open one.
+fn dial<'arena>(
+    fill: u8,
+    arena: &'arena Bump,
+    now: u64,
+    owned: &Owned,
+) -> Result<ChannelClient<'arena>, ClientOutcome> {
+    ChannelClient::open(
+        assembled(fill),
+        arena,
+        now,
+        ENDPOINT,
+        &owned.device,
+        std::sync::Arc::clone(&owned.signer) as std::sync::Arc<dyn SignOperation>,
+        &owned.anchor,
+    )
+}
+
+/// The whole channel handshake against a real management server: mutual
+/// authentication both ways, the three code points the contract fixes,
+/// application data under the traffic keys, and a clean close.
+#[test]
+fn a_real_server_completes_a_mutually_authenticated_handshake_and_carries_data_both_ways() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x70, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0x71, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0x72,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: true,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+
+    // The client's hello and the server's whole first flight, then the client's
+    // `Finished` and the application data behind it.
+    channel.round();
+    assert_eq!(channel.client.outcome(), None, "nothing had settled yet");
+    channel.client.push(b"channel hello");
+    channel.round();
+    assert_eq!(
+        channel.client.outcome(),
+        Some(&ClientOutcome::Established(Established {
+            // TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768.
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }))
+    );
+    channel.round();
+    assert_eq!(
+        channel.client.received(),
+        b"channel hello",
+        "the traffic keys did not carry the round trip"
+    );
+    // And the protocol above takes it, which is the other half of the plaintext
+    // interface: what it has read is gone and what it has not is still there.
+    channel.client.consumed(b"channel ".len());
+    assert_eq!(channel.client.received(), b"hello");
+    channel.client.consumed(channel.client.received().len());
+    assert!(channel.client.received().is_empty());
+
+    // The appliance authenticated, under a key it does not hold: exactly one
+    // `CertificateVerify`, made through the delegation rather than anywhere a
+    // unit test can reach.
+    assert_eq!(
+        *owned.signer.calls.lock().expect("not poisoned"),
+        1,
+        "exactly one `CertificateVerify` is what a TLS 1.3 client signs"
+    );
+    assert_eq!(
+        channel.server.peer().as_deref(),
+        Some(owned.device.as_slice()),
+        "the server did not see this appliance's own device certificate"
+    );
+    assert!(channel.server.refused.is_none());
+
+    channel.client.close();
+    let last = channel.settle();
+    assert!(last.finished, "the session never finished");
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// A server whose certificate the delivered anchor did not issue. **Which way**
+/// it did not is the fact an operator acts on, so both shapes are held here: an
+/// authority of another name leaves no path to build at all, and one that took
+/// the same name leaves a path whose signature does not check — the second
+/// being what a management server rebuilt from scratch looks like to an
+/// appliance still holding the old anchor.
+#[test]
+fn a_server_the_delivered_anchor_did_not_issue_is_refused_by_the_way_it_did_not() {
+    for (at, (authority, expected)) in [
+        (
+            b"another management".as_slice(),
+            CertificateError::UnknownIssuer,
+        ),
+        (AUTHORITY, CertificateError::BadSignature),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fill = 0x73_u8.wrapping_add(u8::try_from(at).unwrap_or(0).wrapping_mul(3));
+        let arena = Bump::new(ROOM);
+        let owned = installed(fill, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+        let stranger = installed(fill.wrapping_add(1), ENDPOINT, ENDPOINT_NAME, authority);
+        let client = dial(fill.wrapping_add(2), &arena, NOW, &owned).expect("the client opens");
+        let mut channel = Channel {
+            client,
+            server: Server::new(
+                fill.wrapping_add(3),
+                std::sync::Arc::clone(&stranger.endpoint),
+                Judging::Anchor(owned.anchor.clone()),
+            ),
+            echo: false,
+            out: Vec::new(),
+            spoken: Vec::new(),
+        };
+        channel.settle();
+        assert_eq!(
+            channel.client.outcome(),
+            Some(&ClientOutcome::ServerCertificateRejected(expected)),
+            "case {at} named the wrong way the anchor failed"
+        );
+    }
+}
+
+/// A server whose certificate the delivered anchor *did* issue, for a different
+/// address than the one this appliance dialled. The contract validates against
+/// what was dialled and not against a name, so this is the arm that says so.
+#[test]
+fn a_server_certificate_naming_another_address_is_refused_for_the_name() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x77, [10, 0, 0, 1], b"10.0.0.1", AUTHORITY);
+    let client = dial(0x78, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0x79,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.settle();
+    match channel.client.outcome() {
+        Some(ClientOutcome::ServerCertificateRejected(CertificateError::NotValidForName)) => {}
+        Some(ClientOutcome::ServerCertificateRejected(
+            CertificateError::NotValidForNameContext { .. },
+        )) => {}
+        other => panic!("a certificate for another address produced {other:?}"),
+    }
+}
+
+/// The validity window is judged against the appliance's own clock, so a
+/// certificate that has run out is its own answer rather than an unknown
+/// issuer.
+#[test]
+fn a_server_certificate_outside_its_validity_is_refused_for_the_window() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x7a, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    // Ten years and change after the authority issued anything.
+    let later = NOW + 400 * 365 * 24 * 3600;
+    let client = dial(0x7b, &arena, later, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0x7c,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.settle();
+    match channel.client.outcome() {
+        Some(ClientOutcome::ServerCertificateRejected(CertificateError::Expired)) => {}
+        Some(ClientOutcome::ServerCertificateRejected(CertificateError::ExpiredContext {
+            ..
+        })) => {}
+        other => panic!("an expired certificate produced {other:?}"),
+    }
+}
+
+/// The other direction of the same judgement: a server that does not accept
+/// **this appliance** says so in an alert, and the registry code point is the
+/// whole of what this end learns — there being no message in the protocol by
+/// which a server accepts a client certificate, and so nothing else to read.
+///
+/// Three of them, because an unknown authority, a certificate that would not
+/// parse and one refused for a reason of the server's own are three different
+/// things to go and fix. It is also the arm that proves this end does not
+/// report a refused appliance as established: the client's own handshake
+/// finished a flight before any of these alerts arrived.
+fn refused_by(judging: Judging, presenting: Option<Vec<u8>>, fill: u8) -> ClientOutcome {
+    let arena: &'static Bump = Box::leak(Box::new(Bump::new(ROOM)));
+    let mut owned = installed(fill, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    if let Some(presenting) = presenting {
+        owned.device = presenting;
+    }
+    let client = dial(fill.wrapping_add(1), arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            fill.wrapping_add(2),
+            std::sync::Arc::clone(&owned.endpoint),
+            judging,
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.settle();
+    assert!(
+        channel.server.refused.is_some(),
+        "the server accepted an appliance it was meant to refuse"
+    );
+    channel
+        .client
+        .outcome()
+        .cloned()
+        .expect("a settled outcome")
+}
+
+/// A device certificate a different authority issued: the server's own
+/// validator says unknown authority, and that is alert 48.
+#[test]
+fn a_server_that_does_not_know_this_appliances_authority_answers_unknown_ca() {
+    let stranger = installed(0x80, ENDPOINT, ENDPOINT_NAME, b"another management");
+    assert_eq!(
+        refused_by(Judging::Anchor(stranger.anchor), None, 0x81),
+        ClientOutcome::AlertReceived(AlertDescription::UnknownCA)
+    );
+}
+
+/// An identity domain that handed over bytes that are not a certificate: the
+/// server cannot read what it was sent, and that is alert 42.
+#[test]
+fn a_server_handed_bytes_that_are_not_a_certificate_answers_bad_certificate() {
+    let owned = installed(0x84, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    assert_eq!(
+        refused_by(
+            Judging::Anchor(owned.anchor),
+            Some(b"not a certificate".to_vec()),
+            0x85
+        ),
+        ClientOutcome::AlertReceived(AlertDescription::BadCertificate)
+    );
+}
+
+/// A server that refused for a reason of its own — a device this management
+/// plane knows and does not authorize, which is where revocation lives. That is
+/// alert 46, and the adopted validator never produces it.
+#[test]
+fn a_server_that_refuses_for_a_reason_of_its_own_answers_certificate_unknown() {
+    assert_eq!(
+        refused_by(
+            Judging::Refusing(CertificateError::Other(rustls::OtherError())),
+            None,
+            0x88
+        ),
+        ClientOutcome::AlertReceived(AlertDescription::CertificateUnknown)
+    );
+}
+
+/// A transport that goes away under a session that came up is the transport's
+/// account and not the handshake's: what this end reports is still the session
+/// it established, so a channel that was up and was cut is never reported as
+/// one that never came up.
+#[test]
+fn a_channel_whose_transport_goes_away_after_it_came_up_still_reads_established() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xa4, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0xa5, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0xa6,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: true,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.round();
+    channel.client.push(b"channel hello");
+    channel.round();
+    channel.round();
+    assert!(matches!(
+        channel.client.outcome(),
+        Some(ClientOutcome::Established(_))
+    ));
+    channel.client.ended();
+    assert!(matches!(
+        channel.client.outcome(),
+        Some(ClientOutcome::Established(_))
+    ));
+}
+
+/// More plaintext than one direction holds, handed down by the protocol above
+/// rather than up by a peer: the records it would take do not fit what this end
+/// keeps for the wire, and that is refused with what it would have had to hold
+/// rather than grown.
+#[test]
+fn a_frame_the_wire_buffer_could_not_hold_the_records_of_is_refused() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xa7, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0xa8, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0xa9,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.round();
+    assert_eq!(channel.client.push(&vec![0x5a_u8; HELD_MAX]), HELD_MAX);
+    channel.round();
+    match channel.client.outcome() {
+        Some(ClientOutcome::Backlogged { held }) => {
+            assert!(
+                *held > HELD_MAX,
+                "a direction was refused for fitting inside what it holds"
+            );
+        }
+        other => panic!("a frame past what the wire buffer holds produced {other:?}"),
+    }
+}
+
+/// A peer that takes the connection and says nothing is not a peer that failed
+/// a handshake, and the two are different things to go and look at.
+#[test]
+fn a_server_that_answers_nothing_leaves_no_server_hello() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x90, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0x91, &arena, NOW, &owned).expect("the client opens");
+    let mut answer = [0_u8; ANSWER];
+    let turn = client.advance(&[], &mut answer);
+    assert!(
+        turn.sent > 0,
+        "the client dialled and put no hello on the wire"
+    );
+    assert!(!turn.finished);
+    client.ended();
+    assert_eq!(client.outcome(), Some(&ClientOutcome::NoServerHello));
+}
+
+/// A server that answered and went away mid-handshake, which is the other half
+/// of the pair above.
+#[test]
+fn a_server_that_goes_away_mid_handshake_is_reported_as_the_peer_closing() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x92, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0x93, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0x94,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    // The client's hello reaches the server and the server's first flight
+    // starts back — and stops part way, which is the shape this arm is about: a
+    // client that heard something is not one that heard nothing, and neither is
+    // one whose handshake finished.
+    channel.poll();
+    let spoken = core::mem::take(&mut channel.out);
+    channel.server.incoming.extend_from_slice(&spoken);
+    let flight = channel.server.turn();
+    assert!(
+        flight.len() > 1000,
+        "the server's first flight is a kilobyte and more of certificate and key share"
+    );
+    let turn = channel.deliver(flight.get(..200).unwrap_or_default());
+    assert!(!turn.finished);
+    assert_eq!(channel.client.outcome(), None, "nothing had settled yet");
+    channel.client.ended();
+    assert_eq!(channel.client.outcome(), Some(&ClientOutcome::PeerClosed));
+}
+
+/// A peer that puts a warning alert on the wire before it has said anything
+/// else has neither refused the session nor completed one: the handshake is
+/// still waiting, and when the transport goes away that is what this end
+/// reports — a peer that spoke and stopped, told apart from one that never
+/// spoke at all by the very fact that it did.
+#[test]
+fn a_server_that_speaks_without_answering_is_still_a_peer_that_spoke() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xaa, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0xab, &arena, NOW, &owned).expect("the client opens");
+    let mut answer = [0_u8; ANSWER];
+    client.advance(&[], &mut answer);
+    // One alert record: warning, close notify — which TLS 1.3 does not act on
+    // before the keys exist.
+    client.advance(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00], &mut answer);
+    assert_eq!(client.outcome(), None, "a warning settled the session");
+    client.ended();
+    assert_eq!(client.outcome(), Some(&ClientOutcome::PeerClosed));
+}
+
+/// A peer that is not speaking TLS at all is refused in the library's own
+/// vocabulary — the variant this end decided.
+#[test]
+fn a_server_that_is_not_speaking_tls_is_refused_as_the_variant_this_end_decided() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x95, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0x96, &arena, NOW, &owned).expect("the client opens");
+    let mut answer = [0_u8; ANSWER];
+    client.advance(&[], &mut answer);
+    let turn = client.advance(b"HTTP/1.1 200 OK\r\n\r\n", &mut answer);
+    assert!(turn.finished || turn.sent > 0);
+    match client.outcome() {
+        Some(ClientOutcome::Refused(rustls::Error::InvalidMessage(_))) => {}
+        other => panic!("a peer speaking HTTP produced {other:?}"),
+    }
+}
+
+/// An anchor that is not a certificate at all is refused before the session
+/// begins, and under a token of its own: the fault is in what was installed
+/// rather than in what a server presented, and the two send an operator to two
+/// different places.
+#[test]
+fn an_anchor_that_is_not_a_certificate_refuses_the_client_before_it_opens() {
+    let arena = Bump::new(ROOM);
+    let mut owned = installed(0x97, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    owned.anchor = b"not a certificate".to_vec();
+    assert_eq!(
+        dial(0x98, &arena, NOW, &owned).err(),
+        Some(ClientOutcome::AnchorRejected)
+    );
+    owned.anchor = Vec::new();
+    assert_eq!(
+        dial(0x99, &arena, NOW, &owned).err(),
+        Some(ClientOutcome::AnchorRejected)
+    );
+}
+
+/// The arena short of one phase's reserve refuses the session before the
+/// session begins, and refuses it as a value.
+#[test]
+fn an_arena_below_the_reserve_refuses_the_client_before_it_opens() {
+    let arena = Bump::new(STEP_RESERVE - 1);
+    let owned = installed(0x9a, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    assert_eq!(
+        dial(0x9b, &arena, NOW, &owned).err(),
+        Some(ClientOutcome::ArenaExhausted(ArenaExhausted {
+            requested: STEP_RESERVE,
+            remaining: STEP_RESERVE - 1,
+        }))
+    );
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// And an arena that runs out under a session already running closes it, with
+/// the allocator's own refusal count still zero.
+#[test]
+fn an_arena_that_runs_out_under_a_channel_closes_it_rather_than_faulting() {
+    let arena = Bump::new(STEP_RESERVE * 2);
+    let owned = installed(0x9c, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0x9d, &arena, NOW, &owned).expect("the client opens");
+    arena
+        .allocate(STEP_RESERVE + 1, 16)
+        .expect("the arena has room for this");
+    let mut answer = [0_u8; ANSWER];
+    let turn = client.advance(b"anything", &mut answer);
+    assert_eq!(turn.sent, 0);
+    assert!(turn.finished);
+    match client.outcome() {
+        Some(ClientOutcome::ArenaExhausted(exhausted)) => {
+            assert_eq!(exhausted.requested, STEP_RESERVE);
+            assert!(exhausted.remaining < STEP_RESERVE);
+        }
+        other => panic!("a starved session produced {other:?}"),
+    }
+    assert_eq!(arena.refusals(), 0);
+}
+
+/// An identity domain that hands over no certificate leaves nothing to present,
+/// and that is refused here rather than at the `Certificate` message.
+#[test]
+fn a_client_with_no_certificate_to_present_does_not_open() {
+    let arena = Bump::new(ROOM);
+    let mut owned = installed(0x9e, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    owned.device = Vec::new();
+    assert_eq!(
+        dial(0x9f, &arena, NOW, &owned).err(),
+        Some(ClientOutcome::Refused(
+            rustls::Error::NoCertificatesPresented
+        ))
+    );
+}
+
+/// More than one direction holds at once is refused rather than grown: the
+/// region every buffer here comes out of is fixed, and a management server
+/// paces this one whether or not it is the one that was delivered for.
+#[test]
+fn a_server_that_hands_over_more_than_one_direction_holds_is_refused() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xa0, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0xa1, &arena, NOW, &owned).expect("the client opens");
+    let mut answer = [0_u8; ANSWER];
+    client.advance(&[], &mut answer);
+    let flood = vec![0_u8; HELD_MAX + 1];
+    let turn = client.advance(&flood, &mut answer);
+    assert!(turn.finished);
+    assert_eq!(
+        client.outcome(),
+        Some(&ClientOutcome::Backlogged { held: HELD_MAX + 1 })
+    );
+}
+
+/// The protocol above is given as much room as one direction holds and no more,
+/// and learns how much went rather than being refused.
+#[test]
+fn frames_offered_past_what_one_direction_holds_are_taken_as_far_as_they_fit() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xa2, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(0xa3, &arena, NOW, &owned).expect("the client opens");
+    assert_eq!(client.push(&vec![0_u8; HELD_MAX + 32]), HELD_MAX);
+    assert_eq!(client.push(b"and nothing after it"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// A peer that did authenticate, and then misbehaved
+// ---------------------------------------------------------------------------
+//
+// These three are the arms no stream of bytes can reach and no fuzz target
+// therefore covers: the server's flight is bound to this end's own ephemeral
+// key share, so only a peer holding a certificate the delivered anchor issued
+// gets past the handshake at all. What it may then do is the whole authority a
+// *compromised* management server has, and the appliance's answer to each of
+// them is what these hold.
+
+/// A channel driven to the point where this end's own handshake is done and
+/// the peer has not yet confirmed it.
+fn handshaked<'arena>(fill: u8, arena: &'arena Bump, owned: &Owned) -> Channel<'arena> {
+    let client = dial(fill, arena, NOW, owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            fill.wrapping_add(1),
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: false,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    // Two rounds: this end's hello and the server's whole first flight, then
+    // this end's certificate and `Finished` — after which the server has
+    // judged this appliance and has nothing of its own to say.
+    channel.round();
+    channel.round();
+    assert!(
+        channel.server.handshaked,
+        "the server did not accept this appliance"
+    );
+    assert_eq!(
+        channel.client.outcome(),
+        None,
+        "this end confirmed a session the peer had not spoken on"
+    );
+    channel
+}
+
+/// An authenticated peer that then puts a record the traffic keys cannot open
+/// on the wire. It is reported as a refusal and **not** as an established
+/// channel, which is the ordering this end's confirmation exists to get right:
+/// a peer this appliance cannot speak to is not a channel that came up.
+#[test]
+fn an_authenticated_peer_whose_records_do_not_open_is_a_refusal_and_not_a_channel() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xb4, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut channel = handshaked(0xb5, &arena, &owned);
+    // An application record whose body is nothing the key schedule produced.
+    let mut forged = std::vec![0x17, 0x03, 0x03, 0x00, 0x40];
+    forged.extend_from_slice(&[0x5a; 0x40]);
+    channel.deliver(&forged);
+    match channel.client.outcome() {
+        Some(ClientOutcome::Refused(rustls::Error::DecryptError)) => {}
+        other => panic!("a record that would not open produced {other:?}"),
+    }
+}
+
+/// An authenticated peer that says nothing at all, and a transport that then
+/// goes away. The handshake did complete, so that is what this end reports —
+/// a peer that never spoke is the transport's account rather than a handshake
+/// that failed.
+#[test]
+fn an_authenticated_peer_that_never_speaks_still_leaves_an_established_channel() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xb6, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut channel = handshaked(0xb7, &arena, &owned);
+    channel.client.ended();
+    assert_eq!(
+        channel.client.outcome(),
+        Some(&ClientOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }))
+    );
+}
+
+/// An authenticated peer that sends more than the protocol above has taken.
+/// The direction is refused rather than grown — the region every buffer here
+/// comes out of is fixed whoever paces it, and a management server holding a
+/// valid certificate paces it just as well as one that does not — and the
+/// session is over rather than left holding what it could not.
+///
+/// What an operator reads stays the handshake's own outcome, because the
+/// handshake is what it is about: this peer authenticated, and then flooded a
+/// session that had come up. A flood displacing the cause would be the general
+/// rule breaking, not an exception worth making for it.
+#[test]
+fn an_authenticated_peer_that_outruns_the_protocol_above_is_refused_rather_than_grown() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xb8, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut channel = handshaked(0xb9, &arena, &owned);
+    // Three maximal records, which is past what one direction holds — and the
+    // protocol above takes none of it.
+    channel.server.pending = vec![0x5a_u8; 3 * (1 << 14)];
+    let said = channel.server.turn();
+    assert!(said.len() > HELD_MAX);
+    let turn = channel.deliver(&said);
+    assert!(turn.finished, "a flooded session was left running");
+    assert!(
+        channel.client.received().len() <= HELD_MAX,
+        "the plaintext the protocol above has not taken outgrew what one direction holds"
+    );
+    assert!(matches!(
+        channel.client.outcome(),
+        Some(ClientOutcome::Established(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Servers this stack cannot build, written out as the bytes such a server sends
+// ---------------------------------------------------------------------------
+//
+// The two arms below need a peer that answers with something this appliance did
+// not offer, and this appliance's own server cannot be asked to: the provider it
+// is built from carries one protocol version, one cipher suite and one group, so
+// a rustls server over it can select nothing else. What such a peer sends is a
+// server hello, and a server hello is a shape rather than a library — so it is
+// written here as the bytes, which is also what an old or foreign server on a
+// wire really is.
+
+/// One server hello, in one handshake record.
+///
+/// `version` absent is a server that answered with no supported-versions
+/// extension at all, which is what a server that has only ever spoken TLS 1.2
+/// looks like; present, it is the version that server selected.
+fn server_hello(suite: u16, version: Option<u16>) -> Vec<u8> {
+    let mut extensions = Vec::new();
+    if let Some(version) = version {
+        extensions.extend_from_slice(&extension(0x002b, &version.to_be_bytes()));
+    }
+
+    let mut body = std::vec![0x03, 0x03];
+    body.extend_from_slice(&[0x5a; 32]);
+    // An empty session id echo. What follows is decided before the echo is
+    // compared, so this hello never reaches that comparison.
+    body.push(0);
+    body.extend_from_slice(&suite.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = std::vec![0x02];
+    let length = body.len() as u32;
+    handshake.extend_from_slice(&length.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = std::vec![0x16, 0x03, 0x03];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
+/// Hand `hello` to a fresh client that has already dialled, and answer what it
+/// made of it.
+fn answered(fill: u8, hello: &[u8]) -> (ClientOutcome, usize) {
+    let arena: &'static Bump = Box::leak(Box::new(Bump::new(ROOM)));
+    let owned = installed(fill, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let mut client = dial(fill ^ 0xff, arena, NOW, &owned).expect("the client opens");
+    let mut answer = [0_u8; ANSWER];
+    client.advance(&[], &mut answer);
+    let turn = client.advance(hello, &mut answer);
+    let outcome = client.outcome().cloned().expect("a settled outcome");
+    (outcome, turn.sent)
+}
+
+/// A server that never learned TLS 1.3 answers with no supported-versions
+/// extension, and the library says exactly that. The discriminant travels whole
+/// rather than this end going back to the peer's bytes to work out what it
+/// selected.
+#[test]
+fn a_server_that_answers_under_tls_12_is_reported_by_the_librarys_own_discriminant() {
+    let (outcome, sent) = answered(0xb0, &server_hello(0x1303, None));
+    assert_eq!(
+        outcome,
+        ClientOutcome::Incompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig)
+    );
+    assert!(sent > 0, "the peer was not told why it was refused");
+}
+
+/// A server that selected a cipher suite this appliance never offered. On this
+/// end a mismatch is not two lists failing to intersect but a pick outside the
+/// one list that was sent, and the library names it as that.
+#[test]
+fn a_server_that_selects_a_suite_this_appliance_never_offered_is_reported_as_misbehaviour() {
+    let (outcome, sent) = answered(0xb1, &server_hello(0x1301, Some(0x0304)));
+    assert_eq!(
+        outcome,
+        ClientOutcome::Misbehaved(PeerMisbehaved::SelectedUnofferedCipherSuite)
+    );
+    assert!(sent > 0, "the peer was not told why it was refused");
+}
+
+/// Every outcome renders as itself and compares as itself, which is what keeps
+/// two causes from reaching one console token.
+#[test]
+fn every_client_outcome_is_its_own_value() {
+    let cases = [
+        ClientOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }),
+        ClientOutcome::NoServerHello,
+        ClientOutcome::Incompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig),
+        ClientOutcome::Misbehaved(PeerMisbehaved::SelectedUnofferedCipherSuite),
+        ClientOutcome::ServerCertificateRejected(CertificateError::UnknownIssuer),
+        ClientOutcome::AnchorRejected,
+        ClientOutcome::AlertReceived(AlertDescription::UnknownCA),
+        ClientOutcome::Refused(rustls::Error::NoCertificatesPresented),
+        ClientOutcome::PeerClosed,
+        ClientOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 1,
+            remaining: 0,
+        }),
+        ClientOutcome::Backlogged { held: HELD_MAX + 1 },
+        ClientOutcome::Stalled,
+    ];
+    for (at, case) in cases.iter().enumerate() {
+        assert!(!std::format!("{case:?}").is_empty());
+        for (also, other) in cases.iter().enumerate() {
+            assert_eq!(at == also, case == other, "two outcomes compared equal");
+        }
+    }
+}
+
+/// The three alert code points a refused appliance is told apart by are three
+/// numbers, and this is the place that states them: an operator holding a
+/// capture against the protocol registry is comparing numbers, and a token that
+/// covered all three would name none of them.
+#[test]
+fn the_alerts_a_refused_appliance_is_told_apart_by_are_their_registry_numbers() {
+    for (alert, point) in [
+        (AlertDescription::BadCertificate, 42_u8),
+        (AlertDescription::CertificateUnknown, 46),
+        (AlertDescription::UnknownCA, 48),
+    ] {
+        assert_eq!(u8::from(alert), point);
+    }
+}
+
+/// The certificate this appliance dialled for is judged against the address it
+/// dialled and against nothing else, so an anchor that vouches for one server
+/// does not vouch for another the same authority issued.
+#[test]
+fn two_authorities_produce_two_anchors_that_do_not_vouch_for_each_other() {
+    let one = installed(0xb2, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let other = installed(0xb3, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    assert_ne!(one.anchor, other.anchor);
+    assert_ne!(one.device, other.device);
 }
 
 /// The chain check the onboarding package's device certificate is held to,
