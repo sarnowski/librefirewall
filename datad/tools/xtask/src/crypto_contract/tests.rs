@@ -34,6 +34,7 @@ fn capture() -> String {
         );
     }
     text.push_str(DELEGATION_BEFORE);
+    text.push_str(ANCHOR_ABSENT);
     text.push_str(SESSION);
     text.push_str(DELEGATION_AFTER);
     text.push_str(DELEGATION_SIGNED);
@@ -66,6 +67,12 @@ const DELEGATION_AFTER: &str = "LFW-PD domain=crypto state=negotiated \
 const DELEGATION_SIGNED: &str = "LFW-PD domain=crypto state=negotiated \
      delegated-device=3f7a1b0c5d2e4f6a8b9c0d1e2f3a4b5c delegated-signatures=3 \
      delegated-certificate=452\r\n";
+
+/// The anchor record of an appliance nobody has taken: no authority delivered,
+/// and no bytes of one. It agrees with the store domain's `onboarded=false`
+/// below, which is the pairing this record exists to be judged against.
+const ANCHOR_ABSENT: &str = "LFW-PD domain=crypto state=negotiated \
+     delegated-anchor-delivered=false delegated-anchor=0\r\n";
 
 /// The key holder's own record, on the same boot.
 const STORE_IDENTITY: &str = "LFW-PD domain=store state=ready \
@@ -259,6 +266,74 @@ fn a_boot_that_did_not_delegate_or_delegated_to_the_wrong_appliance_is_refused()
     let alone = capture().replace(STORE_IDENTITY, "");
     let verdict = judge(alone.as_bytes(), log(), true).expect_err("no holder record");
     assert!(verdict.contains("no `device=` record"), "{verdict}");
+}
+
+/// The anchor record held to the store domain's own word, which is the whole of
+/// what makes it worth having: neither domain can check itself here.
+#[test]
+fn the_anchor_is_held_to_what_the_key_holder_said_about_the_same_appliance() {
+    // An appliance whose record says it has an owner, on a boot where the
+    // delegation delivered no authority: it cannot check the management plane
+    // that took it.
+    let half = capture().replace("onboarded=false", "onboarded=true");
+    let verdict = judge(half.as_bytes(), log(), true).expect_err("an owner with no anchor");
+    assert!(
+        verdict.contains("one fact read from either end"),
+        "{verdict}"
+    );
+
+    // And the reverse: an authority arriving on a node nobody has taken.
+    let unasked = capture().replace(
+        "delegated-anchor-delivered=false delegated-anchor=0",
+        "delegated-anchor-delivered=true delegated-anchor=398",
+    );
+    let verdict = judge(unasked.as_bytes(), log(), true).expect_err("an anchor with no owner");
+    assert!(
+        verdict.contains("one fact read from either end"),
+        "{verdict}"
+    );
+
+    // A boot claiming an authority and no bytes of one, which the channel's own
+    // refusal makes unreachable and which is caught here anyway.
+    let empty = capture()
+        .replace("onboarded=false", "onboarded=true")
+        .replace(
+            "delegated-anchor-delivered=false",
+            "delegated-anchor-delivered=true",
+        );
+    let verdict = judge(empty.as_bytes(), log(), true).expect_err("an empty anchor");
+    assert!(verdict.contains("0 bytes, which is no anchor"), "{verdict}");
+
+    // And the mirror of it: no authority delivered, and a size beside the word.
+    let sized = capture().replace("delegated-anchor=0", "delegated-anchor=398");
+    let verdict = judge(sized.as_bytes(), log(), true).expect_err("a sized absence");
+    assert!(verdict.contains("cannot both be so"), "{verdict}");
+
+    // A record that lost the size entirely is not an anchor record at all, on the
+    // delegation records' terms: a partial rendering must not pass for a whole
+    // one.
+    let partial = capture().replace(" delegated-anchor=0\r\n", "\r\n");
+    let verdict = judge(partial.as_bytes(), log(), true).expect_err("a partial record");
+    assert!(verdict.contains("exactly one"), "{verdict}");
+
+    // And a boot whose delegation never got that far at all.
+    let none = capture().replace(ANCHOR_ABSENT, "");
+    let verdict = judge(none.as_bytes(), log(), true).expect_err("no anchor record");
+    assert!(verdict.contains("exactly one"), "{verdict}");
+}
+
+/// An owned appliance's boot, which is the other half of the pairing: the two
+/// domains agree, and the verdict says which authority arrived.
+#[test]
+fn an_owned_appliance_reports_the_anchor_its_owner_delivered() {
+    let owned = capture()
+        .replace("onboarded=false", "onboarded=true")
+        .replace(
+            "delegated-anchor-delivered=false delegated-anchor=0",
+            "delegated-anchor-delivered=true delegated-anchor=398",
+        );
+    let verdict = judge(owned.as_bytes(), log(), true).expect("an owned appliance");
+    assert!(verdict.contains("398-byte anchor"), "{verdict}");
 }
 
 #[test]

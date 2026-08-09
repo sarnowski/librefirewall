@@ -355,6 +355,19 @@ the alternative is a domain installing an identity it cannot see the key of. Two
 the archive crosses in a region of its own that the store domain may only read, and the store domain
 copies it before applying a rule, so what it validates is what it writes.
 
+**What an owner delivered is handed out of that domain the same way, and to two different readers.**
+An onboarding package leaves two facts in the record besides the certificate: the trust anchor the
+appliance validates its management server against, and the address it dials. They go to different
+domains because different domains use them — the anchor to the one that terminates the session, over
+the same delegation the certificate travels; the address to the one that opens the connection, as a
+read-only region of its own. Neither is a secret. An anchor is the authority the peer at the other
+end issues under, so that peer holds it already; an address literal and a port are what a management
+server publishes to every appliance it owns and what appears in the clear on any wire carrying a
+session to it. **Both are absent on an appliance nobody has taken, and the absence is stated rather
+than implied**: the region reads as nowhere to dial rather than as an address of zeroes, and the
+delegation refuses the anchor by name rather than answering with no bytes — so neither reader can
+mistake "nothing was delivered" for a value.
+
 **The key is plaintext on the medium**: no TPM, no secure element, nowhere to keep a wrapping key.
 Physical access to the store device is identity theft, recorded as such in the
 [threat model](threat-model.md), and [factory reset](updates.md#factory-reset) overwrites the key

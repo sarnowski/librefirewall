@@ -330,6 +330,26 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " delegated-device={device:032x} delegated-signatures={signatures} \
              delegated-certificate={certificate}"
         ),
+        // Whether an anchor was delivered at all, then how large it is. The word
+        // comes first because it is the one an operator reads: a size beside
+        // `false` is a zero, and a zero is not a length anybody delivered.
+        DomainDetail::DelegatedAnchor { delivered, anchor } => write!(
+            cursor,
+            " delegated-anchor-delivered={delivered} delegated-anchor={anchor}"
+        ),
+        // Where the domain holding the record has told the dialling domain to go,
+        // and whether it has told it anywhere at all. The address is spelled as an
+        // address on `dial-destination=`'s terms; the word after it is what stops
+        // an all-zero address from reading as somewhere.
+        DomainDetail::Published {
+            destination,
+            port,
+            published,
+        } => write!(
+            cursor,
+            " published-endpoint={destination} published-port={port} \
+             published={published}"
+        ),
         // Where this appliance reached out to and how it got on, as four fields
         // an operator reads in one direction: the place, the port, how many
         // attempts it took, and the outcome of the last of them. The destination
@@ -964,6 +984,70 @@ mod tests {
              delegated-device=ffffffffffffffffffffffffffffffff \
              delegated-signatures=18446744073709551615 \
              delegated-certificate=18446744073709551615"
+        );
+    }
+
+    /// The anchor the delegating domain was handed, in both readings: an
+    /// appliance nobody has taken says so and carries no size, and an owned one
+    /// carries the size of the authority its owner delivered.
+    #[test]
+    fn a_delegating_domain_renders_whether_it_was_handed_an_anchor() {
+        let anchor = |delivered, anchor| {
+            rendered(&Event::Domain {
+                domain: Domain::Crypto,
+                state: DomainState::Negotiated,
+                detail: DomainDetail::DelegatedAnchor { delivered, anchor },
+            })
+        };
+        assert_eq!(
+            anchor(true, 398),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-anchor-delivered=true delegated-anchor=398"
+        );
+        // The un-onboarded reading, which is the ordinary state of an appliance
+        // waiting for an owner rather than a failure of anything.
+        assert_eq!(
+            anchor(false, 0),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-anchor-delivered=false delegated-anchor=0"
+        );
+        assert_eq!(
+            anchor(true, u64::MAX),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=crypto state=negotiated \
+             delegated-anchor-delivered=true delegated-anchor=18446744073709551615"
+        );
+    }
+
+    /// Where the domain holding the record told the dialling domain to go, in
+    /// both readings — and the second is the one the flag exists for: an all-zero
+    /// address is not somewhere, and the word beside it is what says so.
+    #[test]
+    fn a_store_domain_renders_where_it_told_the_channel_to_dial() {
+        let published = |octets: [u8; 4], port, published| {
+            rendered(&Event::Domain {
+                domain: Domain::Store,
+                state: DomainState::Ready,
+                detail: DomainDetail::Published {
+                    destination: Ipv4Address::from_octets(octets),
+                    port,
+                    published,
+                },
+            })
+        };
+        assert_eq!(
+            published([10, 0, 2, 2], 8443, true),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             published-endpoint=10.0.2.2 published-port=8443 published=true"
+        );
+        assert_eq!(
+            published([0, 0, 0, 0], 0, false),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             published-endpoint=0.0.0.0 published-port=0 published=false"
+        );
+        assert_eq!(
+            published([255, 255, 255, 255], u16::MAX, true),
+            "LFW-PD time=2026-07-30T20:27:00.123456789Z domain=store state=ready \
+             published-endpoint=255.255.255.255 published-port=65535 published=true"
         );
     }
 

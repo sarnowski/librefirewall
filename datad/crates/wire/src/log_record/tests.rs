@@ -775,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 42,
+                detail: 44,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 42 },
+            LogRecordError::DetailKindUnknown { detail: 44 },
         ),
         // The handshake details' own token words, on the session end's terms:
         // an outcome, an incompatibility or a refusal past its set names
@@ -1300,10 +1300,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::AnchorFingerprint,
         LogDetailKind::OnboardingInstalled,
         LogDetailKind::Ownership,
+        LogDetailKind::DelegatedAnchor,
+        LogDetailKind::Published,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(42), None);
+    assert_eq!(LogDetailKind::from_bits(44), None);
 
     for value in [
         LogValueKind::Absent,

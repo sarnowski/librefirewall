@@ -154,7 +154,9 @@ const DETAIL_ADOPTED: u8 = 38;
 const DETAIL_ANCHOR_FINGERPRINT: u8 = 39;
 const DETAIL_ONBOARDING_INSTALLED: u8 = 40;
 const DETAIL_OWNERSHIP: u8 = 41;
-const DETAIL_COUNT: u8 = 42;
+const DETAIL_DELEGATED_ANCHOR: u8 = 42;
+const DETAIL_PUBLISHED: u8 = 43;
+const DETAIL_COUNT: u8 = 44;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -617,7 +619,9 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_ADOPTED
                 | DETAIL_ANCHOR_FINGERPRINT
                 | DETAIL_ONBOARDING_INSTALLED
-                | DETAIL_OWNERSHIP => {
+                | DETAIL_OWNERSHIP
+                | DETAIL_DELEGATED_ANCHOR
+                | DETAIL_PUBLISHED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -787,8 +791,11 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // two-value check it is, once, because the ABI carries a flag in one
         // position and this harness has one rule for it too.
         // The channel's segment counts join them: their fourth word is the one
-        // flag they carry, in the one position this ABI puts a flag in.
-        DETAIL_IDENTITY | DETAIL_RESET | DETAIL_DIAL_SEGMENTS => {
+        // flag they carry, in the one position this ABI puts a flag in. So does
+        // the delegated anchor's, whose flag is the whole of what separates an
+        // appliance nobody has taken from a delegation that answered badly, and
+        // whose other three words are a length and two holes.
+        DETAIL_IDENTITY | DETAIL_RESET | DETAIL_DIAL_SEGMENTS | DETAIL_DELEGATED_ANCHOR => {
             (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
                 value: record.operands[3],
             })
@@ -870,6 +877,22 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
                 value: record.operands[0],
             })
             .or_else(|| wide_code_point(record.operands[1])),
+        // The published endpoint reads the same address and port and then the
+        // flag beside them, in the order the ABI reads them — so the first
+        // refusal a record earns is the one this harness expects. The flag is
+        // its own arm rather than folded into the group above, because that
+        // group's members range nothing before the flag and this one ranges two
+        // words first.
+        DETAIL_PUBLISHED => (record.operands[0] > u64::from(u32::MAX))
+            .then_some(LogRecordError::AddressTooWide {
+                value: record.operands[0],
+            })
+            .or_else(|| wide_code_point(record.operands[1]))
+            .or_else(|| {
+                (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
+                    value: record.operands[3],
+                })
+            }),
         // The seven a handshake on that port produces. Every one of them leads
         // with a token naming how the handshake ended, and each ranges what
         // follows for the shape it will be rendered as — restated here in the
@@ -1569,6 +1592,48 @@ mod tests {
                 region_from_record(&LogRecord {
                     detail: DETAIL_ADOPTED,
                     operands: [u64::from(u32::MAX), u64::from(u16::MAX), u64::MAX, 0],
+                    ..domain_record()
+                }),
+            ),
+            // The published endpoint, whose first two words are the same ranged
+            // pair and whose FOURTH is the flag that tells an all-zero address
+            // from a published one. Both readings are committed: a uniform draw
+            // reaches neither, and the absent one is the record whose numbers are
+            // zero and whose meaning is carried entirely by the flag.
+            (
+                "valid_domain_published",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_PUBLISHED,
+                    operands: [u64::from(u32::MAX), u64::from(u16::MAX), 0, 1],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_published_nowhere",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_PUBLISHED,
+                    operands: [0, 0, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            // The delivered anchor, whose leading word is an unranged size and
+            // whose fourth is the flag. Committed for the endpoint's reason and
+            // one of its own: the absence is the shape an un-onboarded appliance
+            // reports on every boot, so a corpus that never reached it would leave
+            // the ordinary case uncovered.
+            (
+                "valid_domain_delegated_anchor",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DELEGATED_ANCHOR,
+                    operands: [u64::MAX, 0, 0, 1],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_delegated_anchor_absent",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_DELEGATED_ANCHOR,
+                    operands: [0, 0, 0, 0],
                     ..domain_record()
                 }),
             ),

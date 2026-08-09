@@ -286,6 +286,12 @@ pub enum LogDetailKind {
     /// Whether the domain that decides frames believes this appliance has an
     /// owner. Appended, never inserted, on [`Self::Identity`]'s terms.
     Ownership,
+    /// The trust anchor a delegating domain was handed, and whether one had been
+    /// delivered at all. Appended, never inserted.
+    DelegatedAnchor,
+    /// Where the domain holding the record has told the dialling domain to go.
+    /// Appended, never inserted.
+    Published,
 }
 
 impl LogDetailKind {
@@ -334,6 +340,8 @@ impl LogDetailKind {
             Self::AnchorFingerprint => 39,
             Self::OnboardingInstalled => 40,
             Self::Ownership => 41,
+            Self::DelegatedAnchor => 42,
+            Self::Published => 43,
         }
     }
 
@@ -382,6 +390,8 @@ impl LogDetailKind {
             39 => Some(Self::AnchorFingerprint),
             40 => Some(Self::OnboardingInstalled),
             41 => Some(Self::Ownership),
+            42 => Some(Self::DelegatedAnchor),
+            43 => Some(Self::Published),
             _ => None,
         }
     }
@@ -1049,6 +1059,25 @@ impl LogRecord {
             // fact is the whole record.
             Some(LogDetailKind::Ownership) => CheckedDetail::Ownership {
                 ownership: ownership_token(self.operands[0])?,
+            },
+            // A length and a flag. The length is unranged because every bit
+            // pattern of it is a size the emitting domain could have been handed;
+            // the flag sits in the FOURTH word, where this ABI puts the one flag a
+            // detail may carry, and is ranged on `Reset`'s terms — two values, and
+            // a wider word is a writer stating a third.
+            Some(LogDetailKind::DelegatedAnchor) => CheckedDetail::DelegatedAnchor {
+                anchor: self.operands[0],
+                delivered: flag(self.operands[3])?,
+            },
+            // An address, a port and a flag, ranged on `Adopted`'s terms for the
+            // first two and `Reset`'s for the third, which sits in the fourth word
+            // beside every other flag this ABI carries. The flag is what tells an
+            // all-zero address apart from a published one, so a word outside its
+            // two values would leave that undecided.
+            Some(LogDetailKind::Published) => CheckedDetail::Published {
+                destination: address_bits(self.operands[0])?,
+                port: code_point(self.operands[1])?,
+                published: flag(self.operands[3])?,
             },
         };
         Ok(CheckedBody::Domain {
@@ -1749,6 +1778,19 @@ pub enum CheckedDetail {
     /// The fingerprint of the authority it will validate that channel against.
     AnchorFingerprint {
         words: [u64; LOG_OPERANDS],
+    },
+    /// The trust anchor a delegating domain was handed, and whether one had been
+    /// delivered at all.
+    DelegatedAnchor {
+        delivered: bool,
+        anchor: u64,
+    },
+    /// Where the domain holding the record has told the dialling domain to go,
+    /// and whether it has told it anywhere.
+    Published {
+        destination: u32,
+        port: u16,
+        published: bool,
     },
     /// Whether the domain that decides frames believes this appliance has an
     /// owner.

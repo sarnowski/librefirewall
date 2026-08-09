@@ -238,8 +238,8 @@ use lfw_package::{Operands, PackageError};
 use lfw_store::{
     ChainFault, CheckedState, Cleared, Copies, IdentityError, InstallError, Onboarding,
     RESET_REQUEST_BYTES, RESET_REQUEST_SECTOR, ResetRequest, STATE_A_SECTOR, STATE_COPY_BYTES,
-    STORE_SECTORS, State, StateError, StateWrite, StoredEndpoint, decode_state, encode_state, mint,
-    read_package, verify,
+    STORE_SECTORS, State, StateError, StateWrite, StoredCertificate, StoredEndpoint, decode_state,
+    encode_state, mint, read_package, verify,
 };
 use pd_runtime::{
     BlockCounters, PdClock, StoreIdentity, StoreSigning, attach_region, log_sample,
@@ -251,8 +251,9 @@ use sel4_microkit::{
 use virtio::pci::PciConfig;
 use wire::{
     ApplianceOwnership, ClockCalibration, DeviceIdentity, InstallStaging, LogConsume, LogRecords,
-    MAX_CERTIFICATE_LEN, MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN, SignDemand,
-    SignOperation, SignRefusal, SignReply, SignRequest, SignResponder, StagedArchive,
+    MAX_CERTIFICATE_LEN, MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,
+    ManagementDestination, ManagementEndpoint, SignDemand, SignOperation, SignRefusal, SignReply,
+    SignRequest, SignResponder, StagedArchive,
 };
 
 /// Bytes both copies of the state record occupy, and so the one transfer this
@@ -733,6 +734,18 @@ struct DeviceKey {
     /// read would put a device transfer on a path that must not wait.
     certificate: [u8; MAX_CERTIFICATE_LEN],
     certificate_len: usize,
+    /// The trust anchor a management plane delivered, held beside the
+    /// certificate and for the same reason: it is one field of the record this
+    /// domain already holds, and rereading it off the medium per request would
+    /// put a device transfer on a path that must not wait.
+    ///
+    /// **Empty is a state this one may legitimately be in**, unlike the
+    /// certificate above: an appliance nobody has taken has an identity and no
+    /// anchor, so a length of zero here is the normal reading of an un-onboarded
+    /// node rather than half an identity. What keeps that unambiguous is that it
+    /// is never *answered* as zero bytes — the delegation refuses by name.
+    anchor: [u8; MAX_CERTIFICATE_LEN],
+    anchor_len: usize,
 }
 
 impl DeviceKey {
@@ -770,12 +783,24 @@ impl DeviceKey {
             *slot = *byte;
             certificate_len += 1;
         }
+        // The anchor, on the same terms and with the opposite reading of an
+        // empty one: an appliance no management plane has taken has none, and
+        // that is a record to hold rather than a record to refuse.
+        let stored_anchor = state.anchor_certificate();
+        let mut anchor = [0_u8; MAX_CERTIFICATE_LEN];
+        let mut anchor_len = 0_usize;
+        for (slot, byte) in anchor.iter_mut().zip(stored_anchor.as_bytes()) {
+            *slot = *byte;
+            anchor_len += 1;
+        }
         Some(Self {
             public_key: key.public_key(),
             key,
             device_id: state.device_id(),
             certificate,
             certificate_len,
+            anchor,
+            anchor_len,
         })
     }
 
@@ -799,6 +824,29 @@ impl DeviceKey {
     fn certificate(&self) -> &[u8] {
         self.certificate.get(..self.certificate_len).unwrap_or(&[])
     }
+
+    /// The anchor a `SignOperation::Anchor` request is answered with, bounded by
+    /// what was actually stored. Empty where none was delivered, which the
+    /// caller turns into a refusal by name rather than an empty answer.
+    fn anchor(&self) -> &[u8] {
+        self.anchor.get(..self.anchor_len).unwrap_or(&[])
+    }
+
+    /// Take the anchor an install has just made durable.
+    ///
+    /// The one thing about a held identity that an install changes: the keypair
+    /// and the device certificate are what they were — an appliance is issued
+    /// its certificate before it is owned — and the anchor is what arrives with
+    /// the owner. Written here rather than by rebuilding the whole holder, which
+    /// would read the scalar back out of a record a second time for no reason.
+    fn adopt_anchor(&mut self, delivered: &StoredCertificate) {
+        self.anchor = [0; MAX_CERTIFICATE_LEN];
+        self.anchor_len = 0;
+        for (slot, byte) in self.anchor.iter_mut().zip(delivered.as_bytes()) {
+            *slot = *byte;
+            self.anchor_len += 1;
+        }
+    }
 }
 
 /// The identity this boot established, and how it came by it.
@@ -813,6 +861,11 @@ struct Established {
     /// the domain answering every signing request with a typed refusal instead of
     /// faulting.
     key: Option<DeviceKey>,
+    /// Where the record says this appliance answers to, which is
+    /// [`StoredEndpoint::ABSENT`] for every appliance nobody has taken. Carried
+    /// out of the establishing run rather than reread, because the record it
+    /// comes out of is the one this boot already held to itself.
+    endpoint: StoredEndpoint,
     /// Whether this boot is the one that minted it. The difference an operator
     /// cares about: a node reporting `minted` after a boot that did not has lost
     /// its identity.
@@ -849,6 +902,7 @@ fn init() -> Store {
     // and the handle taken here has no store on it.
     let staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
     let owner: &'static ApplianceOwnership = attach_region!(owner_vaddr: ApplianceOwnership);
+    let endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     let outcome = bring_up(&sink, wall_seconds(&clock));
@@ -862,7 +916,7 @@ fn init() -> Store {
     // The keypair is moved out of the verdict rather than borrowed from it: what
     // signs after this function returns is the handler's, and a copy left behind
     // would be a second holder of the scalar inside this domain.
-    let (identity, key) = match verdict {
+    let (identity, key, published) = match verdict {
         Ok(established) => {
             // What was given up, before what replaced it: a reset is the one
             // event on this surface that destroys rather than establishes, and an
@@ -898,6 +952,21 @@ fn init() -> Store {
                 DomainState::Ready,
                 DomainDetail::Fingerprint(established.fingerprint),
             );
+            // And where the record says this appliance answers to, which is the
+            // one fact on this boot about a domain other than this one: it is
+            // what the management domain will read out of the region below, so
+            // an operator holding a node that opens no channel can tell an
+            // appliance that was told nowhere to go from one that could not get
+            // there.
+            announce(
+                &sink,
+                DomainState::Ready,
+                DomainDetail::Published {
+                    destination: Ipv4Address::from_octets(established.endpoint.address),
+                    port: established.endpoint.port,
+                    published: !established.endpoint.is_absent(),
+                },
+            );
             (
                 StoreIdentity {
                     established: true,
@@ -907,6 +976,7 @@ fn init() -> Store {
                     reset: established.reset.is_some(),
                 },
                 established.key,
+                established.endpoint,
             )
         }
         Err(cause) => {
@@ -915,8 +985,10 @@ fn init() -> Store {
             announce(&sink, DomainState::Refused, DomainDetail::Refusal(cause));
             // No key, so the delegation is answered with `NoIdentity` rather than
             // being unreachable: a domain waiting on a signature it will never get
-            // cannot tell that from a domain that is merely slow.
-            (StoreIdentity::default(), None)
+            // cannot tell that from a domain that is merely slow. And no record,
+            // so nowhere to dial: a boot that established nothing publishes the
+            // absence rather than leaving whatever the region held.
+            (StoreIdentity::default(), None, StoredEndpoint::ABSENT)
         }
     };
     let store = Store {
@@ -933,6 +1005,7 @@ fn init() -> Store {
         signing: StoreSigning::default(),
         installs: 0,
         owner,
+        endpoint,
     };
     // The one fact the dataplane needs off this medium, published before the
     // shard and before a peer can ask for anything: the forwarding domain
@@ -942,6 +1015,14 @@ fn init() -> Store {
     // which is what the zeroed region already says and is stated anyway — the
     // region's own reading and this domain's must not differ by an omission.
     store.publish_ownership();
+    // And where this appliance answers to, published beside it and for the same
+    // reason: the domain that will open the management channel dials nothing
+    // until it reads a destination here, so a boot that established an owned
+    // record and did not say so would be a node that silently talked to nobody.
+    // A boot that established none publishes the absence, which is what the
+    // zeroed region already says and is stated anyway — the region's own reading
+    // and this domain's must not differ by an omission.
+    store.publish_endpoint(published);
     // The shard as this boot established it, before a signature has been asked
     // for. It moves again on every wakeup that serves one, which is the change
     // this delegation makes to a shard that used to be written once.
@@ -1045,6 +1126,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 generation: state.get().generation(),
                 onboarding: state.get().onboarding(),
                 key: DeviceKey::of(state.get()),
+                endpoint: state.get().endpoint(),
                 minted: false,
                 reset: None,
             })
@@ -1152,6 +1234,7 @@ impl<'region> Medium<'region> {
             generation: minted.state.generation(),
             onboarding: minted.state.onboarding(),
             key: DeviceKey::of(&minted.state),
+            endpoint: minted.state.endpoint(),
             minted: true,
             reset: None,
         })
@@ -1550,11 +1633,20 @@ struct Store {
     /// whether this appliance has an owner, which the forwarding domain maps
     /// read-only and refuses every frame against until it says so.
     owner: &'static ApplianceOwnership,
+    /// The region carrying where this appliance dials, which the management
+    /// domain maps read-only. Written by this domain alone, at the three moments
+    /// the record it comes out of can change: a mint, a reload, and an install.
+    endpoint: &'static ManagementEndpoint,
 }
 
 /// What one accepted package changed, as the two records an operator reads.
 struct Installed {
     endpoint: StoredEndpoint,
+    /// The anchor the commit made durable, carried back so the holder this
+    /// domain answers delegations out of learns it without reading the record a
+    /// second time — and so the scalar is not rebuilt to reach one field beside
+    /// it.
+    anchor: StoredCertificate,
     anchor_fingerprint: [u8; DIGEST_LEN],
     /// The generation the record carrying the ownership stands at, which is what
     /// says the commit landed rather than that one was attempted.
@@ -1570,6 +1662,26 @@ impl Store {
     /// after the one that asks for it.
     fn publish_ownership(&self) {
         self.owner.publish(self.identity.onboarded);
+    }
+
+    /// State on the endpoint region where this domain's own record says the
+    /// appliance answers to.
+    ///
+    /// Called at the same three moments [`Self::publish_ownership`] is and
+    /// nowhere else, because the two facts move together: an appliance takes an
+    /// owner and an address to report to in one commit, and gives both up in one
+    /// factory reset.
+    ///
+    /// **The absent endpoint is published as the absence rather than skipped.**
+    /// A record with no endpoint is exactly what an un-onboarded appliance has,
+    /// and the region's reading of it is nowhere to dial — but leaving the write
+    /// out would make that a fact about what the region happened to hold rather
+    /// than a fact this domain stated.
+    fn publish_endpoint(&self, endpoint: StoredEndpoint) {
+        self.endpoint.publish(ManagementDestination {
+            address: endpoint.address,
+            port: endpoint.port,
+        });
     }
 
     /// Answer one demand, and exactly one: every path below consumes it, because
@@ -1594,6 +1706,7 @@ impl Store {
                 }
             }
             Some(SignOperation::Certificate) => self.certificate(demand),
+            Some(SignOperation::Anchor) => self.anchor(demand),
             Some(SignOperation::Sign) => self.sign(demand),
             Some(SignOperation::Install) => self.install(demand),
         }
@@ -1625,6 +1738,40 @@ impl Store {
         // of a holder that has none and is why this answers rather than asserts.
         let certificate = key.as_ref().map_or(&[][..], DeviceKey::certificate);
         responder.certificate(demand, certificate);
+    }
+
+    /// Hand over the trust anchor a management plane delivered, or say why there
+    /// is none.
+    ///
+    /// **A public artifact leaving a domain that holds a private one**, on the
+    /// certificate's terms: an anchor is the certificate of the authority the
+    /// peer this appliance dials issues under, so that peer holds it already and
+    /// what crosses reveals nothing to the adversary it is used against.
+    ///
+    /// Two refusals, and they say different things. `NoIdentity` is a node still
+    /// coming up or one whose medium refused, which is the same answer every
+    /// other operation gives it. `NoAnchor` is a node that came up fine and that
+    /// no management plane has taken — an ordinary state for an appliance
+    /// waiting to be onboarded, and the reason it is a refusal at all rather
+    /// than an empty answer: zero bytes under a success would leave the asking
+    /// domain free to read "nobody has delivered one" as "an anchor of no
+    /// length", and whom this appliance trusts is not a question to answer
+    /// ambiguously.
+    fn anchor(&mut self, demand: SignDemand) {
+        let Some(key) = self.key.as_ref() else {
+            self.refuse(demand, SignRefusal::NoIdentity);
+            return;
+        };
+        if key.anchor().is_empty() {
+            self.refuse(demand, SignRefusal::NoAnchor);
+            return;
+        }
+        // Read out of one field and published through another, destructured on
+        // the certificate's terms so the disjointness is visible and no copy of
+        // the anchor is made on the way to the region.
+        let Self { key, responder, .. } = self;
+        let anchor = key.as_ref().map_or(&[][..], DeviceKey::anchor);
+        responder.anchor(demand, anchor);
     }
 
     /// Sign what the request carries, or say why not.
@@ -1735,10 +1882,19 @@ impl Store {
                 );
                 self.identity.onboarded = true;
                 self.identity.generation = installed.generation;
+                // The holder this domain answers delegations out of learns the
+                // anchor the commit just made durable, so the next boot and this
+                // one give the same answer to "whom does this appliance trust".
+                if let Some(key) = self.key.as_mut() {
+                    key.adopt_anchor(&installed.anchor);
+                }
                 // After the record is durable and before the requester is told,
                 // so nothing can observe an appliance that has been told it is
-                // owned while the dataplane still refuses every frame.
+                // owned while the dataplane still refuses every frame — or one
+                // told it has an owner while the domain that would report to
+                // that owner still has nowhere to dial.
                 self.publish_ownership();
+                self.publish_endpoint(installed.endpoint);
                 self.responder.installed(demand);
             }
             Err(refusal) => {
@@ -1802,6 +1958,11 @@ impl Store {
         let endpoint = adoption.endpoint();
         let anchor_fingerprint = adoption.anchor_fingerprint();
         adoption.take_ownership(&mut state);
+        // Out of the record the adoption was just written into, rather than out
+        // of the adoption: what this domain goes on answering with has to be what
+        // it is about to make durable, and reading it from the state is what says
+        // those are the same bytes.
+        let anchor = *state.anchor_certificate();
         // The copy the generation's parity selects, so the record the appliance
         // is currently relying on is not the one being written; the barrier
         // inside is what makes the new one durable rather than merely submitted.
@@ -1814,6 +1975,7 @@ impl Store {
         zeroize(&mut region);
         Ok(Installed {
             endpoint,
+            anchor,
             anchor_fingerprint,
             generation,
         })

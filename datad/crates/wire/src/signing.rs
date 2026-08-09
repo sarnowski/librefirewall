@@ -21,27 +21,39 @@
 //!
 //! # What the reply *can* carry, and why none of it is a secret
 //!
-//! Four things, and each is public by construction. A **signature**, which is
+//! Five things, and each is public by construction. A **signature**, which is
 //! what a private key produces and not what it is. A **public point** and a
-//! **device identifier**, which are the two values a peer is told. And a
+//! **device identifier**, which are the two values a peer is told. A
 //! **certificate**, which is the artifact a peer validates that point out of —
 //! it is published to every party the appliance ever talks to, so a channel that
 //! moves it moves nothing an adversary could not have asked the appliance for.
+//! And a **trust anchor**, the certificate of the authority a management plane
+//! delivered when it took this appliance: the peer this appliance will dial holds
+//! it already, being the party that issues under it, so moving it reveals nothing
+//! to the adversary it is used against.
 //!
-//! The scalar is absent from all four, and the certificate does not weaken that:
-//! a certificate is a signed statement *about* a public key, and its encoding has
+//! The scalar is absent from all five, and neither certificate weakens that: a
+//! certificate is a signed statement *about* a public key, and its encoding has
 //! no place a private one goes. The claim this ABI makes is unchanged and is
-//! still structural — every field is one of those four shapes, and none of them
+//! still structural — every field is one of those five shapes, and none of them
 //! is 32 bytes of private scalar under any interpretation.
 //!
-//! # What the reply *cannot* carry, now that a fourth operation asks a question
+//! **The anchor is the one answer whose absence is normal.** An appliance nobody
+//! has taken has no anchor, and the holder says so by name
+//! ([`SignRefusal::NoAnchor`]) rather than answering an empty byte string: zero
+//! bytes under a success would be a caller free to read "nothing was delivered"
+//! as "an anchor of no length", and whom this appliance trusts is not a question
+//! to answer ambiguously.
+//!
+//! # What the reply *cannot* carry, which one operation's answer settles
 //!
 //! [`SignOperation::Install`] asks the holder to take ownership of the appliance
 //! out of an archive staged in [`crate::InstallStaging`], and its answer is **the
 //! status word and nothing else**: installed, or refused. No field is added for
-//! it, which is the measurement that decided the shape — the reply already uses
-//! 945 of the 4096 bytes its region grants, so a byte string would have been free
-//! and is still refused.
+//! it, which is the measurement that decided the shape — the reply used 946 of
+//! the 4096 bytes its region grants when that was decided and uses 1714 now, so a
+//! byte string would have been free then and is free still, and is refused
+//! either way.
 //!
 //! It is refused because the vocabulary that would go in one is not this ABI's.
 //! **Which rule** refused a package is the holder's own catalogue of the package
@@ -80,11 +92,14 @@
 //!
 //! # The reply carries the operation it answers
 //!
-//! A signature, a public key, a certificate and an install verdict are different
-//! shapes — two of them are variable-length byte strings with different bounds and
-//! one carries no bytes at all — so a channel whose reply said only "here are some
+//! A signature, a public key, a certificate, an anchor and an install verdict are
+//! different shapes — three of them are variable-length byte strings and one
+//! carries no bytes at all — so a channel whose reply said only "here are some
 //! bytes" would leave the caller to remember which question was outstanding *and*
-//! which bound to hold the length to. So the operation travels back with the
+//! which bound to hold the length to. Two of the three share a bound and are
+//! still separate fields with separate faults, because they are statements about
+//! different keys and a caller told only that "a length was overrun" would not
+//! know which answer to go and look at. So the operation travels back with the
 //! answer and a mismatch is a fault: answering the wrong question is the
 //! responder's error and not the requester's obligation.
 //!
@@ -201,6 +216,29 @@ pub enum SignOperation {
     /// deciding whose the appliance is without being able to see whose key it
     /// holds.
     Install,
+    /// Answer the trust anchor a management plane delivered when it took this
+    /// appliance.
+    ///
+    /// A **public** artifact on [`Self::Certificate`]'s terms and for one more
+    /// reason: it is the certificate of the authority a management server is
+    /// about to present a certificate under, so the peer this appliance is going
+    /// to dial holds it already. What it decides is what this appliance will
+    /// accept, and nothing about it is a secret from the party it is used
+    /// against.
+    ///
+    /// It travels this channel because the holder is where a delivered anchor
+    /// lives: it arrived inside an onboarding package, this holder judged that
+    /// package and made the anchor durable, and it is one field of the very
+    /// record the other three answers come out of. A domain that kept its own
+    /// copy would be a second answer to the question of whom this appliance
+    /// trusts, with no domain able to say which one a session was validated
+    /// against.
+    ///
+    /// **An appliance nobody owns has none**, and that is not a fault: the holder
+    /// refuses [`SignRefusal::NoAnchor`] by name rather than answering an empty
+    /// byte string, so a caller is told there is nothing to trust yet instead of
+    /// being handed zero bytes it might read as an anchor.
+    Anchor,
 }
 
 impl SignOperation {
@@ -211,6 +249,7 @@ impl SignOperation {
             Self::PublicKey => 1,
             Self::Certificate => 2,
             Self::Install => 3,
+            Self::Anchor => 4,
         }
     }
 
@@ -226,6 +265,7 @@ impl SignOperation {
             1 => Some(Self::PublicKey),
             2 => Some(Self::Certificate),
             3 => Some(Self::Install),
+            4 => Some(Self::Anchor),
             _ => None,
         }
     }
@@ -257,6 +297,15 @@ pub enum SignStatus {
     /// console rather than in this word — see the header on what this reply
     /// deliberately cannot carry.
     InstallRefused,
+    /// The holder has an identity and no delivered trust anchor: an appliance no
+    /// management plane has taken.
+    ///
+    /// Its own value rather than [`Self::NoIdentity`], which would say the holder
+    /// is still coming up, and rather than a success carrying zero bytes, which a
+    /// caller could read as an anchor of no length. **This is the fail-closed
+    /// answer to "whom does this appliance trust", and it is a positive
+    /// statement**: nobody yet, said by the one domain that can know.
+    NoAnchor,
 }
 
 impl SignStatus {
@@ -269,6 +318,7 @@ impl SignStatus {
             Self::NoSuchOperation => 3,
             Self::MessageTooLong => 4,
             Self::InstallRefused => 5,
+            Self::NoAnchor => 6,
         }
     }
 
@@ -283,6 +333,7 @@ impl SignStatus {
             3 => Some(Self::NoSuchOperation),
             4 => Some(Self::MessageTooLong),
             5 => Some(Self::InstallRefused),
+            6 => Some(Self::NoAnchor),
             _ => None,
         }
     }
@@ -296,6 +347,7 @@ pub enum SignRefusal {
     NoSuchOperation,
     MessageTooLong,
     InstallRefused,
+    NoAnchor,
 }
 
 impl SignRefusal {
@@ -307,6 +359,7 @@ impl SignRefusal {
             Self::NoSuchOperation => SignStatus::NoSuchOperation,
             Self::MessageTooLong => SignStatus::MessageTooLong,
             Self::InstallRefused => SignStatus::InstallRefused,
+            Self::NoAnchor => SignStatus::NoAnchor,
         }
     }
 
@@ -320,6 +373,7 @@ impl SignRefusal {
             SignStatus::NoSuchOperation => Some(Self::NoSuchOperation),
             SignStatus::MessageTooLong => Some(Self::MessageTooLong),
             SignStatus::InstallRefused => Some(Self::InstallRefused),
+            SignStatus::NoAnchor => Some(Self::NoAnchor),
         }
     }
 }
@@ -408,6 +462,21 @@ pub struct SignReply {
     /// padding that was already there — which the size assertion at the foot of
     /// this file states rather than leaves to be noticed.
     owned: AtomicU8,
+    /// Last, and the second field whose length is stated rather than fixed: the
+    /// trust anchor a management plane delivered.
+    ///
+    /// Appended after the ownership word on the certificate's own terms, so every
+    /// offset above it is the one it was. **This one is not free** — it is a
+    /// second certificate's worth of region — and what makes it affordable is
+    /// measured rather than assumed: the reply grows past 952 bytes and stays
+    /// inside the single page the system description grants, which the assertion
+    /// at the foot of this file holds it to. A field that pushed the type onto a
+    /// second page would widen a capability, and it fails there first.
+    ///
+    /// It is its own field rather than a second use of `certificate`, because the
+    /// two are different statements about different keys and a holder answering
+    /// one out of the other's storage would be one buffer with two meanings.
+    anchor: [AtomicU8; MAX_CERTIFICATE_LEN],
 }
 
 impl SignReply {
@@ -426,6 +495,7 @@ impl SignReply {
             device_id: [const { AtomicU8::new(0) }; DEVICE_ID_LEN],
             certificate: [const { AtomicU8::new(0) }; MAX_CERTIFICATE_LEN],
             owned: AtomicU8::new(NOT_OWNED),
+            anchor: [const { AtomicU8::new(0) }; MAX_CERTIFICATE_LEN],
         }
     }
 
@@ -521,6 +591,14 @@ mod peer {
         pub(super) fn owned(&self) -> u8 {
             self.0.owned.load(Ordering::Relaxed)
         }
+
+        /// Bounded by `into` on [`Self::copy_signature`]'s terms, against the
+        /// anchor's own field rather than the certificate's.
+        pub(super) fn copy_anchor(&self, into: &mut [u8]) {
+            for (byte, cell) in into.iter_mut().zip(&self.0.anchor) {
+                *byte = cell.load(Ordering::Relaxed);
+            }
+        }
     }
 
     /// The request region as the key holder holds it, on [`PeerReply`]'s terms.
@@ -609,6 +687,16 @@ pub enum SignFault {
     /// A certificate of zero length under a success, which is not a certificate.
     /// A holder with no certificate to give refuses by name instead.
     EmptyCertificate,
+    /// More anchor bytes claimed than the region holds, which is the third. Its
+    /// own variant rather than [`Self::LenPastCertificate`] even though the two
+    /// bounds are equal: the fields are separate, and a shared fault would leave
+    /// an operator unable to tell which answer the holder overran.
+    LenPastAnchor { len: u32 },
+    /// An anchor of zero length under a success, which is not an anchor. A holder
+    /// with none to give refuses [`SignRefusal::NoAnchor`] by name instead, which
+    /// is what keeps "nobody has taken this appliance" apart from "the domain
+    /// holding the anchor answered with nothing".
+    EmptyAnchor,
     /// An identity answer stating a length. The public point and the identifier
     /// are fixed-width fields, so a length there is a claim about nothing — and a
     /// responder making one is not this protocol's, which is worth saying rather
@@ -644,6 +732,7 @@ pub enum SignFault {
 pub struct SignAnswerBuffer {
     signature: [u8; MAX_SIGNATURE_LEN],
     certificate: [u8; MAX_CERTIFICATE_LEN],
+    anchor: [u8; MAX_CERTIFICATE_LEN],
 }
 
 impl SignAnswerBuffer {
@@ -652,6 +741,7 @@ impl SignAnswerBuffer {
         Self {
             signature: [0; MAX_SIGNATURE_LEN],
             certificate: [0; MAX_CERTIFICATE_LEN],
+            anchor: [0; MAX_CERTIFICATE_LEN],
         }
     }
 }
@@ -704,6 +794,13 @@ pub enum SignPoll<'buf> {
     /// The holder answered with the appliance's certificate over that key.
     /// `certificate` is the DER encoding, bounded by the region.
     Certificate { certificate: &'buf [u8] },
+    /// The holder answered with the trust anchor a management plane delivered.
+    /// `anchor` is the DER encoding, bounded by the region.
+    ///
+    /// Never empty: an appliance with no anchor comes back as
+    /// [`SignRefusal::NoAnchor`], so a caller reaching this arm holds bytes
+    /// somebody really delivered.
+    Anchor { anchor: &'buf [u8] },
     /// The holder installed the staged package: this appliance now has an owner,
     /// and the record that says so is durable.
     ///
@@ -889,6 +986,16 @@ impl SignRequester<'_> {
                 }
                 SignPoll::Installed
             }
+            SignOperation::Anchor => {
+                let Some(target) = into.anchor.get_mut(..len as usize) else {
+                    return self.fault(SignFault::LenPastAnchor { len });
+                };
+                if len == 0 {
+                    return self.fault(SignFault::EmptyAnchor);
+                }
+                self.reply.copy_anchor(target);
+                SignPoll::Anchor { anchor: target }
+            }
         }
     }
 
@@ -1059,6 +1166,24 @@ impl SignResponder<'_> {
         published as usize
     }
 
+    /// Answer `demand` with the trust anchor a management plane delivered, on
+    /// [`Self::certificate`]'s terms exactly: truncated to what the region holds,
+    /// and the published length is what was actually stored.
+    ///
+    /// An empty `anchor` publishes a zero length, which the requester reads as
+    /// [`SignFault::EmptyAnchor`] — so a holder that has none, which is every
+    /// appliance nobody has taken, must refuse [`SignRefusal::NoAnchor`] rather
+    /// than answer with nothing.
+    pub fn anchor(&mut self, demand: SignDemand, anchor: &[u8]) -> usize {
+        let mut published = 0_u32;
+        for (cell, byte) in self.reply.anchor.iter().zip(anchor) {
+            cell.store(*byte, Ordering::Relaxed);
+            published += 1;
+        }
+        self.publish(demand, SignOperation::Anchor, SignStatus::Ok, published);
+        published as usize
+    }
+
     /// Answer `demand` with the fact that the staged package was installed.
     ///
     /// Publishes a zero length, and there is nothing else to publish: the answer
@@ -1140,8 +1265,8 @@ const _: () = {
     assert!(SignStatus::Ok.to_bits() == 0);
     assert!(SignOperation::Sign.to_bits() == 0);
     assert!(SignRefusal::from_status(SignStatus::Ok).is_none());
-    assert!(SignStatus::from_bits(6).is_none());
-    assert!(SignOperation::from_bits(4).is_none());
+    assert!(SignStatus::from_bits(7).is_none());
+    assert!(SignOperation::from_bits(5).is_none());
 
     assert!(offset_of!(SignRequest, sequence) == 0);
     assert!(offset_of!(SignRequest, operation) == 4);
@@ -1171,24 +1296,33 @@ const _: () = {
         offset_of!(SignReply, owned)
             == 24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN
     );
+    assert!(
+        offset_of!(SignReply, anchor)
+            == 25 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN
+    );
     assert!(align_of::<SignReply>() == 8);
     assert!(
         size_of::<SignReply>()
-            == (25 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN)
+            == (25
+                + MAX_SIGNATURE_LEN
+                + PUBLIC_KEY_LEN
+                + DEVICE_ID_LEN
+                + MAX_CERTIFICATE_LEN
+                + MAX_CERTIFICATE_LEN)
                 .next_multiple_of(align_of::<SignReply>())
     );
-    // And the byte cost nothing: the certificate ended inside the tail padding
-    // an eight-byte alignment had already reserved, so appending the ownership
-    // word left the region the size it was. Stated rather than derived, because
-    // a field that *did* grow the type would push the region onto a second page
-    // and widen a capability in a diff nobody was reading — and the assertion
-    // below that pins the region to one page would then be the only thing
-    // catching it, by which point the reason is gone.
-    assert!(
-        size_of::<SignReply>()
-            == (24 + MAX_SIGNATURE_LEN + PUBLIC_KEY_LEN + DEVICE_ID_LEN + MAX_CERTIFICATE_LEN)
-                .next_multiple_of(align_of::<SignReply>())
-    );
+    // WHAT THE ANCHOR COSTS THE REGION, stated as the number rather than left to
+    // be derived. The ownership word before it was free — the certificate ended
+    // inside tail padding an eight-byte alignment had already reserved — and this
+    // field is not: 946 bytes were used of the 4096 a page grants, and a second
+    // certificate's worth takes that to 1714, padded to 1720. It fits, with 2376
+    // bytes of the page still unspoken for, so no grant moves and the region stays
+    // one page. A field that pushed the type past the page would widen a
+    // capability in a diff nobody was reading, and the assertion below that pins
+    // the region to one page is what stops it — but the arithmetic is written here
+    // so the next person adding a field can see how much room is left.
+    assert!(size_of::<SignReply>() == 1720);
+    assert!(size_of::<SignReply>() < MAPPING_ALIGN);
     // A zeroed reply says the appliance has no owner, which is the state that
     // keeps the onboarding surface open — so a holder that never answered
     // cannot close it, and the close is a thing a holder has to say.

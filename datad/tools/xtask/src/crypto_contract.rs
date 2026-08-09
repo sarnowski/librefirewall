@@ -43,6 +43,19 @@
 //! appliance has one certificate, so two sizes on one boot would be two answers to
 //! one question.
 //!
+//! # The anchor, which is the same claim read from both ends at once
+//!
+//! A fourth answer crosses the same channel and leaves one record:
+//! `delegated-anchor-delivered=`, and the size beside it. [`anchor_record`] holds
+//! it to the **store domain's** own `onboarded=` on the same boot, and that
+//! pairing is the point. The store domain reads its medium and says whether this
+//! appliance has an owner; the cryptography domain asks the delegation and says
+//! whether it was handed the authority that owner delivered. Neither can check
+//! itself. Together they catch an owned appliance holding nothing to validate its
+//! management plane against, and an unowned one holding an authority nobody
+//! delivered — and the size is held to the word, because a delivery of zero bytes
+//! is a boot reporting an authority it was never handed.
+//!
 //! # Why the verdict is only asserted on an accelerated run
 //!
 //! Under emulation every instruction is a host function call and the guest's
@@ -295,11 +308,96 @@ pub(crate) fn judge(serial: &[u8], log: &Path, accelerated: bool) -> Result<Stri
     };
     let session = session_records(&steps, log)?;
     let delegation = delegation_records(&text, &steps, log)?;
+    let anchor = anchor_record(&text, &steps, log)?;
     Ok(format!(
-        "the cryptography domain proved {}vectors on this part, measured {}({verdict}), {}, and \
-         {}",
-        proved, costs, session, delegation
+        "the cryptography domain proved {}vectors on this part, measured {}({verdict}), {}, {}, \
+         and {}",
+        proved, costs, session, delegation, anchor
     ))
+}
+
+/// Judge the record this domain leaves about the anchor it was handed, and hold
+/// it to what the **store domain** said about the same appliance on the same boot.
+///
+/// This is a cross-domain claim and that is the whole of its value. The store
+/// domain reports `onboarded=`, off its own record; this domain reports whether
+/// an anchor was delivered, off a delegation it does not control. The two are the
+/// same fact seen from either end of the channel, so a boot where they disagree
+/// is a boot where an appliance believes it has an owner and holds nothing that
+/// owner delivered — or the reverse, which is an anchor arriving on a node nobody
+/// has taken. Neither could be found by reading one domain's records.
+fn anchor_record(text: &str, steps: &[&&str], log: &Path) -> Result<String, String> {
+    let observed: Vec<(&str, &str)> = steps
+        .iter()
+        .filter_map(|record| {
+            Some((
+                field_value(record, "delegated-anchor-delivered")?,
+                field_value(record, "delegated-anchor")?,
+            ))
+        })
+        .collect();
+    let [(delivered, size)] = observed[..] else {
+        return Err(format!(
+            "the cryptography domain published {} complete `delegated-anchor-delivered=` \
+             record(s) and a boot produces exactly one: the anchor is asked for once, because one \
+             appliance has one authority and a size that moved would be two answers to one \
+             question. None means the delegation never got that far. A record carrying the word \
+             without `delegated-anchor=` is not counted here, because a partial record is a \
+             rendering that lost a field\n  records observed: {steps:#?}\n  full run log: {}",
+            observed.len(),
+            log.display()
+        ));
+    };
+    let bytes = size.parse::<u64>().map_err(|error| {
+        format!(
+            "the `delegated-anchor={size}` is no number: {error}\n  full run log: {}",
+            log.display()
+        )
+    })?;
+    // The store domain's own word about the same appliance, off the same wire, on
+    // `delegation_records`'s terms exactly.
+    let onboarded = lifecycle_records(text)
+        .into_iter()
+        .filter(|record| record.contains(&field("domain", Domain::Store.name())))
+        .find_map(|record| field_value(record, "onboarded"))
+        .ok_or_else(|| {
+            format!(
+                "the store domain published no `onboarded=` record, so there is nothing to hold \
+                 the cryptography domain's `delegated-anchor-delivered=` to\n  full run log: {}",
+                log.display()
+            )
+        })?;
+    if delivered != onboarded {
+        return Err(format!(
+            "the store domain reports `onboarded={onboarded}` and the cryptography domain \
+             `delegated-anchor-delivered={delivered}`, and the two are one fact read from either \
+             end of the delegation. An owned appliance holding no anchor cannot validate the \
+             management plane that took it; an unowned one holding one was handed an authority \
+             nobody delivered\n  full run log: {}",
+            log.display()
+        ));
+    }
+    if delivered == "true" && bytes == 0 {
+        return Err(format!(
+            "the key holder delivered an anchor of 0 bytes, which is no anchor: the channel \
+             refuses an empty one under a success, so a zero here is a boot that reported having \
+             an authority without having been handed one\n  full run log: {}",
+            log.display()
+        ));
+    }
+    if delivered == "false" && bytes != 0 {
+        return Err(format!(
+            "the cryptography domain reports no anchor delivered and {bytes} bytes of it, and the \
+             two cannot both be so: the size is zero exactly where nothing was delivered\n  full \
+             run log: {}",
+            log.display()
+        ));
+    }
+    Ok(if delivered == "true" {
+        format!("was handed the {bytes}-byte anchor its owner delivered")
+    } else {
+        String::from("was handed no anchor, this appliance having no owner")
+    })
 }
 
 /// Judge the three records this domain leaves about the key it does not hold.

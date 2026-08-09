@@ -176,6 +176,149 @@ fn a_certificate_length_past_the_region_is_refused_before_the_copy() {
     );
 }
 
+/// The fourth answer, and the one this appliance validates a management server
+/// against. It crosses whole and it is not the device certificate: the two are
+/// separate fields, so a holder answering one leaves the other where it was.
+#[test]
+fn the_anchor_request_answers_the_delivered_anchor() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Anchor, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    assert_eq!(demand.operation(), Some(SignOperation::Anchor));
+    let der = vec![0x30_u8; 398];
+    assert_eq!(channel.responder.anchor(demand, &der), der.len());
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Anchor { anchor } => assert_eq!(anchor, &der[..]),
+        other => panic!("expected an anchor: {other:?}"),
+    }
+    // Handing over an anchor is not signing, on the certificate's terms.
+    assert_eq!(channel.responder.signatures(), 0);
+    // And the certificate's own destination was never touched, which is what
+    // says the two answers do not share storage.
+    assert_eq!(into.certificate, [0; MAX_CERTIFICATE_LEN]);
+}
+
+/// The two byte strings are separate fields of the region, not one field read
+/// twice: an answer to each leaves the other's bytes alone, so a caller holding
+/// both holds two statements rather than one written over itself.
+#[test]
+fn the_certificate_and_the_anchor_do_not_share_the_region() {
+    let mut channel = Channel::new();
+    let certificate = vec![0xC1_u8; 300];
+    let anchor = vec![0xA2_u8; 400];
+
+    let pending = channel.requester.request(SignOperation::Certificate, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.certificate(demand, &certificate);
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Certificate { certificate: got } => assert_eq!(got, &certificate[..]),
+        other => panic!("expected a certificate: {other:?}"),
+    }
+
+    let pending = channel.requester.request(SignOperation::Anchor, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.anchor(demand, &anchor);
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Anchor { anchor: got } => assert_eq!(got, &anchor[..]),
+        other => panic!("expected an anchor: {other:?}"),
+    }
+
+    // And back again: the certificate is still the certificate, which it would
+    // not be had the anchor been published into its bytes.
+    let pending = channel.requester.request(SignOperation::Certificate, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.certificate(demand, &certificate);
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Certificate { certificate: got } => assert_eq!(got, &certificate[..]),
+        other => panic!("expected a certificate: {other:?}"),
+    }
+}
+
+#[test]
+fn an_anchor_exactly_the_bound_crosses_whole() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Anchor, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    let widest = vec![0xA5_u8; MAX_CERTIFICATE_LEN];
+    assert_eq!(
+        channel.responder.anchor(demand, &widest),
+        MAX_CERTIFICATE_LEN
+    );
+    let mut into = SignAnswerBuffer::zero();
+    match channel.requester.poll(pending, &mut into) {
+        SignPoll::Anchor { anchor } => assert_eq!(anchor, &widest[..]),
+        other => panic!("an anchor at the bound was not handed over whole: {other:?}"),
+    }
+}
+
+/// An appliance nobody has taken has no anchor, and the holder says so by name.
+/// The refusal is the normal answer here rather than a failure, and it is
+/// distinct from every other refusal on this channel — an operator reading it
+/// learns that the holder is up, has a key, and has not been onboarded.
+#[test]
+fn an_appliance_with_no_anchor_is_refused_by_name() {
+    let mut channel = Channel::new();
+    let pending = channel.requester.request(SignOperation::Anchor, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.refuse(demand, SignRefusal::NoAnchor);
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        channel.requester.poll(pending, &mut into),
+        SignPoll::Refused(SignRefusal::NoAnchor)
+    );
+    assert_eq!(channel.requester.faults(), 0, "a refusal is not a fault");
+    assert_eq!(into.anchor, [0; MAX_CERTIFICATE_LEN], "nothing was copied");
+}
+
+/// The one shape the refusal exists to keep out of the channel: zero bytes under
+/// a success. A holder answering that way is answering some other protocol, and
+/// a caller must not read it as an anchor of no length.
+#[test]
+fn an_empty_anchor_under_a_success_is_a_fault() {
+    let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+    let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+    let mut requester = request.requester(reply);
+    let pending = requester.request(SignOperation::Anchor, &[]);
+    publish_raw(
+        reply,
+        pending.sequence(),
+        SignStatus::Ok.to_bits(),
+        SignOperation::Anchor.to_bits(),
+        0,
+    );
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        SignPoll::Faulted(SignFault::EmptyAnchor)
+    );
+}
+
+/// The anchor's bound is its own, and so is the fault that names it: the two
+/// byte strings have equal bounds and a shared fault would leave an operator
+/// unable to tell which answer the holder overran.
+#[test]
+fn an_anchor_length_past_the_region_is_refused_by_its_own_name() {
+    let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
+    let reply: &'static SignReply = Box::leak(Box::new(SignReply::zero()));
+    let mut requester = request.requester(reply);
+    let pending = requester.request(SignOperation::Anchor, &[]);
+    let len = (MAX_CERTIFICATE_LEN + 1) as u32;
+    publish_raw(
+        reply,
+        pending.sequence(),
+        SignStatus::Ok.to_bits(),
+        SignOperation::Anchor.to_bits(),
+        len,
+    );
+    let mut into = SignAnswerBuffer::zero();
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        SignPoll::Faulted(SignFault::LenPastAnchor { len })
+    );
+}
+
 #[test]
 fn a_signature_length_inside_the_certificate_bound_is_still_past_the_signature() {
     let request: &'static SignRequest = Box::leak(Box::new(SignRequest::zero()));
@@ -360,6 +503,10 @@ fn a_reply_carrying_another_sequence_is_ignored_entirely() {
     );
     assert_eq!(
         into.certificate, [0; MAX_CERTIFICATE_LEN],
+        "nothing was copied out"
+    );
+    assert_eq!(
+        into.anchor, [0; MAX_CERTIFICATE_LEN],
         "nothing was copied out"
     );
 }
@@ -714,6 +861,12 @@ proptest! {
                 SignPoll::Identity(_) => {
                     prop_assert_eq!(offset, 0);
                     prop_assert_eq!(asked, SignOperation::PublicKey);
+                }
+                SignPoll::Anchor { anchor } => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::Anchor);
+                    prop_assert!(!anchor.is_empty());
+                    prop_assert!(anchor.len() <= MAX_CERTIFICATE_LEN);
                 }
                 SignPoll::Installed => {
                     prop_assert_eq!(offset, 0);

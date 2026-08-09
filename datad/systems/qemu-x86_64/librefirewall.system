@@ -599,6 +599,59 @@
          domain has published anything forwards nothing. -->
     <memory_region name="owner" size="0x1000" />
 
+    <!-- WHERE THIS APPLIANCE DIALS ITS MANAGEMENT PLANE: one word, one writer,
+         one reader, and the same shape as `owner` above for the same reasons.
+
+         The store domain holds the state record an onboarding package wrote and
+         is the only thing that can change where this appliance answers to — by
+         minting on a fresh medium, by reading the record back on a later boot,
+         or by committing a package. It maps this read-write. The management
+         domain maps it read-only and will open the outbound channel to whatever
+         is published here; while nothing is, it dials nowhere.
+
+         WHY THE MANAGEMENT DOMAIN IS THE READER AND THE OTHER TWO ARE NOT. It is
+         the domain that will hold the session, so the address belongs where the
+         socket is opened. The read grant is withheld from the CONFIGURATION
+         domain, so where this appliance reports to cannot become a value the
+         parser that reads an attacker's document composes — an appliance whose
+         management address could be moved by a document would be one an
+         administrator could redirect by uploading a file. And it is withheld from
+         the FORWARDER, which decides frames: a dataplane that knew the management
+         address could treat that traffic specially, and a compromised one could
+         tell an operator's session from everything else it carries. Neither
+         domain has any use for the address, and a grant nobody needs is one that
+         outlives its reason.
+
+         WHAT A READ GRANT HERE CONFERS, stated plainly because it is the whole of
+         the exposure: an address literal and a port, both of which the management
+         server publishes to every appliance it owns and which appear in the
+         clear on the wire of any session opened to it. It is not a credential and
+         it authenticates nothing — what makes a session to that address safe is
+         the anchor the cryptography domain holds and the certificate the peer
+         presents under it, neither of which crosses here.
+
+         NO CHANNEL, in either direction, on `owner`'s reasoning. The management
+         domain is woken on a period by the clock domain and by the traffic on its
+         own port, so it reads this word on a wakeup it was going to have; a
+         notify direction from the domain that holds the private key into it would
+         buy a latency nothing measures.
+
+         ONE WORD AND NO SEQLOCK, and here that is load-bearing rather than merely
+         cheap: an address and a port are meaningful only together, so a torn pair
+         could spell a destination nobody published. They share one naturally
+         aligned 64-bit word — 32 bits of address, 16 of port, 16 of tag — which
+         is one access, so there is no torn read for a counter to bracket. Size is
+         `wire::ENDPOINT_REGION_SIZE`, its type's `size_of` rounded up to the
+         mapping granularity and held to it by `xtask::sysdesc` like every
+         constant here.
+
+         No phys_addr, on `owner`'s reasoning exactly — and the zeroing that
+         follows from it is load-bearing here too: a zeroed word carries no tag, a
+         zero port and an unspecified address, so a reader that runs before the
+         store domain has published anything finds nowhere to dial rather than
+         somewhere. -->
+    <memory_region name="endpoint" size="0x1000" />
+
     <!-- THE CAPTURE TAP, one region per direction, and the third handover in
          this system built the way the log ring and the configuration handover
          are.
@@ -1514,6 +1567,7 @@
         <map mr="cfg_request" vaddr="0x3_100_000" perms="rw" cached="true" setvar_vaddr="cfg_request_vaddr" />
         <map mr="cfg_reply" vaddr="0x3_200_000" perms="r" cached="true" setvar_vaddr="cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="endpoint" vaddr="0x3_00b_000" perms="r" cached="true" setvar_vaddr="endpoint_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_management_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_forwarder" vaddr="0x5_000_000" perms="r" cached="true" setvar_vaddr="stats_forwarder_vaddr" />
@@ -2041,6 +2095,7 @@
         <map mr="sign_reply" vaddr="0x7_100_000" perms="rw" cached="true" setvar_vaddr="sign_reply_vaddr" />
         <map mr="install_staging" vaddr="0x7_400_000" perms="r" cached="true" setvar_vaddr="install_staging_vaddr" />
         <map mr="owner" vaddr="0x3_00a_000" perms="rw" cached="true" setvar_vaddr="owner_vaddr" />
+        <map mr="endpoint" vaddr="0x3_00b_000" perms="rw" cached="true" setvar_vaddr="endpoint_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar4" />
         <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
         <setvar symbol="io_paddr" region_paddr="blk2_io" />

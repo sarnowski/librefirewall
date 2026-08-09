@@ -521,6 +521,27 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Ownership.to_bits();
                     record.operands = [*ownership as u64, 0, 0, 0];
                 }
+                // The flag takes the FOURTH word, where this ABI puts the one
+                // flag a detail may carry — `Identity`'s owner word and
+                // `Reset`'s sit there too — so a reader of the encoding has one
+                // position to know rather than one per detail.
+                DomainDetail::DelegatedAnchor { delivered, anchor } => {
+                    record.detail = LogDetailKind::DelegatedAnchor.to_bits();
+                    record.operands = [*anchor, 0, 0, u64::from(*delivered)];
+                }
+                DomainDetail::Published {
+                    destination,
+                    port,
+                    published,
+                } => {
+                    record.detail = LogDetailKind::Published.to_bits();
+                    record.operands = [
+                        u64::from(destination.bits()),
+                        u64::from(*port),
+                        0,
+                        u64::from(*published),
+                    ];
+                }
                 DomainDetail::Adopted {
                     destination,
                     port,
@@ -902,6 +923,23 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
         CheckedDetail::Ownership { ownership } => {
             DomainDetail::Ownership(ownership_of(*ownership)?)
         }
+        // Total: `wire` ranged the flag, and a size is a number every bit pattern
+        // of which the holder could have handed over.
+        CheckedDetail::DelegatedAnchor { delivered, anchor } => DomainDetail::DelegatedAnchor {
+            delivered: *delivered,
+            anchor: *anchor,
+        },
+        // Total on `Adopted`'s terms, with the flag ranged beside the two values
+        // it qualifies.
+        CheckedDetail::Published {
+            destination,
+            port,
+            published,
+        } => DomainDetail::Published {
+            destination: net_headers::Ipv4Address::from_octets(destination.to_be_bytes()),
+            port: *port,
+            published: *published,
+        },
         // Total: `wire` ranged the address and the port, and a generation is a
         // position every bit pattern of which a record could stand at.
         CheckedDetail::Adopted {
@@ -1257,6 +1295,18 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         destination,
                         port,
                         generation,
+                    },
+                    DomainDetail::DelegatedAnchor { delivered, anchor } => {
+                        DomainDetail::DelegatedAnchor { delivered, anchor }
+                    }
+                    DomainDetail::Published {
+                        destination,
+                        port,
+                        published,
+                    } => DomainDetail::Published {
+                        destination,
+                        port,
+                        published,
                     },
                     DomainDetail::Reset {
                         generation,

@@ -632,6 +632,52 @@ pub enum DomainDetail<C = &'static str> {
     /// is counted under; a count here would be a second, later reading of a
     /// number the metrics surface already carries per reason.
     Ownership(Ownership),
+    /// The trust anchor a domain that holds no private key was handed by the
+    /// domain that does: whether one had been delivered at all, and how large it
+    /// is.
+    ///
+    /// Appended, never inserted, on the details above's terms. The two fields
+    /// travel together because the size alone cannot say the thing an operator
+    /// most needs to know. An appliance nobody has taken has no anchor, and that
+    /// is an ordinary state rather than a failure — so the flag is what separates
+    /// "no management plane has adopted this node" from "the delegation answered
+    /// and something is wrong", and the size is what says which authority
+    /// arrived once one has. A single number would have had to spell the absence
+    /// as a zero, which is a length, and a length is not what an un-onboarded
+    /// appliance has.
+    ///
+    /// **The anchor itself has no representation here.** It is public — the peer
+    /// this appliance dials issues under it — and it is still not printed, for
+    /// the reason the device certificate is not: hundreds of bytes of DER on a
+    /// bounded ring would push out every record an operator can actually read.
+    /// What identifies *which* anchor was delivered is its fingerprint, which the
+    /// domain that installed it renders whole on a record of its own.
+    DelegatedAnchor {
+        delivered: bool,
+        /// Bytes of the anchor the holder handed over, and zero exactly where
+        /// `delivered` is false — a holder that answers with an empty one is
+        /// refused by the channel before it reaches a record.
+        anchor: u64,
+    },
+    /// Where the domain that holds this appliance's record has told the domain
+    /// that opens the management channel to dial, and whether it has told it
+    /// anywhere at all.
+    ///
+    /// Appended, never inserted. The flag is not redundant with the address, and
+    /// that is the point of carrying both: an appliance with nowhere to dial has
+    /// an all-zero address and a port of zero, and an operator reading `0.0.0.0`
+    /// alone would be reading something that looks like an address. The word says
+    /// which of the two situations they are in, and the numbers say where when
+    /// there is a where.
+    ///
+    /// **What this reports is what was published, not what was reached.** Whether
+    /// a session to that address succeeds is the dialling domain's to report, on
+    /// its own record; this one says only what that domain was told.
+    Published {
+        destination: Ipv4Address,
+        port: u16,
+        published: bool,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

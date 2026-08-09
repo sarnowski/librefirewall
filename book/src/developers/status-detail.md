@@ -2702,6 +2702,27 @@ against the ones the client printed, and the certificate's subject against the d
 and no single surface can state it. The successful handshake goes first, so the three failures after
 it are sessions on a port that has already carried one.
 
+**The anchor that client will validate against now reaches this domain, and nothing here judges it.**
+It is a fourth answer on the key delegation, asked for exactly where the appliance's own certificate
+is and out of the same record: this is the domain that will build a verifier over it, and the domain
+that answers is the one that took delivery of it. What a boot claims about it is deliberately
+narrower than what it claims about the certificate — the certificate is held to the public key the
+same channel named, which is a question this domain can settle by itself, while an anchor is a
+statement by a third party about a third party and the only thing that can judge one is the verifier
+it is used to build. So the record says two things and no more: whether one was delivered, and how
+large it is.
+
+**It is asked for only where the holder says this appliance has an owner.** An un-onboarded node has
+no anchor, so asking would turn its ordinary state into a refusal this domain then had to forgive;
+instead it is not asked, and the record carries `delegated-anchor-delivered=false` beside a zero. A
+holder that says it *is* owned and then cannot produce one has the two halves of an ownership
+disagreeing, and that draws one of three tokens of its own — the sharpest being the holder answering
+that it has no anchor one exchange after saying it has an owner. **The gate holds that word to the
+store domain's own `onboarded=` on the same boot**, which is the point of having it: the two domains
+reach the same fact independently, one by reading its medium and the other by asking, and neither can
+check itself. An owned appliance holding no anchor cannot validate the management plane that took it;
+an unowned one holding an anchor was handed an authority nobody delivered.
+
 **The channel's client half is built beside it, and nothing runs it.** `lfw_tls::ChannelClient` is
 the onboarding server's sibling: the same incremental shape — bytes in a delivery at a time, bytes
 back into the room the wire has, the session held across calls — over the same provider, the same
@@ -3154,8 +3175,10 @@ states, and the counter is read by hand. The management domain's own dial is
 a separate thing and still carries ten bytes of first-party probe and no protocol at all — and the
 channel client that will run over it, though built and host-tested, is reached by **no protection
 domain**: no booted image has run a channel handshake, no console record says how one ended, no
-scenario drives one, and the anchor it validates against is passed in by its caller rather than
-delivered to the domain that would open one. The session is proved
+scenario drives one. **The two values it needs now reach the domains that will use them, and nothing
+consumes either**: the trust anchor is delivered to the cryptography domain over the key delegation
+and reported on its console, and where to dial is published into a region the management domain
+maps — which that domain does not read, its destination still being a constant compiled into it. The session is proved
 against this same build on both ends, so nothing about interoperating with a second implementation is
 established — and the client end and the certification authority above both are still generated here,
 standing in for a management server and an anchor this appliance has never seen. SHA-NI stays unreachable for the reason the [status page](../status.md) records.

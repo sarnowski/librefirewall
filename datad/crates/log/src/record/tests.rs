@@ -314,6 +314,31 @@ fn every_domain_detail_shape_survives_the_crossing() {
         },
         DomainDetail::AnchorFingerprint([0xff; 32]),
         DomainDetail::AnchorFingerprint(counting_digest()),
+        // Both readings of the anchor: the appliance that was handed one, and the
+        // one nobody has taken. The second is the pair that must survive whole —
+        // a flag read out of the wrong word would make an un-onboarded node
+        // report an authority it does not have.
+        DomainDetail::DelegatedAnchor {
+            delivered: true,
+            anchor: 398,
+        },
+        DomainDetail::DelegatedAnchor {
+            delivered: false,
+            anchor: 0,
+        },
+        // And both readings of the endpoint, on the same terms: no two fields
+        // equal on the published one, and the absence carrying the flag that
+        // tells it from an address.
+        DomainDetail::Published {
+            destination: net_headers::Ipv4Address::from_octets([10, 0, 2, 2]),
+            port: 8443,
+            published: true,
+        },
+        DomainDetail::Published {
+            destination: net_headers::Ipv4Address::from_octets([0, 0, 0, 0]),
+            port: 0,
+            published: false,
+        },
         // No two fields equal, for the reason the channel's five are that way:
         // a field read out of the wrong operand word survives only symmetry.
         DomainDetail::Adopted {

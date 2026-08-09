@@ -31,10 +31,10 @@
 //!    every measured primitive reports thousandths of a cycle per byte, and
 //!    the gate holds AES-256-GCM's below a figure no portable implementation
 //!    reaches. This is the claim that would otherwise go quietly untrue.
-//! 4. **The appliance can authenticate under a key it does not hold, and can
-//!    present the certificate over it.** The device key belongs to the domain
-//!    that owns the medium it is written on, and this domain is not that one. So
-//!    it asks three things: which key do you hold, sign these bytes, and hand me
+//! 4. **The appliance can authenticate under a key it does not hold, can present
+//!    the certificate over it, and knows whom it trusts.** The device key belongs
+//!    to the domain that owns the medium it is written on, and this domain is not
+//!    that one. So it asks: which key do you hold, sign these bytes, and hand me
 //!    the certificate over that key — then verifies the signature against the key
 //!    it was given, which is a claim about the delegation and not about ECDSA, and
 //!    holds the certificate to that same key, which is a claim this domain can
@@ -42,6 +42,15 @@
 //!    same delegated key**, because that is the only thing that proves the seam
 //!    where it will actually be used: `sign` is called synchronously, deep inside
 //!    a rustls handshake, at the point a server produces its `CertificateVerify`.
+//!
+//!    Where the holder says this appliance has an owner it asks a fourth thing:
+//!    hand me the trust anchor that owner delivered. That one is not verified
+//!    here and could not be — an anchor is a statement by somebody else about
+//!    somebody else, and the only domain that can judge it is the one it is used
+//!    against, which is a TLS verifier built out of it. What a boot claims about
+//!    it is therefore narrower and is stated as such: one was delivered, and it
+//!    is this many bytes. An appliance nobody has taken has none, is not asked,
+//!    and says so.
 //!
 //! # Why the measurement takes the minimum of several rounds
 //!
@@ -143,7 +152,7 @@ use wire::{
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
-use delegate::{Delegated, DelegationError, HeldCertificate, HeldKey};
+use delegate::{Delegated, DelegationError, HeldAnchor, HeldCertificate, HeldKey};
 use upload::PackageUpload;
 
 /// The appliance's only allocator, and the one exception to the rule that a
@@ -697,6 +706,16 @@ fn onboarding_identity(
 struct Delegation {
     held: HeldKey,
     certificate: HeldCertificate,
+    /// The trust anchor a management plane delivered, and `None` for every
+    /// appliance nobody has taken.
+    ///
+    /// An `Option` and not an empty byte string, because the two states are
+    /// different facts about the appliance and only one of them is a problem: an
+    /// un-onboarded node has no anchor and is working exactly as it should, while
+    /// a node that has an owner and no anchor is holding half of what an owner
+    /// delivered. The channel spells that difference as a refusal by name, and
+    /// this type is where it is kept rather than flattened.
+    anchor: Option<HeldAnchor>,
 }
 
 /// Ask the key holder which key it holds, have it sign a fixed challenge, verify
@@ -711,9 +730,15 @@ struct Delegation {
 /// scalar, and a certificate belonging to some other appliance are each a refusal
 /// here rather than a handshake failure three steps later.
 ///
-/// The record it leaves names the appliance, the holder's own tally and the size of
-/// the certificate. Reported before the session, so a boot whose session then fails
-/// still shows the delegation having worked.
+/// Where the holder says this appliance has an owner, it also takes the trust
+/// anchor that owner delivered — the one answer on this channel this domain does
+/// not judge, because an anchor is a statement about a third party and the only
+/// thing that can judge one is the verifier it is used to build.
+///
+/// The records it leaves name the appliance, the holder's own tally and the size
+/// of the certificate, and then whether an anchor was delivered and how large it
+/// is. Reported before the session, so a boot whose session then fails still shows
+/// the delegation having worked.
 fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<Delegation, CryptoError> {
     let held = delegated.held_key().map_err(delegation_refusal)?;
     // An all-zero point is what a zeroed region reads as, so it is the one shape
@@ -742,8 +767,25 @@ fn prove_delegation(sink: &dyn Sink, delegated: &Delegated) -> Result<Delegation
         ))
     })?;
     let certificate = held_certificate(delegated, &held)?;
-    let delegation = Delegation { held, certificate };
+    // Only where the holder says this appliance has an owner. An un-onboarded
+    // node has no anchor to fetch, and asking for one would turn its ordinary
+    // state into a refusal this domain then had to forgive — so the question is
+    // not asked, and the record below says plainly that none was delivered. A
+    // holder that says it is owned and then cannot produce one has the two halves
+    // of an ownership disagreeing, which is a refusal and reaches the console by
+    // name.
+    let anchor = if held.owned {
+        Some(delegated.held_anchor().map_err(anchor_refusal)?)
+    } else {
+        None
+    };
+    let delegation = Delegation {
+        held,
+        certificate,
+        anchor,
+    };
     report_delegation(sink, delegated, &delegation);
+    report_anchor(sink, &delegation);
     Ok(delegation)
 }
 
@@ -807,6 +849,52 @@ fn report_delegation(sink: &dyn Sink, delegated: &Delegated, delegation: &Delega
             certificate: delegation.certificate.as_bytes().len() as u64,
         },
     );
+}
+
+/// What the delegation was handed to validate a management server against, and
+/// whether it was handed anything at all.
+///
+/// Its own record rather than a field beside the certificate's size, because the
+/// four operand words a detail carries are already spent there — the identifier
+/// alone takes two — and because the two say different things: one is this
+/// appliance's own identity, the other is whom it trusts. A reader looking for
+/// either does not have to hold the other in their head.
+///
+/// **The absence is stated rather than left as a missing line.** An appliance
+/// nobody has taken has no anchor, and a boot that simply said nothing about it
+/// would be indistinguishable from one whose delegation stopped before it got
+/// there.
+fn report_anchor(sink: &dyn Sink, delegation: &Delegation) {
+    let anchor = delegation.anchor.as_ref();
+    announce(
+        sink,
+        DomainState::Negotiated,
+        DomainDetail::DelegatedAnchor {
+            delivered: anchor.is_some(),
+            anchor: anchor.map_or(0, |held| held.as_bytes().len() as u64),
+        },
+    );
+}
+
+/// Why the anchor could not be had, as a cause token group of its own.
+///
+/// Its own three rather than the certificate's, on exactly the reasoning that
+/// gave the certificate its own: by the time one of these can appear the key
+/// exchange has worked, a challenge has been signed under that key, the device
+/// certificate has arrived and it carried the key the same channel named — and
+/// the holder has said this appliance HAS an owner. So a holder that stops here
+/// is not a node coming up and not a node with a broken identity; it is a node
+/// whose record says it was adopted and that cannot produce what the adoption
+/// delivered. `delegated-anchor-refused` is the sharpest of the three: the holder
+/// answered, and said it has no anchor, one exchange after saying it has an
+/// owner.
+fn anchor_refusal(error: DelegationError) -> CryptoError {
+    let cause = match error {
+        DelegationError::Unanswered => "delegated-anchor-unanswered",
+        DelegationError::Refused => "delegated-anchor-refused",
+        DelegationError::Faulted => "delegated-anchor-faulted",
+    };
+    CryptoError(refusal(cause, RefusalDetail::None))
 }
 
 /// Why the delegation refused, as a cause token an operator can act on.

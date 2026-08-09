@@ -10,14 +10,24 @@
 //! `KeyProvider` already refuses to load one from an encoding, which is what
 //! keeps this a substitution rather than a rewrite.
 //!
-//! Three things are asked over that channel and only one of them is the trait's:
-//! a signature, the public point and name the holder signs under, and **the
-//! appliance's own certificate over that point**. The certificate is fetched
-//! rather than issued here because the holder is the identity domain — it minted
-//! that certificate and made it durable — and a certificate written in this domain
-//! would be a second statement over one key, with no domain able to say which one
-//! a peer was shown. It is a public artifact either way: what crosses is what
-//! every peer of this appliance is handed.
+//! Four things are asked over that channel and only one of them is the trait's:
+//! a signature, the public point and name the holder signs under, **the
+//! appliance's own certificate over that point**, and **the trust anchor a
+//! management plane delivered**. The certificate is fetched rather than issued
+//! here because the holder is the identity domain — it minted that certificate
+//! and made it durable — and a certificate written in this domain would be a
+//! second statement over one key, with no domain able to say which one a peer was
+//! shown. It is a public artifact either way: what crosses is what every peer of
+//! this appliance is handed.
+//!
+//! The anchor is fetched for the sharper version of the same reason. It arrived
+//! inside an onboarding package, the holder judged that package and made the
+//! anchor durable, and it is one field of the very record the other three answers
+//! come out of. **This is the domain that will validate a management server's
+//! certificate**, so the anchor has to reach here — and a copy kept anywhere else
+//! would be a second answer to the question of whom this appliance trusts. It is
+//! public too: the peer this appliance dials issues under it and therefore holds
+//! it already.
 //!
 //! It lives in this protection domain and not in `wire` for one reason: this is
 //! the only place that sees both the TLS trait and the channel ABI, and `wire`
@@ -104,6 +114,35 @@ pub struct HeldCertificate {
 impl HeldCertificate {
     /// The certificate, bounded by what the holder published rather than by the
     /// array behind it.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// What the holder answered an `Anchor` request with: the trust anchor a
+/// management plane delivered, and how many bytes of the array are anchor.
+///
+/// Owned rather than a borrow of the region, on [`HeldCertificate`]'s terms
+/// exactly, and its own type rather than a second use of that one because the two
+/// are statements about different keys — one binds this appliance's key, the
+/// other is the authority that will sign a peer's. A single type would let a
+/// caller hand the wrong one to a verifier and be told only that validation
+/// failed.
+///
+/// **Public throughout**, and for a reason of its own beyond the certificate's:
+/// this is the authority the party at the other end of the channel issues under,
+/// so it holds these bytes already.
+#[derive(Clone, Copy)]
+pub struct HeldAnchor {
+    bytes: [u8; MAX_CERTIFICATE_LEN],
+    len: usize,
+}
+
+impl HeldAnchor {
+    /// The anchor, bounded by what the holder published rather than by the array
+    /// behind it. Never empty: a holder with none refuses by name, so a value of
+    /// this type is one somebody really delivered.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.get(..self.len).unwrap_or(&[])
@@ -225,9 +264,10 @@ impl Delegated {
             // it reaches here, so these arms are unreachable. Answered as a fault
             // rather than asserted: nothing on a path the TLS library calls into
             // may panic.
-            Answer::Signature { .. } | Answer::Certificate { .. } | Answer::Installed => {
-                Err(DelegationError::Faulted)
-            }
+            Answer::Signature { .. }
+            | Answer::Certificate { .. }
+            | Answer::Anchor { .. }
+            | Answer::Installed => Err(DelegationError::Faulted),
         }
     }
 
@@ -252,9 +292,10 @@ impl Delegated {
         match self.exchange(Ask::Install(staged), None)? {
             Answer::Installed => Ok(()),
             // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
-            Answer::Signature { .. } | Answer::Identity(_) | Answer::Certificate { .. } => {
-                Err(DelegationError::Faulted)
-            }
+            Answer::Signature { .. }
+            | Answer::Identity(_)
+            | Answer::Certificate { .. }
+            | Answer::Anchor { .. } => Err(DelegationError::Faulted),
         }
     }
 
@@ -281,9 +322,46 @@ impl Delegated {
         )? {
             Answer::Certificate { len } => Ok(HeldCertificate { bytes, len }),
             // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
-            Answer::Signature { .. } | Answer::Identity(_) | Answer::Installed => {
-                Err(DelegationError::Faulted)
-            }
+            Answer::Signature { .. }
+            | Answer::Identity(_)
+            | Answer::Anchor { .. }
+            | Answer::Installed => Err(DelegationError::Faulted),
+        }
+    }
+
+    /// Ask the holder for the trust anchor a management plane delivered.
+    ///
+    /// The anchor is fetched rather than kept here because the holder is the
+    /// domain that took delivery of it: it read the package that carried it,
+    /// judged it, and made it durable. A copy in this domain would be a second
+    /// answer to whom this appliance trusts, and a session validated against the
+    /// stale one would be a session no domain could account for.
+    ///
+    /// Nothing here judges the bytes, on [`Self::held_certificate`]'s terms. What
+    /// comes back is a byte string the holder chose, bounded by the region;
+    /// whether it is a certificate at all is a question for the TLS stack that
+    /// will build a verifier out of it, which is where a second X.509 reader in
+    /// this domain would otherwise have to go.
+    ///
+    /// **A holder with no anchor is a refusal and not an empty answer.** An
+    /// appliance nobody has taken has none, so the caller must be able to tell
+    /// that from a holder that answered badly — which is why the channel spells
+    /// it [`wire::SignRefusal::NoAnchor`] and why nothing here turns a refusal
+    /// into zero bytes.
+    ///
+    /// # Errors
+    /// [`DelegationError`], naming which way the exchange failed.
+    pub fn held_anchor(&self) -> Result<HeldAnchor, DelegationError> {
+        // The destination is this frame's, handed down rather than returned up,
+        // on the certificate's terms: [`Answer`] says why.
+        let mut bytes = [0_u8; MAX_CERTIFICATE_LEN];
+        match self.exchange(Ask::Message(SignOperation::Anchor, &[]), Some(&mut bytes))? {
+            Answer::Anchor { len } => Ok(HeldAnchor { bytes, len }),
+            // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
+            Answer::Signature { .. }
+            | Answer::Identity(_)
+            | Answer::Certificate { .. }
+            | Answer::Installed => Err(DelegationError::Faulted),
         }
     }
 
@@ -305,7 +383,7 @@ impl Delegated {
     fn exchange(
         &self,
         ask: Ask<'_>,
-        certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
+        into: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
     ) -> Result<Answer, DelegationError> {
         while self
             .taken
@@ -314,16 +392,21 @@ impl Delegated {
         {
             core::hint::spin_loop();
         }
-        let outcome = self.issue(ask, certificate);
+        let outcome = self.issue(ask, into);
         self.taken.store(false, Ordering::Release);
         outcome
     }
 
     /// The exchange itself, with the flag held.
+    /// `into` is the caller's destination for whichever of the two
+    /// certificate-shaped answers it asked for. One parameter for both, because
+    /// the exchange admits one request at a time and the answering arm knows
+    /// which question it is: two would be two ways to pass the same buffer and a
+    /// third state where neither was supplied.
     fn issue(
         &self,
         ask: Ask<'_>,
-        mut certificate: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
+        mut into: Option<&mut [u8; MAX_CERTIFICATE_LEN]>,
     ) -> Result<Answer, DelegationError> {
         // SAFETY: the flag is held by the caller, so this is the only live
         // reference to the requester for the duration of the call, and the
@@ -373,14 +456,26 @@ impl Delegated {
                     // the shorter of the two and the ABI has already bounded the
                     // slice by the region, so the two lengths agree and no index is
                     // taken.
-                    if let Some(into) = certificate.as_mut() {
-                        for (slot, byte) in into.iter_mut().zip(published) {
+                    if let Some(destination) = into.as_mut() {
+                        for (slot, byte) in destination.iter_mut().zip(published) {
                             *slot = *byte;
                         }
                     }
                     return Ok(Answer::Certificate {
                         len: published.len(),
                     });
+                }
+                SignPoll::Anchor { anchor } => {
+                    // Into the caller's destination on the certificate's terms:
+                    // the two answers share this one parameter because they are
+                    // the same shape and only one is ever outstanding, the
+                    // exchange admitting one request at a time.
+                    if let Some(destination) = into.as_mut() {
+                        for (slot, byte) in destination.iter_mut().zip(anchor) {
+                            *slot = *byte;
+                        }
+                    }
+                    return Ok(Answer::Anchor { len: anchor.len() });
                 }
                 SignPoll::Refused(_) => return Err(DelegationError::Refused),
                 SignPoll::Installed => return Ok(Answer::Installed),
@@ -410,12 +505,12 @@ unsafe impl Sync for Delegated {}
 /// above declare its window per iteration — and what means no caller here holds a
 /// view into a region a peer may still be writing.
 ///
-/// **The certificate is the exception and carries only its length.** It is ten
-/// times the size of everything else this channel moves, so a variant holding it
-/// would make every exchange return a certificate's worth of stack — including the
-/// signature exchange that runs inside a handshake, which is the one path here that
-/// is not a once-per-boot call. The caller that asks for a certificate says where it
-/// goes instead, and only that caller carries the buffer.
+/// **The two certificate-shaped answers are the exception and carry only their
+/// length.** Each is ten times the size of everything else this channel moves, so
+/// a variant holding one would make every exchange return a certificate's worth
+/// of stack — including the signature exchange that runs inside a handshake,
+/// which is the one path here that is not a once-per-boot call. The caller that
+/// asks says where the bytes go instead, and only that caller carries the buffer.
 enum Answer {
     Signature {
         bytes: [u8; MAX_SIGNATURE_LEN],
@@ -423,6 +518,12 @@ enum Answer {
     },
     Identity(DeviceIdentity),
     Certificate {
+        len: usize,
+    },
+    /// The trust anchor a management plane delivered, carrying only its length
+    /// for the certificate's reason and into the same caller-supplied
+    /// destination.
+    Anchor {
         len: usize,
     },
     /// The package staged in the region was installed. It carries nothing, which

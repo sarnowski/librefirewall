@@ -172,8 +172,8 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    DownloadReply, DownloadRequest, LogConsume, LogRecords, RelayFault, RelayRefusal, RelayReply,
-    RelayRequest,
+    DownloadReply, DownloadRequest, LogConsume, LogRecords, ManagementEndpoint, RelayFault,
+    RelayRefusal, RelayReply, RelayRequest,
 };
 
 /// How many dataplane ports the build has, and so the bound a committed image's
@@ -651,6 +651,13 @@ fn init() -> Management {
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    // Where the appliance dials, published by the domain that holds its record
+    // and mapped read-only here. Attached and **not read**: this domain dials a
+    // destination compiled into it, and nothing yet consults this region. The
+    // attach is not optional even so — a domain granted a mapping whose image has
+    // no symbol for it is a description the Microkit tool refuses to build — so
+    // the binding this domain will use exists from the boot its grant does.
+    let _endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting, DomainDetail::None);
 

@@ -106,10 +106,10 @@ use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
-    DOWNLOAD_REQUEST_REGION_SIZE, INSTALL_STAGING_REGION_SIZE, LOG_CONSUME_REGION_SIZE,
-    LOG_RECORDS_REGION_SIZE, OWNERSHIP_REGION_SIZE, RELAY_REPLY_REGION_SIZE,
-    RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE,
-    TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
+    DOWNLOAD_REQUEST_REGION_SIZE, ENDPOINT_REGION_SIZE, INSTALL_STAGING_REGION_SIZE,
+    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, OWNERSHIP_REGION_SIZE,
+    RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
+    SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -477,6 +477,21 @@ const OWNERSHIP_WITHHELD: &str = "the store domain is the ONLY writer of the wor
      an attacker's document, and the management domain, so the domain facing the management-plane \
      attacker cannot learn from a mapping what it can already learn by asking the store domain \
      for the identity. No `phys_addr`, so no device reaches it by DMA either";
+
+/// What the management endpoint withholds, which is an authority in one
+/// direction and a piece of knowledge in the other.
+const ENDPOINT_WITHHELD: &str = "the store domain is the ONLY writer of the address this \
+     appliance dials, and the management domain the only reader. The write grant is withheld from \
+     every other domain including the management domain itself, because a domain that could write \
+     it could point the appliance's own management channel at a peer of its choosing — which is \
+     the one thing an attacker who reached that domain would most want. The read grant is \
+     withheld from the configuration domain, so where this appliance reports to cannot become a \
+     value composed by the parser that reads an attacker's document; and from the forwarder, \
+     which decides frames, so a compromised dataplane cannot tell an operator's session from the \
+     traffic around it. What a read here confers is an address literal and a port and nothing \
+     else — values the management server publishes to every appliance it owns and that appear in \
+     the clear on the wire — so the grant is narrow because what it carries authenticates \
+     nothing. No `phys_addr`, so no device reaches it by DMA either";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -962,6 +977,21 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_write("store"), read_only("forwarder")],
         withheld: Some(OWNERSHIP_WITHHELD),
+    },
+    // Where the appliance dials: one writer, one reader, and no channel — the
+    // reader is woken on a period and by its own port's traffic, so it reads this
+    // on a wakeup it was going to have. As with `owner`, what this rule withholds
+    // is an authority and a piece of knowledge rather than a mapping, so the perms
+    // carry half the argument and `withheld` states the exclusions they cannot.
+    RegionRule {
+        name: "endpoint",
+        size: ExpectedSize {
+            rust_name: "wire::ENDPOINT_REGION_SIZE",
+            bytes: ENDPOINT_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store"), read_only("management")],
+        withheld: Some(ENDPOINT_WITHHELD),
     },
     RegionRule {
         name: "cfgack",
@@ -3966,10 +3996,10 @@ mod tests {
     #[test]
     fn the_management_domain_reaching_the_acknowledgement_region_is_reported() {
         let findings = findings_after(
-            "<map mr=\"clock\" vaddr=\"0x3_009_000\" perms=\"r\" cached=\"true\" \
-             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"log_management\"",
-            "<map mr=\"clock\" vaddr=\"0x3_009_000\" perms=\"r\" cached=\"true\" \
-             setvar_vaddr=\"clock_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_008_000\" \
+            "<map mr=\"endpoint\" vaddr=\"0x3_00b_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"endpoint_vaddr\" />\n        <map mr=\"log_management\"",
+            "<map mr=\"endpoint\" vaddr=\"0x3_00b_000\" perms=\"r\" cached=\"true\" \
+             setvar_vaddr=\"endpoint_vaddr\" />\n        <map mr=\"cfgack\" vaddr=\"0x3_008_000\" \
              perms=\"rw\" cached=\"true\" setvar_vaddr=\"cfgack_vaddr\" />\n        \
              <map mr=\"log_management\"",
         );
