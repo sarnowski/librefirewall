@@ -3003,6 +3003,12 @@ fn legacy_broadcast_frame(marker: &[u8]) -> Vec<u8> {
 pub enum BootContract<'a> {
     /// Both routed packets must arrive on the far port rewritten exactly for
     /// their next hop, and no refused packet may arrive at all.
+    ///
+    /// The traffic is what this variant *proves*, and on a boot that also owes a
+    /// record of the channel it dials it is not the whole of what ends the run:
+    /// such a boot waits for that record too ([`BootTest::channel`]). The two
+    /// are settled by different domains on different passes, and a run that
+    /// stopped on the traffic alone would race the one the appliance writes last.
     Routed,
     /// **The cryptography domain came up and finished**, and nothing else is
     /// judged at all.
@@ -3130,6 +3136,17 @@ pub struct BootTest<'a> {
     /// fourth of those boots has no station: it lets real clients onto the wire
     /// through a forwarded host port, which is a different thing to be told.
     pub onboard: crate::qemu::OnboardContract,
+    /// What the appliance owes on the **console** for the channel it dials, which
+    /// is what such a boot waits for before it ends.
+    ///
+    /// Its own field beside [`Self::dial`] because the two are different
+    /// surfaces: that one is the transport's account, read off a station on the
+    /// wire, and this is the session's, read off the appliance's own output. A
+    /// boot that stopped when its traffic was decided would kill the guest with
+    /// the session's record still unwritten — the domain that terminates a
+    /// session writes on the pass that decided it, which is later than anything
+    /// the routed contract waits for.
+    pub channel: crate::channel_contract::ChannelContract,
     /// Whether QEMU is executing the guest on hardware rather than emulating
     /// it. Carried through to [`Booted`] because one judge needs it and cannot
     /// re-derive it honestly: a cycle count taken under emulation measures the
@@ -4078,9 +4095,16 @@ enum OnboardStep {
     AwaitAck,
     /// This end has closed its half; the appliance owes its own `FIN`.
     AwaitFin,
-    /// This end reset the connection. Terminal, and nothing further may arrive:
-    /// a segment after a reset is the appliance answering a connection it was
-    /// told to forget.
+    /// This end reset the connection. Terminal: the station owes nothing further
+    /// and composes nothing, whatever arrives.
+    ///
+    /// Segments still may arrive, and tolerating them is the contract rather than
+    /// a relaxation of it. A reset agrees nothing with the peer and does not
+    /// overtake what the peer already put on the wire, so the close it had decided
+    /// on for itself — or a repeat of what it already sent — crosses the reset and
+    /// lands here. What is refused is a segment the appliance could not have
+    /// composed before it saw the reset: a `SYN` re-offering the connection, or a
+    /// sequence number past the space it had reached.
     Reset,
     /// The appliance's `FIN` has been acknowledged and both halves are closed.
     Closed,
@@ -4972,11 +4996,66 @@ impl ManagementProbe {
                 ));
                 Ok(OnboardStep::Closed)
             }
-            OnboardStep::Reset => Err(format!(
-                "a segment came back after this station reset the onboarding connection: flags \
-                 {:#04x}, sequence {}",
-                segment.flags, segment.sequence
-            )),
+            // A reset is not a barrier on the wire. This end abandoned the
+            // connection without agreeing anything about it, so whatever the
+            // appliance had already put on the wire is still travelling — and a
+            // segment that crossed the reset is the transport working, not the
+            // port answering a connection it was told to forget. It is the close
+            // the peer had decided on for itself, or a repeat of what it already
+            // sent, and both are what a real peer produces.
+            //
+            // What is refused is a segment the appliance could not have composed
+            // before it saw the reset. Two things say that, and nothing else can:
+            //
+            // A `SYN` — the passive open being offered again. The appliance sends
+            // that flag only in a `SYN-ACK`, so one arriving here is a transport
+            // still trying to establish a connection it has been told to drop.
+            //
+            // Sequence space the appliance had not yet reached. Everything it had
+            // composed lies between its own initial sequence number and the next
+            // number this station expects; it never sends a payload byte, so that
+            // span is one flag wide and a segment past it is new transmission
+            // rather than an old one still in flight. Compared as offsets from
+            // that one origin, so the arithmetic is a wrap of the sequence space
+            // rather than a comparison that breaks across it.
+            //
+            // The tolerance is bounded by the same thing every other step's is:
+            // [`ONBOARD_SEGMENT_LIMIT`] counts every segment on this connection
+            // before the step is even looked at, so a port that answers without
+            // end still fails — on the count, which is what such a port is.
+            OnboardStep::Reset => {
+                if segment.carries(TCP_SYN, 0) {
+                    return Err(format!(
+                        "the appliance offered the onboarding connection again after this station \
+                         reset it: flags {:#04x}, sequence {}. A SYN reaches this port only in a \
+                         SYN-ACK, so one here is a transport still establishing a connection it \
+                         was told to forget rather than a segment that was already travelling",
+                        segment.flags, segment.sequence
+                    ));
+                }
+                let Some(peer_isn) = station.peer_isn else {
+                    return Err(format!(
+                        "a segment came back after this station reset the onboarding connection \
+                         and the appliance never claimed an initial sequence number for it: flags \
+                         {:#04x}, sequence {}",
+                        segment.flags, segment.sequence
+                    ));
+                };
+                let composed = segment.sequence.wrapping_sub(peer_isn);
+                let reached = station.expect.wrapping_sub(peer_isn);
+                if composed > reached {
+                    return Err(format!(
+                        "the appliance sent sequence {} after this station reset the onboarding \
+                         connection, and it had composed no further than {}: flags {:#04x}. A \
+                         segment already travelling carries a number the appliance had reached, \
+                         so one past it is a connection this port is still writing to",
+                        segment.sequence, station.expect, segment.flags
+                    ));
+                }
+                // Nothing is owed back and the step does not move: this end
+                // abandoned the connection, so it acknowledges nothing on it.
+                Ok(OnboardStep::Reset)
+            }
             OnboardStep::Closed => Err(format!(
                 "a segment came back after the onboarding connection closed: flags {:#04x}, \
                  sequence {}",
@@ -6819,10 +6898,27 @@ fn run_boot(
                             probe.wave == wave && !probe.waits()
                         });
                     }
+                    // AND the console has said what this boot's channel contract
+                    // owes, which is the one thing on such a boot that no other
+                    // clause here waits for. The session's outcome is written by
+                    // the domain that terminates it, on the pass that decided the
+                    // session; the traffic, the scrape and the recordings are all
+                    // settled by other domains and can be settled first. A run
+                    // that broke out on those alone would kill the guest with the
+                    // channel's record still in the log ring and report an
+                    // appliance that was about to speak as one that never did.
+                    //
+                    // Waited for on the observable and never provoked, and never
+                    // bounded by a count of the appliance's own re-dials: it
+                    // chooses how often it dials, and each attempt writes the same
+                    // record. `total_timeout` below is what bounds it, so an
+                    // appliance that genuinely never reports fails on the budget
+                    // every other boot takes rather than hanging here.
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.is_none()
-                            && scrapes.is_empty() =>
+                            && scrapes.is_empty()
+                            && test.channel.satisfied(&output) =>
                     {
                         let ManagementBacking::UserNetwork {
                             host_port,
@@ -7203,10 +7299,17 @@ fn run_boot(
             }
             if start.elapsed() >= total_timeout {
                 break 'run Err(match &test.contract {
+                    // The channel clause sits beside the traffic's rather than
+                    // in place of it: a boot that ran out of budget may be short
+                    // of either or both, and a verdict that named one would send
+                    // a reader to the wrong half. It is empty where nothing is
+                    // outstanding, so every boot whose subject is something else
+                    // reads exactly as it did.
                     BootContract::Routed => format!(
-                        "timed out after {}s waiting for the routed contract; {}; {}{}; see {}",
+                        "timed out after {}s waiting for the routed contract; {}{}; {}{}; see {}",
                         total_timeout.as_secs(),
                         describe_pending(&probes, &deliveries),
+                        test.channel.outstanding(&output),
                         describe_management(&output, &injected, management.as_ref()),
                         describe_injection_failures(&endpoints),
                         log_path.display()
@@ -7708,6 +7811,10 @@ mod tests {
         BootTest {
             dial: crate::qemu::DialContract::Answered,
             onboard: crate::qemu::OnboardContract::Untouched,
+            // These boots point no management server at the appliance and read
+            // no record of one, so the contract that owes a console record is
+            // the one this harness's own tests never take.
+            channel: crate::channel_contract::ChannelContract::Untouched,
             contract: BootContract::Routed,
             // No client of this harness's own reaches for it: these boots run
             // no management server, so the workspace is named and never opened.
@@ -9239,6 +9346,158 @@ mod tests {
         assert!(echo.contains(&format!("{ECHO_IDENTIFIER:#06x}")), "{echo}");
         assert!(echo.contains(&format!("{ECHO_SEQUENCE:#06x}")), "{echo}");
         assert!(echo.contains(&ECHO_REPLY_TTL.to_string()), "{echo}");
+    }
+
+    /// The appliance's own initial sequence number for the onboarding
+    /// connection, chosen here so the arithmetic the reset step does is visible.
+    const ONBOARD_PEER_ISN: u32 = 0x7f00_0000;
+
+    /// A segment the appliance sends on the onboarding connection, composed as
+    /// it must compose one so a step can be driven and then moved a field at a
+    /// time.
+    fn onboard_answer(management: &ManagementPort, numbers: Numbers, flags: u8) -> Vec<u8> {
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&pd_runtime::ONBOARDING_PORT.to_be_bytes());
+        segment.extend_from_slice(&ONBOARD_STATION_PORT.to_be_bytes());
+        segment.extend_from_slice(&numbers.sequence.to_be_bytes());
+        segment.extend_from_slice(&numbers.acknowledgement.to_be_bytes());
+        segment.push(5 << 4);
+        segment.push(flags);
+        segment.extend_from_slice(&8192u16.to_be_bytes());
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        let checksum = tcp_checksum(&management.address, &management.station, &segment);
+        segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MANAGEMENT_STATION_MAC);
+        frame.extend_from_slice(&management.mac);
+        frame.extend_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        let mut ip = [0u8; IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&((IPV4_HEADER_LEN + segment.len()) as u16).to_be_bytes());
+        ip[8] = 64;
+        ip[9] = TCP_PROTOCOL;
+        ip[12..16].copy_from_slice(&management.address);
+        ip[16..20].copy_from_slice(&management.station);
+        let sum = header_checksum(&ip);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&segment);
+        frame
+    }
+
+    /// A station driven to the step where it has abandoned the connection: the
+    /// handshake, the payload, the acknowledgement covering it, and the reset
+    /// this end answers that with.
+    fn abandoned(probe: &ManagementProbe) -> OnboardStation {
+        let mut station = OnboardStation::new(OnboardBehaviour::Abandons);
+        station.open(&probe.port);
+        station.step = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &probe.port,
+                    Numbers {
+                        sequence: ONBOARD_PEER_ISN,
+                        acknowledgement: ONBOARD_STATION_ISN.wrapping_add(1),
+                    },
+                    TCP_SYN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect("the passive open");
+        assert_eq!(station.step, OnboardStep::AwaitAck);
+        station.step = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &probe.port,
+                    Numbers {
+                        sequence: ONBOARD_PEER_ISN.wrapping_add(1),
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect("the acknowledgement of the payload");
+        assert_eq!(station.step, OnboardStep::Reset);
+        station
+    }
+
+    /// A reset does not overtake what the peer already put on the wire, so the
+    /// close it had decided on for itself crosses it — and this station used to
+    /// call that segment the appliance answering a connection it had been told
+    /// to forget, which failed a boot on a peer behaving correctly.
+    #[test]
+    fn a_segment_already_travelling_when_the_onboarding_reset_went_out_is_not_misbehaviour() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut station = abandoned(&probe);
+
+        // The FIN the appliance had composed for its own half, and a repeat of
+        // the acknowledgement it already sent. Both carry numbers it had
+        // reached, and neither may move the step or draw an answer.
+        for flags in [TCP_FIN | TCP_ACK, TCP_ACK] {
+            let owed = station.owed.len();
+            let step = probe
+                .judge_onboard_tcp(
+                    &onboard_answer(
+                        &probe.port,
+                        Numbers {
+                            sequence: ONBOARD_PEER_ISN.wrapping_add(1),
+                            acknowledgement: station.sequence,
+                        },
+                        flags,
+                    ),
+                    &mut station,
+                )
+                .expect("a segment already travelling");
+            assert_eq!(step, OnboardStep::Reset);
+            assert_eq!(station.owed.len(), owed, "a reset station answers nothing");
+        }
+    }
+
+    /// And the two shapes that are: a connection offered again, and sequence
+    /// space the appliance had not reached when it was told to forget it.
+    #[test]
+    fn a_segment_the_appliance_composed_after_the_onboarding_reset_still_fails_the_boot() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+
+        let mut station = abandoned(&probe);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &probe.port,
+                    Numbers {
+                        sequence: ONBOARD_PEER_ISN,
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_SYN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("a connection offered again");
+        assert!(
+            verdict.contains("offered the onboarding connection again"),
+            "{verdict}"
+        );
+
+        let mut station = abandoned(&probe);
+        let beyond = station.expect.wrapping_add(1);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &probe.port,
+                    Numbers {
+                        sequence: beyond,
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("sequence space the appliance had not reached");
+        assert!(verdict.contains("composed no further"), "{verdict}");
     }
 
     /// Each reply is owed exactly once, and the port must answer both before a

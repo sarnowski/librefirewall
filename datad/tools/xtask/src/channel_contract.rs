@@ -33,6 +33,22 @@
 //! The port is therefore fixed rather than reserved, and the bind failing is
 //! reported as what it is: something else on this machine already holds it.
 //!
+//! # The boot ends on the record, not beside it
+//!
+//! A session's outcome is written by the domain that terminates it, on the pass
+//! that decided the session — which is a different domain and a later pass than
+//! anything the routed contract waits for. A boot that stopped when its traffic
+//! and its recordings were done would therefore kill the guest with the channel's
+//! own record still unwritten, and read an appliance that was about to speak as
+//! one that never did.
+//!
+//! So [`ChannelContract::satisfied`] states what the capture must already carry
+//! and the run loop waits on it, under the same total budget every other boot
+//! takes: an appliance that genuinely never reports fails on that budget rather
+//! than hanging the gate. The wait asks whether the record has *appeared*, never
+//! how many times the appliance re-dialled — that is the appliance's decision,
+//! and a harness that counted connections would be asserting its own schedule.
+//!
 //! # No adversary
 //!
 //! The server is this harness's own and the console is the appliance's own
@@ -100,6 +116,160 @@ impl ChannelContract {
     pub(crate) const fn judged(self) -> bool {
         !matches!(self, Self::Untouched)
     }
+
+    /// Whether the capture already carries every console record this contract is
+    /// judged on, which is what lets the boot that owes one **wait** for it
+    /// rather than race it.
+    ///
+    /// Deliberately only the *positive* half, on
+    /// [`crate::config_transcript::RefusedContract::satisfied`]'s terms: a record
+    /// that has not arrived yet and one that never will look alike while a guest
+    /// is still running, so the absences this contract also states are judged
+    /// once the capture is complete.
+    ///
+    /// **Nothing here counts attempts.** The appliance decides how often it
+    /// re-dials, and every one of these records is written per session, so what
+    /// is asked is whether the record has appeared at all — a boot bounded by a
+    /// number of connections would be one this harness had decided the shape of.
+    pub(crate) fn satisfied(self, serial: &[u8]) -> bool {
+        let records = self.owed_records();
+        // Before the capture is decoded at all, because this is asked on every
+        // pass of the run loop and every boot whose subject is something else
+        // takes the variant that owes nothing.
+        if records.is_empty() {
+            return true;
+        }
+        let log = &String::from_utf8_lossy(serial);
+        records.iter().all(|owed| owed.carried(log))
+            && (!self.owes_frames_beyond_the_greeting()
+                || expect_frames_beyond_the_greeting(log).is_ok())
+    }
+
+    /// One clause naming what this boot is still owed on the channel it dials and
+    /// what the capture has to show for it, for the verdict a run that spent its
+    /// whole budget leaves behind — and **empty where nothing is outstanding**,
+    /// so a boot whose subject is something else adds no clause at all.
+    pub(crate) fn outstanding(self, serial: &[u8]) -> String {
+        if self.satisfied(serial) {
+            return String::new();
+        }
+        let mut owed: Vec<String> = self
+            .owed_records()
+            .iter()
+            .map(|record| format!("`{}`", record.owed))
+            .collect();
+        if self.owes_frames_beyond_the_greeting() {
+            owed.push(String::from(
+                "a `channel-agreed=true` record whose `channel-frames-sent` is past the greeting",
+            ));
+        }
+        let log = &String::from_utf8_lossy(serial);
+        format!(
+            "; the console is also silent on the channel this boot dials, which owes {}. What it \
+             did write about the attempt:\n  {}\nand about the session:\n  {}",
+            owed.join(", "),
+            or_nothing(dial_records(log)),
+            or_nothing(channel_records(log)),
+        )
+    }
+
+    /// Whether this boot also holds the appliance to having shipped a frame
+    /// beyond its own greeting, which is a tally rather than a token and so is
+    /// not stated as a record substring.
+    const fn owes_frames_beyond_the_greeting(self) -> bool {
+        matches!(self, Self::Established)
+    }
+
+    /// The console records this boot is judged on, each named exactly as
+    /// [`judge`] asks for it: one place says what is owed, so the wait and the
+    /// verdict cannot come apart.
+    fn owed_records(self) -> Vec<OwedRecord> {
+        match self {
+            Self::Untouched => Vec::new(),
+            Self::NoServer => vec![OwedRecord::dial("reset-by-peer")],
+            Self::Established => vec![
+                OwedRecord::dial("established"),
+                OwedRecord::channel(&established_session()),
+            ],
+            Self::AnchorRejectsTheServer => {
+                vec![OwedRecord::channel(&anchor_refused_the_server())]
+            }
+            Self::RejectsTheAppliance => vec![OwedRecord::channel(&appliance_refused())],
+        }
+    }
+}
+
+/// Records as a verdict lists them, and the word for having written none.
+fn or_nothing(records: Vec<&str>) -> String {
+    if records.is_empty() {
+        return String::from("(nothing)");
+    }
+    records.join("\n  ")
+}
+
+/// One console record a boot owes, and which of the appliance's two domains
+/// writes it.
+struct OwedRecord {
+    /// The substring the record must carry, verbatim as [`judge`] asks for it.
+    owed: String,
+    /// Whether the domain that owns the network wrote it, rather than the one
+    /// that terminates the session.
+    from_the_network: bool,
+}
+
+impl OwedRecord {
+    fn dial(outcome: &str) -> Self {
+        Self {
+            owed: field("dial-outcome", outcome),
+            from_the_network: true,
+        }
+    }
+
+    fn channel(owed: &str) -> Self {
+        Self {
+            owed: owed.to_owned(),
+            from_the_network: false,
+        }
+    }
+
+    /// Whether the capture carries this record, read off the domain that writes
+    /// it — the same two sets [`judge`] reads.
+    fn carried(&self, log: &str) -> bool {
+        let domain = if self.from_the_network {
+            management(log)
+        } else {
+            crypto(log)
+        };
+        domain.iter().any(|record| record.contains(&self.owed))
+    }
+}
+
+/// The record an established session leaves, composed once so the wait and the
+/// verdict ask for the same bytes.
+fn established_session() -> String {
+    format!(
+        "channel-tls={} channel-tls-version=0x0304 channel-tls-suite=0x1303 \
+         channel-tls-group=0x11ec",
+        ChannelOutcome::Established
+    )
+}
+
+/// The record the delivered anchor leaves when it refuses the server.
+fn anchor_refused_the_server() -> String {
+    format!(
+        "channel-tls={} channel-tls-certificate={}",
+        ChannelOutcome::ServerCertificateRejected,
+        TlsCertificateRefusal::UnknownIssuer
+    )
+}
+
+/// The record a server that will not have this appliance leaves: the fatal
+/// alert, as a number an operator can look up.
+fn appliance_refused() -> String {
+    format!(
+        "channel-tls={} channel-tls-alert=0x0030",
+        ChannelOutcome::AlertReceived
+    )
 }
 
 /// The management server for one boot: the process, and where it wrote.
@@ -456,14 +626,7 @@ pub(crate) fn judge(
             };
             let (transcript, verification) = server.finish()?;
             expect_dial(log, "established")?;
-            expect_channel(
-                log,
-                &format!(
-                    "channel-tls={} channel-tls-version=0x0304 channel-tls-suite=0x1303 \
-                     channel-tls-group=0x11ec",
-                    ChannelOutcome::Established
-                ),
-            )?;
+            expect_channel(log, &established_session())?;
             expect_certificate(&verification, device)?;
             expect_greeting(&transcript)?;
             let records = expect_records(&transcript)?;
@@ -482,14 +645,7 @@ pub(crate) fn judge(
         }
         ChannelContract::AnchorRejectsTheServer => {
             let _ = server.map(Server::finish).transpose()?;
-            expect_channel(
-                log,
-                &format!(
-                    "channel-tls={} channel-tls-certificate={}",
-                    ChannelOutcome::ServerCertificateRejected,
-                    TlsCertificateRefusal::UnknownIssuer
-                ),
-            )?;
+            expect_channel(log, &anchor_refused_the_server())?;
             Ok(format!(
                 "  refused    channel               appliance->server  {}:{DIAL_PORT}  the \
                  server presented a certificate from an authority nobody delivered, and the \
@@ -500,13 +656,7 @@ pub(crate) fn judge(
         }
         ChannelContract::RejectsTheAppliance => {
             let _ = server.map(Server::finish).transpose()?;
-            expect_channel(
-                log,
-                &format!(
-                    "channel-tls={} channel-tls-alert=0x0030",
-                    ChannelOutcome::AlertReceived
-                ),
-            )?;
+            expect_channel(log, &appliance_refused())?;
             // And **no session came up**, which is half of what this boot is
             // for. The server judges the device certificate inside the
             // handshake and writes no application data at all, so this end
@@ -795,3 +945,139 @@ const SECTION_HEADER_PREFIX_LEN: usize = 12;
 /// it waits for.
 const _: () = assert!(SERVER_GREETING.len() == GREETING_LEN + 4);
 const _: () = assert!(SERVER_GREETING.len() - GREETING_LEN < HEADER_LEN);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lifecycle record on the channel the domain `domain` writes, as the
+    /// appliance renders one: the marker, the domain, its state, and the detail.
+    fn record(domain: Domain, detail: &str) -> String {
+        format!(
+            "LFW-PD time=1 domain={} state={}{detail}\r\n",
+            domain.name(),
+            DomainState::Ready.name()
+        )
+    }
+
+    /// The console of a boot whose server refused the appliance, as many times
+    /// over as it re-dialled.
+    fn refused_console(attempts: usize) -> Vec<u8> {
+        let mut capture = String::new();
+        for attempt in 1..=attempts {
+            capture.push_str(&record(
+                Domain::Management,
+                &format!(" dial-attempts={attempt} dial-outcome=established"),
+            ));
+            capture.push_str(&record(
+                Domain::Crypto,
+                &format!(" {}", appliance_refused()),
+            ));
+        }
+        capture.into_bytes()
+    }
+
+    #[test]
+    fn a_boot_that_owes_no_record_is_satisfied_by_an_empty_capture() {
+        assert!(ChannelContract::Untouched.satisfied(b""));
+        assert!(ChannelContract::Untouched.outstanding(b"").is_empty());
+    }
+
+    #[test]
+    fn a_boot_that_owes_a_record_is_unsatisfied_until_that_very_record_arrives() {
+        let contract = ChannelContract::RejectsTheAppliance;
+        // The transport got there and the session has not spoken, which is the
+        // capture the run used to stop on and judge as a failure.
+        let attempt = record(
+            Domain::Management,
+            " dial-attempts=1 dial-outcome=established",
+        );
+        assert!(!contract.satisfied(attempt.as_bytes()));
+        // Another session's outcome is not this one's: an appliance that refused
+        // the server's certificate has not reported an alert.
+        let other = format!(
+            "{attempt}{}",
+            record(Domain::Crypto, &format!(" {}", anchor_refused_the_server()))
+        );
+        assert!(!contract.satisfied(other.as_bytes()));
+        assert!(contract.satisfied(&refused_console(1)));
+    }
+
+    #[test]
+    fn how_often_the_appliance_re_dialled_decides_nothing() {
+        // The appliance chooses how many times it dials and each attempt writes
+        // the same record, so one and many are the same answer. A wait that
+        // counted connections would be waiting for a schedule this harness
+        // invented.
+        let contract = ChannelContract::RejectsTheAppliance;
+        for attempts in [1, 2, 7] {
+            assert!(
+                contract.satisfied(&refused_console(attempts)),
+                "{attempts} attempt(s) must satisfy the contract"
+            );
+        }
+    }
+
+    #[test]
+    fn the_record_is_read_off_the_domain_that_writes_it() {
+        // The session's outcome belongs to the domain that terminates the
+        // session; the same text under the domain that owns the network is a
+        // record no reader of this contract would have believed.
+        let misfiled = record(Domain::Management, &format!(" {}", appliance_refused()));
+        assert!(!ChannelContract::RejectsTheAppliance.satisfied(misfiled.as_bytes()));
+    }
+
+    #[test]
+    fn an_established_channel_waits_for_the_frame_past_its_own_greeting() {
+        let contract = ChannelContract::Established;
+        let mut capture = record(
+            Domain::Management,
+            " dial-attempts=1 dial-outcome=established",
+        );
+        capture.push_str(&record(
+            Domain::Crypto,
+            &format!(" {}", established_session()),
+        ));
+        // The session is up and nothing has been shipped over it yet, which is
+        // the second half of what this boot judges.
+        assert!(!contract.satisfied(capture.as_bytes()));
+        capture.push_str(&record(
+            Domain::Crypto,
+            " channel-agreed=true channel-version=1 channel-frames-sent=1 channel-frames-received=1",
+        ));
+        assert!(!contract.satisfied(capture.as_bytes()));
+        capture.push_str(&record(
+            Domain::Crypto,
+            " channel-agreed=true channel-version=1 channel-frames-sent=2 channel-frames-received=1",
+        ));
+        assert!(contract.satisfied(capture.as_bytes()));
+    }
+
+    #[test]
+    fn a_boot_with_nothing_listening_waits_for_the_transports_own_account() {
+        let contract = ChannelContract::NoServer;
+        let established = record(
+            Domain::Management,
+            " dial-attempts=1 dial-outcome=established",
+        );
+        assert!(!contract.satisfied(established.as_bytes()));
+        let reset = record(
+            Domain::Management,
+            " dial-attempts=1 dial-outcome=reset-by-peer",
+        );
+        assert!(contract.satisfied(reset.as_bytes()));
+    }
+
+    #[test]
+    fn the_verdict_of_a_boot_that_ran_out_of_budget_names_what_was_owed() {
+        let verdict = ChannelContract::RejectsTheAppliance.outstanding(
+            record(
+                Domain::Management,
+                " dial-attempts=1 dial-outcome=established",
+            )
+            .as_bytes(),
+        );
+        assert!(verdict.contains("channel-tls-alert=0x0030"), "{verdict}");
+        assert!(verdict.contains("dial-outcome=established"), "{verdict}");
+        assert!(verdict.contains("(nothing)"), "{verdict}");
+    }
+}

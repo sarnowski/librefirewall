@@ -241,6 +241,9 @@ struct Bench {
     /// Whether this boot opens a session on the appliance's onboarding port, and
     /// how the station on this end of it behaves.
     onboard: OnboardContract,
+    /// What the appliance owes on the console for the channel it dials out, and
+    /// so what such a boot waits for before it ends.
+    channel: ChannelContract,
     /// Which store medium this boot attaches: a fresh one, the one an earlier
     /// boot of the same run minted an identity on — reset or not — or a copy of
     /// one an earlier boot was onboarded on.
@@ -266,6 +269,7 @@ pub(crate) struct ForwardBench {
     pub(crate) traffic: Traffic,
     pub(crate) dial: DialContract,
     pub(crate) onboard: OnboardContract,
+    pub(crate) channel: ChannelContract,
     pub(crate) store: StoreMedium,
     pub(crate) data: DataMedium,
     pub(crate) owner: Ownership,
@@ -2739,6 +2743,7 @@ fn run_scenario(
             traffic: scenario.traffic,
             dial: scenario.dial,
             onboard: scenario.onboard,
+            channel: scenario.channel,
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -3171,6 +3176,7 @@ fn run_cryptography_scenario(
             traffic: scenario.traffic,
             dial: scenario.dial,
             onboard: scenario.onboard,
+            channel: scenario.channel,
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -3227,6 +3233,7 @@ fn run_store_scenario(
             traffic: scenario.traffic,
             dial: scenario.dial,
             onboard: scenario.onboard,
+            channel: scenario.channel,
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -3328,6 +3335,7 @@ pub(crate) fn boot_and_forward(
         traffic,
         dial,
         onboard,
+        channel,
         store,
         data,
         owner,
@@ -3347,6 +3355,7 @@ pub(crate) fn boot_and_forward(
             traffic,
             dial,
             onboard,
+            channel,
             store,
             data,
             owner,
@@ -3570,6 +3579,9 @@ pub(crate) fn boot_and_fail_closed(
             traffic: Traffic::Routed,
             dial: DialContract::Answered,
             onboard: OnboardContract::Untouched,
+            // A node that refused its own document has been told nowhere to
+            // dial, so there is no channel here to owe a record.
+            channel: ChannelContract::Untouched,
             store,
             data,
             owner,
@@ -3604,6 +3616,8 @@ pub(crate) fn boot_and_halt(
             traffic: Traffic::Routed,
             dial: DialContract::Answered,
             onboard: OnboardContract::Untouched,
+            // No slot boots, so nothing dials and nothing reports.
+            channel: ChannelContract::Untouched,
             // A fresh medium, so the appliance on it has no owner — which decides
             // nothing here: no slot boots, so no domain reads the word.
             store: StoreMedium::Fresh,
@@ -3631,6 +3645,7 @@ fn boot(
         traffic,
         dial,
         onboard,
+        channel,
         store,
         data: data_medium,
         owner,
@@ -3727,6 +3742,7 @@ fn boot(
             traffic,
             dial,
             onboard,
+            channel,
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;

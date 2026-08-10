@@ -376,6 +376,11 @@ fn run_scenario(
                     // opened here would sit beside a contract about which slot
                     // booted.
                     onboard: crate::qemu::OnboardContract::Untouched,
+                    // And no management server either, for the same reason: what
+                    // the appliance makes of the channel it dials is a statement
+                    // about the image, which the scenario whose subject that is
+                    // already makes.
+                    channel: crate::channel_contract::ChannelContract::Untouched,
                     // This boot's own copy of the medium this run's onboarding
                     // boot left. A copy rather than that file itself, because
                     // these boots make no claim about the medium and write to it;
