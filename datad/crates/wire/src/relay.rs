@@ -208,22 +208,35 @@ impl RelayEnding {
     }
 }
 
+/// Which connection a session runs on: an administrator dialling *in* to an
+/// appliance nobody owns, or an owned appliance dialling *out* to the plane that
+/// owns it. **Told rather than worked out**: the two are opposite ends of a TLS
+/// handshake, only the domain that owns the network knows which transport took the
+/// connection, and a terminating end deciding for itself could disagree — answering
+/// an inbound connection with a client half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    /// The connection an administrator opened to an appliance nobody owns.
+    Onboarding,
+    /// The connection this appliance dialled to its management plane.
+    Channel,
+}
+
 /// What a request asks the terminating end to do with *the* connection.
 ///
-/// Four operations, and the set is closed deliberately: it is the whole
-/// vocabulary a network end has, and there is no member of it that asks for a
-/// plaintext byte. One of them carries a value, and it is the only one that
-/// could: an ending exists exactly where a session ends, so a
-/// [`Self::Deliver`] has nowhere to put one and a close cannot be written
-/// without one.
+/// Four operations, and the set is closed deliberately: it is the whole vocabulary
+/// a network end has, and no member of it asks for a plaintext byte. Two carry a
+/// value and are the only two that could: an ending exists where a session ends, a
+/// half where one begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayOperation {
-    /// A connection was accepted; begin a session over it. The only thing that
-    /// starts one, and the reason this ABI needs no identifier: there is one
-    /// session, and this is where it comes from. It also **ends** any session the
-    /// terminating end still holds — see this module's header on why that is what
-    /// keeps the two ends from disagreeing about which session is running.
-    Open,
+    /// A connection was accepted on the named half; begin a session over it. The
+    /// only thing that starts one, and the reason this ABI needs no identifier:
+    /// there is one session, this is where it comes from, and the half named here is
+    /// that session's for life. It also **ends** any session the terminating end
+    /// holds — see this module's header on why that keeps the two ends from
+    /// disagreeing about which is running.
+    Open(Half),
     /// Here are the bytes the peer sent. The payload is whatever arrived and is
     /// not required to be a whole record — the terminating end reassembles,
     /// because it is the end that knows what a record is.
@@ -238,16 +251,16 @@ pub enum RelayOperation {
 }
 
 impl RelayOperation {
-    /// The three operations that carry no ending, which is where a close's own
-    /// encoding starts.
-    const CLOSE_BASE: u32 = 3;
+    /// The words before a close's own encoding: an open per half, a deliver, a poll.
+    const CLOSE_BASE: u32 = 4;
 
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
-            Self::Open => 0,
-            Self::Deliver => 1,
-            Self::Poll => 2,
+            Self::Open(Half::Onboarding) => 0,
+            Self::Open(Half::Channel) => 1,
+            Self::Deliver => 2,
+            Self::Poll => 3,
             Self::Close(ending) => Self::CLOSE_BASE + ending.to_bits(),
         }
     }
@@ -258,13 +271,15 @@ impl RelayOperation {
     /// with [`RelayRefusal::NoSuchOperation`] rather than ignoring it, because a
     /// requester left waiting cannot tell a refusal from a hang. A close whose
     /// ending cannot be read is such a word: it is not a close this end has, and
-    /// coercing one would be inventing the fact the ending exists to carry.
+    /// coercing one would invent the fact the ending carries — as would defaulting
+    /// an open's half.
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
-            0 => Some(Self::Open),
-            1 => Some(Self::Deliver),
-            2 => Some(Self::Poll),
+            0 => Some(Self::Open(Half::Onboarding)),
+            1 => Some(Self::Open(Half::Channel)),
+            2 => Some(Self::Deliver),
+            3 => Some(Self::Poll),
             _ => match RelayEnding::from_bits(bits.wrapping_sub(Self::CLOSE_BASE)) {
                 Some(ending) => Some(Self::Close(ending)),
                 None => None,
@@ -437,8 +452,25 @@ pub struct RelayReply {
     /// last bytes of a session *and* say it has ended, and a status able to mean
     /// both would be a status a caller had to decode twice.
     closed: AtomicU32,
-    /// Alignment only.
-    _pad: AtomicU32,
+    /// One where the protocol behind this end has **agreed a greeting** with the
+    /// peer at some point in this session, zero where it has not, and a fault for
+    /// anything else — see [`RelayFault::AgreedUnknown`].
+    ///
+    /// Its own word beside [`Self::closed`] rather than a status, for that
+    /// word's reason and one more of its own. A session can carry its last bytes
+    /// *and* be over, and it can agree a greeting on an item that carries bytes
+    /// too — so neither fact fits in a status. And the two say opposite things:
+    /// one ends a session, and this one is the only evidence the network end has
+    /// that a session became worth anything. It is what the redial schedule is
+    /// reset on, and nothing else may reset it: a peer that accepts a connection
+    /// and closes it must not be able to shorten the wait, so a word carried by
+    /// the transport rather than by the protocol above it would be exactly the
+    /// wrong signal.
+    ///
+    /// **Latching, and stated on every answer after the first that sets it.** The
+    /// network end reads it as a level rather than an edge, so an answer whose
+    /// wakeup was coalesced with another cannot lose the fact.
+    agreed: AtomicU32,
     payload: [AtomicU8; MAX_RELAY_PAYLOAD],
 }
 
@@ -454,7 +486,7 @@ impl RelayReply {
             len: AtomicU32::new(0),
             answered: AtomicU64::new(0),
             closed: AtomicU32::new(0),
-            _pad: AtomicU32::new(0),
+            agreed: AtomicU32::new(0),
             payload: [const { AtomicU8::new(0) }; MAX_RELAY_PAYLOAD],
         }
     }
@@ -518,6 +550,10 @@ mod peer {
 
         pub(super) fn closed(&self) -> u32 {
             self.0.closed.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn agreed(&self) -> u32 {
+            self.0.agreed.load(Ordering::Relaxed)
         }
 
         pub(super) fn answered(&self) -> u64 {
@@ -627,6 +663,12 @@ pub enum RelayFault {
     /// cannot be read out of it — and guessing either way is a connection left
     /// open or a connection cut.
     ClosedUnknown { closed: u32 },
+    /// The agreed word is neither zero nor one. Its own fault rather than
+    /// [`Self::ClosedUnknown`]'s, because guessing costs something different:
+    /// read as agreed it would reset a redial schedule a peer never earned, and
+    /// read as not it would leave an appliance whose channel is up backing off as
+    /// though it were down.
+    AgreedUnknown { agreed: u32 },
 }
 
 /// What [`RelayRequester::poll`] found.
@@ -645,6 +687,9 @@ pub enum RelayPoll<'buf> {
         /// The terminating end considers the session over. The network end
         /// finishes sending `records` and then closes.
         closed: bool,
+        /// The protocol behind the terminating end has agreed a greeting with
+        /// the peer. Latched, so this stays true for the rest of the session.
+        agreed: bool,
         /// Items this responder has answered, so a caller can report the relay
         /// working without a record byte reaching a surface.
         answered: u64,
@@ -738,6 +783,7 @@ impl RelayRequester<'_> {
         let raw_status = self.reply.status();
         let raw_operation = self.reply.operation();
         let raw_closed = self.reply.closed();
+        let raw_agreed = self.reply.agreed();
         let len = self.reply.len();
         // The window is free from here on: every path below is an answer to this
         // item, and a caller holding a fault or a refusal is a caller that must be
@@ -781,10 +827,16 @@ impl RelayRequester<'_> {
             1 => true,
             other => return self.fault(RelayFault::ClosedUnknown { closed: other }),
         };
+        let agreed = match raw_agreed {
+            0 => false,
+            1 => true,
+            other => return self.fault(RelayFault::AgreedUnknown { agreed: other }),
+        };
         self.reply.copy_payload(target);
         RelayPoll::Answered {
             records: target,
             closed,
+            agreed,
             answered: self.reply.answered(),
         }
     }
@@ -930,7 +982,13 @@ impl RelayResponder<'_> {
     /// `records` is truncated to what the region holds, and the published length
     /// is what was actually stored — so a responder handing over more than fits
     /// publishes only what it wrote. Answers how many bytes that was.
-    pub fn answered(&mut self, demand: RelayDemand, records: &[u8], closed: bool) -> usize {
+    pub fn answered(
+        &mut self,
+        demand: RelayDemand,
+        records: &[u8],
+        closed: bool,
+        agreed: bool,
+    ) -> usize {
         let mut published = 0_u32;
         for (cell, byte) in self.reply.payload.iter().zip(records) {
             cell.store(*byte, Ordering::Relaxed);
@@ -939,7 +997,14 @@ impl RelayResponder<'_> {
         let operation = demand.operation.unwrap_or(RelayOperation::Poll);
         self.answered = self.answered.saturating_add(1);
         self.reply.answered.store(self.answered, Ordering::Relaxed);
-        self.publish(demand, operation, RelayStatus::Ok, published, closed);
+        self.publish(
+            demand,
+            operation,
+            RelayStatus::Ok,
+            published,
+            closed,
+            agreed,
+        );
         published as usize
     }
 
@@ -949,14 +1014,18 @@ impl RelayResponder<'_> {
     /// every refusal ends the session.
     pub fn refuse(&mut self, demand: RelayDemand, reason: RelayRefusal) {
         // The operation echoed on a refusal is the one that was asked for, where
-        // the word named one; where it named none the encoding falls back to
-        // `Open`'s zero, there being no operation to echo. The requester does not
+        // the word named one; where it named none the encoding falls back to the
+        // zero word, there being no operation to echo. The requester does not
         // judge either — see [`RelayRequester::poll`] on why a refusal's echo is
-        // decoration.
-        let operation = demand.operation.unwrap_or(RelayOperation::Open);
+        // decoration, which is also why the half in that fallback says nothing.
+        let operation = demand
+            .operation
+            .unwrap_or(RelayOperation::Open(Half::Onboarding));
         self.answered = self.answered.saturating_add(1);
         self.reply.answered.store(self.answered, Ordering::Relaxed);
-        self.publish(demand, operation, reason.to_status(), 0, true);
+        // Nothing is agreed on a refusal: a refusal is this end saying it never
+        // had a session to speak a protocol over.
+        self.publish(demand, operation, reason.to_status(), 0, true, false);
     }
 
     /// Items this responder has answered, refusals included.
@@ -977,6 +1046,7 @@ impl RelayResponder<'_> {
         status: RelayStatus,
         len: u32,
         closed: bool,
+        agreed: bool,
     ) {
         self.reply.status.store(status.to_bits(), Ordering::Relaxed);
         self.reply
@@ -986,7 +1056,10 @@ impl RelayResponder<'_> {
         self.reply
             .closed
             .store(u32::from(closed), Ordering::Relaxed);
-        // Release, and last: the bytes and the four words above must be visible to
+        self.reply
+            .agreed
+            .store(u32::from(agreed), Ordering::Relaxed);
+        // Release, and last: the bytes and the five words above must be visible to
         // the network end before the sequence that claims them as this item's
         // answer is.
         self.reply
@@ -1020,15 +1093,15 @@ const _: () = {
     // request and answers none, so neither side acts on what the kernel handed
     // it, and the closed word reads as a session that is not over.
     assert!(RelayStatus::Ok.to_bits() == 0);
-    assert!(RelayOperation::Open.to_bits() == 0);
+    assert!(RelayOperation::Open(Half::Onboarding).to_bits() == 0);
     assert!(RelayRefusal::from_status(RelayStatus::Ok).is_none());
     assert!(RelayStatus::from_bits(5).is_none());
-    // A close's four endings occupy the words after the three operations that
-    // carry none, so the vocabulary ends exactly there.
+    // A close's four endings occupy the words after the four before them, so the
+    // vocabulary ends exactly there.
     assert!(RelayEnding::COUNT == LOG_ONBOARD_END_COUNT as usize);
-    assert!(RelayOperation::CLOSE_BASE as usize + RelayEnding::COUNT == 7);
-    assert!(RelayOperation::from_bits(6).is_some());
-    assert!(RelayOperation::from_bits(7).is_none());
+    assert!(RelayOperation::CLOSE_BASE as usize + RelayEnding::COUNT == 8);
+    assert!(RelayOperation::from_bits(7).is_some());
+    assert!(RelayOperation::from_bits(8).is_none());
     assert!(RelayEnding::from_bits(RelayEnding::COUNT as u32).is_none());
 
     assert!(offset_of!(RelayRequest, sequence) == 0);
@@ -1045,7 +1118,7 @@ const _: () = {
     assert!(offset_of!(RelayReply, len) == 12);
     assert!(offset_of!(RelayReply, answered) == 16);
     assert!(offset_of!(RelayReply, closed) == 24);
-    assert!(offset_of!(RelayReply, _pad) == 28);
+    assert!(offset_of!(RelayReply, agreed) == 28);
     assert!(offset_of!(RelayReply, payload) == 32);
     assert!(align_of::<RelayReply>() == 8);
     // Naturally aligned, which is what makes the tally a single access rather

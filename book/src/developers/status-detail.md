@@ -710,7 +710,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 16 of the 31 system
+**What the gate proves.** Every scenario whose management port is reachable — 19 of the 34 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -973,7 +973,7 @@ Held by the tests in `datad/crates/config` and `datad/crates/log`, by the handov
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the 31 QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the 34 QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -1233,7 +1233,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 31 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 34 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1457,7 +1457,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Six of the 31 system scenarios additionally hold the console's own record to the frames and the bytes
+Six of the 34 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of them boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1475,7 +1475,8 @@ a domain that faulted or lost its place under that could not report them all.
   port can scrape it, download every packet the appliance recorded, read its policy, and replace
   that policy** — which is the authority to decide what this firewall forwards. The
   [management design](../design/management.md) erases this surface in favor of onboarding and the
-  authenticated channel; until that exists the port belongs on an isolated network. `/logs` does
+  authenticated channel; the channel now comes up but carries none of these operations yet, so until
+  it does the port belongs on an isolated network. `/logs` does
   not exist, so of the debug dump the
   [observability reference](../reference/observability.md) describes, the state half, the running
   document and the two recordings are what a node can be asked for and the retained records cannot be.
@@ -1684,9 +1685,11 @@ established one.
 - **No congestion control**, no delayed acknowledgement, no Nagle. The structural place for the
   first is `Connection::sendable`; the other two need a timer this stack is not driven by.
 - **The urgent pointer is ignored.** `URG` data is delivered in band and counted.
-- **No dataplane consumer.** The only caller is the management domain. Nothing proxies, nothing
-  terminates TLS, and no throughput has been measured — the 10 Gbit/s target this design exists for
-  is untouched (see the [status table](../status.md)).
+- **No dataplane consumer.** The only caller is the management domain. Nothing proxies, no dataplane
+  flow is intercepted or terminated here, and no throughput has been measured — the 10 Gbit/s target
+  this design exists for is untouched (see the [status table](../status.md)). The TLS on the two
+  connections this stack does carry terminates in **another** domain: this one moves ciphertext and
+  reads none of it.
 - **The appliance dials where it was told, and keeps dialling.** The management domain reads the
   endpoint the store domain published — an address literal and a port in one word it maps read-only
   — and opens an outbound session to it: resolve the next hop, dial, hold the connection. It reports
@@ -1697,14 +1700,15 @@ established one.
   the domain says so once with `cause=dial-endpoint-unpublished` rather than being silent. The first
   attempt opens the moment a destination is published, so an appliance adopted while it is running
   dials without being rebooted.
-- **The outbound half is a byte stream, and nothing puts a byte on it.** What the transport carries
-  is whatever a consumer above it pushes and whatever the peer sends back, moved and never read —
-  two fixed arrays sized for the records a TLS session composes rather than for any fixed message,
-  with the receive window kept equal to the room actually left. **No consumer is wired to it**:
-  there is no TLS on the connection, no authentication of either end, and no protocol above the
-  transport, so what a booted appliance puts on this wire is a handshake and then nothing at all.
-  That is the layer this dial exists to put underneath, and the client and the codec that will fill
-  it are both built and both unreached.
+- **The outbound half is a byte stream, and the channel's TLS session now puts the bytes on it.**
+  What the transport carries is whatever the consumer above it pushes and whatever the peer sends
+  back, moved and never read — two fixed arrays sized for the records a TLS session composes rather
+  than for any fixed message, with the receive window kept equal to the room actually left. The
+  consumer is the **cryptography** domain, reached over the relay this domain already held for the
+  onboarding port: this domain never sees a plaintext byte, and the open that starts a session now
+  names which half it is so the far end answers an outbound connection with a client and an inbound
+  one with a server rather than inferring it. What a booted appliance puts on this wire is therefore a
+  handshake, a TLS 1.3 session under the delivered anchor, and the channel's greeting.
 - **It re-dials on bounded exponential backoff with full jitter**, as the
   [channel framing contract](../contracts/channel-framing.md) requires: the wait is drawn uniformly
   between zero and a bound that starts at one second, doubles after every attempt that fails, and
@@ -1713,12 +1717,16 @@ established one.
   instant is observable to anybody on the wire, so a schedule seeded from that secret would leak it
   through its own timing. The clock domain's hundred-millisecond tick is what reaches the deadline,
   so a wait is honoured to within one tick and the drawn instants are quantised to it.
-- **Only an agreed greeting starts the schedule fresh**, and this appliance cannot yet agree one:
-  there is no HELLO exchange because there is no session over the transport, so **every schedule in
-  this build goes on doubling to the cap**. That is the contract's own rule rather than a
-  simplification — a server that accepts a connection and closes it must not be able to shorten the
-  wait, or it is handed a redial loop — and the reset is implemented and host-tested against the
-  moment a greeting will reach it.
+- **Only an agreed greeting starts the schedule fresh, and one now reaches it.** The fact comes back
+  across the relay as a **latching word of its own** rather than as a status or as anything the
+  transport decides: the terminating end sets it when the server's greeting has been read, and this
+  end reads it as a level rather than an edge, so an answer whose wakeup was coalesced with another
+  cannot lose it. Nothing else resets the wait — a connection that merely came up buys nothing, which
+  is the contract's own rule rather than a simplification: a server that accepts a connection and
+  closes it must not be able to shorten the wait, or it is handed a redial loop. A word that is
+  neither zero nor one is its own fault token rather than being coerced, because guessing costs
+  something different each way — read as agreed it resets a schedule no peer earned, read as not it
+  leaves an appliance whose channel is up backing off as though it were down.
 - **Management unreachability is never traffic-affecting.** The dataplane keeps forwarding the last
   committed configuration however long the channel is down, and nothing about the channel's state
   gates it: the two domains share no region that carries it, the forwarding domain holds no
@@ -1886,7 +1894,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 30 console cause tokens. Two of the 31 system scenarios assert that record
+one of 30 console cause tokens. Two of the 34 system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -2433,7 +2441,11 @@ does not), seeds the generator from 32 `RDRAND` draws, and then establishes **on
 mutually-authenticated TLS 1.3 session with itself** — `TLS_CHACHA20_POLY1305_SHA256` over
 `X25519MLKEM768`, both chains validated against an anchor it issued, application data echoed both
 ways, closed with an alert — before running a second, deliberately starved session that must be
-refused. It holds the appliance's only allocator: a 2 MiB region mapped into it and nothing else.
+refused. It holds the appliance's only allocator: a 4 MiB region mapped into it and nothing else —
+two of those megabytes arriving with the management channel, whose framing reassembles into a
+mebibyte-and-eight-bytes array taken from the arena **once** at bring-up and handed from channel
+session to channel session, so it sits below the mark every session is wound back to and what is left
+above it has to be a whole session's worth on its own.
 
 **All of that is now proved on both accelerators, which it was not.** The harness prefers KVM and
 falls back to emulation, printing and logging which it took, and the image used to come up only
@@ -2729,9 +2741,9 @@ against the ones the client printed, and the certificate's subject against the d
 and no single surface can state it. The successful handshake goes first, so the three failures after
 it are sessions on a port that has already carried one.
 
-**The anchor that client will validate against now reaches this domain, and nothing here judges it.**
+**The anchor that client validates against reaches this domain, and nothing judges the anchor itself.**
 It is a fourth answer on the key delegation, asked for exactly where the appliance's own certificate
-is and out of the same record: this is the domain that will build a verifier over it, and the domain
+is and out of the same record: this is the domain that builds the verifier over it, and the domain
 that answers is the one that took delivery of it. What a boot claims about it is deliberately
 narrower than what it claims about the certificate — the certificate is held to the public key the
 same channel named, which is a question this domain can settle by itself, while an anchor is a
@@ -2750,8 +2762,8 @@ reach the same fact independently, one by reading its medium and the other by as
 check itself. An owned appliance holding no anchor cannot validate the management plane that took it;
 an unowned one holding an anchor was handed an authority nobody delivered.
 
-**The channel's client half is built beside it, and nothing runs it.** `lfw_tls::ChannelClient` is
-the onboarding server's sibling: the same incremental shape — bytes in a delivery at a time, bytes
+**The channel's client half runs beside it, over the relay the two domains already shared.**
+`lfw_tls::ChannelClient` is the onboarding server's sibling: the same incremental shape — bytes in a delivery at a time, bytes
 back into the room the wire has, the session held across calls — over the same provider, the same
 bounded arena and the same key delegation. What differs is which way the trust runs. It presents the
 device certificate a management authority issued and signs the handshake through the domain that
@@ -2781,7 +2793,16 @@ certificate was accepted — so the registry code point is the entire fact, and 
 are three numbers rather than one token. That absence is also why **a completed handshake is
 reported only once the peer has spoken on the session**: a TLS 1.3 client finishes a flight before
 its certificate has been judged, so reporting the three code points at that moment would put
-`established` on the console for exactly the appliance a management server is refusing.
+`established` on the console for an appliance a management server is in the middle of refusing, and
+for one that took the connection and never answered.
+
+**And a session that came up and then ended reports that too**, on a second record. Its outcome is
+reported per *distinct* outcome rather than once: the handshake's, and — only where that was an
+established session — the one thing that then ended it, whether a fatal alert from a peer that had
+already spoken, a clean goodbye, a flood, or an exhausted arena. Without it a channel that came up
+and then died left `established` as its last word, which is the console reporting a healthy node
+about one that is not. There is never a third record, and a peer decides neither which outcomes
+there are nor how many, so a session a server abuses a thousand times over leaves the same two.
 
 **Host-tested against a real management server, arm by arm.** A rustls server over this appliance's
 own provider, holding the endpoint certificate the delivered anchor issued and authenticating the
@@ -2790,11 +2811,13 @@ application-data round trip through the very interface a protection domain will 
 the delegated signer is held to exactly one call, and the certificate the server saw is held to the
 device certificate byte for byte. Real servers also drive both shapes of anchor mismatch, a
 certificate issued for another address, one outside its validity, all three refusal alerts, a peer
-that answers nothing, one that stops mid-flight, and three things a peer that *did* authenticate can
-then do. Two arms cannot be driven by a rustls server at all — this appliance's provider carries one
-version, one suite and one group, so a server built over it can select nothing else — and are
-written out as the server hello such a peer puts on the wire. `Stalled` is driven by neither: it is
-the two-shot encode and the per-turn state bound giving up, and no input reaches either.
+that answers nothing, one that stops mid-flight, and five things a peer that *did* authenticate can
+then do — among them the two that end a session which had come up, a fatal alert and a clean
+goodbye, each reported beside that session rather than instead of it. Two arms cannot be driven by a
+rustls server at all — this appliance's provider carries one version, one suite and one group, so a
+server built over it can select nothing else — and are written out as the server hello such a peer
+puts on the wire. `Stalled` is driven by neither: it is the two-shot encode and the per-turn state
+bound giving up, and no input reaches either.
 
 **A persistent fuzz target drives it with arbitrary streams cut into arbitrary deliveries**, into an
 answer buffer of an arbitrary size, over an arena an arbitrary amount of which is already spoken
@@ -2802,14 +2825,68 @@ for, and with the anchor or the certificate replaced by the input — neither be
 own to get right, both arriving over a delegation from a package a peer uploaded. What it cannot
 reach is stated where it lives rather than assumed covered: no stream of bytes completes a handshake
 with this end, the server's flight being bound to a key share and transcript that are fresh per
-session, so everything past the confirmation is the crate suite's to hold and is held there.
+session, so everything past the confirmation is the crate suite's to hold and is held there. What it
+does assert about that boundary is that no stream crosses it — every input leaves the session with no
+account of an ending, the second outcome belonging to a session that came up and no arbitrary peer
+bringing one up.
 
-**The framing above that client is built too, and nothing runs it either.** `lfw_channel` is the
+**And a booted release image establishes one against a server this project did not write.** The
+scenario that judges an established channel starts an `openssl s_server` *before* QEMU and kills it
+after, which is the whole of how an outbound connection fits a harness whose other contracts are
+clients: there is nothing to connect *to* the appliance, so a server started once the boot had settled
+would already have been dialled, reset, and be into the second wait of a schedule that doubles. The
+address needs no forwarding rule — the appliance dials the address and port its package named, and
+QEMU's user-mode stack turns a connection to its own gateway into a connection to the host's loopback
+on the same port, so the server binds `127.0.0.1:4433` and the boot exercises the appliance's real
+addressing rather than a special case. The session is held to the parameters the channel's contract
+fixes rather than to `openssl`'s defaults: TLS 1.3, `TLS_CHACHA20_POLY1305_SHA256`,
+`X25519MLKEM768`, and `-Verify 1 -verify_return_error` so that a failed verification actually refuses
+— `-Verify` alone installs a callback that prints the error and returns success anyway, which would
+read on the appliance's console exactly like a server that had accepted it.
+
+**It is judged from both ends, because neither end can state the whole claim.** The appliance's own
+records carry what it made of the server — the three code points, and the greeting agreed with one
+frame each way; the server's own records carry what it made of the appliance — a client certificate
+whose subject is the identifier the **store** domain printed on that same boot, chaining to the
+development authority this run issued under and to no other. The greeting is compared as **literal
+wire bytes** found in the server's transcript rather than through this appliance's own encoder, and
+the greeting the server sends is written out by hand for the same reason: a frame composed from the
+code under test would prove only that the appliance agrees with itself. That greeting is followed by
+four trailing bytes — fewer than a header — so the appliance must take the frame before them as one
+frame and hold those as a fragment, which is what makes the length prefix load-bearing rather than
+incidental.
+
+**The three ways it does not come up are three boots, each under a token of its own.** Nothing
+listening at all, where the user-mode stack answers with a reset and the appliance must report the
+transport's own outcome and write **no session record whatsoever** — asserted as an absence, because
+a TLS record where there was no connection would be a session the console invented. A server holding
+a certificate from a second real authority of the run's own that the appliance was never given, which
+must reach `channel-tls=server-certificate-rejected channel-tls-certificate=unknown-issuer`: a real
+authority rather than a malformed certificate, because what is under test is the **validation** and
+not the parser. And a server that verifies client certificates against that other authority, so it
+refuses this appliance and says so with alert 48 — where the boot asserts both that the alert
+reached the console as a number an operator can look up **and** that no `established` record stands
+beside it, the server having judged the device certificate inside the handshake and written nothing
+under the traffic keys.
+
+**One deviation, and it is the peer that causes it.** The **ending** record — the second outcome a
+session that came up owes when it later stops — is proved on the host and **not observed on a booted
+node**. The only peer any of those boots stands up is `openssl s_server`, and it never puts a TLS
+`close_notify` on the wire on any exit path: it closes the TCP connection bare, which four
+independent measurements established rather than assumed. So no scenario can currently make this
+appliance observe a peer closing an established session cleanly. Making one would mean a TLS server
+this project wrote, and that would give up the property the four boots exist for — that the peer at
+the far end is software nobody here wrote — for a record the host suite already drives through every
+ending a peer can produce. The claim the image does carry is the one that matters more for a node in
+the field: that an established session is reported as established, and that a refused one is never
+reported as established.
+
+**The framing above that client runs too.** `lfw_channel` is the
 whole wire protocol of the [channel framing contract](../contracts/channel-framing.md) as a
-host-testable codec and nothing else: the eight-byte header — a big-endian payload length bounded at
+codec and nothing else: the eight-byte header — a big-endian payload length bounded at
 a mebibyte, a type byte, three reserved bytes that must be zero — the ten frames, both greetings, and
-the closed byte vocabularies inside the payloads. It has no transport under it and no session state
-above it. What it deliberately does **not** decide is *when* a frame is sent: there is no flush
+the closed byte vocabularies inside the payloads. What it deliberately does **not** decide is *when* a
+frame is sent: there is no flush
 cadence, no acknowledgement timer, no commit-confirm sequencing. Those are the session's,
 and a codec that guessed at them would be inventing behaviour the contract assigns elsewhere.
 
@@ -2877,12 +2954,31 @@ coverage. What the target cannot reach is stated where it lives: four encoder re
 *this end* composed wrongly, so no peer's stream produces one, and they are held in the crate's own
 suite instead.
 
-**Nothing runs any of it.** No protection domain reaches this crate, no console record says a frame
-was refused, no metric counts one, and no scenario drives a byte of it — the counting the contract
-asks of a violation belongs with the domain that has a metric to count into, and the console
-vocabulary with the domain that emits a record. What is missing above it is the session: which frame
-is sent when, the flush cadence and the acknowledgement cursors, the commit-confirm over a fresh
-connection, and the backoff between dials.
+**The cryptography domain runs it over the channel's record layer, and only the greeting is
+implemented above it.** The client and the decoder are one value because they are one session: the
+reassembly buffer is handed on from session to session, and a decoder that outlived its client would
+be reading the next server's bytes against the last one's greeting state. This end sends its greeting
+the moment the record layer will carry one; the server's greeting is what latches
+`channel-agreed=true`, and that latch is the single fact the redial schedule may start afresh on. **A
+frame that is not the greeting is counted and dropped**, deliberately not treated as a violation: a
+server that speaks the rest of the protocol to an appliance which has not shipped its half is a
+server running ahead of this build, and refusing it would turn an upgrade of one end into an outage of
+the pair. What bounds that generosity is the decoder, which holds one frame's worth and never two. A
+violation, by contrast, closes the connection and nothing else happens — there is no
+resynchronisation, because where the next header starts is exactly what has been lost — and the
+appliance re-dials under its own schedule.
+
+**Fourteen console tokens on this domain and no metric.** Twelve are rules of the framing a
+management server broke, one per `Violation` variant and carrying no number, the context each has
+being a peer's own bytes; the two above them are this appliance's own state — a node whose store
+published somewhere to dial and whose key holder produced no anchor, which is the two halves of an
+ownership disagreeing, and the reassembly buffer having never been allocated, which is this domain's
+own defect and should never appear. **No metric counts a violation yet**, and no scenario drives one:
+the counting the contract asks of a violation belongs with the domain that has a metric to count
+into, and the four boots that judge the channel point a real `openssl s_server` or a deliberate
+silence at the appliance — a peer that breaks the framing is not one `s_server` can be made to play.
+What is still missing above the greeting is the rest of the session: which frame is sent when, the
+flush cadence and the acknowledgement cursors, and the commit-confirm over a fresh connection.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two
@@ -3144,7 +3240,7 @@ for on the medium and takes effect on the boot after it. The console says so at 
 for the same reason: a peer rewriting the word cannot choose how many lines this domain writes.
 
 On the image, every boot states the word once and it is the word its medium carried — the domain
-that holds the identity publishes before the forwarding domain reads, on every one of the 31 boots.
+that holds the identity publishes before the forwarding domain reads, on every one of the 34 boots.
 So the *transition* is exercised on the host and not on the image: the boot that installs a package
 does so as the last thing it does, after its own frames have been injected and decided, and it ends
 before the forwarding domain's next wakeup. What that leaves unproven on a booted node is the second
@@ -3158,7 +3254,7 @@ as well, so ownership cannot become a table composed by the parser that reads an
 document, and from the management domain, which can already ask the store domain for the identity.
 
 The system gate is arranged around it, at the cost of no extra boot. The scenario that onboards
-an appliance now runs **first**, and **19 scenarios boot a copy of an owned medium** — which is what
+an appliance now runs **first**, and **22 scenarios boot a copy of an owned medium** — which is what
 a deployed appliance is: onboarded once, long ago, running ever since.
 They cannot onboard during their own boot instead, because an accepted package shuts the onboarding
 surface for good and so an install has to be the last thing a boot does. The scenarios that stay
@@ -3198,17 +3294,18 @@ harness has no way to play through a lossless host socket. Nor does any scenario
 crowding refusal as a counter, though the counter now exists: the boot that crowds the port needs a
 station of the harness's own on the management wire, and a scrape needs QEMU's user-mode stack on
 that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
-states, and the counter is read by hand. The management domain's own dial is
-a separate thing and still carries ten bytes of first-party probe and no protocol at all — and the
-channel client that will run over it, though built and host-tested, is reached by **no protection
-domain**: no booted image has run a channel handshake, no console record says how one ended, no
-scenario drives one. **The two values it needs now reach the domains that will use them, and nothing
-consumes either**: the trust anchor is delivered to the cryptography domain over the key delegation
-and reported on its console, and where to dial is published into a region the management domain
-maps — which that domain does not read, its destination still being a constant compiled into it. The session is proved
-against this same build on both ends, so nothing about interoperating with a second implementation is
-established — and the client end and the certification authority above both are still generated here,
-standing in for a management server and an anchor this appliance has never seen. SHA-NI stays unreachable for the reason the [status page](../status.md) records.
+states, and the counter is read by hand. On the channel the appliance dials, **what runs above the
+framing is the greeting and nothing else**: no session composes a recording range, stages a
+configuration document, or moves an acknowledgement cursor, so a booted node exercises the record
+layer and the handshake in full and the protocol above them barely at all. No metric counts a framing
+violation, and no boot provokes one — the four that judge the channel meet a real `openssl s_server`
+or a deliberate silence, and a peer that breaks the framing is not one `s_server` can be made to play.
+The **ending** a session that came up reports is the recorded deviation above: host-driven through
+every ending a peer can produce, and unobserved on a booted node because the only peer those boots use
+closes its connection without a `close_notify`. The boot's own **self**-session is still proved against
+this same build on both ends, which is what it is for — the provider and the vector suite rather than
+interoperability — while what now interoperates with a second implementation is the channel's client
+half and the onboarding server, each against `openssl`. SHA-NI stays unreachable for the reason the [status page](../status.md) records.
 
 ## Management server
 
@@ -3269,7 +3366,9 @@ delivered anchor and matches the profile in every field.
 
 - **No channel listener and no pcapng decoder.** Nothing has ever connected to this server: there
   is no ThousandIsland listener, no [framing](../contracts/channel-framing.md) on this side of the
-  wire — the appliance now has a codec for the whole of it, and this server has none — and no
+  wire — the appliance now dials out, establishes a mutually-authenticated session and puts its
+  greeting on the wire, against an `openssl s_server` the gate stands up because this server cannot
+  take the connection — and no
   decoder tested against bytes the appliance's encoder produced. The telemetry schema and its writer
   therefore have **no producer** — they are exercised only by the suite.
 - **Online, offline and last seen do not exist**, and neither do the columns behind them; they
@@ -3296,7 +3395,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 31 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (31 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 16 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (34 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 19 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **4 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued — while the other three are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 30 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

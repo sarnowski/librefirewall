@@ -12,6 +12,7 @@ license.workspace = true
 
 [dependencies]
 sel4-microkit.workspace = true
+lfw-channel = { path = "../../crates/channel" }
 lfw-clock = { path = "../../crates/clock" }
 lfw-crypto = { path = "../../crates/crypto" }
 lfw-log = { path = "../../crates/log" }

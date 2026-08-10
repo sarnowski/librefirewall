@@ -157,7 +157,28 @@ const DETAIL_OWNERSHIP: u8 = 41;
 const DETAIL_DELEGATED_ANCHOR: u8 = 42;
 const DETAIL_PUBLISHED: u8 = 43;
 const DETAIL_DIAL_RETRY: u8 = 44;
-const DETAIL_COUNT: u8 = 45;
+const DETAIL_CHANNEL_HANDSHAKE: u8 = 45;
+const DETAIL_CHANNEL_ENDED: u8 = 46;
+const DETAIL_CHANNEL_INCOMPATIBLE: u8 = 47;
+const DETAIL_CHANNEL_REFUSED: u8 = 48;
+const DETAIL_CHANNEL_CERTIFICATE: u8 = 49;
+const DETAIL_CHANNEL_ALERT: u8 = 50;
+const DETAIL_CHANNEL_BACKLOGGED: u8 = 51;
+const DETAIL_CHANNEL_FRAMES: u8 = 52;
+const DETAIL_COUNT: u8 = 53;
+
+/// How many ways a handshake on the management channel may end, and how many
+/// ways a delivered anchor may refuse the certificate a server presented.
+///
+/// Stated here as literals, unlike the other vocabulary cardinalities this
+/// module names, which it imports: `wire` publishes neither of these two. That
+/// is the stricter arrangement rather than a concession, and it is the one the
+/// header's independent-model claim actually asks for — a set that grows a
+/// member is then judged against the number the contract was written with
+/// instead of against itself, so the growth surfaces here as a disagreement
+/// rather than passing unnoticed on both sides at once.
+const CHANNEL_OUTCOME_COUNT: u8 = 12;
+const TLS_CERTIFICATE_REFUSAL_COUNT: u8 = 17;
 
 /// The eleven `LogValueKind` discriminants, restated on `KIND_DOMAIN`'s terms.
 const VALUE_ABSENT: u8 = 0;
@@ -623,7 +644,18 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_OWNERSHIP
                 | DETAIL_DELEGATED_ANCHOR
                 | DETAIL_PUBLISHED
-                | DETAIL_DIAL_RETRY => {
+                | DETAIL_DIAL_RETRY
+                // The management channel's eight join them: each reads its
+                // operands from the same place and is refused separately below,
+                // and none of them reads a word outside the array.
+                | DETAIL_CHANNEL_HANDSHAKE
+                | DETAIL_CHANNEL_ENDED
+                | DETAIL_CHANNEL_INCOMPATIBLE
+                | DETAIL_CHANNEL_REFUSED
+                | DETAIL_CHANNEL_CERTIFICATE
+                | DETAIL_CHANNEL_ALERT
+                | DETAIL_CHANNEL_BACKLOGGED
+                | DETAIL_CHANNEL_FRAMES => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -929,6 +961,58 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
                 },
             )
         }),
+        // The eight the **management channel this appliance dialled** produces,
+        // ruled on exactly as the onboarding port's seven are: seven of them
+        // lead with a token naming how the handshake ended and range what
+        // follows for the shape it will be rendered as, left to right, so the
+        // first refusal a record earns is the one this harness expects.
+        //
+        // Two of the eight differ from their onboarding counterparts and the
+        // difference is the whole reason they are not folded into those arms.
+        // The certificate detail's second token comes out of a vocabulary the
+        // onboarding port has no detail for — the anchor delivered to this
+        // appliance judging a server, which is a question only the dialling
+        // side asks. And the framing detail leads with a *flag* rather than a
+        // token: whether the greeting above the handshake was ever agreed.
+        DETAIL_CHANNEL_ENDED | DETAIL_CHANNEL_BACKLOGGED => channel_outcome(record.operands[0]),
+        DETAIL_CHANNEL_HANDSHAKE => channel_outcome(record.operands[0])
+            .or_else(|| wide_code_point(record.operands[1]))
+            .or_else(|| wide_code_point(record.operands[2]))
+            .or_else(|| wide_code_point(record.operands[3])),
+        DETAIL_CHANNEL_ALERT => {
+            channel_outcome(record.operands[0]).or_else(|| wide_code_point(record.operands[1]))
+        }
+        DETAIL_CHANNEL_INCOMPATIBLE => channel_outcome(record.operands[0]).or_else(|| {
+            (record.operands[1] >= u64::from(LOG_TLS_INCOMPATIBLE_COUNT)).then_some(
+                LogRecordError::TlsIncompatibleUnknown {
+                    incompatible: record.operands[1],
+                },
+            )
+        }),
+        DETAIL_CHANNEL_REFUSED => channel_outcome(record.operands[0]).or_else(|| {
+            (record.operands[1] >= u64::from(LOG_TLS_REFUSAL_COUNT)).then_some(
+                LogRecordError::TlsRefusalUnknown {
+                    refusal: record.operands[1],
+                },
+            )
+        }),
+        DETAIL_CHANNEL_CERTIFICATE => channel_outcome(record.operands[0]).or_else(|| {
+            (record.operands[1] >= u64::from(TLS_CERTIFICATE_REFUSAL_COUNT)).then_some(
+                LogRecordError::TlsCertificateRefusalUnknown {
+                    refusal: record.operands[1],
+                },
+            )
+        }),
+        // The one detail in this ABI whose *leading* word is a flag. It cannot
+        // join the group above that reads a flag out of the fourth word, and it
+        // is ruled on before the version beside it because a greeting this end
+        // never agreed and one it did are opposite facts about the node. The two
+        // frame tallies behind them are unranged on `Received`'s terms.
+        DETAIL_CHANNEL_FRAMES => (record.operands[0] > 1)
+            .then_some(LogRecordError::OperandFlagNotBoolean {
+                value: record.operands[0],
+            })
+            .or_else(|| wide_code_point(record.operands[1])),
         // The two offer details range one word and no more: the eight code
         // points are sixteen bits each by where they sit in the two words that
         // carry them, so no bit pattern of those is refusable, and what is left
@@ -1041,6 +1125,14 @@ fn wide_code_point(value: u64) -> Option<LogRecordError> {
 fn onboard_outcome(value: u64) -> Option<LogRecordError> {
     (value >= u64::from(LOG_ONBOARD_OUTCOME_COUNT))
         .then_some(LogRecordError::OnboardOutcomeUnknown { outcome: value })
+}
+
+/// A leading word that names no way for a handshake on the management channel
+/// to have ended. [`onboard_outcome`]'s counterpart, and a separate set: the
+/// dialling side reaches ends the listening port never can.
+fn channel_outcome(value: u64) -> Option<LogRecordError> {
+    (value >= u64::from(CHANNEL_OUTCOME_COUNT))
+        .then_some(LogRecordError::ChannelOutcomeUnknown { outcome: value })
 }
 
 /// A word wider than the thirty-two bits a TCP sequence number has.
@@ -1828,6 +1920,95 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            // The eight the **management channel this appliance dialled**
+            // produces, each committed for the reason the onboarding port's
+            // seven are: each ranges a different set of words behind one leading
+            // word, and a uniform draw over a discriminant plus four operands
+            // reaches none of these discriminants at all. Without a seed apiece
+            // the bounded run every commit performs would leave these arms
+            // untouched.
+            (
+                "valid_domain_channel_handshake",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_HANDSHAKE,
+                    // A completed handshake and the three code points it settled
+                    // on, no two alike so a field read out of the wrong word is
+                    // visible rather than symmetric.
+                    operands: [0, 0x0304, 0x1303, 0x11ec],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_ended",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_ENDED,
+                    // A server that went away, and three words this detail does
+                    // not name — poisoned, so a decode that read one would be
+                    // refused rather than silently reporting a number.
+                    operands: [8, u64::MAX, u64::MAX, u64::MAX],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_incompatible",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_INCOMPATIBLE,
+                    operands: [2, 6, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_refused",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_REFUSED,
+                    operands: [7, 3, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_certificate",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_CERTIFICATE,
+                    // The anchor that was delivered did not know the issuer —
+                    // the likeliest way this channel fails, and the one an
+                    // operator answers by looking at the package rather than at
+                    // the server.
+                    operands: [4, 5, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_alert",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_ALERT,
+                    // `unknown_ca`, as the registry numbers it: how this
+                    // appliance learns its own certificate was refused.
+                    operands: [6, 0x30, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_backlogged",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_BACKLOGGED,
+                    // The count at the widest it can be, which is what a rule
+                    // that crept a range onto it would refuse.
+                    operands: [10, u64::MAX, 0, 0],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_frames",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_FRAMES,
+                    // The one detail whose leading word is a flag rather than a
+                    // token: a greeting the two ends agreed, the version they
+                    // settled on, and two tallies that differ so a direction
+                    // read out of the wrong word is visible.
+                    operands: [1, 1, 9, 7],
+                    ..domain_record()
+                }),
+            ),
             // Every byte the writer could set, set.
             ("every_byte_set", vec![0xFF; RECORD_BYTES]),
         ];
@@ -1994,6 +2175,31 @@ mod tests {
             &|token| LogRecord {
                 detail: DETAIL_ONBOARDING_REFUSED,
                 operands: [5, u64::from(token), 0, 0],
+                ..domain_record()
+            },
+        );
+        // And the management channel's two. Its outcome leads seven of its eight
+        // details, so it is paired once on the narrowest of them, exactly as the
+        // onboarding outcome is; the certificate vocabulary is paired on the one
+        // detail that carries it, and is the one set here whose cardinality this
+        // model states for itself rather than reading from the contract.
+        pair(
+            "channel_outcome_at_its_last_token",
+            "channel_outcome_one_past_its_last_token",
+            CHANNEL_OUTCOME_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_CHANNEL_ENDED,
+                operands: [u64::from(token), 0, 0, 0],
+                ..domain_record()
+            },
+        );
+        pair(
+            "tls_certificate_refusal_at_its_last_token",
+            "tls_certificate_refusal_one_past_its_last_token",
+            TLS_CERTIFICATE_REFUSAL_COUNT,
+            &|token| LogRecord {
+                detail: DETAIL_CHANNEL_CERTIFICATE,
+                operands: [4, u64::from(token), 0, 0],
                 ..domain_record()
             },
         );

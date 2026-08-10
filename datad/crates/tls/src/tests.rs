@@ -1868,11 +1868,11 @@ impl Server {
             let UnbufferedStatus { discard, state } =
                 self.connection.process_tls_records(&mut self.incoming);
             let mut blocked = false;
+            let mut refused = false;
             match state {
                 Err(error) => {
                     self.refused.get_or_insert(error);
-                    blocked = faulted;
-                    faulted = true;
+                    refused = true;
                 }
                 Ok(ConnectionState::EncodeTlsData(mut encoder)) => {
                     room(&mut wire, |out| {
@@ -1916,9 +1916,14 @@ impl Server {
             if discard > 0 {
                 self.incoming.drain(..discard.min(self.incoming.len()));
             }
-            if blocked {
+            // The one turn after a refusal is the alert's, and there is no
+            // second: the adopted library queues its fatal alert as it refuses
+            // and hands it over on the call after, then faults if it is asked
+            // to decide against the same record and send a second one.
+            if blocked || faulted {
                 break;
             }
+            faulted = refused;
         }
         wire
     }
@@ -2365,6 +2370,148 @@ fn a_channel_whose_transport_goes_away_after_it_came_up_still_reads_established(
     ));
 }
 
+/// **A peer that gave up on a session that had already come up.** A server that
+/// refuses this appliance *inside* the handshake never lets it reach
+/// `Established` at all — that is the alert-only shape the booted image proves
+/// against `openssl s_server`. This is the other shape: an authenticated peer
+/// that spoke on the session and then gave up on it, where the alert cannot be
+/// the handshake's own outcome because the handshake had already succeeded.
+///
+/// Reported *beside* the session rather than instead of it, and that is the
+/// whole point: a channel that came up and then died would otherwise leave
+/// `established` as its last word, which is the console saying a node is
+/// healthy about a node that is not.
+#[test]
+fn a_peer_that_gives_up_on_a_session_that_came_up_reports_the_alert_beside_it() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xc0, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0xc1, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0xc2,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: true,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.round();
+    channel.client.push(b"channel hello");
+    channel.round();
+    channel.round();
+    assert_eq!(
+        channel.client.outcome(),
+        Some(&ClientOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        })),
+        "the session never came up"
+    );
+    assert_eq!(
+        channel.client.ending(),
+        None,
+        "a session still running reported how it ended"
+    );
+
+    // A record the traffic keys cannot open, which is how a peer that has
+    // authenticated is brought to give up on a session that had come up. It
+    // answers with a fatal alert, and that alert is the whole of what this end
+    // learns — exactly as a server's verdict on a device certificate is.
+    let mut forged = std::vec![0x17, 0x03, 0x03, 0x00, 0x40];
+    forged.extend_from_slice(&[0x5a; 0x40]);
+    channel.server.incoming.extend_from_slice(&forged);
+    let alert = channel.server.turn();
+    assert!(!alert.is_empty(), "the peer gave up without saying so");
+    channel.deliver(&alert);
+
+    assert_eq!(
+        channel.client.outcome(),
+        Some(&ClientOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        })),
+        "the alert displaced the session it ended"
+    );
+    match channel.client.ending() {
+        Some(ClientOutcome::AlertReceived(alert)) => assert_eq!(
+            channel_lines(&ClientOutcome::AlertReceived(*alert)).len(),
+            1,
+            "the alert reached the console as more than one record"
+        ),
+        other => std::panic!("a peer that gave up ended the session as {other:?}"),
+    }
+}
+
+/// The two console lines that pair makes, verbatim: what an operator reads to
+/// tell a node its fleet dropped from one that is simply up.
+#[test]
+fn a_session_refused_after_it_came_up_reads_as_the_session_and_then_the_alert() {
+    let established = channel_lines(&ClientOutcome::Established(Established {
+        version: 0x0304,
+        suite: 0x1303,
+        group: 0x11ec,
+    }));
+    let refused = channel_lines(&ClientOutcome::AlertReceived(AlertDescription::UnknownCA));
+    assert_eq!(
+        [established, refused].concat(),
+        [
+            "channel-tls=established channel-tls-version=0x0304 channel-tls-suite=0x1303 \
+             channel-tls-group=0x11ec",
+            "channel-tls=alert-received channel-tls-alert=0x0030"
+        ]
+    );
+}
+
+/// A server that says goodbye on a session that came up ends it as the peer
+/// closing — which is what separates an orderly shutdown from the refusal
+/// above, the two being the same session up to their last record.
+#[test]
+fn a_server_that_says_goodbye_on_a_session_that_came_up_ends_it_as_the_peer_closing() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0xc4, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0xc5, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0xc6,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: true,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.round();
+    channel.client.push(b"channel hello");
+    channel.round();
+    channel.round();
+    assert!(matches!(
+        channel.client.outcome(),
+        Some(ClientOutcome::Established(_))
+    ));
+    assert_eq!(
+        channel.client.ending(),
+        None,
+        "a session still running reported how it ended"
+    );
+
+    channel.server.closing = true;
+    channel.settle();
+    assert_eq!(
+        channel.client.ending(),
+        Some(&ClientOutcome::PeerClosed),
+        "a server that said goodbye left the session with no account of its ending"
+    );
+    assert!(matches!(
+        channel.client.outcome(),
+        Some(ClientOutcome::Established(_))
+    ));
+}
+
 /// More plaintext than one direction holds, handed down by the protocol above
 /// rather than up by a peer: the records it would take do not fit what this end
 /// keeps for the wire, and that is refused with what it would have had to hold
@@ -2684,10 +2831,9 @@ fn an_authenticated_peer_that_never_speaks_still_leaves_an_established_channel()
 /// valid certificate paces it just as well as one that does not — and the
 /// session is over rather than left holding what it could not.
 ///
-/// What an operator reads stays the handshake's own outcome, because the
-/// handshake is what it is about: this peer authenticated, and then flooded a
-/// session that had come up. A flood displacing the cause would be the general
-/// rule breaking, not an exception worth making for it.
+/// The handshake's own outcome is untouched by it: this peer authenticated, and
+/// *then* flooded a session that had come up, so the flood is the session's
+/// ending and never a cause that displaces the one before it.
 #[test]
 fn an_authenticated_peer_that_outruns_the_protocol_above_is_refused_rather_than_grown() {
     let arena = Bump::new(ROOM);
@@ -2708,6 +2854,13 @@ fn an_authenticated_peer_that_outruns_the_protocol_above_is_refused_rather_than_
         channel.client.outcome(),
         Some(ClientOutcome::Established(_))
     ));
+    match channel.client.ending() {
+        Some(ClientOutcome::Backlogged { held }) => assert!(
+            *held > HELD_MAX,
+            "a direction was refused for fitting inside what it holds"
+        ),
+        other => std::panic!("a flood on a session that came up ended it as {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2824,6 +2977,135 @@ fn every_client_outcome_is_its_own_value() {
         for (also, other) in cases.iter().enumerate() {
             assert_eq!(at == also, case == other, "two outcomes compared equal");
         }
+    }
+}
+
+/// The lines one channel outcome puts on the console, in the order it puts them.
+fn channel_lines(outcome: &ClientOutcome) -> Vec<String> {
+    outcome
+        .records()
+        .into_iter()
+        .flatten()
+        .map(console)
+        .collect()
+}
+
+/// **Every one of the twelve reaches the console under a token of its own**,
+/// which is the property the whole vocabulary exists for: an operator whose
+/// appliance will not come back has these lines and nothing else, so two causes
+/// sharing a token would leave them with a line that names neither.
+///
+/// The two arms that carry a second token are the two an operator most needs —
+/// the way the delivered anchor refused, and which incompatibility it was — and
+/// the exhausted arena is the one that takes a second record, on the onboarding
+/// server's terms.
+#[test]
+fn every_channel_outcome_puts_its_own_token_on_the_console() {
+    let outcomes = [
+        ClientOutcome::Established(Established {
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        }),
+        ClientOutcome::NoServerHello,
+        ClientOutcome::Incompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig),
+        ClientOutcome::Misbehaved(PeerMisbehaved::SelectedUnofferedCipherSuite),
+        ClientOutcome::ServerCertificateRejected(CertificateError::UnknownIssuer),
+        ClientOutcome::AnchorRejected,
+        ClientOutcome::AlertReceived(AlertDescription::UnknownCA),
+        ClientOutcome::Refused(rustls::Error::DecryptError),
+        ClientOutcome::PeerClosed,
+        ClientOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 262_144,
+            remaining: 262_143,
+        }),
+        ClientOutcome::Backlogged { held: 33_291 },
+        ClientOutcome::Stalled,
+    ];
+    let mut tokens: Vec<String> = Vec::new();
+    for outcome in &outcomes {
+        let lines = channel_lines(outcome);
+        assert!(
+            !lines.is_empty(),
+            "{outcome:?} put nothing on the console at all"
+        );
+        let leading = lines.first().cloned().unwrap_or_default();
+        let token = leading
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("channel-tls="))
+            .map(str::to_owned)
+            .unwrap_or_else(|| std::panic!("{leading} carries no channel-tls= field"));
+        assert!(
+            !tokens.contains(&token),
+            "two outcomes reached the console under `{token}`"
+        );
+        tokens.push(token);
+    }
+    assert_eq!(tokens.len(), outcomes.len());
+
+    // The shapes that carry more than a token, stated verbatim: this is the
+    // console line an operator reads, so a change to it is a change to what a
+    // fleet is debugged from.
+    assert_eq!(
+        channel_lines(&outcomes[0]),
+        [
+            "channel-tls=established channel-tls-version=0x0304 channel-tls-suite=0x1303 \
+          channel-tls-group=0x11ec"
+        ]
+    );
+    assert_eq!(
+        channel_lines(&ClientOutcome::ServerCertificateRejected(
+            CertificateError::UnknownIssuer
+        )),
+        ["channel-tls=server-certificate-rejected channel-tls-certificate=unknown-issuer"]
+    );
+    assert_eq!(
+        channel_lines(&ClientOutcome::AlertReceived(AlertDescription::UnknownCA)),
+        ["channel-tls=alert-received channel-tls-alert=0x0030"]
+    );
+    // Two records, and the second is the one this appliance already states an
+    // arena's shortfall on — so a starved session at boot, one under an
+    // onboarding peer and one under a management server read the same way.
+    assert_eq!(
+        channel_lines(&ClientOutcome::ArenaExhausted(ArenaExhausted {
+            requested: 262_144,
+            remaining: 262_143,
+        })),
+        [
+            "channel-tls=arena-exhausted",
+            "arena-bytes=262143 arena-bound=262144"
+        ]
+    );
+}
+
+/// **A certificate error that carries context reaches the console under its bare
+/// sibling's token**, and the context never travels: the name a server
+/// presented, the instant it was judged against and the algorithm identifier it
+/// used are a peer's own bytes, and a console line is not a place to repeat
+/// them. The cause is the same either way, which is why the two share a token.
+#[test]
+fn a_certificate_refusal_carrying_a_peers_bytes_reaches_the_console_without_them() {
+    let bare = channel_lines(&ClientOutcome::ServerCertificateRejected(
+        CertificateError::NotValidForName,
+    ));
+    let with_context = channel_lines(&ClientOutcome::ServerCertificateRejected(
+        CertificateError::NotValidForNameContext {
+            expected: rustls::pki_types::ServerName::try_from("10.0.2.2")
+                .expect("an address literal")
+                .to_owned(),
+            presented: std::vec![std::string::String::from("10.0.0.1")],
+        },
+    ));
+    assert_eq!(bare, with_context);
+    assert_eq!(
+        bare,
+        ["channel-tls=server-certificate-rejected channel-tls-certificate=not-valid-for-name"]
+    );
+    for line in &with_context {
+        assert!(
+            !line.contains("10.0.0.1"),
+            "a peer's own bytes reached a console line: {line}"
+        );
     }
 }
 

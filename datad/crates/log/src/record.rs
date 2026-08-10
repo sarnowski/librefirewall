@@ -50,9 +50,9 @@ const DIGEST_BYTES: usize = 32;
 
 use crate::detail::{Cause, CauseError, DomainDetail, Refusal, RefusalDetail};
 use crate::event::{
-    ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership, Primitive,
-    RejectReason, TlsIncompatible, TlsRefusal, Value,
+    ChangeKind, ChannelOutcome, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome,
+    NextHopVia, ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership,
+    Primitive, RejectReason, TlsCertificateRefusal, TlsIncompatible, TlsRefusal, Value,
 };
 use crate::identifier::{Identifier, IdentifierError};
 use crate::stamp::{Clock, Stamp};
@@ -624,6 +624,59 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::DialRetry.to_bits();
                     record.operands = [*delay_millis, *bound_millis, 0, 0];
                 }
+                // The management channel's eight, on the onboarding port's
+                // seven's terms exactly: the outcome takes the leading word
+                // wherever a detail's first word names a vocabulary.
+                DomainDetail::ChannelHandshake {
+                    outcome,
+                    version,
+                    suite,
+                    group,
+                } => {
+                    record.detail = LogDetailKind::ChannelHandshake.to_bits();
+                    record.operands = [
+                        *outcome as u64,
+                        u64::from(*version),
+                        u64::from(*suite),
+                        u64::from(*group),
+                    ];
+                }
+                DomainDetail::ChannelEnded { outcome } => {
+                    record.detail = LogDetailKind::ChannelEnded.to_bits();
+                    record.operands = [*outcome as u64, 0, 0, 0];
+                }
+                DomainDetail::ChannelIncompatible {
+                    outcome,
+                    incompatible,
+                } => {
+                    record.detail = LogDetailKind::ChannelIncompatible.to_bits();
+                    record.operands = [*outcome as u64, *incompatible as u64, 0, 0];
+                }
+                DomainDetail::ChannelRefused { outcome, refusal } => {
+                    record.detail = LogDetailKind::ChannelRefused.to_bits();
+                    record.operands = [*outcome as u64, *refusal as u64, 0, 0];
+                }
+                DomainDetail::ChannelCertificate { outcome, refusal } => {
+                    record.detail = LogDetailKind::ChannelCertificate.to_bits();
+                    record.operands = [*outcome as u64, *refusal as u64, 0, 0];
+                }
+                DomainDetail::ChannelAlert { outcome, alert } => {
+                    record.detail = LogDetailKind::ChannelAlert.to_bits();
+                    record.operands = [*outcome as u64, u64::from(*alert), 0, 0];
+                }
+                DomainDetail::ChannelBacklogged { outcome, held } => {
+                    record.detail = LogDetailKind::ChannelBacklogged.to_bits();
+                    record.operands = [*outcome as u64, *held, 0, 0];
+                }
+                DomainDetail::ChannelFrames {
+                    agreed,
+                    version,
+                    sent,
+                    received,
+                } => {
+                    record.detail = LogDetailKind::ChannelFrames.to_bits();
+                    record.operands = [u64::from(*agreed), u64::from(*version), *sent, *received];
+                }
                 DomainDetail::Onboarded {
                     relayed,
                     received,
@@ -1041,6 +1094,59 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             delay_millis: *delay_millis,
             bound_millis: *bound_millis,
         },
+        // Every token below was ranged to its own vocabulary by `wire`, so the
+        // indexes are in bounds by construction; the counts beside them are
+        // tallies the emitting domain kept about its own session.
+        CheckedDetail::ChannelHandshake {
+            outcome,
+            version,
+            suite,
+            group,
+        } => DomainDetail::ChannelHandshake {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+            version: *version,
+            suite: *suite,
+            group: *group,
+        },
+        CheckedDetail::ChannelEnded { outcome } => DomainDetail::ChannelEnded {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+        },
+        CheckedDetail::ChannelIncompatible {
+            outcome,
+            incompatible,
+        } => DomainDetail::ChannelIncompatible {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+            incompatible: TlsIncompatible::ALL[*incompatible as usize],
+        },
+        CheckedDetail::ChannelRefused { outcome, refusal } => DomainDetail::ChannelRefused {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+            refusal: TlsRefusal::ALL[*refusal as usize],
+        },
+        CheckedDetail::ChannelCertificate { outcome, refusal } => {
+            DomainDetail::ChannelCertificate {
+                outcome: ChannelOutcome::ALL[*outcome as usize],
+                refusal: TlsCertificateRefusal::ALL[*refusal as usize],
+            }
+        }
+        CheckedDetail::ChannelAlert { outcome, alert } => DomainDetail::ChannelAlert {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+            alert: *alert,
+        },
+        CheckedDetail::ChannelBacklogged { outcome, held } => DomainDetail::ChannelBacklogged {
+            outcome: ChannelOutcome::ALL[*outcome as usize],
+            held: *held,
+        },
+        CheckedDetail::ChannelFrames {
+            agreed,
+            version,
+            sent,
+            received,
+        } => DomainDetail::ChannelFrames {
+            agreed: *agreed,
+            version: *version,
+            sent: *sent,
+            received: *received,
+        },
         // The token was ranged to the vocabulary by `wire`; the three counts are
         // tallies the emitting domain kept about its own session, so every bit
         // pattern of each is one it could have written.
@@ -1386,6 +1492,50 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     } => DomainDetail::DialRetry {
                         delay_millis,
                         bound_millis,
+                    },
+                    DomainDetail::ChannelHandshake {
+                        outcome,
+                        version,
+                        suite,
+                        group,
+                    } => DomainDetail::ChannelHandshake {
+                        outcome,
+                        version,
+                        suite,
+                        group,
+                    },
+                    DomainDetail::ChannelEnded { outcome } => {
+                        DomainDetail::ChannelEnded { outcome }
+                    }
+                    DomainDetail::ChannelIncompatible {
+                        outcome,
+                        incompatible,
+                    } => DomainDetail::ChannelIncompatible {
+                        outcome,
+                        incompatible,
+                    },
+                    DomainDetail::ChannelRefused { outcome, refusal } => {
+                        DomainDetail::ChannelRefused { outcome, refusal }
+                    }
+                    DomainDetail::ChannelCertificate { outcome, refusal } => {
+                        DomainDetail::ChannelCertificate { outcome, refusal }
+                    }
+                    DomainDetail::ChannelAlert { outcome, alert } => {
+                        DomainDetail::ChannelAlert { outcome, alert }
+                    }
+                    DomainDetail::ChannelBacklogged { outcome, held } => {
+                        DomainDetail::ChannelBacklogged { outcome, held }
+                    }
+                    DomainDetail::ChannelFrames {
+                        agreed,
+                        version,
+                        sent,
+                        received,
+                    } => DomainDetail::ChannelFrames {
+                        agreed,
+                        version,
+                        sent,
+                        received,
                     },
                     DomainDetail::Onboarded {
                         relayed,

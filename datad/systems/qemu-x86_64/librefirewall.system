@@ -630,6 +630,20 @@
          the anchor the cryptography domain holds and the certificate the peer
          presents under it, neither of which crosses here.
 
+         TWO READERS, AND THE SECOND IS THE WHOLE OF WHY THE ROW CHANGED. The
+         management domain reads it to know where to dial. The CRYPTOGRAPHY
+         domain reads it because the address is half of the trust decision the
+         channel makes: a management server's certificate is validated against
+         the ADDRESS LITERAL that was dialled and against no name, so the domain
+         that validates reads the address itself rather than being handed one by
+         the domain that owns the network — which could otherwise point that
+         validation at a name a server it controls holds a certificate for. What
+         a read confers either way is an address and a port that every appliance
+         the management plane owns is told and that appear in the clear on the
+         wire, so the grant is narrow because what it carries authenticates
+         nothing. The WRITE grant is still the store domain's alone, and is
+         withheld from both readers.
+
          NO CHANNEL, in either direction, on `owner`'s reasoning. The management
          domain is woken on a period by the clock domain and by the traffic on its
          own port, so it reads this word on a wakeup it was going to have; a
@@ -1029,7 +1043,7 @@
          WHO MAPS IT: the cryptography domain, read-write, and nobody else. It
          holds the ephemeral keys of a TLS session while one is running, so a
          second mapper would be a second reader of key material. -->
-    <memory_region name="arena_crypto" size="0x200000" />
+    <memory_region name="arena_crypto" size="0x400000" />
 
 
     <!-- THE METRIC SHARDS: one region per protection domain, each written by
@@ -1862,7 +1876,8 @@
          allocator, and the delegation: its own log ring read-write with its
          consume cursor read-only, its own statistics shard read-write, the clock
          calibration read-only to stamp its records, `arena_crypto` read-write,
-         `sign_request` read-write and `sign_reply` READ-ONLY. NO device region of
+         `sign_request` read-write, `sign_reply` READ-ONLY and `endpoint`
+         READ-ONLY. NO device region of
          any kind — no ECAM page, no BAR window, no virtqueue, no block region —
          NO pool, NO dataplane or management ring, NO configuration region, NO
          tap, NO download region and NO `<ioport>`. `RDRAND`, `CPUID` and `RDTSC`
@@ -1870,6 +1885,16 @@
          domain's `RDRAND` and every domain's `RDTSC` are, so nothing in this file
          could grant or withhold them; what this row grants is only the means to
          say what happened, to allocate inside its own bound, and to ask.
+
+         AND IT READS WHERE THE APPLIANCE DIALS, which is the row added with the
+         management channel's client. `endpoint` is READ-ONLY here, exactly as it
+         is in the domain that dials, and the reason it is here at all is that
+         this domain is the one that VALIDATES: a management server's certificate
+         is held to the address literal that was dialled and to no name, so the
+         address is half of a trust decision and must not arrive from the domain
+         that owns the network. The relay's ABI has no field for one either, and
+         that stays true. What the mapping grants is the ability to read an
+         address and a port that authenticate nothing.
 
          WHY IT HOLDS NO STORE DEVICE, though it authenticates under the key that
          medium carries: the device private key must never leave the domain that
@@ -1939,11 +1964,11 @@
          document check on its way to being refused. That made a remote fault of
          the domain holding the device key and the appliance's only allocator.
 
-         MEMORY RATHER THAN AUTHORITY. Nothing this domain may reach changes: no
-         region added or removed, no mapping's extent, cacheability or permissions
-         altered, no channel and no send capability touched. The generated report
-         gains 64 `frame_crypto_stack` pages and nothing else; the description
-         still holds 80 regions and 151 mappings. -->
+         MEMORY RATHER THAN AUTHORITY. The stack budget above changed nothing
+         this domain may reach: no region added or removed, no mapping's extent,
+         cacheability or permissions altered, no channel and no send capability
+         touched. What it added to the generated report was 64
+         `frame_crypto_stack` pages and nothing else. -->
     <protection_domain name="crypto" priority="2" stack_size="0x60000">
         <program_image path="crypto.elf" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
@@ -1956,6 +1981,7 @@
         <map mr="relay_request" vaddr="0x7_200_000" perms="r" cached="true" setvar_vaddr="relay_request_vaddr" />
         <map mr="relay_reply" vaddr="0x7_300_000" perms="rw" cached="true" setvar_vaddr="relay_reply_vaddr" />
         <map mr="install_staging" vaddr="0x7_400_000" perms="rw" cached="true" setvar_vaddr="install_staging_vaddr" />
+        <map mr="endpoint" vaddr="0x3_00b_000" perms="r" cached="true" setvar_vaddr="endpoint_vaddr" />
     </protection_domain>
 
     <!-- The store domain: the one holder of the appliance's own identity, and

@@ -34,12 +34,22 @@ use lfw_tls::Bump;
 
 /// Bytes the cryptography domain's arena holds.
 ///
-/// Two megabytes: far more than a session's measured high-water mark, which
-/// the domain reports on every boot, and small enough to be an ordinary
-/// mapping rather than a claim on the physical-address window — no device
-/// reads it, so it needs no fixed address and is allocated from general
-/// untyped memory like any other region this domain holds.
-pub const ARENA_BYTES: usize = 0x20_0000;
+/// Four megabytes, and two of them are the management channel's framing. The
+/// protocol carries a whole sealed recording segment as one frame, so a decoder
+/// reassembles into a fixed `lfw_channel::MAX_FRAME_LEN` array — one mebibyte
+/// and eight bytes, a constant of the protocol rather than anything a peer's
+/// lengths decide. It is allocated **once** out of this region at bring-up and
+/// handed from channel session to channel session for the domain's life, which
+/// is why the region grew by two and not by one: the buffer sits below the mark
+/// every session is wound back to, so what is left above it has to be a whole
+/// session's worth on its own.
+///
+/// Still far more than a session's measured high-water mark, which the domain
+/// reports on every boot, and still small enough to be an ordinary mapping
+/// rather than a claim on the physical-address window — no device reads it, so
+/// it needs no fixed address and is allocated from general untyped memory like
+/// any other region this domain holds.
+pub const ARENA_BYTES: usize = 0x40_0000;
 
 /// The region, and the cursor over it.
 ///

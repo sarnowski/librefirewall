@@ -193,6 +193,13 @@ pub fn channel_tls_harness(data: &[u8]) {
             !matches!(client.outcome(), Some(ClientOutcome::Established(_))),
             "a session established against a peer holding no certificate this end trusts"
         );
+        // The second outcome slot exists for a session that came up, and no
+        // stream here can bring one up. A peer that reached it would be a peer
+        // deciding how many records this session owes the console.
+        assert!(
+            client.ending().is_none(),
+            "a session that never came up reported how it ended"
+        );
         settled = client.outcome().cloned();
         if finished {
             assert_eq!(turn.sent, 0, "a finished session put more on the wire");
@@ -221,6 +228,10 @@ pub fn channel_tls_harness(data: &[u8]) {
     assert!(
         !matches!(outcome, Some(ClientOutcome::Established(_))),
         "a transport that went away left an established channel behind a peer that never authenticated"
+    );
+    assert!(
+        client.ending().is_none(),
+        "a transport that went away left an ending on a session that never came up"
     );
 }
 

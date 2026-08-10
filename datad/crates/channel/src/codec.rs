@@ -473,6 +473,23 @@ impl<'buf> FrameDecoder<'buf> {
         }
     }
 
+    /// Give the reassembly buffer back, consuming the decoder.
+    ///
+    /// A connection is one decoder and the next connection is another, so the
+    /// megabyte has to travel from one to the next — and a caller that owns one
+    /// buffer for the life of a domain has no other way to hand it on: the borrow
+    /// lasts the decoder's whole life by construction, which is what makes one
+    /// buffer and one decoder a pairing the type keeps.
+    ///
+    /// Whatever the buffer holds goes with it and is ignored by whoever takes it
+    /// next, on [`Self::new`]'s terms: a decoder overwrites as bytes arrive and
+    /// hands out nothing it has not filled, so a half-arrived frame cannot reach
+    /// the connection after.
+    #[must_use]
+    pub fn release(self) -> &'buf mut [u8; MAX_FRAME_LEN] {
+        self.held
+    }
+
     /// The rule the peer broke, once it has broken one.
     #[must_use]
     pub const fn violation(&self) -> Option<Violation> {

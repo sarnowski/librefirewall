@@ -436,6 +436,44 @@ fn every_domain_detail_shape_survives_the_crossing() {
             ],
             offered: 8,
         },
+        // The dialled channel's eight, on the onboarding port's terms: no two
+        // fields of one shape are equal, so a field read out of the wrong
+        // operand word is a value that does not come back.
+        DomainDetail::ChannelHandshake {
+            outcome: ChannelOutcome::Established,
+            version: 0x0304,
+            suite: 0x1303,
+            group: 0x11ec,
+        },
+        DomainDetail::ChannelEnded {
+            outcome: ChannelOutcome::NoServerHello,
+        },
+        DomainDetail::ChannelIncompatible {
+            outcome: ChannelOutcome::Incompatible,
+            incompatible: TlsIncompatible::ServerTlsVersionIsDisabledByOurConfig,
+        },
+        DomainDetail::ChannelRefused {
+            outcome: ChannelOutcome::Refused,
+            refusal: TlsRefusal::DecryptError,
+        },
+        DomainDetail::ChannelCertificate {
+            outcome: ChannelOutcome::ServerCertificateRejected,
+            refusal: TlsCertificateRefusal::UnknownIssuer,
+        },
+        DomainDetail::ChannelAlert {
+            outcome: ChannelOutcome::AlertReceived,
+            alert: 0x0030,
+        },
+        DomainDetail::ChannelBacklogged {
+            outcome: ChannelOutcome::Backlogged,
+            held: 33_291,
+        },
+        DomainDetail::ChannelFrames {
+            agreed: true,
+            version: 1,
+            sent: 7,
+            received: 11,
+        },
         // And the request surface's three, on the same terms: no two fields of
         // one shape are equal, so a field read out of the wrong operand word
         // fails here.
@@ -708,11 +746,82 @@ fn a_minted_event_becomes_its_bounded_form_field_for_field() {
 /// refusal waiting to happen for the records that make up most of a transcript.
 #[test]
 fn a_shape_with_no_cause_crosses_the_seam_unconditionally() {
-    let events: [Event; 6] = [
+    let events: [Event; 14] = [
         Event::Domain {
             domain: Domain::Console,
             state: DomainState::Ready,
             detail: DomainDetail::None,
+        },
+        // The dialled channel's eight, which cross the seam like any other
+        // shape that carries no cause — and which the framing's own record ends
+        // the group with, its `agreed` word being the one an operator reads a
+        // healthy channel by.
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelHandshake {
+                outcome: ChannelOutcome::Established,
+                version: 0x0304,
+                suite: 0x1303,
+                group: 0x11ec,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelEnded {
+                outcome: ChannelOutcome::AnchorRejected,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelIncompatible {
+                outcome: ChannelOutcome::Incompatible,
+                incompatible: TlsIncompatible::NoKxGroupsInCommon,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelRefused {
+                outcome: ChannelOutcome::Refused,
+                refusal: TlsRefusal::InvalidMessage,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelCertificate {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                refusal: TlsCertificateRefusal::NotValidForName,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelAlert {
+                outcome: ChannelOutcome::AlertReceived,
+                alert: 0x0030,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelBacklogged {
+                outcome: ChannelOutcome::Backlogged,
+                held: 33_291,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelFrames {
+                agreed: true,
+                version: 1,
+                sent: 1,
+                received: 1,
+            },
         },
         Event::Domain {
             domain: Domain::Forwarder,
@@ -1015,6 +1124,37 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
             .prop_map(|(outcome, alert)| DomainDetail::OnboardingAlert { outcome, alert }),
         (pick(OnboardOutcome::ALL), any::<u64>())
             .prop_map(|(outcome, held)| DomainDetail::OnboardingBacklogged { outcome, held }),
+        (pick(ChannelOutcome::ALL), any::<(u16, u16, u16)>()).prop_map(
+            |(outcome, (version, suite, group))| DomainDetail::ChannelHandshake {
+                outcome,
+                version,
+                suite,
+                group,
+            }
+        ),
+        pick(ChannelOutcome::ALL).prop_map(|outcome| DomainDetail::ChannelEnded { outcome }),
+        (pick(ChannelOutcome::ALL), pick(TlsIncompatible::ALL)).prop_map(
+            |(outcome, incompatible)| DomainDetail::ChannelIncompatible {
+                outcome,
+                incompatible,
+            }
+        ),
+        (pick(ChannelOutcome::ALL), pick(TlsRefusal::ALL))
+            .prop_map(|(outcome, refusal)| DomainDetail::ChannelRefused { outcome, refusal }),
+        (pick(ChannelOutcome::ALL), pick(TlsCertificateRefusal::ALL))
+            .prop_map(|(outcome, refusal)| DomainDetail::ChannelCertificate { outcome, refusal }),
+        (pick(ChannelOutcome::ALL), any::<u16>())
+            .prop_map(|(outcome, alert)| DomainDetail::ChannelAlert { outcome, alert }),
+        (pick(ChannelOutcome::ALL), any::<u64>())
+            .prop_map(|(outcome, held)| DomainDetail::ChannelBacklogged { outcome, held }),
+        any::<(bool, u16, u64, u64)>().prop_map(|(agreed, version, sent, received)| {
+            DomainDetail::ChannelFrames {
+                agreed,
+                version,
+                sent,
+                received,
+            }
+        }),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()
             .prop_map(|(points, offered)| DomainDetail::OnboardingSuites { points, offered }),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()

@@ -101,6 +101,15 @@ pub const LOG_ONBOARD_ROUTE_COUNT: u8 = 2;
 /// `lfw_log::OnboardRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
 pub const LOG_ONBOARD_REFUSAL_COUNT: u8 = 26;
 
+/// How many ways a handshake on the management channel this appliance dialled
+/// may end — `lfw_log::ChannelOutcome::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s
+/// terms.
+pub const LOG_CHANNEL_OUTCOME_COUNT: u8 = 12;
+
+/// How many ways a delivered anchor may refuse a server's certificate —
+/// `lfw_log::TlsCertificateRefusal::ALL`, on [`LOG_DIAL_OUTCOME_COUNT`]'s terms.
+pub const LOG_TLS_CERTIFICATE_REFUSAL_COUNT: u8 = 17;
+
 /// How many things an appliance's ownership may be — `lfw_log::Ownership::ALL`,
 /// on [`LOG_DIAL_OUTCOME_COUNT`]'s terms. A token rather than a flag, although
 /// the fact is a yes or a no: the console spells the same word the drop reason
@@ -295,6 +304,20 @@ pub enum LogDetailKind {
     /// How long the dialling domain will wait before its next attempt, and the
     /// bound that wait was drawn below. Appended, never inserted.
     DialRetry,
+    /// The eight the **management channel this appliance dialled** produces:
+    /// six for how one handshake on it ended, and two for the framing above
+    /// that handshake. Appended, never inserted, and eight discriminants rather
+    /// than one for [`Self::OnboardingHandshake`]'s reason exactly — a completed
+    /// handshake carries three code points, and the four ways it does not each
+    /// carry a token out of a different vocabulary.
+    ChannelHandshake,
+    ChannelEnded,
+    ChannelIncompatible,
+    ChannelRefused,
+    ChannelCertificate,
+    ChannelAlert,
+    ChannelBacklogged,
+    ChannelFrames,
 }
 
 impl LogDetailKind {
@@ -346,6 +369,14 @@ impl LogDetailKind {
             Self::DelegatedAnchor => 42,
             Self::Published => 43,
             Self::DialRetry => 44,
+            Self::ChannelHandshake => 45,
+            Self::ChannelEnded => 46,
+            Self::ChannelIncompatible => 47,
+            Self::ChannelRefused => 48,
+            Self::ChannelCertificate => 49,
+            Self::ChannelAlert => 50,
+            Self::ChannelBacklogged => 51,
+            Self::ChannelFrames => 52,
         }
     }
 
@@ -397,6 +428,14 @@ impl LogDetailKind {
             42 => Some(Self::DelegatedAnchor),
             43 => Some(Self::Published),
             44 => Some(Self::DialRetry),
+            45 => Some(Self::ChannelHandshake),
+            46 => Some(Self::ChannelEnded),
+            47 => Some(Self::ChannelIncompatible),
+            48 => Some(Self::ChannelRefused),
+            49 => Some(Self::ChannelCertificate),
+            50 => Some(Self::ChannelAlert),
+            51 => Some(Self::ChannelBacklogged),
+            52 => Some(Self::ChannelFrames),
             _ => None,
         }
     }
@@ -960,6 +999,50 @@ impl LogRecord {
                 delay_millis: self.operands[0],
                 bound_millis: self.operands[1],
             },
+            // The management channel's eight, ranged exactly as the onboarding
+            // port's seven are: the leading word is the outcome's own
+            // vocabulary, a code point beside it is sixteen bits wherever a TLS
+            // registry numbers one, and a second token is held to its own set.
+            Some(LogDetailKind::ChannelHandshake) => CheckedDetail::ChannelHandshake {
+                outcome: channel_outcome_token(self.operands[0])?,
+                version: code_point(self.operands[1])?,
+                suite: code_point(self.operands[2])?,
+                group: code_point(self.operands[3])?,
+            },
+            Some(LogDetailKind::ChannelEnded) => CheckedDetail::ChannelEnded {
+                outcome: channel_outcome_token(self.operands[0])?,
+            },
+            Some(LogDetailKind::ChannelIncompatible) => CheckedDetail::ChannelIncompatible {
+                outcome: channel_outcome_token(self.operands[0])?,
+                incompatible: tls_incompatible_token(self.operands[1])?,
+            },
+            Some(LogDetailKind::ChannelRefused) => CheckedDetail::ChannelRefused {
+                outcome: channel_outcome_token(self.operands[0])?,
+                refusal: tls_refusal_token(self.operands[1])?,
+            },
+            Some(LogDetailKind::ChannelCertificate) => CheckedDetail::ChannelCertificate {
+                outcome: channel_outcome_token(self.operands[0])?,
+                refusal: tls_certificate_refusal_token(self.operands[1])?,
+            },
+            Some(LogDetailKind::ChannelAlert) => CheckedDetail::ChannelAlert {
+                outcome: channel_outcome_token(self.operands[0])?,
+                alert: code_point(self.operands[1])?,
+            },
+            // The count is unranged on `Received`'s terms.
+            Some(LogDetailKind::ChannelBacklogged) => CheckedDetail::ChannelBacklogged {
+                outcome: channel_outcome_token(self.operands[0])?,
+                held: self.operands[1],
+            },
+            // A flag, a protocol version and two frame tallies. The flag is one
+            // of two values or the record is not readable at all — a greeting
+            // this end never agreed and one it did are opposite facts about the
+            // node, and the schedule's reset hangs off exactly this word.
+            Some(LogDetailKind::ChannelFrames) => CheckedDetail::ChannelFrames {
+                agreed: flag(self.operands[0])?,
+                version: code_point(self.operands[1])?,
+                sent: self.operands[2],
+                received: self.operands[3],
+            },
             // A token and three counts, in `Dialled`'s order: the token takes
             // the leading word wherever a detail's first word names a
             // vocabulary, and the three counts are unranged because every bit
@@ -1234,6 +1317,22 @@ fn tls_refusal_token(raw: u64) -> Result<u8, LogRecordError> {
     match u8::try_from(raw) {
         Ok(narrow) if narrow < LOG_TLS_REFUSAL_COUNT => Ok(narrow),
         _ => Err(LogRecordError::TlsRefusalUnknown { refusal: raw }),
+    }
+}
+
+/// A channel-outcome token carried in an operand word, on the same terms.
+fn channel_outcome_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_CHANNEL_OUTCOME_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::ChannelOutcomeUnknown { outcome: raw }),
+    }
+}
+
+/// A certificate-refusal token carried in an operand word, on the same terms.
+fn tls_certificate_refusal_token(raw: u64) -> Result<u8, LogRecordError> {
+    match u8::try_from(raw) {
+        Ok(narrow) if narrow < LOG_TLS_CERTIFICATE_REFUSAL_COUNT => Ok(narrow),
+        _ => Err(LogRecordError::TlsCertificateRefusalUnknown { refusal: raw }),
     }
 }
 
@@ -1705,6 +1804,51 @@ pub enum CheckedDetail {
         delay_millis: u64,
         bound_millis: u64,
     },
+    /// How one handshake on the dialled management channel ended, and the three
+    /// code points it settled on where it completed.
+    ChannelHandshake {
+        outcome: u8,
+        version: u16,
+        suite: u16,
+        group: u16,
+    },
+    /// One that ended carrying nothing beyond the way it did.
+    ChannelEnded {
+        outcome: u8,
+    },
+    /// One the library and the server had no protocol in common for.
+    ChannelIncompatible {
+        outcome: u8,
+        incompatible: u8,
+    },
+    /// One this appliance refused, as the library's own error variant.
+    ChannelRefused {
+        outcome: u8,
+        refusal: u8,
+    },
+    /// The way the delivered anchor refused the server's certificate.
+    ChannelCertificate {
+        outcome: u8,
+        refusal: u8,
+    },
+    /// The fatal alert the server gave up with, as the registry numbers it.
+    ChannelAlert {
+        outcome: u8,
+        alert: u16,
+    },
+    /// A direction that outgrew what one session holds.
+    ChannelBacklogged {
+        outcome: u8,
+        held: u64,
+    },
+    /// What the framing above one channel session carried: whether a greeting
+    /// was agreed, the version it was agreed at, and the frames each way.
+    ChannelFrames {
+        agreed: bool,
+        version: u16,
+        sent: u64,
+        received: u64,
+    },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.
     Onboarded {
@@ -1926,6 +2070,12 @@ pub enum LogRecordError {
     OnboardRefusalUnknown {
         refusal: u64,
     },
+    ChannelOutcomeUnknown {
+        outcome: u64,
+    },
+    TlsCertificateRefusalUnknown {
+        refusal: u64,
+    },
     /// An operand carrying a TCP sequence number wider than the thirty-two bits
     /// one has.
     SequenceTooWide {
@@ -2045,6 +2195,16 @@ impl fmt::Display for LogRecordError {
                 f,
                 "onboarding request refusal token {refusal} is not below \
                  {LOG_ONBOARD_REFUSAL_COUNT}"
+            ),
+            Self::ChannelOutcomeUnknown { outcome } => write!(
+                f,
+                "management channel handshake outcome token {outcome} is not below \
+                 {LOG_CHANNEL_OUTCOME_COUNT}"
+            ),
+            Self::TlsCertificateRefusalUnknown { refusal } => write!(
+                f,
+                "server certificate refusal token {refusal} is not below \
+                 {LOG_TLS_CERTIFICATE_REFUSAL_COUNT}"
             ),
             Self::DialOutcomeUnknown { outcome } => write!(
                 f,

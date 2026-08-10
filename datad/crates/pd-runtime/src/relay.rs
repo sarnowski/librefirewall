@@ -1,6 +1,22 @@
-//! The network end of the TLS relay: moving an onboarding connection's bytes to
+//! The network end of the TLS relay: moving a management connection's bytes to
 //! the domain that terminates the session, and that domain's answers back onto
 //! the wire.
+//!
+//! # One relay, two connections, never both at once
+//!
+//! The domain that owns the management port has two TLS connections in its life
+//! and exactly one of them exists at a time: the **onboarding** connection an
+//! administrator opens to an appliance nobody owns, and the **channel** this
+//! appliance dials once it has an owner. An accepted onboarding package shuts
+//! the first for good and publishes where to dial, so the two are the two halves
+//! of one appliance's life rather than two things to carry side by side.
+//!
+//! So there is one relay and one window, and [`Relayed`] is the seam: it
+//! presents whichever half is live, and its session identity carries **which**
+//! half it is. That last part is load-bearing rather than tidy — the two
+//! transports number their connections independently, so the same connection id
+//! can name one of each, and a relay that compared only the number could carry
+//! an onboarding session's account straight into a channel session.
 //!
 //! # Adversary
 //!
@@ -54,6 +70,7 @@
 use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ConnectionId, onboard::Ended};
 use lfw_log::{OnboardEnd, RefusalDetail};
+pub use wire::Half;
 use wire::{
     MAX_RELAY_PAYLOAD, PendingRelay, RelayDemand, RelayEnding, RelayFault, RelayOperation,
     RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester, RelayResponder,
@@ -144,16 +161,35 @@ pub struct RelayPass {
     pub notify: bool,
     /// A session finished and owes the console its account.
     pub report: Option<RelayReport>,
+    /// The protocol behind the terminating end agreed a greeting with the peer
+    /// **on this pass**, which is the one event that starts the redial schedule
+    /// afresh. An edge and not the latch: a level would reset the schedule on
+    /// every pass of a healthy channel, which is the same thing said many times
+    /// and one more thing for a caller to remember not to act on twice.
+    pub agreed: bool,
 }
 
-/// The onboarding half of an endpoint, as this module needs it.
+/// One session's identity: which [`Half`] it is on, and which connection of that
+/// half.
+///
+/// The half is part of the identity rather than a parameter beside it, which is
+/// what makes carrying one into the other unrepresentable: the two transports
+/// number their connections independently, so comparing connection ids alone
+/// would read a channel that opened as the onboarding session that closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelaySession {
+    pub half: Half,
+    pub connection: ConnectionId,
+}
+
+/// The live half of an endpoint, as this module needs it.
 ///
 /// A trait rather than the concrete stage on the configuration channel's terms:
 /// driving a real endpoint to a session with bytes in it is a handshake and
 /// several frames away there, and one call away against a fake.
-pub trait Onboarding {
-    /// The connection a session is running on, or `None` where there is none.
-    fn session(&self) -> Option<ConnectionId>;
+pub trait Relayed {
+    /// The session running now, or `None` where there is none.
+    fn session(&self) -> Option<RelaySession>;
     /// Bytes the peer sent that have not been handed over.
     fn received(&self) -> &[u8];
     /// Drop the first `bytes`, which have been handed over.
@@ -162,18 +198,21 @@ pub trait Onboarding {
     fn peer_closed(&self) -> bool;
     /// Put `bytes` on the wire, answering how many there was room for.
     fn push(&mut self, bytes: &[u8]) -> usize;
-    /// End the session running on `connection`, answering whether that was still
+    /// End the session running on `session`, answering whether that was still
     /// the session this stream held.
-    fn end_session(&mut self, connection: ConnectionId) -> bool;
+    fn end_session(&mut self, session: RelaySession) -> bool;
     /// How the last session ended, taken once.
     fn take_ending(&mut self) -> Option<Ended>;
     /// How the session running now would end if it ended at this instant.
     fn ending(&self) -> Ended;
 }
 
-impl Onboarding for EndpointStage<'_> {
-    fn session(&self) -> Option<ConnectionId> {
-        Self::onboard_session(self)
+impl Relayed for EndpointStage<'_> {
+    fn session(&self) -> Option<RelaySession> {
+        Self::onboard_session(self).map(|connection| RelaySession {
+            half: Half::Onboarding,
+            connection,
+        })
     }
 
     fn received(&self) -> &[u8] {
@@ -192,8 +231,8 @@ impl Onboarding for EndpointStage<'_> {
         Self::onboard_push(self, bytes)
     }
 
-    fn end_session(&mut self, connection: ConnectionId) -> bool {
-        Self::onboard_end_session(self, connection)
+    fn end_session(&mut self, session: RelaySession) -> bool {
+        session.half == Half::Onboarding && Self::onboard_end_session(self, session.connection)
     }
 
     fn take_ending(&mut self) -> Option<Ended> {
@@ -202,6 +241,66 @@ impl Onboarding for EndpointStage<'_> {
 
     fn ending(&self) -> Ended {
         Self::onboard_ending(self)
+    }
+}
+
+/// The **channel** half of an endpoint, as the same relay needs it.
+///
+/// A wrapper rather than a second set of methods on one impl, because one type
+/// implements one trait once — and the two halves are the same shape seen from
+/// opposite ends of a connection. What is inside is a borrow and nothing else:
+/// it is constructed for one pass, so it can hold no state and there is none it
+/// would want.
+///
+/// Only the domain that owns the management port constructs one, and it
+/// constructs exactly one of the two per pass, from what the store domain has
+/// published: an appliance told nowhere to dial has no channel, and one that has
+/// been told has no onboarding surface left.
+pub struct ChannelStream<'stage, 'ring>(pub &'stage mut EndpointStage<'ring>);
+
+impl Relayed for ChannelStream<'_, '_> {
+    fn session(&self) -> Option<RelaySession> {
+        self.0.dial_connection().map(|connection| RelaySession {
+            half: Half::Channel,
+            connection,
+        })
+    }
+
+    fn received(&self) -> &[u8] {
+        self.0.dial_received()
+    }
+
+    fn consumed(&mut self, bytes: usize) {
+        self.0.dial_consumed(bytes);
+    }
+
+    fn peer_closed(&self) -> bool {
+        self.0.dial_peer_closed()
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> usize {
+        self.0.dial_push(bytes)
+    }
+
+    fn end_session(&mut self, session: RelaySession) -> bool {
+        session.half == Half::Channel && self.0.end_dial_session_on(session.connection)
+    }
+
+    /// Nothing is ever taken here, and that is the difference between the two
+    /// halves rather than a gap in this one.
+    ///
+    /// The onboarding stream is the transport's own and it forgets a connection
+    /// a frame or two after the close goes out, so an ending has to be kept for
+    /// the pass that asks. The channel's session is the *dialling schedule's*,
+    /// and that schedule holds it until this relay has closed its account — so
+    /// the live ending is answerable for as long as anybody asks for it, and a
+    /// second copy kept here would be a second answer to drift from it.
+    fn take_ending(&mut self) -> Option<Ended> {
+        None
+    }
+
+    fn ending(&self) -> Ended {
+        self.0.dial_stream_ending()
     }
 }
 
@@ -225,6 +324,7 @@ enum Claimed {
         offered: usize,
         kept: usize,
         closed: bool,
+        agreed: bool,
     },
     Refused(RelayRefusal),
     Faulted(RelayFault),
@@ -243,15 +343,23 @@ pub struct Relay<'chan> {
     requester: RelayRequester<'chan>,
     outstanding: Option<Outstanding>,
     far: Far,
-    /// The stream connection this end is carrying a session for, so a
-    /// connection replaced between two passes is noticed rather than carried on
-    /// as though it were the same one — and so a session that has been finished
-    /// is not opened again on the connection it was finished on.
-    carried: Option<ConnectionId>,
+    /// The session this end is carrying, so a connection replaced between two
+    /// passes is noticed rather than carried on as though it were the same one —
+    /// and so a session that has been finished is not opened again on the
+    /// connection it was finished on. It carries which half it is on, which is
+    /// what makes the onboarding connection closing and the channel opening two
+    /// sessions rather than one that changed underneath the account.
+    carried: Option<RelaySession>,
     /// A `Poll` has been issued and nothing has happened since. See the module
     /// header on why this is what keeps a quiet session from answering itself
     /// forever.
     polled: bool,
+    /// The protocol behind the terminating end has agreed a greeting with the
+    /// peer at some point in this session. Latched from the answers that carry
+    /// it, and the **one** thing the redial schedule may be started afresh on:
+    /// a peer that accepts a connection and closes it must not be able to
+    /// shorten the wait, and a transport that came up is exactly that peer.
+    agreed: bool,
     /// A close issued *because* the session failed. It is attempted once: a
     /// second against a far end that is already answering rubbish is a loop.
     closing_after_failure: bool,
@@ -282,6 +390,7 @@ impl<'chan> Relay<'chan> {
             outstanding: None,
             far: Far::Closed,
             carried: None,
+            agreed: false,
             polled: false,
             closing_after_failure: false,
             ended: None,
@@ -306,23 +415,49 @@ impl<'chan> Relay<'chan> {
         self.outstanding.is_some()
     }
 
+    /// The half whose session's account is still open here, and `None` between
+    /// sessions. Two callers read the two halves of one fact.
+    ///
+    /// *Whether* there is one is the dialled channel's schedule, and the reason is
+    /// identity rather than tidiness: a transport numbers its connections
+    /// independently of this relay's life, so an attempt opened before the last
+    /// one's account was closed could carry the same connection id — and the relay
+    /// would read the new session as the old one continuing. The schedule holds
+    /// off until this answers `None`, bounded by [`ANSWER_TIMEOUT`] whatever the
+    /// far end does. *Which* pins the stream a pass may hand to [`Self::poll`], so
+    /// a half chosen afresh cannot offer an outstanding answer to the other one.
+    #[must_use]
+    pub const fn carrying(&self) -> Option<Half> {
+        match self.carried {
+            Some(session) => Some(session.half),
+            None => None,
+        }
+    }
+
     /// One bounded pass: claim the answer if one has arrived, then issue at most
     /// one item.
     ///
     /// Never blocks and never spins. A pass with nothing to do returns a
     /// [`RelayPass`] that asks for nothing, which is the whole of the contract
     /// with the event loop.
-    pub fn poll(&mut self, now: Option<Monotonic>, stream: &mut impl Onboarding) -> RelayPass {
-        self.claim(now, stream);
+    pub fn poll(&mut self, now: Option<Monotonic>, stream: &mut impl Relayed) -> RelayPass {
+        let agreed = self.claim(now, stream);
         let (notify, report) = self.issue(now, stream);
-        RelayPass { notify, report }
+        RelayPass {
+            notify,
+            report,
+            agreed,
+        }
     }
 
     /// Look **once** for the answer to the outstanding item, giving up on one
     /// that has outlived [`ANSWER_TIMEOUT`].
-    fn claim(&mut self, now: Option<Monotonic>, stream: &mut impl Onboarding) {
+    ///
+    /// Answers whether this claim is the one on which the protocol above first
+    /// agreed a greeting.
+    fn claim(&mut self, now: Option<Monotonic>, stream: &mut impl Relayed) -> bool {
         let Some(Outstanding { pending, deadline }) = self.outstanding.take() else {
-            return;
+            return false;
         };
         let asked = pending.operation();
         // The answer is turned into plain values inside this block, because the
@@ -339,11 +474,13 @@ impl<'chan> Relay<'chan> {
                 RelayPoll::Answered {
                     records,
                     closed,
+                    agreed,
                     answered: _,
                 } => Claimed::Answered {
                     offered: records.len(),
                     kept: stream.push(records),
                     closed,
+                    agreed,
                 },
                 RelayPoll::Refused(reason) => Claimed::Refused(reason),
                 RelayPoll::Faulted(fault) => Claimed::Faulted(fault),
@@ -353,7 +490,7 @@ impl<'chan> Relay<'chan> {
             Claimed::Outstanding(pending) => {
                 if !expired(now, deadline) {
                     self.outstanding = Some(Outstanding { pending, deadline });
-                    return;
+                    return false;
                 }
                 // Given up on rather than re-parked, which frees this end's one
                 // slot: `wire::RelayRequester::abandon` is what makes that a
@@ -366,17 +503,25 @@ impl<'chan> Relay<'chan> {
                 self.requester.abandon(pending);
                 self.far = Far::Closed;
                 self.fail(stream, RelayFailure::Unanswered);
+                false
             }
             Claimed::Answered {
                 offered,
                 kept,
                 closed,
+                agreed,
             } => {
                 self.relayed = self.relayed.saturating_add(1);
                 self.sent = self.sent.saturating_add(kept as u64);
                 if offered > 0 {
                     self.polled = false;
                 }
+                // The edge, taken before anything below can end the session: a
+                // greeting agreed on the very answer that also carried the last
+                // bytes of a session is still a greeting agreed, and the
+                // schedule is owed its reset for it.
+                let first = agreed && !self.agreed;
+                self.agreed |= agreed;
                 if kept < offered {
                     self.far = Far::Closed;
                     self.fail(
@@ -385,12 +530,12 @@ impl<'chan> Relay<'chan> {
                             refused: offered.saturating_sub(kept),
                         },
                     );
-                    return;
+                    return first;
                 }
                 match asked {
                     // The far end holds a session from here on, and owes one
                     // answer to every item until it is closed.
-                    RelayOperation::Open => self.far = Far::Open,
+                    RelayOperation::Open(_) => self.far = Far::Open,
                     RelayOperation::Close(_) => self.far = Far::Closed,
                     RelayOperation::Deliver | RelayOperation::Poll => {}
                 }
@@ -398,12 +543,14 @@ impl<'chan> Relay<'chan> {
                     self.far = Far::Closed;
                     self.end_carried(stream);
                 }
+                first
             }
             Claimed::Refused(reason) => {
                 // Every refusal publishes a closed session, so the far end holds
                 // nothing to close.
                 self.far = Far::Closed;
                 self.fail(stream, RelayFailure::Refused(reason));
+                false
             }
             Claimed::Faulted(fault) => {
                 // The far end may or may not still hold a session: a reply this
@@ -414,9 +561,10 @@ impl<'chan> Relay<'chan> {
                 self.fail(stream, RelayFailure::Faulted(fault));
                 if self.far == Far::Open && !self.closing_after_failure {
                     self.closing_after_failure = true;
-                    return;
+                    return false;
                 }
                 self.far = Far::Closed;
+                false
             }
         }
     }
@@ -433,7 +581,7 @@ impl<'chan> Relay<'chan> {
     fn issue(
         &mut self,
         now: Option<Monotonic>,
-        stream: &mut impl Onboarding,
+        stream: &mut impl Relayed,
     ) -> (bool, Option<RelayReport>) {
         if self.outstanding.is_some() {
             return (false, None);
@@ -445,8 +593,12 @@ impl<'chan> Relay<'chan> {
             let Some(session) = session else {
                 return (false, None);
             };
+            // The half is the stream's own, so one value reaches both ends.
             self.carried = Some(session);
-            return (self.ask(stream, now, RelayOperation::Open, &[]), None);
+            return (
+                self.ask(stream, now, RelayOperation::Open(session.half), &[]),
+                None,
+            );
         };
         if session != Some(carried) {
             // The connection this session ran on is gone or has been replaced.
@@ -509,7 +661,7 @@ impl<'chan> Relay<'chan> {
     /// admissible on a path a peer paces.
     fn ask(
         &mut self,
-        stream: &mut impl Onboarding,
+        stream: &mut impl Relayed,
         now: Option<Monotonic>,
         operation: RelayOperation,
         payload: &[u8],
@@ -537,7 +689,7 @@ impl<'chan> Relay<'chan> {
     /// The window was taken while this end tried to issue an item. The session
     /// ends here and the far end is given up on rather than closed: a close
     /// would need the very window that was refused.
-    fn refuse_window(&mut self, stream: &mut impl Onboarding) {
+    fn refuse_window(&mut self, stream: &mut impl Relayed) {
         self.far = Far::Closed;
         self.fail(stream, RelayFailure::Busy);
     }
@@ -545,7 +697,7 @@ impl<'chan> Relay<'chan> {
     /// Record a failure and take the connection down with it, keeping the first:
     /// what went wrong first is what an operator has to look at, and a later
     /// consequence of it would displace the cause.
-    fn fail(&mut self, stream: &mut impl Onboarding, failure: RelayFailure) {
+    fn fail(&mut self, stream: &mut impl Relayed, failure: RelayFailure) {
         if self.failure.is_none() {
             self.failure = Some(failure);
         }
@@ -558,13 +710,13 @@ impl<'chan> Relay<'chan> {
     /// close belongs to the session it was decided for, and a peer that resets
     /// and reconnects between two passes has a different one running by the time
     /// the close is acted on. Naming it costs a comparison and makes ending the
-    /// wrong session unrepresentable — `Onboarding::end_session` refuses a name
+    /// wrong session unrepresentable — `Relayed::end_session` refuses a name
     /// it does not hold — where an unnamed close hands a peer the new session as
     /// the price of the old one.
     ///
     /// Nothing carried is nothing to end, which is the state before the first
     /// open and after the account is closed.
-    fn end_carried(&self, stream: &mut impl Onboarding) {
+    fn end_carried(&self, stream: &mut impl Relayed) {
         if let Some(carried) = self.carried {
             stream.end_session(carried);
         }
@@ -582,7 +734,7 @@ impl<'chan> Relay<'chan> {
     /// the transport still holds the connection there is nothing to take yet and
     /// the live ending is what a close carries — a peer that hung up has already
     /// fixed it, and a session with neither end finished has nothing to close.
-    fn ending(&mut self, stream: &mut impl Onboarding) -> OnboardEnd {
+    fn ending(&mut self, stream: &mut impl Relayed) -> OnboardEnd {
         if let Some(taken) = stream.take_ending() {
             self.ended = Some(taken);
         }
@@ -600,13 +752,13 @@ impl<'chan> Relay<'chan> {
     }
 
     /// Write the close for this session, carrying how it ended.
-    fn close(&mut self, stream: &mut impl Onboarding, now: Option<Monotonic>) -> bool {
+    fn close(&mut self, stream: &mut impl Relayed, now: Option<Monotonic>) -> bool {
         let ending = relay_ending(self.ending(stream));
         self.ask(stream, now, RelayOperation::Close(ending), &[])
     }
 
     /// Close the session's account, if there is one to close.
-    fn finish(&mut self, stream: &mut impl Onboarding) -> Option<RelayReport> {
+    fn finish(&mut self, stream: &mut impl Relayed) -> Option<RelayReport> {
         self.carried?;
         let ended = self.ending(stream);
         let report = RelayReport {
@@ -618,6 +770,7 @@ impl<'chan> Relay<'chan> {
         };
         self.carried = None;
         self.far = Far::Closed;
+        self.agreed = false;
         self.polled = false;
         self.closing_after_failure = false;
         self.ended = None;
@@ -676,6 +829,16 @@ pub struct Answered {
     /// it as a closed session, which is what takes the connection down at the
     /// end that owns it.
     pub finished: bool,
+    /// Whether the protocol has **agreed a greeting** with the peer at some
+    /// point in this session. A level rather than an edge: the relay publishes
+    /// it on every answer after the first that sets it, so a wakeup that
+    /// coalesced with another cannot lose the fact.
+    ///
+    /// It is the one thing the network end may start its redial schedule afresh
+    /// on, which is why it is the protocol's word and not the transport's: a
+    /// server that accepts a connection and closes it is exactly the peer a
+    /// reset on a completed handshake would reward.
+    pub agreed: bool,
 }
 
 /// The protocol that terminates an onboarding session.
@@ -694,13 +857,25 @@ pub struct Answered {
 /// the pacing. This crate reads none of them and bounds every quantity it hands
 /// on.
 pub trait Terminator {
-    /// Begin a session, discarding whatever the last one left.
-    fn opened(&mut self);
+    /// Begin a session on `half`, discarding whatever the last one left. The half
+    /// is a parameter and never worked out here, for the reason [`Half`] carries.
+    fn opened(&mut self, half: Half);
 
     /// Take what the peer sent — empty, where the network end is only asking
     /// whether there is anything to send — and write what goes back into
     /// `answer`.
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered;
+
+    /// Whether the protocol has agreed a greeting with the peer in the session
+    /// it holds now.
+    ///
+    /// Asked rather than remembered by this crate, so the fact has one home: the
+    /// protocol is the only thing that can know it, and a copy kept here would be
+    /// a second answer to drift from the first. Answered `false` by a protocol
+    /// that has no greeting to agree, which is what the onboarding server is.
+    fn agreed(&self) -> bool {
+        false
+    }
 
     /// The session is over, however it ended.
     fn closed(&mut self);
@@ -844,7 +1019,7 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             // network end left waiting cannot tell a refusal from a hang.
             return self.refuse(demand, RelayRefusal::NoSuchOperation, RefusalDetail::None);
         };
-        if operation == RelayOperation::Open {
+        if let RelayOperation::Open(half) = operation {
             // **An open is the beginning of a session and the end of any this
             // end still held.** The network end is the only end that opens one,
             // so its open is the newer fact and whatever this end still believed
@@ -860,10 +1035,11 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
                 .session
                 .map(|held| held.finished(OnboardEnd::Forgotten));
             self.session = Some(Held::default());
-            self.terminator.opened();
+            self.terminator.opened(half);
             // Nothing goes back with an open: a session that has heard nothing
-            // from the peer has nothing to say to it.
-            self.publish(demand, 0, false);
+            // from the peer has nothing to say to it, and nothing has been
+            // agreed with an end that has not spoken.
+            self.publish(demand, 0, false, false);
             return TerminatingPass {
                 refused: None,
                 report,
@@ -880,7 +1056,7 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             // Handled above; an open cannot reach here. A poll is the protocol's
             // turn to speak without having been handed anything, so it is a turn
             // with nothing delivered rather than an answer of nothing.
-            RelayOperation::Open | RelayOperation::Poll => self.turn(demand, 0),
+            RelayOperation::Open(_) | RelayOperation::Poll => self.turn(demand, 0),
             RelayOperation::Deliver => self.deliver(demand),
             RelayOperation::Close(ending) => {
                 // Answered as closed, which is what makes the network end stop
@@ -890,8 +1066,9 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
                 // Counted before the session is taken, so the item that ended it
                 // is in its own account — and so the two domains' `relayed`
                 // counts are the same number rather than differing by the close.
+                let agreed = self.terminator.agreed();
                 self.terminator.closed();
-                self.publish(demand, 0, true);
+                self.publish(demand, 0, true, agreed);
                 TerminatingPass {
                     refused: None,
                     report: self
@@ -942,7 +1119,11 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             ..
         } = self;
         let received = records.get(..taken).unwrap_or_default();
-        let Answered { sent, finished } = terminator.advance(received, answer);
+        let Answered {
+            sent,
+            finished,
+            agreed,
+        } = terminator.advance(received, answer);
         // Clamped rather than trusted: a length past the buffer is this
         // appliance's own defect, and no panic is admissible on a path a peer
         // paces.
@@ -950,7 +1131,7 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
         if finished {
             self.terminator.closed();
         }
-        self.publish(demand, sent, finished);
+        self.publish(demand, sent, finished, agreed);
         TerminatingPass {
             refused: None,
             report: finished
@@ -965,11 +1146,16 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
     ///
     /// The bytes answered with are counted as the channel published them rather
     /// than as they were offered: what the account states is what crossed.
-    fn publish(&mut self, demand: RelayDemand, sent: usize, closed: bool) {
+    fn publish(&mut self, demand: RelayDemand, sent: usize, closed: bool, agreed: bool) {
         let Self {
             responder, answer, ..
         } = self;
-        let published = responder.answered(demand, answer.get(..sent).unwrap_or_default(), closed);
+        let published = responder.answered(
+            demand,
+            answer.get(..sent).unwrap_or_default(),
+            closed,
+            agreed,
+        );
         if let Some(held) = self.session.as_mut() {
             held.relayed = held.relayed.saturating_add(1);
             held.sent = held.sent.saturating_add(published as u64);

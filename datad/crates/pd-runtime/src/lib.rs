@@ -567,9 +567,10 @@ pub use owner::{OwnershipChange, OwnershipWatch};
 pub use pipeline::{Configuration, Ownership, PolicySweep, Tracking};
 pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
 pub use relay::{
-    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered,
-    DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Relay, RelayFailure, RelayPass, RelayReport,
-    TerminatedSession, Terminating, TerminatingPass, Terminator,
+    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered, ChannelStream,
+    DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Half, Relay, RelayFailure, RelayPass,
+    RelayReport, RelaySession, Relayed, TerminatedSession, Terminating, TerminatingPass,
+    Terminator,
 };
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,

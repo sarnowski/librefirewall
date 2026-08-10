@@ -59,8 +59,9 @@
 //!
 //! # It is woken by frames and by the passage of time
 //!
-//! Every deadline this domain holds — a retransmission, a reaping, and one day a
-//! reconnection backoff and an acknowledgement cadence — is judged on a pass, and
+//! Every deadline this domain holds — a retransmission, a reaping, the
+//! reconnection backoff, and one day an acknowledgement cadence — is judged on a
+//! pass, and
 //! a pass happens when this domain is woken. A silent link produces no frame, so
 //! until the clock domain gained a timer those deadlines could not be reached at
 //! all on the one condition they exist for. That domain now signals this one on a
@@ -111,11 +112,11 @@
 //! the renderer walks one uniform array rather than seven regions plus a live
 //! read of its own counters.
 //!
-//! # Deviation from the design: the endpoint is plain HTTP, and it now takes writes
+//! # Deviation from the design: the HTTP endpoint carries no TLS
 //!
 //! The design requires the management API to carry encryption, authentication and
-//! read/write authorization through an mTLS certificate pair. **None of it exists.**
-//! There is no TLS in this appliance and this domain authenticates nobody, so
+//! read/write authorization through an mTLS certificate pair. **The HTTP surface
+//! on this port has none of it**: this domain authenticates nobody there, so
 //! **anything that can reach the management port can read every metric this node
 //! exposes, download every packet it has recorded, read its configuration, and
 //! replace that configuration** — which is to say, decide what this firewall
@@ -123,15 +124,38 @@
 //! required TLS termination and certificate handling exist. `GET /logs` is still
 //! absent and answers 404 rather than being stubbed.
 //!
-//! # It carries an onboarding session's ciphertext and decides nothing about it
+//! The two *other* connections this port carries do have it, and neither of them
+//! is that surface: the onboarding session an administrator opens, and the
+//! channel this appliance dials. Both terminate where the keys are, which is not
+//! here.
 //!
-//! The port answers on a second listening port, and what arrives there is not a
-//! protocol this domain speaks. Every byte of it is moved into a region the
-//! cryptography domain reads, and every byte that comes back is put on the
-//! wire unread: TLS terminates where the keys are, and the keys are not here.
-//! **This domain holds no key, no session secret and no plaintext**, and the
-//! relay's ABI has no field for one in either direction — see
-//! `pd_runtime::relay`, which is where the bounds on that handover live.
+//! # It carries two sessions' ciphertext and decides nothing about either
+//!
+//! The port answers on a second listening port, and it dials out on a third
+//! connection of its own; what crosses either is not a protocol this domain
+//! speaks. Every byte is moved into a region the cryptography domain reads, and
+//! every byte that comes back is put on the wire unread: TLS terminates where the
+//! keys are, and the keys are not here. **This domain holds no key, no session
+//! secret and no plaintext**, and the relay's ABI has no field for one in either
+//! direction — see `pd_runtime::relay`, which is where the bounds on that
+//! handover live.
+//!
+//! **One relay carries both, and never both at once.** Which half a pass carries
+//! is this domain's to decide, because it owns both transports and is the only
+//! domain that knows which of them a connection arrived on; it decides once per
+//! session and states the answer on the open, and the domain that terminates the
+//! session speaks the protocol it was told. A session keeps the relay until its
+//! account is closed, an appliance taking an owner in the middle of the very
+//! session that installs the package. The two halves are not two eras either: an
+//! owned appliance goes on serving the onboarding surface, where what it serves
+//! is the refusal saying it has an owner.
+//!
+//! What this domain learns back about the session is **one word**: whether the
+//! protocol above agreed a greeting with the far end. It is the only thing that
+//! starts the redial schedule afresh, and it has to come from up there — a
+//! connection that came up is not an agreement, and a server that accepts every
+//! connection and closes it is exactly the peer a reset on a completed handshake
+//! would reward.
 //!
 //! What it costs is the second send capability named below, and what that buys
 //! whoever reaches this domain is a wakeup on a domain holding no device, no
@@ -163,11 +187,12 @@ use lfw_log::{
 };
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    CalibrationRefused, ClockCalibration, ConfigHandover, ConfigReply, ConfigRequest,
-    Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage, ForwardRings, Hop,
-    Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OnboardCounters, OpenError, PdClock, Pool,
-    RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
-    StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
+    CalibrationRefused, ChannelStream, ClockCalibration, ConfigHandover, ConfigReply,
+    ConfigRequest, Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage,
+    ForwardRings, Half, Hop, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OnboardCounters,
+    OpenError, PdClock, Pool, RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport,
+    Resolutions, ReturnRing, StatsRegions, Via, Wait, attach_region, log_sample,
+    read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -247,6 +272,14 @@ fn relay_refusal(failure: RelayFailure) -> Refusal {
         RelayFailure::Faulted(RelayFault::ClosedUnknown { closed }) => (
             "relay-closed-unknown",
             RefusalDetail::One(u64::from(closed)),
+        ),
+        // Its own token rather than the closed word's, because guessing costs
+        // something different: read as agreed it would start a redial schedule
+        // afresh that no far end earned, and read as not it would leave an
+        // appliance whose channel is up backing off as though it were down.
+        RelayFailure::Faulted(RelayFault::AgreedUnknown { agreed }) => (
+            "relay-agreed-unknown",
+            RefusalDetail::One(u64::from(agreed)),
         ),
         // The bound that was spent, in milliseconds, because the token alone
         // says a far end went quiet and not how long this end waited.
@@ -328,9 +361,10 @@ struct OutboundChannel {
     established: bool,
     /// When the next attempt may open, and how long the wait after a failure
     /// may be. **The only thing that resets it is a greeting agreed with the far
-    /// end**, which is a thing this domain cannot yet do — so every schedule
-    /// here goes on doubling, which is exactly what a server that refuses every
-    /// connection must not be able to shorten.
+    /// end** — the exchange the domain that terminates the session reports over
+    /// the relay, and nothing else. A connection that came up is not one: a
+    /// server that accepts every connection and closes it is exactly the peer a
+    /// reset on a completed handshake would let invite a tight redial loop.
     schedule: Reconnect,
     /// Where the store domain published this appliance's management plane, as
     /// this domain last read it. It is what tells the two silences apart on the
@@ -361,20 +395,56 @@ impl OutboundChannel {
         }
     }
 
+    /// Whether an attempt of this appliance's own is open, which is what claims
+    /// the relay for the channel half. **The attempt and not its connection**: a
+    /// claim made from the connection would leave the window between a `SYN` and
+    /// the handshake open for the onboarding surface to take the relay and hold
+    /// it while the channel sat established with nothing carrying it.
+    const fn attempting(&self) -> bool {
+        self.running
+    }
+
+    /// The greeting the far end agreed, which is the one thing that starts the
+    /// schedule afresh.
+    ///
+    /// Reported by the domain that terminates the session, over the relay,
+    /// because it is the only party that can know it: this domain carries the
+    /// bytes and reads none of them. **A connection coming up is deliberately
+    /// not this** — the contract's rule and not a simplification, since a server
+    /// that accepts every connection and closes it is exactly what a reset on a
+    /// completed handshake would hand a redial loop.
+    fn agreed(&mut self) {
+        self.schedule.established();
+    }
+
     /// Carry the channel forward by one wakeup.
     ///
     /// A pass either opens an attempt, moves the running one, reports one that
     /// came up, or reports one that ended and schedules the next. A pass over a
     /// port with no address yet does nothing at all, which is the ordinary state
     /// of a node between boot and its first commit.
+    ///
+    /// `relayed` is whether the relay's account of a session is still open.
+    /// **Both ends of an attempt wait on it**, and the reason is identity rather
+    /// than tidiness: the transport numbers its connections independently of the
+    /// relay's life, so an attempt opened before the last one's account was
+    /// closed could carry the same connection id and be read there as the last
+    /// session continuing — and the session the relay is closing is the one this
+    /// domain would otherwise have dropped out from under it, taking the ending
+    /// it reports with it. Both waits are bounded by the relay's own answer
+    /// timeout whatever the far end does.
     fn drive(
         &mut self,
         stage: &mut EndpointStage<'static>,
         endpoint: &ManagementEndpoint,
         now: Monotonic,
         sink: &dyn Sink,
+        relayed: bool,
     ) {
         if !self.running {
+            if relayed {
+                return;
+            }
             self.open(stage, endpoint, now, sink);
         }
         if !self.running {
@@ -392,16 +462,18 @@ impl OutboundChannel {
         let Some(ended) = stage.dial_ended() else {
             return;
         };
+        if relayed {
+            return;
+        }
         // Read before the close, which drops the session and everything it
         // watched: the counts are the evidence beside the token, and a token
         // with no evidence is a failure an operator cannot act on.
         let hop = stage.dial_facts();
         stage.close_dial();
         self.running = false;
-        // The attempt is over and nothing was agreed with the far end, so the
-        // schedule goes on rather than starting fresh. This is the whole of what
-        // keeps a server that closes every connection from inviting a tight
-        // redial loop.
+        // The attempt is over. Whether the schedule goes on doubling or starts
+        // afresh was decided when the far end agreed a greeting, or did not:
+        // this draws the next wait from wherever the schedule now stands.
         let wait = self.schedule.failed(now);
         self.report(stage, sink, outcome_of(ended), hop, Some(ended), wait);
     }
@@ -950,21 +1022,56 @@ impl Handler for Management {
         // shard is published again here, so a scrape reads the channel's own
         // counters as of this pass rather than the one before it.
         if let Some(now) = now {
-            running
-                .channel
-                .drive(&mut running.stage, running.endpoint, now, &running.sink);
-            // The onboarding port, after the drain so a record that arrived in
-            // this very pass is handed over in it, and before the send below so
-            // an answer that came back goes out in it too. One item crosses per
-            // pass — the channel's window is one — and the wakeup it owes is
-            // sent here because the capability is this domain's.
-            let pass = running.relay.poll(Some(now), &mut running.stage);
+            running.channel.drive(
+                &mut running.stage,
+                running.endpoint,
+                now,
+                &running.sink,
+                running.relay.carrying().is_some(),
+            );
+            // **Which of the two connections the relay carries this pass**: the
+            // session already open for as long as its account lasts, and between
+            // sessions the attempt this domain has open — the channel wherever
+            // one is, the onboarding surface otherwise. Ownership is not
+            // consulted, an owned appliance serving that surface too. What the
+            // onboarding half can hold the relay for is bounded by the transport
+            // rather than the peer: one connection at a time, reaped on the
+            // endpoint's own idle timer.
+            let half = running
+                .relay
+                .carrying()
+                .unwrap_or(if running.channel.attempting() {
+                    Half::Channel
+                } else {
+                    Half::Onboarding
+                });
+            // The relay, after the drain so a record that arrived in this very
+            // pass is handed over in it, and before the sends below so an answer
+            // that came back goes out in it too. One item crosses per pass — the
+            // channel's window is one — and the wakeup it owes is sent here
+            // because the capability is this domain's.
+            let pass = match half {
+                Half::Channel => running
+                    .relay
+                    .poll(Some(now), &mut ChannelStream(&mut running.stage)),
+                Half::Onboarding => running.relay.poll(Some(now), &mut running.stage),
+            };
             if pass.notify {
                 CRYPTO.notify();
+            }
+            // The one thing that starts the redial schedule afresh, and it
+            // arrives here and nowhere else: the far end agreed a greeting with
+            // the protocol this domain cannot read.
+            if pass.agreed {
+                running.channel.agreed();
             }
             if let Some(report) = pass.report {
                 announce_session(&running.sink, &report, running.stage.onboard_counters());
             }
+            // Both halves, because the relay just pushed onto one of them and a
+            // pass that drove only the other would leave the answer waiting for
+            // the next wakeup.
+            running.stage.drive_dial(now);
             running.stage.drive_onboarding(now);
             running.stage.publish(log);
         }

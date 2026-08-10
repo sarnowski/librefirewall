@@ -596,6 +596,111 @@ node: an operator holding a silent appliance still has only the external act.
   A node whose clock domain never published is not limited at all, which is deliberate — a limiter
   with no clock cannot expire a refusal, and refusing for ever on the only port into an
   unprovisioned appliance is worse than not limiting it.
+- `channel-tls=<outcome>` — **how the TLS handshake on the management channel this appliance
+  *dialled* ended.** The onboarding records above are what an administrator reaching an unowned
+  appliance sees; this is what a fleet operator sees for the rest of that appliance's life, and the
+  two never appear on one node at the same time — an accepted onboarding package shuts the surface
+  for good and publishes where to dial.
+
+  **It is written when an outcome settles and not when the session ends**, which is the difference
+  between this and `onboard-tls=`. The channel is a connection an appliance holds open, so a record
+  written at the close would say nothing at all about a channel that is up and would say it only
+  once the thing an operator was looking for had already gone wrong.
+
+  **One session writes one of these, or two.** The first says how the handshake settled. Where that
+  first record is `established`, a second follows if and when something ends the session that came
+  up — the server refusing it with a fatal alert, the server saying goodbye, a flood, an exhausted
+  arena. The second never appears without the first and never before it, and there is no third: a
+  handshake that failed is the whole of that session's account, and a session that came up ends
+  once. Nothing a server does on the wire adds to the count, so a session a management server abuses
+  a thousand times over leaves the same one or two lines as one it abuses once.
+
+  **`established` on its own means the channel is up. `established` followed by another
+  `channel-tls=` means it came up and then stopped**, and the second record says how. Read the
+  session's records as a sequence, never the first alone: `established` is written the moment the
+  server speaks on the session, and it says nothing about what the server did next.
+
+  A management server that will not have this appliance refuses it **inside the handshake** — it
+  judges the device certificate before it writes any application data, so nothing crosses under the
+  traffic keys and no session comes up. That reads as `channel-tls=alert-received
+  channel-tls-alert=0x0030` with **no** `established` record before it, and beside it
+  `channel-agreed=false`. A server that instead gives up on a session it had already spoken on
+  reads as `established` and *then* the alert.
+
+  It carries whatever its outcome holds, on `onboard-tls=`'s terms exactly: a completed handshake
+  adds `channel-tls-version=`, `channel-tls-suite=` and `channel-tls-group=`; an incompatibility
+  adds `channel-tls-incompatible=`; a refusal this appliance decided adds `channel-tls-error=`; an
+  alert the server sent adds `channel-tls-alert=`; a direction that outgrew what a session holds
+  adds `channel-tls-held=`; and an exhausted arena is followed by the `arena-bytes=` record. One
+  outcome has a field of its own: a certificate the delivered anchor refused adds
+  `channel-tls-certificate=`, which is the whole of what separates the two faults an operator can
+  act on.
+
+  **No key, no traffic secret, no plaintext and no byte of the server's certificate has a
+  representation here.** What crosses is which protocol was settled on, or which of twelve ways it
+  was not.
+
+  `channel-tls=` is one of 12 channel outcomes:
+
+  | channel outcome | what it means |
+  |---|---|
+  | `established` | the handshake completed **and the server went on with the session**. On this end those are two moments: a TLS 1.3 client finishes before the server has judged the certificate it just sent, and the protocol has no message for "accepted" — so a server that refuses this appliance inside the handshake never reaches this token at all. It says the session came up and nothing about what became of it; a second `channel-tls=` record after it says that. |
+  | `no-server-hello` | the server took the connection and sent no byte at all. A management server listening and not answering, which is a different thing from one that is not there — whether anything answered the dial at all is on the `dial-outcome=` record. |
+  | `incompatible` | the server and this appliance had no protocol in common. `channel-tls-incompatible=` says which; a server without post-quantum hybrid key exchange reaches `no-kx-groups-in-common`. |
+  | `misbehaved` | the server kept to the syntax and departed from the protocol — most often by selecting a suite or a group this appliance never offered. It carries no second token, and that is deliberate: the library's own account here names which field of which message a broken or hostile server got wrong across dozens of members, and an administrator answers every one of them the same way. |
+  | `server-certificate-rejected` | **the delivered anchor did not vouch for the certificate the server presented.** `channel-tls-certificate=` says which way it refused, and that is the fact that separates "the wrong anchor was delivered" from "the server is not the one it was delivered for". |
+  | `anchor-rejected` | the delivered anchor is not something a verifier can be built over at all. A fault in what was **installed** rather than in what the peer presented, so the place to look is the package that adopted this node. |
+  | `alert-received` | the server gave up and said why. **This is how the appliance learns its own device certificate was refused**, there being no other message in which a server says so: `0x0030` is an authority it does not know, `0x002a` a certificate it could not read, and `0x002e` a refusal of its own — revocation among them. A server refusing the device certificate does so inside the handshake, so this normally appears with **no** `established` record before it; after one, it is a server that gave up on a session it had already spoken on. |
+  | `refused` | **this appliance** refused the session. `channel-tls-error=` says what it decided; a server that is not speaking TLS at all reaches `invalid-message`. |
+  | `peer-closed` | the server went away. Before the handshake completed, it is how that handshake failed; after an `established` record, it is a session that came up and was shut down cleanly — which is what separates an orderly close from `alert-received` in the same position. |
+  | `arena-exhausted` | the bounded allocator had less than one phase's reserve free. The `arena-bytes=` record beside it says by how much. |
+  | `backlogged` | one direction outgrew what a session holds, and `channel-tls-held=` is what it would have had to hold. A management server pacing this appliance — which a valid certificate does not stop it doing. |
+  | `stalled` | neither the library nor this appliance could make progress. **This appliance's own defect**, and it should never appear. |
+
+  `channel-tls-certificate=` is the adopted TLS library's own account of why the **delivered anchor**
+  refused a server, mirrored whole for the reason `onboard-tls-incompatible=` is: this is the
+  channel's most likely failure and each member is a different thing to go and fix. **The
+  discriminant crosses and the context never does** — several members of the library's own type come
+  in two shapes, one bare and one carrying the name a server presented, the instant it was judged
+  against, or an algorithm identifier, and the two share a token here because the cause is the same
+  and the context is a peer's own bytes. It is one of 17 certificate refusals:
+
+  | certificate refusal | what it means |
+  |---|---|
+  | `unknown-issuer` | the anchor did not issue the certificate the server presented, and no chain from it reaches one that did. **The most likely line in this table**: the package that adopted this appliance carries an authority for another fleet, or the server is holding a certificate from one. |
+  | `bad-signature` | a signature in the chain does not check under the key above it. An authority with the right name and the wrong key. |
+  | `not-valid-for-name` | the certificate does not name the address this appliance dialled. A server certificate issued for the wrong endpoint — and note that the appliance holds it to the address **literal**, never to a name, so a certificate carrying the address only as a common name reaches this. |
+  | `expired` | the certificate is past its validity. Read it beside the `clock-` records: an appliance whose time is wrong reaches this against a perfectly good certificate. |
+  | `not-valid-yet` | the certificate's validity has not begun, on `expired`'s terms and with the clock the same first thing to check. |
+  | `bad-encoding` | a certificate in the chain would not parse. |
+  | `revoked` | a certificate in the chain is on a revocation list. |
+  | `unknown-revocation-status` | revocation could not be established for a certificate that required it. |
+  | `expired-revocation-list` | the revocation list itself is past its validity. |
+  | `unhandled-critical-extension` | a certificate carries a critical extension this appliance's verifier does not implement. |
+  | `unsupported-signature-algorithm` | a signature in the chain uses an algorithm this appliance does not have. |
+  | `unsupported-signature-algorithm-for-public-key` | the algorithm and the key it is used with do not go together. |
+  | `invalid-purpose` | the certificate is not usable for what it was presented for — a server certificate without server authentication among them. |
+  | `invalid-ocsp-response` | a stapled revocation response would not validate. |
+  | `application-verification-failure` | the certificate is valid and the session was refused for another reason. |
+  | `other` | the verifier had no better name for it. |
+  | `unrecognized` | **the library grew a member this build cannot name**, on the incompatibility table's terms. |
+- `channel-agreed=<true|false> channel-version=<n> channel-frames-sent=<n>
+  channel-frames-received=<n>` — **what the framing above one channel session carried.** One record
+  per session, written when the two ends agree a greeting, or at the close for a session that never
+  did.
+
+  `channel-agreed=` is the fact this whole record exists for: it is the **only** thing that starts
+  the appliance's redial schedule afresh. A connection that came up is deliberately not enough — a
+  server that accepts every connection and closes it is exactly the peer a reset on a completed
+  handshake would invite a tight redial loop from — so a channel that reads `channel-tls=established`
+  with `channel-agreed=false` beside it is a node to go and look at, and one that reads both, with no
+  second `channel-tls=` record after them, is a node that is up. `channel-version=` is the protocol
+  version the two settled on and `0` where they
+  settled none; the two counts are frames each way, the greetings included.
+
+  **No frame's payload has a representation here.** What was in them is a customer's recording, a
+  configuration document, or a management server's instruction, and none of it reaches a console
+  line.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -624,17 +729,17 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 20 the `management` domain raises, 39
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 143 the `crypto` domain
+`nic-driver` domain raises, 30 the `clock` domain raises, 21 the `management` domain raises, 39
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 157 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **One of those eight tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
-raise, so its table names both and its tokens are counted in each domain's total — 87 of the 143 and
-87 of the 155. Listing it twice would make a reader learn one vocabulary twice; attributing it to one
-domain would leave the other's records looking unnamed.
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 157
+and 87 of the 155. Listing it twice would make a reader learn one vocabulary twice; attributing it
+to one domain would leave the other's records looking unnamed.
 
 **`nic-driver` and `recorder` share eighteen tokens, and `domain=` is what tells them apart.** Both
 are virtio 1.0 PCI device classes and both run the same handshake in the same order, so a
@@ -755,7 +860,7 @@ anything.
 | the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
 | nowhere to dial (a `ready` record, no `detail=`; the port serves everything else and opens no channel) | `dial-endpoint-unpublished` |
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
-| an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown` |
+| an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown` |
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
 
 **`recorder`.** Its first token is the domain's own, raised before the device is touched at all. The
@@ -823,6 +928,26 @@ of a vector's contents.
 | a session opened on a boot whose cryptography never established (a `ready` record, no `detail=`) | `onboarding-cryptography-unproven` |
 | composing the identity the onboarding surface serves, which happens once at bring-up and never per request (none carries a `detail=`) | `onboarding-key-unencodable`, `onboarding-request-unsignable`, `onboarding-request-unarmourable` |
 | taking delivery of an onboarding package, before a rule of it is read (`detail=` is the arena an upload needs and the arena that was free, on the first; the second carries none) | `upload-window-unavailable`, `upload-unprepared` |
+| the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
+| a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
+
+**The two `channel-*` tokens above the framing's are this appliance's own state and not a
+server's.** `channel-identity-absent` is a node whose store published somewhere to dial and whose
+key holder produced no trust anchor — the two halves of an ownership disagreeing, which is a thing
+to go and look at rather than a channel that failed. `channel-buffer-unavailable` is the megabyte
+the framing reassembles into having never been allocated, which is this appliance's own defect and
+should never appear.
+
+**The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
+rule of the channel's own protocol that the far end broke, and the context the code has for each —
+the byte, the length, the frame type — is a peer's own bytes. A console line is not a place to
+repeat those, so what crosses is which rule, which is what an operator acts on: a header of a
+protocol this is not (`channel-reserved-non-zero`), a frame the server's end may not send
+(`channel-wrong-direction`), a greeting naming a version this build does not speak
+(`channel-version-mismatch`), and a first frame that is not a greeting at all
+(`channel-first-frame-not-hello`) are four different places to look. **A violation closes the
+connection and nothing else happens** — there is no resynchronisation, because where the next header
+starts is exactly what has been lost — and the appliance re-dials under its own schedule.
 
 **The two `upload-*` tokens are this appliance and never the package.** An upload is validated in a
 window taken from this domain's bounded arena, and the window is reserved before a byte of the body
@@ -1128,7 +1253,16 @@ domain, which is running perfectly well and has just said so by refusing. `confi
 belongs to a domain that could not come up under the document its image carries, and reading it as a
 refused submission would be reading a healthy node as a broken one.
 
-## Two things an operator will otherwise read wrong
+## Three things an operator will otherwise read wrong
+
+**`channel-tls=established` is not the last word on a channel session.** It is written the moment
+the server speaks on the session and says nothing about what the server did next, so a session that
+came up and then died reports `established` first and how it died second. Read a session's
+`channel-tls=` records as a sequence: a channel that is genuinely up writes `established`, then
+`channel-agreed=true`, and then nothing further, while one that stopped writes a second
+`channel-tls=` record naming what stopped it. (An appliance whose device certificate the server
+refuses is a different shape again — the refusal happens inside the handshake, so that reads as
+`alert-received` with no `established` at all.)
 
 **A first boot produces two `outcome=applied` records for generation 1.** `LFW-CFG` carries no
 domain field, so the pair looks like a duplicate and is not. The publishing domain commits the

@@ -48,6 +48,7 @@ use std::{
 
 use lfw_log::{DialOutcome, OnboardEnd, Ownership};
 
+use crate::channel_contract::{self, ChannelContract};
 use crate::{
     artifacts::DIST_DISK,
     clock_contract,
@@ -297,10 +298,12 @@ pub(crate) enum DialContract {
     /// appliance and not about the document, so proving it twice would state
     /// the same fact twice.
     ///
-    /// It stops at the handshake because the channel is a **stream** and this
-    /// appliance has nothing to say over one yet: nothing is composed, so what
-    /// the station can observe ends where the connection comes up, and the
-    /// connection is then held rather than closed.
+    /// It stops at the handshake because a station is not a TLS server. The
+    /// appliance now speaks first over the channel — a client hello leaves the
+    /// moment the connection comes up — and this station takes those bytes,
+    /// acknowledges them and answers nothing, which is a management server
+    /// listening and not answering. What the session above makes of that is the
+    /// business of the boots that point a real server at it.
     Judged,
     /// The station misbehaves in the named way, and the appliance must report the
     /// channel as the one outcome that misbehaviour can produce — while the node
@@ -920,6 +923,29 @@ pub(crate) enum Console {
     /// durable, for the anchor's fingerprint and the endpoint it will answer to
     /// — and held to what this run's own certification authority issued.
     JudgedOnTheOnboardingInstall,
+    /// **The channel the appliance dialled, terminated by a real management
+    /// server.**
+    ///
+    /// The narrow shape once more, for the boots whose subject is the session
+    /// the appliance holds open to the plane that owns it. The transcript, the
+    /// clock, the hardware probe and the cryptography domain's bring-up are
+    /// facts about the image that other boots state; what only these can settle
+    /// is whether the client this appliance dials with interoperates with a
+    /// server this project did not write, and says how each attempt ended in a
+    /// vocabulary an operator can act on.
+    ///
+    /// **Both ends are read**, which no other console shape does: the appliance's
+    /// own records for what it made of the server, and the server's own record
+    /// of the certificate it validated. A boot that asserted only the first
+    /// would pass against an appliance reporting a session it had invented.
+    ///
+    /// Unlike the shape above it, this one states no port count, because a boot
+    /// that reaches a server on the host is one whose management port carries
+    /// user-mode networking, and nothing injects a frame into that. The evidence
+    /// that the node stayed healthy under the session is the scrape such a boot
+    /// is required to take, which is a stronger statement than a frame tally and
+    /// one this shape does not have to repeat.
+    JudgedOnTheDialledChannelSession,
     /// **An appliance that came back owned, and serves nothing.**
     ///
     /// The other half of the claim above, and the half no single boot can make:
@@ -951,6 +977,13 @@ pub(crate) struct Scenario {
     /// Whether this boot opens a session on the appliance's onboarding port, and
     /// how the station on this end of it behaves.
     onboard: OnboardContract,
+    /// Which management server — if any — stands at the far end of the channel
+    /// this appliance dials, and what its own record of the session is held to.
+    ///
+    /// Separate from `dial`, which is the *transport's* contract and is stated
+    /// by a station at frame level: the two are different layers and different
+    /// backings, since a station and a real server cannot both be on one wire.
+    channel: crate::channel_contract::ChannelContract,
     /// Which accelerator QEMU must use. All but one scenario take whatever the
     /// machine offers; the one that does not is what proves the shipped image
     /// runs on the emulator as well as on a processor.
@@ -1154,6 +1187,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Onboards,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // Fresh, necessarily: the whole subject is an appliance that has never
         // had an owner being given one.
@@ -1168,6 +1202,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1180,6 +1215,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Judged,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1192,6 +1228,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1208,6 +1245,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1232,6 +1270,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1253,6 +1292,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1277,6 +1317,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Policy,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1289,6 +1330,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Policy,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1318,6 +1360,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Stateful,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1330,6 +1373,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Stateful,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1388,6 +1432,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Reconfiguration,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1428,6 +1473,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Revocation,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1462,6 +1508,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Related,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1474,6 +1521,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Lifecycle,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1517,6 +1565,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Flood,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1570,6 +1619,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // Fresh, so this is the whole fail-closed picture: an appliance out of the
         // box has no owner and no committed configuration, and it must carry
@@ -1615,6 +1665,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::Emulated,
         store: StoreMedium::Fresh,
     },
@@ -1654,6 +1705,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1666,6 +1718,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the boot above minted on. It must precede this one in this
         // table, and `StoreDisk::carried` says so by name when it does not.
@@ -1696,6 +1749,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the two boots above ran on, which by here carries an
         // identity that has already been shown to survive a reboot — so what this
@@ -1744,6 +1798,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::SilentToTheDial),
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1756,6 +1811,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::ResetsTheDial),
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1768,6 +1824,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::AcknowledgesTheWrongSequence),
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1789,6 +1846,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Misbehaves(DialMisbehaviour::AnswersForAnotherAddress),
         onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
@@ -1831,6 +1889,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Completes),
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1849,6 +1908,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Abandons),
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1868,6 +1928,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Session(OnboardBehaviour::Crowds),
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1903,6 +1964,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Handshakes,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1938,6 +2000,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Unowned,
         dial: DialContract::Answered,
         onboard: OnboardContract::Requests,
+        channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
     },
@@ -1982,10 +2045,76 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Routed,
         dial: DialContract::Answered,
         onboard: OnboardContract::Owned,
+        // **Nothing is listening**, which this boot now states rather than
+        // leaving to whatever happens to hold the port: the appliance dials the
+        // endpoint its package named, the user-mode stack answers with a reset,
+        // and the console must carry the transport's own token and no session
+        // record at all.
+        channel: ChannelContract::NoServer,
         accelerator: Accelerator::WhateverTheMachineOffers,
         // The medium the boot above was adopted on. It must precede this one in
         // this table, and `StoreDisk::carried` says so by name when it does not.
         store: StoreMedium::CarriedFrom("onboarding-adopted"),
+    },
+    // THE FOUR BOOTS WHOSE SUBJECT IS THE CHANNEL THE APPLIANCE DIALS, and they
+    // come last because every one of them needs the medium the first boot left:
+    // a node nobody owns has been told nowhere to dial and opens no channel at
+    // all, so the contract could not even be stated against one.
+    //
+    // The first three point a real `openssl s_server` at the appliance through
+    // QEMU's user-mode stack, which turns the appliance's connection to its
+    // gateway into a connection to this host's loopback. The fourth points
+    // nothing at it, which is the third of the three ways a channel does not
+    // come up and the only one that never reaches TLS — and it is
+    // `onboarding-owned` above rather than a boot of its own, because that boot
+    // already dials into a port nothing holds and asserting it there costs no
+    // extra boot.
+    Scenario {
+        name: "channel-established",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Established,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
+    },
+    // The delivered anchor refusing the server, which is the channel's most
+    // likely failure and the one whose token sends an operator to the package
+    // that adopted the node rather than to the node.
+    Scenario {
+        name: "channel-anchor-refuses",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::AnchorRejectsTheServer,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
+    },
+    // And the other direction: a server that will not have this appliance. TLS
+    // 1.3 gives a client no message saying its certificate was accepted, so the
+    // only way this appliance can learn it was refused is the alert — which is
+    // what this boot exists to prove reaches the console as a number an operator
+    // can look up, with no session coming up beside it.
+    Scenario {
+        name: "channel-server-refuses",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::RejectsTheAppliance,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
     },
 ];
 
@@ -2084,6 +2213,20 @@ pub(crate) fn copied_medium_scenario_count() -> usize {
     SCENARIOS
         .iter()
         .filter(|scenario| matches!(scenario.store, StoreMedium::CopiedFrom(_)))
+        .count()
+}
+
+/// How many scenarios hold the appliance to the channel it dials, and to what a
+/// management server made of it.
+///
+/// Read as data by [`crate::reference_contract`] rather than restated in prose,
+/// on [`copied_medium_scenario_count`]'s terms: a boot moved off a channel
+/// contract changes what the gate proves about the one connection an appliance
+/// holds open for its whole life.
+pub(crate) fn channel_scenario_count() -> usize {
+    SCENARIOS
+        .iter()
+        .filter(|scenario| scenario.channel.judged())
         .count()
 }
 
@@ -2420,6 +2563,7 @@ fn run_scenario(
         | Console::JudgedOnTheOnboardingHandshakes
         | Console::JudgedOnTheOnboardingRequests
         | Console::JudgedOnTheOnboardingInstall
+        | Console::JudgedOnTheDialledChannelSession
         | Console::JudgedOnTheOwnedApplianceServingNothing => {}
     }
 
@@ -2437,6 +2581,17 @@ fn run_scenario(
     } else {
         ManagementBacking::Socket
     };
+    // **Before QEMU**, which is the whole of how an outbound channel fits a
+    // harness whose other contracts are clients: there is nothing to connect to
+    // the appliance, so a server started once the boot had settled would already
+    // have been dialled, reset, and be into the second wait of a schedule that
+    // doubles.
+    let server = channel_contract::serve(
+        root,
+        &root.join(crate::artifacts::BUILD_DEV_CA_DIR),
+        scenario.channel,
+    )
+    .map_err(|error| format!("scenario {name}: {error}"))?;
     let booted = boot_and_forward(
         root,
         &disk,
@@ -2552,6 +2707,37 @@ fn run_scenario(
             }
         }
     };
+    // **Both ends of the channel**, wherever a boot names a contract for one:
+    // what the appliance made of the server, and what the server made of the
+    // appliance. Neither alone would do — a boot reading only the console would
+    // pass against an appliance reporting a session it had invented.
+    //
+    // Judged here rather than inside the console match, because a boot whose
+    // subject is something else can still state what its channel did: the one
+    // that comes back owned dials into a port nothing holds, and asserting that
+    // costs no extra boot.
+    let channelled = if scenario.channel.judged() {
+        // The appliance the store domain printed, read off this very boot's
+        // console: it is what the server's own verification of the client
+        // certificate is held to, so a name taken from anywhere else would be
+        // the harness comparing two of its own values.
+        let device = store_contract::judge(&booted.serial, &log)
+            .map(|reported| reported.device)
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+        let channel = channel_contract::judge(scenario.channel, server, &booted.serial, &device)
+            .map_err(|error| format!("scenario {name}: {error}"))?;
+        println!("{channel}");
+        append_evidence(
+            &log,
+            "the management server this boot pointed at the appliance, and what crossed the \
+             channel it dialled",
+            &channel,
+        )
+        .map_err(|error| format!("scenario {name}: {error}"))?;
+        format!("; {channel}")
+    } else {
+        String::new()
+    };
     // What the store domain said about itself, on the two boots whose subject
     // is an appliance changing hands. Held out here because the claim the pair
     // makes is between two boots and only the run has seen both.
@@ -2567,6 +2753,13 @@ fn run_scenario(
         | Console::JudgedOnARefusal
         | Console::JudgedOnCryptographyAlone
         | Console::JudgedOnTheStoredIdentityAlone => String::new(),
+        // What the session itself did is judged for every boot that names a
+        // channel contract, below, and the node's health by the scrape a
+        // user-mode-networked boot must take. Neither is this arm's to state,
+        // and the port count the shape below it adds is not available here at
+        // all: the frame injection needs a socket-backed port, and a boot that
+        // dials a server on the host cannot have one.
+        Console::JudgedOnTheDialledChannelSession => String::new(),
         Console::JudgedOnTheDialledChannelAndThePortsCount => {
             // The appliance's own account of the channel, held to the one
             // outcome this boot's station can produce.
@@ -2726,8 +2919,8 @@ fn run_scenario(
     let owned = ownership_contract::judge(&booted.serial, owner, &log)
         .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}; {owned}{judged}{scraped}); QEMU \
-         output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}; {owned}{judged}{channelled}{scraped}); \
+         QEMU output is in {}",
         run.config(),
         booted.traffic.summary(),
         log.display()

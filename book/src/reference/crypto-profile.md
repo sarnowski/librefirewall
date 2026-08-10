@@ -170,10 +170,12 @@ through a signing capability that forwards over a channel — so the `Certificat
 server signs is computed in another protection domain, synchronously, in the middle of the
 handshake. That is deliberate rather than incidental: it is the only arrangement that proves the
 delegation where it will actually be used. The client half and the certification authority above
-both are still generated in this domain, standing in for a management server and an anchor this
-appliance has never spoken to.
+both are generated in this domain, and that is what this session is for: it proves the provider, the
+vectors and the delegation against a peer whose every parameter is known, not interoperability. The
+appliance's channel session is where a management server this project did not write comes in, and it
+is judged separately.
 
-One session exercises, in one go, everything the management channel's own handshake will: the
+One session exercises, in one go, everything the management channel's own handshake needs: the
 hybrid key exchange, an ECDSA signature over the transcript, a certificate chain validated against
 a trust anchor, the key schedule, and the record layer in both directions. It is
 **mutually authenticated** — each end presents a certificate this domain issued from its own

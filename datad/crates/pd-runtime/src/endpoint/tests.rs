@@ -1425,3 +1425,81 @@ fn an_onboarding_session_crosses_the_stage_and_leaves_on_the_transmit_pipeline()
     assert!(fixture.stage.onboard_received().is_empty());
     fixture.stage.onboard_consumed(4);
 }
+
+/// The channel half a relay sees, on a port that has no session on it.
+///
+/// **Every method has a defined answer here and none of them is a guess**, which
+/// is the property worth stating: the relay above is driven on every wakeup of a
+/// domain whose channel spends most of its life between attempts, so the shape it
+/// meets when there is nothing to carry is the shape it meets most of the time. A
+/// stream that answered a connection identity it did not have would have the
+/// relay open a session at the far end for a transport that has none.
+#[test]
+fn the_channel_half_of_a_port_with_no_session_carries_nothing() {
+    use crate::relay::Relayed;
+
+    let mut fixture = Fixture::new();
+    let mut stream = crate::relay::ChannelStream(&mut fixture.stage);
+    assert!(
+        stream.session().is_none(),
+        "a port with no dial has no session for the relay to carry"
+    );
+    assert!(stream.received().is_empty());
+    assert!(!stream.peer_closed());
+    assert_eq!(
+        stream.push(b"a client hello"),
+        0,
+        "bytes with nowhere to go are refused rather than counted as sent"
+    );
+    // A close naming a session this stream does not hold is refused, which is
+    // what keeps a decision taken on one wakeup from ending whatever is running
+    // on the next.
+    let named = crate::relay::RelaySession {
+        half: crate::relay::Half::Channel,
+        connection: fixture_connection(),
+    };
+    assert!(!stream.end_session(named));
+    assert!(
+        stream.take_ending().is_none(),
+        "the dialling schedule holds the session until the relay is done, so nothing is kept here"
+    );
+    assert_eq!(stream.ending(), OnboardEnded::Forgotten);
+    // And a close named for the other half is refused whatever the connection
+    // is: the two transports number their connections independently, so the
+    // half is part of the identity rather than beside it.
+    let onboarding = crate::relay::RelaySession {
+        half: crate::relay::Half::Onboarding,
+        connection: fixture_connection(),
+    };
+    assert!(!stream.end_session(onboarding));
+    // The stage itself answers the same way through its own accessors, which is
+    // what the wrapper above is a view of rather than a second account.
+    assert!(fixture.stage.dial_connection().is_none());
+    assert!(!fixture.stage.dial_peer_closed());
+    assert_eq!(fixture.stage.dial_stream_ending(), OnboardEnded::Forgotten);
+    assert!(!fixture.stage.close_dial());
+    fixture.stage.end_dial_session();
+    assert_eq!(fixture.stage.dial_push(b"nothing"), 0);
+    assert!(fixture.stage.dial_received().is_empty());
+    fixture.stage.dial_consumed(1);
+}
+
+/// A connection identity a transport really issued, so the comparisons above are
+/// against a value of the right generation rather than one invented here.
+fn fixture_connection() -> ConnectionId {
+    use core::num::NonZeroU64;
+    let mut stack: lfw_tcp::TcpStack<2> = lfw_tcp::TcpStack::new(
+        Ipv4Address::from_octets([10, 0, 0, 1]),
+        4443,
+        1460,
+        4096,
+        IsnSecret::from_bytes(SECRET),
+    );
+    let hz = NonZeroU64::new(lfw_clock::NANOS_PER_SECOND).expect("a nonzero frequency");
+    let now = lfw_clock::Calibration::new(hz, Ticks(0), 0).monotonic(Ticks(0));
+    let mut out = [0_u8; 128];
+    stack
+        .connect(now, Ipv4Address::from_octets([10, 0, 0, 2]), 443, &mut out)
+        .expect("a dial into an empty table")
+        .connection
+}

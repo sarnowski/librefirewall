@@ -470,6 +470,138 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// How one handshake on the management channel this appliance **dialled**
+    /// ended, as the domain that terminates it reports.
+    ///
+    /// [`OnboardOutcome`]'s mirror on the other end of the appliance's life, and
+    /// under all of its reasoning: one token per cause, because an administrator
+    /// whose fleet has an appliance that will not come back has this appliance's
+    /// console and nothing else.
+    ///
+    /// Ten of these are the ten the server half has, because both ends of a
+    /// handshake fail in the same ten ways. **Two are only a client's**, and they
+    /// are the two an operator most often needs, because only this end validates
+    /// a peer against an anchor somebody delivered to it: whether the anchor
+    /// refused the certificate the server presented, or whether what was
+    /// installed is not an anchor at all. Those send somebody to two different
+    /// places — the server's certificate, and the package that adopted this node.
+    ///
+    /// The server's `NothingInCommon` has no analogue here and its slot is
+    /// [`Self::Misbehaved`]: a client lists what it has and a server picks one,
+    /// so this end learns the pick was wrong rather than that two lists failed
+    /// to intersect, and there is no offer to print beside it.
+    ///
+    /// The order is the wire encoding, so a variant is appended and never
+    /// inserted.
+    ChannelOutcome {
+        /// The handshake completed **and the peer went on with the session**. On
+        /// this end those are two moments: a TLS 1.3 client finishes before the
+        /// server has judged the certificate it just sent, and the protocol has
+        /// no message for "accepted": a server refusing inside the handshake never
+        /// reaches this, and one giving up later reaches it before an alert.
+        Established => "established",
+        /// The peer took the connection and sent no byte at all. A management
+        /// server listening and not answering, which is a different thing from
+        /// one that is not there — whether anything answered the dial is the
+        /// transport's account and rides on the `dial-outcome=` record.
+        NoServerHello => "no-server-hello",
+        /// The peer and this appliance had no protocol in common.
+        /// [`TlsIncompatible`] says which.
+        Incompatible => "incompatible",
+        /// The peer broke the protocol: a server that selected a suite or a
+        /// group this appliance never offered reaches this.
+        ///
+        /// It carries no second token, unlike the three around it, and that is a
+        /// decision rather than an omission. The library's own vocabulary here
+        /// names which field of which message a broken or hostile server got
+        /// wrong across dozens of members, and an administrator answers every
+        /// one of them identically: the server is not speaking this protocol
+        /// correctly. Where the distinction *is* actionable the library puts it
+        /// in a different error, which is what the tokens beside this one carry.
+        Misbehaved => "misbehaved",
+        /// The delivered anchor did not vouch for the certificate the server
+        /// presented. [`TlsCertificateRefusal`] says which way it refused, which
+        /// is the fact that separates "the wrong anchor was delivered" from "the
+        /// server is not the one it was delivered for".
+        ServerCertificateRejected => "server-certificate-rejected",
+        /// The delivered anchor is not something a verifier can be built over at
+        /// all — a fault in what was *installed* rather than in what the peer
+        /// presented. It carries nothing: every way a delivered anchor can be
+        /// unusable has one answer, which is that the package naming it is
+        /// wrong.
+        AnchorRejected => "anchor-rejected",
+        /// The peer gave up with a fatal alert, whose registry code point is on
+        /// the record beside this token. **This is how the appliance learns its
+        /// own certificate was refused**, there being no other message in which
+        /// a server says so.
+        AlertReceived => "alert-received",
+        /// This appliance refused the session. [`TlsRefusal`] says what it
+        /// decided.
+        Refused => "refused",
+        /// The peer went away, before the handshake completed or after it.
+        PeerClosed => "peer-closed",
+        /// The bounded allocator had less than one phase's reserve free. What
+        /// was asked for and what was left is on the `arena-` record beside this
+        /// token.
+        ArenaExhausted => "arena-exhausted",
+        /// A direction outgrew what one session holds, carrying what it would
+        /// have had to hold.
+        Backlogged => "backlogged",
+        /// Neither the library nor this appliance could make progress.
+        Stalled => "stalled",
+    }
+}
+
+closed_vocabulary! {
+    /// Why the delivered anchor refused the certificate a management server
+    /// presented: the adopted TLS library's own `CertificateError`, as a console
+    /// token.
+    ///
+    /// [`TlsIncompatible`]'s third sibling, mirrored whole for that vocabulary's
+    /// reason — and here the reason is at its strongest, because this is the
+    /// **most likely failure the management channel has** and each member is a
+    /// different thing to go and fix: an issuer the anchor does not know is a
+    /// package delivered for another fleet, a certificate outside its window is
+    /// a clock or an expiry, and one that does not name the address dialled is a
+    /// server certificate issued for the wrong endpoint.
+    ///
+    /// **The discriminant travels and the context never does.** Several members
+    /// of the library's type come in two shapes — one bare and one carrying what
+    /// the peer presented, the instant it was judged against, or the algorithm
+    /// identifier it used. Those are a peer's own bytes, so the two shapes share
+    /// one token here: the cause is the same and the context is exactly what a
+    /// console line must not repeat.
+    ///
+    /// The order is the wire encoding, so a variant is appended and never
+    /// inserted.
+    TlsCertificateRefusal {
+        BadEncoding => "bad-encoding",
+        Expired => "expired",
+        NotValidYet => "not-valid-yet",
+        Revoked => "revoked",
+        UnhandledCriticalExtension => "unhandled-critical-extension",
+        UnknownIssuer => "unknown-issuer",
+        UnknownRevocationStatus => "unknown-revocation-status",
+        ExpiredRevocationList => "expired-revocation-list",
+        BadSignature => "bad-signature",
+        UnsupportedSignatureAlgorithm => "unsupported-signature-algorithm",
+        UnsupportedSignatureAlgorithmForPublicKey =>
+            "unsupported-signature-algorithm-for-public-key",
+        NotValidForName => "not-valid-for-name",
+        InvalidPurpose => "invalid-purpose",
+        InvalidOcspResponse => "invalid-ocsp-response",
+        ApplicationVerificationFailure => "application-verification-failure",
+        /// The library's own residual, which a verifier uses for a failure it has
+        /// no better name for. Distinct from [`Self::Unrecognized`] below on
+        /// [`TlsRefusal::Other`]'s terms.
+        Other => "other",
+        /// A member the library grew after this mirror was written, on
+        /// [`TlsIncompatible::Unrecognized`]'s terms.
+        Unrecognized => "unrecognized",
+    }
+}
+
+closed_vocabulary! {
     /// Whether this appliance has an owner, as the domain that decides frames
     /// believes it.
     ///
@@ -813,6 +945,8 @@ mod tests {
         check_vocabulary!(OnboardRefusal);
         check_vocabulary!(TlsIncompatible);
         check_vocabulary!(TlsRefusal);
+        check_vocabulary!(ChannelOutcome);
+        check_vocabulary!(TlsCertificateRefusal);
     }
 
     #[test]

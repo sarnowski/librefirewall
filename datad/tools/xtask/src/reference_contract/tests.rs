@@ -111,6 +111,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/crypto/src/main.rs", &["rdrand-output-stuck"]),
         ("pds/crypto/src/delegate.rs", &["delegated-key-refused"]),
         ("pds/crypto/src/upload.rs", &["upload-window-unavailable"]),
+        ("pds/crypto/src/channel.rs", &["channel-version-mismatch"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         (
             "crates/package/src/refusal.rs",
@@ -154,6 +155,7 @@ fn sound_console() -> String {
                     "rdrand-output-stuck",
                     "delegated-key-refused",
                     "upload-window-unavailable",
+                    "channel-version-mismatch",
                     "install-endpoint-loopback",
                 ][..],
             ),
@@ -188,6 +190,7 @@ fn sound_console() -> String {
                     "rdrand-output-stuck",
                     "delegated-key-refused",
                     "upload-window-unavailable",
+                    "channel-version-mismatch",
                 ][..],
             ),
             (
@@ -299,6 +302,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
                 "rdrand-output-stuck",
                 "delegated-key-refused",
                 "upload-window-unavailable",
+                "channel-version-mismatch",
                 "install-endpoint-loopback",
             ],
         ),
@@ -753,7 +757,8 @@ fn a_stated_count_about_the_gate_is_held_to_the_list_it_is_about() {
     let scenarios = crate::qemu::SCENARIOS.len();
     let sound = format!(
         "The gate boots {scenarios} system scenarios, and the {} scenarios that reach the \
-         management port judge every surface; {} scenarios boot a copy of an owned medium. \
+         management port judge every surface; {} scenarios boot a copy of an owned medium, and {} \
+         scenarios judge the channel the appliance dials. \
          Coverage covers {} library crates, and the {} persistent fuzz targets the gate runs \
          cover the untrusted parsers.",
         crate::qemu::SCENARIOS
@@ -761,6 +766,7 @@ fn a_stated_count_about_the_gate_is_held_to_the_list_it_is_about() {
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
         crate::qemu::copied_medium_scenario_count(),
+        crate::qemu::channel_scenario_count(),
         crate::host::library_crate_count(),
         crate::host::fuzz_target_count(),
     );
@@ -802,14 +808,17 @@ fn a_mention_that_states_no_number_is_left_alone() {
         "Every system scenario boots the release image. The gate boots {scenarios} system \
          scenarios in all, and the {} scenarios that reach the management port are scraped. \
          Most scenarios boot a copy of an owned medium, and {} scenarios boot a copy of an owned \
-         medium in this build. Coverage runs over {} library crates, and the library crates are \
-         all `no_std`. The {} persistent fuzz targets the gate runs always build, and the \
-         persistent fuzz targets the gate runs are listed in one place.",
+         medium in this build. Some scenarios judge the channel the appliance dials, and {} \
+         scenarios judge the channel the appliance dials in this build. Coverage runs over {} \
+         library crates, and the library crates are all `no_std`. The {} persistent fuzz targets \
+         the gate runs always build, and the persistent fuzz targets the gate runs are listed in \
+         one place.",
         crate::qemu::SCENARIOS
             .iter()
             .filter(|scenario| scenario.reaches_the_management_port())
             .count(),
         crate::qemu::copied_medium_scenario_count(),
+        crate::qemu::channel_scenario_count(),
         crate::host::library_crate_count(),
         crate::host::fuzz_target_count(),
     );

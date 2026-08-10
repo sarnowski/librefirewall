@@ -68,8 +68,8 @@ use std::{
 };
 
 use lfw_log::{
-    DialOutcome, MAX_CAUSE_LEN, OnboardOutcome, OnboardRefusal, OnboardRoute, RejectReason,
-    TlsIncompatible, TlsRefusal,
+    ChannelOutcome, DialOutcome, MAX_CAUSE_LEN, OnboardOutcome, OnboardRefusal, OnboardRoute,
+    RejectReason, TlsCertificateRefusal, TlsIncompatible, TlsRefusal,
 };
 use lfw_metrics::{
     ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, MANAGEMENT_PORT_DOMAIN, PORT_DOMAINS, RULE_HITS,
@@ -159,6 +159,11 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         Vocabulary::Causes(&["hardware-probe"]),
     ),
     ("pds/crypto/src/main.rs", Vocabulary::Causes(&["crypto"])),
+    // The management channel this appliance dials: the rules a server can break
+    // in the protocol's own framing, and the two states in which this domain has
+    // no session to open. Named where the decisions are, so scanning the
+    // domain's main file alone would leave the group uncompared.
+    ("pds/crypto/src/channel.rs", Vocabulary::Causes(&["crypto"])),
     // Taking delivery of an onboarding package: the room an upload is validated
     // in, which this domain reserves out of its own arena before it places a
     // byte. Named where the decision is, so scanning the domain's main file
@@ -367,6 +372,14 @@ const STATED_COUNTS: &[StatedCount] = &[
     StatedCount {
         phrase: "persistent fuzz targets the gate runs",
         count: crate::host::fuzz_target_count,
+    },
+    // The boots that point a management server — or deliberately nothing — at
+    // the channel the appliance dials. Held here for the reason the count above
+    // it is: it is stated in prose beside a table nothing else compares it to,
+    // and a boot moved off a channel contract changes what the gate proves.
+    StatedCount {
+        phrase: "scenarios judge the channel the appliance dials",
+        count: crate::qemu::channel_scenario_count,
     },
 ];
 
@@ -834,6 +847,29 @@ fn check_onboarding_vocabularies(console: &str, findings: &mut Vec<String>) {
             total: "request refusals:",
             code: "lfw_log::OnboardRefusal",
             tokens: &OnboardRefusal::ALL.map(OnboardRefusal::name),
+        },
+    );
+    // The dialled channel's own two, which the chapter tabulates beside the
+    // onboarding port's five: the two ends of one appliance's life, and an
+    // operator reading a node is reading one of them.
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["channel outcome", "what it means"],
+            total: "channel outcomes:",
+            code: "lfw_log::ChannelOutcome",
+            tokens: &ChannelOutcome::ALL.map(ChannelOutcome::name),
+        },
+    );
+    check_vocabulary_table(
+        console,
+        findings,
+        &Tabulated {
+            header: ["certificate refusal", "what it means"],
+            total: "certificate refusals:",
+            code: "lfw_log::TlsCertificateRefusal",
+            tokens: &TlsCertificateRefusal::ALL.map(TlsCertificateRefusal::name),
         },
     );
 }

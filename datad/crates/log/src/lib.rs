@@ -69,9 +69,9 @@ pub use detail::{
     Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, MAX_OFFERED_POINTS, Refusal, RefusalDetail,
 };
 pub use event::{
-    ChangeKind, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome, NextHopVia,
-    ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership, Primitive,
-    RejectReason, TlsIncompatible, TlsRefusal, Value,
+    ChangeKind, ChannelOutcome, DialOutcome, Domain, DomainState, Event, Field, GenerationOutcome,
+    NextHopVia, ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership,
+    Primitive, RejectReason, TlsCertificateRefusal, TlsIncompatible, TlsRefusal, Value,
 };
 pub use identifier::{Identifier, IdentifierError, MAX_IDENTIFIER_LEN};
 pub use record::{DecodeError, Vocabulary};

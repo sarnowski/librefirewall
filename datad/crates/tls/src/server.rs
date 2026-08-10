@@ -242,7 +242,7 @@ const fn ended(outcome: OnboardOutcome) -> DomainDetail {
 /// that *adds* a member has to land somewhere, and it lands on a token that
 /// says this build cannot name it rather than on a neighbour that would read as
 /// a diagnosis.
-fn named(incompatible: &PeerIncompatible) -> TlsIncompatible {
+pub(crate) fn named(incompatible: &PeerIncompatible) -> TlsIncompatible {
     match incompatible {
         PeerIncompatible::EcPointsExtensionRequired => TlsIncompatible::EcPointsExtensionRequired,
         PeerIncompatible::ExtendedMasterSecretExtensionRequired => {
@@ -302,7 +302,7 @@ fn named(incompatible: &PeerIncompatible) -> TlsIncompatible {
 /// administrator answers identically — the peer is not speaking this protocol
 /// correctly. Where the difference *is* actionable the library puts it in a
 /// different variant, which is what this list carries.
-fn refusal(error: &Error) -> TlsRefusal {
+pub(crate) fn refusal(error: &Error) -> TlsRefusal {
     match error {
         Error::InappropriateMessage { .. } => TlsRefusal::InappropriateMessage,
         Error::InappropriateHandshakeMessage { .. } => TlsRefusal::InappropriateHandshakeMessage,

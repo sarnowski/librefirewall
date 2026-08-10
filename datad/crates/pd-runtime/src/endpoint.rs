@@ -940,6 +940,22 @@ impl<'ring> EndpointStage<'ring> {
         }
     }
 
+    /// End the channel's session **on `connection`**, answering whether that was
+    /// still the session this stage held.
+    ///
+    /// The connection is named rather than implied, on
+    /// [`Self::onboard_end_session`]'s terms: the terminating domain decides on
+    /// one wakeup and the schedule above may have opened a different attempt by
+    /// the next, and ending the wrong one would hand a peer the new session as
+    /// the price of the old.
+    pub fn end_dial_session_on(&mut self, connection: ConnectionId) -> bool {
+        if self.dial_connection() != Some(connection) {
+            return false;
+        }
+        self.end_dial_session();
+        true
+    }
+
     /// Send whatever the outbound session now owes.
     ///
     /// [`drive_output`](Self::drive_output)'s shape on the half that dials
@@ -1097,8 +1113,70 @@ impl<'ring> EndpointStage<'ring> {
             .map(|session| (session.next_hop(), session.facts()))
     }
 
+    /// The connection the channel's session is running on, or `None` where the
+    /// port has no addressing, no session, a session whose handshake has not
+    /// finished, or one that has ended.
+    ///
+    /// **Held to the handshake at one end deliberately.** What reads this is the
+    /// relay above, and a relay that opened a session at the far end while the
+    /// transport was still resolving or retransmitting would have the domain
+    /// that holds the device key composing a client hello into a connection that
+    /// may never come up — and paying for it out of a bounded arena on every
+    /// attempt of a schedule that never gives up.
+    ///
+    /// **And to the ending at the other**, which is what lets the relay above
+    /// finish: a session it can no longer carry stops being one it holds, so the
+    /// relay closes the far end and closes its account, and the schedule that
+    /// owns the transport session lets it go only once that has happened.
+    #[must_use]
+    pub fn dial_connection(&self) -> Option<ConnectionId> {
+        let session = self.endpoint.as_ref().and_then(Endpoint::outbound)?;
+        if !session.established() || session.phase().ended().is_some() {
+            return None;
+        }
+        session.connection()
+    }
+
+    /// Whether the channel's peer has closed its half.
+    #[must_use]
+    pub fn dial_peer_closed(&self) -> bool {
+        self.endpoint
+            .as_ref()
+            .and_then(Endpoint::outbound)
+            .is_some_and(Session::peer_closed)
+    }
+
+    /// How the channel's session would end if it ended at this instant, in the
+    /// vocabulary both domains report a relayed session in.
+    ///
+    /// The three-value vocabulary and not the transport's ten: what an operator
+    /// reads about *why* a dial failed is the `dial-outcome=` record, which
+    /// carries all ten. What this answers is the narrower question the relay asks
+    /// — which end finished it — so a fold here loses nothing that is reported
+    /// anywhere else.
+    #[must_use]
+    pub fn dial_stream_ending(&self) -> OnboardEnded {
+        self.endpoint.as_ref().and_then(Endpoint::outbound).map_or(
+            OnboardEnded::Forgotten,
+            |session| {
+                if session.peer_closed() {
+                    OnboardEnded::ByPeer
+                } else if session.consumer_closed() {
+                    OnboardEnded::ByConsumer
+                } else {
+                    OnboardEnded::Forgotten
+                }
+            },
+        )
+    }
+
     /// Forget a finished session, so another may be opened. `false` where the
     /// session is still running or there is none.
+    ///
+    /// The caller holds it until the relay above has finished with it, which is
+    /// what keeps [`Self::dial_stream_ending`] answerable for as long as anybody
+    /// asks: everything the ending is read off is inside the session, and
+    /// closing it drops all of it.
     pub fn close_dial(&mut self) -> bool {
         self.endpoint.as_mut().is_some_and(Endpoint::close_outbound)
     }

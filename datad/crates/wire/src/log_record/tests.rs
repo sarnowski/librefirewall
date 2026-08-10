@@ -758,7 +758,7 @@ fn every_token_at_its_cardinality_is_refused_and_one_below_it_accepted() {
 
 #[test]
 fn every_shape_discriminant_outside_its_set_is_refused() {
-    let cases: [(LogRecord, LogRecordError); 21] = [
+    let cases: [(LogRecord, LogRecordError); 23] = [
         (
             LogRecord {
                 kind: 4,
@@ -775,10 +775,33 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 45,
+                detail: 53,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 45 },
+            LogRecordError::DetailKindUnknown { detail: 53 },
+        ),
+        // The dialled channel's own two token words, on the onboarding port's
+        // terms: an outcome or a certificate refusal past its set names nothing
+        // a console line can spell.
+        (
+            LogRecord {
+                detail: LogDetailKind::ChannelEnded.to_bits(),
+                operands: [u64::from(LOG_CHANNEL_OUTCOME_COUNT), 0, 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::ChannelOutcomeUnknown {
+                outcome: u64::from(LOG_CHANNEL_OUTCOME_COUNT),
+            },
+        ),
+        (
+            LogRecord {
+                detail: LogDetailKind::ChannelCertificate.to_bits(),
+                operands: [0, u64::from(LOG_TLS_CERTIFICATE_REFUSAL_COUNT), 0, 0],
+                ..domain_record()
+            },
+            LogRecordError::TlsCertificateRefusalUnknown {
+                refusal: u64::from(LOG_TLS_CERTIFICATE_REFUSAL_COUNT),
+            },
         ),
         // The handshake details' own token words, on the session end's terms:
         // an outcome, an incompatibility or a refusal past its set names
@@ -1303,10 +1326,18 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::DelegatedAnchor,
         LogDetailKind::Published,
         LogDetailKind::DialRetry,
+        LogDetailKind::ChannelHandshake,
+        LogDetailKind::ChannelEnded,
+        LogDetailKind::ChannelIncompatible,
+        LogDetailKind::ChannelRefused,
+        LogDetailKind::ChannelCertificate,
+        LogDetailKind::ChannelAlert,
+        LogDetailKind::ChannelBacklogged,
+        LogDetailKind::ChannelFrames,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(45), None);
+    assert_eq!(LogDetailKind::from_bits(53), None);
 
     for value in [
         LogValueKind::Absent,

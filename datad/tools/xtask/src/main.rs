@@ -70,6 +70,7 @@ use std::{env, error::Error, fmt, fs, io, path::Path, process::ExitCode};
 mod ab_test;
 mod artifacts;
 mod budgets;
+mod channel_contract;
 mod clock_contract;
 mod config_submission_contract;
 mod config_transcript;

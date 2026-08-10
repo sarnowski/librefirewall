@@ -27,8 +27,8 @@ use lfw_clock::UtcNanos;
 use net_headers::Ipv4Address;
 
 use crate::event::{
-    DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, Ownership,
-    Primitive, TlsIncompatible, TlsRefusal,
+    ChannelOutcome, DialOutcome, NextHopVia, OnboardEnd, OnboardOutcome, OnboardRefusal,
+    OnboardRoute, Ownership, Primitive, TlsCertificateRefusal, TlsIncompatible, TlsRefusal,
 };
 
 /// The longest `cause` token [`MAX_LINE_LEN`](crate::MAX_LINE_LEN) is derived
@@ -701,6 +701,119 @@ pub enum DomainDetail<C = &'static str> {
         destination: Ipv4Address,
         port: u16,
         published: bool,
+    },
+    /// How one handshake on the management channel this appliance **dialled**
+    /// ended, and — where it completed — the three code points it settled on.
+    ///
+    /// The first of six that report that handshake, and they share the
+    /// `channel-tls=` key so a boot's channel story is one grep, exactly as the
+    /// onboarding port's seven share `onboard-tls=`. The two families are
+    /// separate keys and not one, because they are the two ends of this
+    /// appliance's life and never run at once: an operator greps for the one
+    /// their node is in.
+    ///
+    /// Code points and not names, on [`Self::OnboardingHandshake`]'s terms.
+    ///
+    /// **No key, no traffic secret, no plaintext and no byte of a peer's
+    /// certificate has a representation here**, and that holds for every one of
+    /// the six. What these carry is which protocol was settled on, or which of a
+    /// closed set of ways it was not.
+    ChannelHandshake {
+        outcome: ChannelOutcome,
+        version: u16,
+        suite: u16,
+        group: u16,
+    },
+    /// A channel handshake that ended carrying nothing beyond the way it did.
+    ///
+    /// The outcomes with no fact of their own — a server that said nothing, one
+    /// that went away, a peer that broke the protocol, an anchor that is not one,
+    /// neither end able to progress — and the one whose facts are a record of
+    /// their own: an exhausted arena is reported with the [`Self::Arena`] record
+    /// beside it.
+    ChannelEnded {
+        outcome: ChannelOutcome,
+    },
+    /// A channel handshake the library and the server had no protocol in common
+    /// for, in the library's own vocabulary.
+    ChannelIncompatible {
+        outcome: ChannelOutcome,
+        incompatible: TlsIncompatible,
+    },
+    /// A channel handshake this appliance refused, as the library's own error
+    /// variant.
+    ChannelRefused {
+        outcome: ChannelOutcome,
+        refusal: TlsRefusal,
+    },
+    /// The way the **delivered anchor** refused the certificate a management
+    /// server presented.
+    ///
+    /// Its own record rather than an arm of [`Self::ChannelRefused`], because it
+    /// is the failure this end exists to be able to report: an appliance whose
+    /// channel will not come up has two candidate faults an operator can act on
+    /// — the wrong anchor was delivered, or the server is not the one it was
+    /// delivered for — and which of the two it is lives in this token.
+    ///
+    /// **The discriminant and never the context.** The library's own type carries
+    /// the name a certificate presented, the instant it was judged against and
+    /// the algorithm it used in several of its members; every one of those is a
+    /// peer's own bytes, and a console line is not a place to repeat them.
+    ChannelCertificate {
+        outcome: ChannelOutcome,
+        refusal: TlsCertificateRefusal,
+    },
+    /// The fatal alert a management server gave up with, as the registry numbers
+    /// it.
+    ///
+    /// **This is how the appliance learns its own device certificate was
+    /// refused**: TLS 1.3 gives a client no message saying its certificate was
+    /// accepted, so the server's verdict arrives as this code point or not at
+    /// all. An unknown authority, a certificate the server would not parse and
+    /// one it refused for a reason of its own are three different numbers and
+    /// three different things to go and fix.
+    ChannelAlert {
+        outcome: ChannelOutcome,
+        alert: u16,
+    },
+    /// A direction of one channel handshake that outgrew what a session holds,
+    /// carrying what it would have had to hold.
+    ///
+    /// The count is this appliance's own arithmetic over a peer's pacing, on
+    /// [`Self::OnboardingBacklogged`]'s terms — and it is worth as much here,
+    /// the peer being a management server that holds a valid certificate and is
+    /// bounded by this number rather than by the handshake.
+    ChannelBacklogged {
+        outcome: ChannelOutcome,
+        held: u64,
+    },
+    /// What one management channel's framing has carried: the greeting exchange,
+    /// and the frames each way over the session that followed it.
+    ///
+    /// Its own record rather than fields beside the handshake's, because it is
+    /// the layer above and answers a different question: the handshake says the
+    /// session came up, and this says the two ends agreed a protocol version and
+    /// went on speaking it. `agreed` is the one fact the redial schedule is reset
+    /// on — a server that accepts a connection and closes it never sets it — so
+    /// a channel that reads `established` with `channel-agreed=false` beside it
+    /// is a node an operator has to go and look at, and one that reads both is a
+    /// node that is up.
+    ///
+    /// **No frame's payload has a representation here.** What is reported is how
+    /// many frames went each way; what was in them is a customer's recording, a
+    /// configuration document, or a management server's instruction, and none of
+    /// them reaches a console line.
+    ChannelFrames {
+        agreed: bool,
+        /// The protocol version the two ends agreed, and zero where they agreed
+        /// none. It is this end's own constant once agreed — a greeting naming
+        /// any other version never becomes one — so it says which build the pair
+        /// settled on rather than what the peer claimed.
+        version: u16,
+        /// Frames this appliance put on the session, the greeting included.
+        sent: u64,
+        /// Frames the server put on it, likewise.
+        received: u64,
     },
 }
 

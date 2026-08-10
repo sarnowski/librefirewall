@@ -516,6 +516,52 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             cursor,
             " dial-retry-in={delay_millis} dial-retry-bound={bound_millis}"
         ),
+        // The management channel's eight, keyed `channel-` throughout: a boot's
+        // channel story is one grep, and it is a different grep from the
+        // onboarding port's because the two are the two ends of this
+        // appliance's life and never run at once.
+        DomainDetail::ChannelHandshake {
+            outcome,
+            version,
+            suite,
+            group,
+        } => write!(
+            cursor,
+            " channel-tls={outcome} channel-tls-version=0x{version:04x} \
+             channel-tls-suite=0x{suite:04x} channel-tls-group=0x{group:04x}"
+        ),
+        DomainDetail::ChannelEnded { outcome } => write!(cursor, " channel-tls={outcome}"),
+        DomainDetail::ChannelIncompatible {
+            outcome,
+            incompatible,
+        } => write!(
+            cursor,
+            " channel-tls={outcome} channel-tls-incompatible={incompatible}"
+        ),
+        DomainDetail::ChannelRefused { outcome, refusal } => {
+            write!(cursor, " channel-tls={outcome} channel-tls-error={refusal}")
+        }
+        DomainDetail::ChannelCertificate { outcome, refusal } => write!(
+            cursor,
+            " channel-tls={outcome} channel-tls-certificate={refusal}"
+        ),
+        DomainDetail::ChannelAlert { outcome, alert } => write!(
+            cursor,
+            " channel-tls={outcome} channel-tls-alert=0x{alert:04x}"
+        ),
+        DomainDetail::ChannelBacklogged { outcome, held } => {
+            write!(cursor, " channel-tls={outcome} channel-tls-held={held}")
+        }
+        DomainDetail::ChannelFrames {
+            agreed,
+            version,
+            sent,
+            received,
+        } => write!(
+            cursor,
+            " channel-agreed={agreed} channel-version={version} channel-frames-sent={sent} \
+             channel-frames-received={received}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -573,9 +619,9 @@ mod tests {
     use crate::detail::{Cause, MAX_CAUSE_LEN};
     use crate::event::Primitive;
     use crate::event::{
-        ChangeKind, DialOutcome, Domain, DomainState, Field, GenerationOutcome, NextHopVia,
-        ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute, RejectReason,
-        TlsIncompatible, TlsRefusal, Value,
+        ChangeKind, ChannelOutcome, DialOutcome, Domain, DomainState, Field, GenerationOutcome,
+        NextHopVia, ObjectKind, OnboardEnd, OnboardOutcome, OnboardRefusal, OnboardRoute,
+        RejectReason, TlsCertificateRefusal, TlsIncompatible, TlsRefusal, Value,
     };
     use crate::identifier::{Identifier, MAX_IDENTIFIER_LEN};
     use net_headers::{Ipv4Address, MacAddress};
@@ -1692,6 +1738,41 @@ mod tests {
                 delay_millis: u64::MAX,
                 bound_millis: u64::MAX,
             },
+            DomainDetail::ChannelHandshake {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                version: u16::MAX,
+                suite: u16::MAX,
+                group: u16::MAX,
+            },
+            DomainDetail::ChannelEnded {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+            },
+            DomainDetail::ChannelIncompatible {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                incompatible: TlsIncompatible::NoCertificateRequestSignatureSchemesInCommon,
+            },
+            DomainDetail::ChannelRefused {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                refusal: TlsRefusal::InappropriateHandshakeMessage,
+            },
+            DomainDetail::ChannelCertificate {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                refusal: TlsCertificateRefusal::UnsupportedSignatureAlgorithmForPublicKey,
+            },
+            DomainDetail::ChannelAlert {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                alert: u16::MAX,
+            },
+            DomainDetail::ChannelBacklogged {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                held: u64::MAX,
+            },
+            DomainDetail::ChannelFrames {
+                agreed: false,
+                version: u16::MAX,
+                sent: u64::MAX,
+                received: u64::MAX,
+            },
             DomainDetail::Onboarded {
                 relayed: u64::MAX,
                 received: u64::MAX,
@@ -1886,6 +1967,57 @@ mod tests {
             any::<(u64, u64)>().prop_map(|(delay_millis, bound_millis)| DomainDetail::DialRetry {
                 delay_millis,
                 bound_millis,
+            }),
+            (0..ChannelOutcome::ALL.len(), any::<(u16, u16, u16)>(),).prop_map(
+                |(outcome, (version, suite, group))| DomainDetail::ChannelHandshake {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    version,
+                    suite,
+                    group,
+                }
+            ),
+            (0..ChannelOutcome::ALL.len()).prop_map(|outcome| DomainDetail::ChannelEnded {
+                outcome: ChannelOutcome::ALL[outcome],
+            }),
+            (0..ChannelOutcome::ALL.len(), 0..TlsIncompatible::ALL.len()).prop_map(
+                |(outcome, incompatible)| DomainDetail::ChannelIncompatible {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    incompatible: TlsIncompatible::ALL[incompatible],
+                }
+            ),
+            (0..ChannelOutcome::ALL.len(), 0..TlsRefusal::ALL.len()).prop_map(
+                |(outcome, refusal)| DomainDetail::ChannelRefused {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    refusal: TlsRefusal::ALL[refusal],
+                }
+            ),
+            (
+                0..ChannelOutcome::ALL.len(),
+                0..TlsCertificateRefusal::ALL.len()
+            )
+                .prop_map(|(outcome, refusal)| DomainDetail::ChannelCertificate {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    refusal: TlsCertificateRefusal::ALL[refusal],
+                }),
+            (0..ChannelOutcome::ALL.len(), any::<u16>()).prop_map(|(outcome, alert)| {
+                DomainDetail::ChannelAlert {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    alert,
+                }
+            }),
+            (0..ChannelOutcome::ALL.len(), any::<u64>()).prop_map(|(outcome, held)| {
+                DomainDetail::ChannelBacklogged {
+                    outcome: ChannelOutcome::ALL[outcome],
+                    held,
+                }
+            }),
+            any::<(bool, u16, u64, u64)>().prop_map(|(agreed, version, sent, received)| {
+                DomainDetail::ChannelFrames {
+                    agreed,
+                    version,
+                    sent,
+                    received,
+                }
             }),
             (any::<(u64, u64, u64)>(), (0..OnboardEnd::ALL.len())).prop_map(
                 |((relayed, received, sent), ended)| DomainDetail::Onboarded {

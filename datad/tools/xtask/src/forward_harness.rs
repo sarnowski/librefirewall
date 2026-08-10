@@ -333,6 +333,16 @@ const DIAL_ATTEMPTS_WHILE_FAILING: usize = 121;
 /// not a retry.
 const DIAL_RESTART_LIMIT: usize = DIAL_ATTEMPTS_WHILE_FAILING;
 
+/// The most a station that answers nothing will take off the channel across a
+/// whole boot before it calls the appliance unbounded.
+///
+/// The appliance's own outbound window times the attempts a scheduled channel
+/// can open in one run: a session whose peer never speaks composes one client
+/// hello and then waits, so a boot's worth of them is one flight per attempt.
+/// Derived from the two bounds rather than measured off a run, so a hello that
+/// grew would still fit and a node emitting without end would still not.
+const DIAL_OFFER_LIMIT: usize = 2048 * DIAL_RESTART_LIMIT;
+
 /// The same bound for a station whose misbehaviour makes the appliance spend its
 /// whole retransmission budget on every attempt.
 ///
@@ -3924,6 +3934,10 @@ struct DialStation {
     /// neither of those explains — a node asking or opening without end.
     resolutions: usize,
     dials: usize,
+    /// Bytes the appliance has put on the channel, accumulated across every
+    /// session of the boot. Counted rather than kept: what a station that
+    /// answers nothing can state about them is how many there were.
+    offered: usize,
 }
 
 impl DialStation {
@@ -3940,6 +3954,7 @@ impl DialStation {
             owed: VecDeque::new(),
             resolutions: 0,
             dials: 0,
+            offered: 0,
         }
     }
 
@@ -5202,11 +5217,22 @@ impl ManagementProbe {
                  a SYN alone",
                 segment.flags
             )),
-            // **The end of what this station can observe.** The channel is a
-            // stream and this appliance has nothing to put on one yet, so what
-            // arrives here is the handshake's own third segment and nothing
-            // after it — the connection is then held rather than closed, which
-            // is what a persistent channel is.
+            // **The end of what this station can observe, and it is no longer
+            // the handshake.** The appliance now speaks first over the channel:
+            // the domain that holds the device key composes a TLS client hello
+            // the moment the connection comes up, and it arrives here as
+            // ordinary stream bytes.
+            //
+            // This station **takes them and answers nothing**, which is the
+            // deliberate half. It is not a TLS server and pretending to be one
+            // would be this harness re-implementing the peer the boots that
+            // point a real server at the appliance already drive; what it states
+            // instead is that the transport under the channel behaves — in
+            // order, acknowledged, and the connection held open — while the
+            // session above it waits for a server that never speaks. A
+            // management server listening and not answering is a real thing for
+            // an appliance to meet, and this is what it looks like from the
+            // wire.
             DialStep::Handshaken => {
                 if !segment.carries(TCP_ACK, TCP_SYN) {
                     return Err(format!(
@@ -5230,20 +5256,48 @@ impl ManagementProbe {
                         segment.sequence, station.expect
                     ));
                 }
-                if !segment.payload.is_empty() {
-                    return Err(format!(
-                        "the appliance put {} bytes on the channel it dialled, and it carries \
-                         nothing yet: what runs over this connection is terminated in a domain \
-                         that has not been wired to it, so a byte here is one no part of this \
-                         appliance composed on purpose",
-                        segment.payload.len()
-                    ));
-                }
                 if segment.carries(TCP_FIN, 0) {
                     return Err(String::from(
                         "the appliance closed the channel it dialled, and a management channel is \
                          a connection it holds: a close here is a node that will re-dial a server \
                          that did nothing wrong",
+                    ));
+                }
+                if !segment.payload.is_empty() {
+                    // Bounded by what the appliance's own outbound window holds,
+                    // which is the one number that says this is a session's
+                    // first flight and not a node emitting without end. A
+                    // station that accumulated whatever arrived would still be
+                    // accumulating on a boot whose channel had gone wrong.
+                    station.offered = station.offered.saturating_add(segment.payload.len());
+                    if station.offered > DIAL_OFFER_LIMIT {
+                        return Err(format!(
+                            "the appliance has put {} bytes on the channel it dialled against an \
+                             outbound window of {}, and this station has acknowledged every one \
+                             of them and answered nothing. A session whose peer never speaks owes \
+                             one flight, so more than a window's worth is a node composing \
+                             without end",
+                            station.offered, DIAL_OFFER_LIMIT
+                        ));
+                    }
+                    station.expect = station.expect.wrapping_add(segment.payload.len() as u32);
+                    // Acknowledged and nothing else. The window is re-advertised
+                    // whole, so nothing the appliance does next turns on this
+                    // station closing one.
+                    station.owed.push_back(station_segment(
+                        &self.port,
+                        DIAL_DESTINATION,
+                        Ports {
+                            source: DIAL_PORT,
+                            destination: segment.source_port,
+                        },
+                        Numbers {
+                            sequence: station.sequence,
+                            acknowledgement: station.expect,
+                        },
+                        TCP_ACK,
+                        STATION_WINDOW,
+                        &[],
                     ));
                 }
                 Ok(DialStep::Handshaken)
@@ -9408,9 +9462,12 @@ mod tests {
         );
         assert!(station.completed());
 
-        // And a byte on it is refused: this appliance composes none, so one here
-        // is a byte no part of it meant to send.
-        let refused = probe
+        // And a byte on it is **taken and acknowledged**: the appliance speaks
+        // first over the channel, so what arrives here is a TLS client hello and
+        // this station's whole part is to keep the transport honest under a
+        // session that waits for a server which never answers.
+        let before = station.expect;
+        probe
             .judge(
                 &dial_segment(
                     &management,
@@ -9425,8 +9482,18 @@ mod tests {
                 &mut station,
                 &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
-            .expect_err("bytes on a channel that carries none");
-        assert!(refused.contains("carries nothing yet"), "{refused}");
+            .expect("bytes on the channel are taken");
+        assert_eq!(
+            station.expect,
+            before.wrapping_add(b"anything".len() as u32),
+            "the station advanced over what it acknowledged"
+        );
+        assert_eq!(station.offered, b"anything".len());
+        assert_eq!(
+            station.owed.len(),
+            1,
+            "and answered with an acknowledgement"
+        );
     }
 
     /// What the station refuses: a dial that never asked, a probe that is not
@@ -9500,6 +9567,11 @@ mod tests {
             .expect("the SYN");
         station.step = DialStep::Handshaken;
         station.owed.clear();
+        // A payload past the appliance's own outbound window, accumulated across
+        // a boot's worth of attempts, is a node composing without end — which is
+        // the one thing about the bytes on this channel a station that answers
+        // nothing can still catch.
+        station.offered = DIAL_OFFER_LIMIT;
         let verdict = probe
             .judge(
                 &dial_segment(
@@ -9508,15 +9580,15 @@ mod tests {
                     2,
                     STATION_ISN.wrapping_add(1),
                     TCP_ACK | TCP_PSH,
-                    b"not-the-probe",
+                    b"one byte past the window",
                 ),
                 &probes,
                 &mut client,
                 &mut station,
                 &mut OnboardStation::new(OnboardBehaviour::Untouched),
             )
-            .expect_err("a payload on a channel that carries none is refused");
-        assert!(verdict.contains("carries nothing yet"), "{verdict}");
+            .expect_err("a payload past the appliance's own window is refused");
+        assert!(verdict.contains("composing without end"), "{verdict}");
     }
 
     /// Each misbehaviour puts the frame it is named for on the wire, and none of

@@ -121,12 +121,14 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 mod arena;
+mod channel;
 mod delegate;
 mod upload;
 
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
 
+use lfw_channel::MAX_FRAME_LEN;
 use lfw_clock::Monotonic;
 use lfw_crypto::{
     Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, EntropyError, KEY_LEN, MlKem768DecapsulationKey,
@@ -142,16 +144,18 @@ use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
 use lfw_onboarding::{Identity, Onboarding as RequestSurface};
 use lfw_tls::{Bump, CryptoProvider, Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{
-    Answered, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating, TerminatingPass,
-    Terminator, attach_region, log_sample, read_timestamp_counter,
+    Answered, Half, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating,
+    TerminatingPass, Terminator, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    ClockCalibration, InstallStaging, LogConsume, LogRecords, RelayRefusal, RelayReply,
-    RelayRequest, SignReply, SignRequest,
+    ClockCalibration, InstallStaging, LogConsume, LogRecords, ManagementEndpoint, RelayRefusal,
+    RelayReply, RelayRequest, SignReply, SignRequest,
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
+use channel::{CHANNEL_RECORDS, ChannelIdentity, ManagementChannel};
+
 use delegate::{Delegated, DelegationError, HeldAnchor, HeldCertificate, HeldKey};
 use upload::PackageUpload;
 
@@ -433,6 +437,18 @@ fn init() -> Crypto {
     // read back out of it — so the archive this domain accepts is the archive
     // the holder installs.
     let staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
+    // Where the store domain published this appliance's management plane,
+    // mapped READ-ONLY here as it is in the domain that dials.
+    //
+    // **This domain reads the address rather than being told it**, and that is
+    // the whole reason for the mapping: the address is half of the trust
+    // decision the channel makes — a server's certificate is held to the address
+    // literal that was dialled and to no name — so a network-facing domain able
+    // to choose it could point this end's validation at a name a server it
+    // controls holds a certificate for. Read afresh at every session open, never
+    // cached across one, on the dialling domain's terms: an appliance adopted
+    // while running takes its owner within a boot.
+    let endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     // One requester for the whole boot, and behind an `Arc` because the library's
@@ -447,14 +463,52 @@ fn init() -> Crypto {
     // boot made — the requester, the generator, the provider's two leaks — sits
     // below this, where no session's reset reaches it.
     let arena = ARENA.bump();
+    // The framing's reassembly buffer: one mebibyte and eight bytes, allocated
+    // **once** here and handed from channel session to channel session for the
+    // domain's life. Before the mark, deliberately — a buffer inside a session's
+    // reset would be a mebibyte of the arena claimed again on every attempt of a
+    // schedule that never gives up, and this domain's peer decides how often
+    // that is. `vec!` rather than an array, because a `[0; MAX_FRAME_LEN]`
+    // literal is a mebibyte of stack before it is a mebibyte of heap.
+    //
+    // It is leaked on the same terms as the generator and the provider: it
+    // outlives every session and there is nothing to give it back to. A boot
+    // whose arena cannot hold it is a boot that could not have carried a session
+    // either, and the allocator's own refusal is what would say so.
+    //
+    // An `Option`, and the `None` is not a formality: the conversion from a
+    // boxed slice to a boxed array of the same length cannot fail, and a domain
+    // that faced the network must still answer rather than assert. A channel
+    // with no buffer refuses every session under its own token, which is a line
+    // an operator can act on where a panic on this path would be a domain the
+    // monitor reports and nobody can place.
+    let held: Option<&'static mut [u8; MAX_FRAME_LEN]> = alloc::vec![0_u8; MAX_FRAME_LEN]
+        .into_boxed_slice()
+        .try_into()
+        .ok()
+        .map(alloc::boxed::Box::leak);
+    let mark = arena.mark();
+    let established = outcome.established.take();
+    let mut channel = ManagementChannel::new(arena, mark, held);
+    if let Some(identity) = channel_identity(established.as_ref(), endpoint) {
+        channel.adopted(identity);
+    }
     let onboarding = Onboarding::new(
         arena,
-        arena.mark(),
+        mark,
         PdClock::new(calibration),
-        outcome.established.take(),
+        established,
         staging,
         Arc::clone(&delegated),
     );
+    let management = Management {
+        onboarding,
+        channel,
+        carrying: None,
+        endpoint,
+        delegated: Arc::clone(&delegated),
+        clock: PdClock::new(calibration),
+    };
     match &outcome.verdict {
         Ok(()) => announce(&sink, DomainState::Ready, DomainDetail::None),
         Err(CryptoError(cause)) => {
@@ -476,7 +530,7 @@ fn init() -> Crypto {
     };
     stats.publish(&sample.values());
     Crypto {
-        relay: Terminating::attach(relay_request, relay_reply, onboarding),
+        relay: Terminating::attach(relay_request, relay_reply, management),
         sink,
         shard: stats,
         sample,
@@ -633,6 +687,7 @@ fn bring_up(sink: &dyn Sink, now: u64, delegated: &Arc<Delegated>) -> Outcome {
         identity,
         appliance_key,
         owned: delegation.held.owned,
+        anchor: delegation.anchor,
     });
     outcome
 }
@@ -1337,8 +1392,15 @@ struct Established {
     appliance_key: [u8; lfw_x509::SPKI_LEN],
     /// Whether the domain that holds the key says this appliance already has an
     /// owner. What it decides is whether the surface serves onboarding at all —
-    /// see `lfw_onboarding`, which is constructed closed when it is true.
+    /// see `lfw_onboarding`, which is constructed closed when it is true — and,
+    /// with the anchor beside it, whether this domain dials or listens.
     owned: bool,
+    /// The trust anchor that owner delivered, and `None` on an appliance nobody
+    /// has taken. It is what a management server is validated against and it
+    /// reaches this domain from the holder of the device key alone: the domain
+    /// that owns the network carries the channel's bytes and chooses nothing
+    /// about whom they are checked against.
+    anchor: Option<HeldAnchor>,
 }
 
 /// What this domain terminates an onboarding session with: one TLS 1.3 server,
@@ -1484,7 +1546,188 @@ impl Onboarding {
     }
 }
 
-impl Terminator for Onboarding {
+/// The two protocols this domain terminates, and the session that says which.
+///
+/// **They never run at once, and that is a property of the relay rather than of
+/// this file**: it carries one connection at a time, and the domain that owns the
+/// network names on the open which of its two transports that connection arrived
+/// on. Nothing here works it out — ownership says what a session is *allowed* to
+/// be, never which one arrived, and an owned appliance still answers
+/// administrators on the surface it once onboarded over.
+///
+/// The half is fixed **once per session**, at the open, and held for its life: a
+/// session whose protocol changed under it would be a client hello answered by a
+/// server half, which is a deadlock rather than a refusal.
+struct Management {
+    onboarding: Onboarding,
+    channel: ManagementChannel,
+    /// Which protocol the session running now is, and `None` between sessions.
+    carrying: Option<Carrying>,
+    /// Where the store domain published this appliance's management plane, read
+    /// at the one moment ownership changes so the channel has an address to open
+    /// against.
+    endpoint: &'static ManagementEndpoint,
+    /// The delegation, kept so ownership can be re-read at the one moment it
+    /// changes within a boot.
+    delegated: Arc<Delegated>,
+    clock: PdClock<'static>,
+}
+
+/// Which of the two protocols a session is running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carrying {
+    Onboarding,
+    Channel,
+}
+
+impl Management {
+    /// Take on the ownership an install has just made durable.
+    ///
+    /// **Called at exactly one moment**: the pass on which this domain's own
+    /// upload was accepted by the holder of the device key. That is the only way
+    /// an appliance changes hands within a boot, and it is what makes the channel
+    /// identity a thing asked for once rather than re-read per session — a
+    /// delegation exchange per session would be a spin against the store domain
+    /// that an unauthenticated peer could provoke by connecting.
+    ///
+    /// A holder that cannot produce the anchor it has just installed leaves the
+    /// channel without an identity, which is the `channel-identity-absent` token
+    /// on the first session that tries: the two halves of an ownership
+    /// disagreeing is a thing to go and look at rather than a silence.
+    fn adopted(&mut self) {
+        if self.channel.ready() {
+            return;
+        }
+        let Some(established) = self.onboarding.established.as_mut() else {
+            return;
+        };
+        let Ok(held) = self.delegated.held_key() else {
+            return;
+        };
+        if !held.owned {
+            return;
+        }
+        established.owned = true;
+        established.anchor = self.delegated.held_anchor().ok();
+        if let Some(identity) =
+            channel_identity(self.onboarding.established.as_ref(), self.endpoint)
+        {
+            self.channel.adopted(identity);
+        }
+    }
+}
+
+impl Management {
+    /// What the last pass left for the console, from whichever protocol ran.
+    ///
+    /// The sum of the two arrays rather than the larger of them, so the slots
+    /// exist whatever ran; only one of the two is ever non-empty, a session
+    /// being one protocol or the other for its whole life.
+    fn take_records(&mut self) -> [Option<DomainDetail>; MANAGEMENT_RECORDS] {
+        let mut taken = [None; MANAGEMENT_RECORDS];
+        let mut free = taken.iter_mut();
+        for record in self
+            .onboarding
+            .take_records()
+            .into_iter()
+            .chain(self.channel.take_records())
+            .flatten()
+        {
+            let Some(slot) = free.next() else {
+                return taken;
+            };
+            *slot = Some(record);
+        }
+        taken
+    }
+}
+
+/// The most console records one pass of either protocol can leave.
+const MANAGEMENT_RECORDS: usize = STAGED_RECORDS + CHANNEL_RECORDS;
+
+impl Terminator for Management {
+    /// Run the protocol the half this session opened on names. **Told, not
+    /// chosen** — [`Half`] carries why. Deciding here instead, from ownership or
+    /// from where this appliance was told to dial, would answer an administrator's
+    /// inbound connection with a client half: a deadlock rather than a refusal. A
+    /// channel session with no identity to open against is that protocol's own
+    /// `channel-identity-absent` refusal, not a reason to run the other one.
+    fn opened(&mut self, half: Half) {
+        match half {
+            Half::Channel => {
+                self.carrying = Some(Carrying::Channel);
+                self.channel.at(wall_seconds(&self.clock));
+                self.channel.opened();
+            }
+            Half::Onboarding => {
+                self.carrying = Some(Carrying::Onboarding);
+                self.onboarding.opened();
+            }
+        }
+    }
+
+    fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
+        match self.carrying {
+            Some(Carrying::Channel) => self.channel.advance(received, answer),
+            Some(Carrying::Onboarding) => {
+                let answered = self.onboarding.advance(received, answer);
+                // The one moment an appliance changes hands within a boot, taken
+                // as the session that did it is still running: it gives the
+                // channel the identity it needs and changes nothing about the
+                // session running now, which goes on to its own end on the half
+                // it was opened on and is accounted for there.
+                self.adopted();
+                answered
+            }
+            // No protocol was opened, so there is nothing to say. Finished, on
+            // the onboarding server's terms.
+            None => Answered {
+                sent: 0,
+                finished: true,
+                agreed: false,
+            },
+        }
+    }
+
+    fn agreed(&self) -> bool {
+        matches!(self.carrying, Some(Carrying::Channel)) && self.channel.agreed()
+    }
+
+    fn closed(&mut self) {
+        match self.carrying.take() {
+            Some(Carrying::Channel) => self.channel.closed(),
+            Some(Carrying::Onboarding) => self.onboarding.closed(),
+            None => (),
+        }
+    }
+}
+
+/// What a channel session is opened with, where this appliance has all of it.
+///
+/// `None` on an appliance nobody owns, on one whose holder produced no anchor,
+/// and on one the store domain has told nowhere to dial — three states rather
+/// than one, and every one of them is a node that must not open a channel: a
+/// session validated against no anchor, or dialled at no address, is not a
+/// session this appliance has any grounds to trust.
+fn channel_identity(
+    established: Option<&Established>,
+    endpoint: &ManagementEndpoint,
+) -> Option<ChannelIdentity> {
+    let established = established?;
+    let anchor = established.anchor?;
+    let destination = endpoint.destination()?;
+    Some(ChannelIdentity {
+        provider: Arc::clone(&established.provider),
+        certificate: established.certificate,
+        operation: Arc::clone(&established.operation),
+        anchor,
+        endpoint: destination.address,
+    })
+}
+
+/// The onboarding protocol's three turns, inherent rather than a [`Terminator`]
+/// of its own: it is one of the two protocols behind one, never a terminator.
+impl Onboarding {
     /// Wind the arena back and begin a session.
     ///
     /// Back **before** the session and not only after it: a session that ended
@@ -1549,6 +1792,11 @@ impl Terminator for Onboarding {
             return Answered {
                 sent: 0,
                 finished: true,
+                // An onboarding session has no greeting to agree: what an
+                // administrator does over it is HTTP against a surface, and
+                // there is no exchange whose completion says the session became
+                // worth anything.
+                agreed: false,
             };
         };
         // The session first, so the plaintext this delivery produced is
@@ -1635,12 +1883,14 @@ fn drive_again(
         return Answered {
             sent: already,
             finished: false,
+            agreed: false,
         };
     };
     let lfw_tls::Turn { sent, finished } = server.advance(&[], room);
     Answered {
         sent: already.saturating_add(sent),
         finished,
+        agreed: false,
     }
 }
 
@@ -1651,7 +1901,7 @@ struct Crypto {
     /// — what to answer, when one ends, and how — is `pd_runtime::relay`'s and
     /// host-tested there; what is here is the console record each answer owes
     /// and the shard republished beside it.
-    relay: Terminating<'static, Onboarding>,
+    relay: Terminating<'static, Management>,
     sink: RingSink<'static, PdClock<'static>>,
     /// The shard this domain publishes, kept so a session's end can republish
     /// it: the sample's own numbers are the bring-up's and do not move, but the
@@ -1678,8 +1928,13 @@ impl Crypto {
         // Taken before anything is written, because the sink and the relay are
         // both this domain's and a record cannot be emitted while the protocol
         // behind the relay is still borrowed.
-        let handshake = self.relay.terminator().take_records();
-        for detail in handshake.into_iter().flatten() {
+        //
+        // Both protocols are drained, not the one that ran: at most one of them
+        // has anything, since a session is one or the other, and asking the one
+        // that ran would mean this function knowing which — a second copy of a
+        // fact `Management` already holds.
+        let records = self.relay.terminator().take_records();
+        for detail in records.into_iter().flatten() {
             announce(&self.sink, DomainState::Ready, detail);
         }
         if let Some(session) = pass.report {

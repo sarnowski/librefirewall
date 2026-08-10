@@ -481,17 +481,22 @@ const OWNERSHIP_WITHHELD: &str = "the store domain is the ONLY writer of the wor
 /// What the management endpoint withholds, which is an authority in one
 /// direction and a piece of knowledge in the other.
 const ENDPOINT_WITHHELD: &str = "the store domain is the ONLY writer of the address this \
-     appliance dials, and the management domain the only reader. The write grant is withheld from \
-     every other domain including the management domain itself, because a domain that could write \
-     it could point the appliance's own management channel at a peer of its choosing — which is \
-     the one thing an attacker who reached that domain would most want. The read grant is \
-     withheld from the configuration domain, so where this appliance reports to cannot become a \
-     value composed by the parser that reads an attacker's document; and from the forwarder, \
-     which decides frames, so a compromised dataplane cannot tell an operator's session from the \
-     traffic around it. What a read here confers is an address literal and a port and nothing \
-     else — values the management server publishes to every appliance it owns and that appear in \
-     the clear on the wire — so the grant is narrow because what it carries authenticates \
-     nothing. No `phys_addr`, so no device reaches it by DMA either";
+     appliance dials, and two domains read it. The write grant is withheld from every other \
+     domain including both readers, because a domain that could write it could point the \
+     appliance's own management channel at a peer of its choosing — which is the one thing an \
+     attacker who reached either of them would most want. The management domain reads it to know \
+     where to dial; the CRYPTOGRAPHY domain reads it because the address is half of the trust \
+     decision the channel makes — a management server's certificate is validated against the \
+     address literal that was dialled and against no name — so the domain that VALIDATES reads \
+     the address itself rather than being handed one by the network-facing domain, which could \
+     otherwise point that validation at a name a server it controls holds a certificate for. The \
+     read grant is withheld from the configuration domain, so where this appliance reports to \
+     cannot become a value composed by the parser that reads an attacker's document; and from \
+     the forwarder, which decides frames, so a compromised dataplane cannot tell an operator's \
+     session from the traffic around it. What a read here confers is an address literal and a \
+     port and nothing else — values the management server publishes to every appliance it owns \
+     and that appear in the clear on the wire — so the grant is narrow because what it carries \
+     authenticates nothing. No `phys_addr`, so no device reaches it by DMA either";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -990,7 +995,11 @@ const REGIONS: &[RegionRule] = &[
             bytes: ENDPOINT_REGION_SIZE,
         },
         cacheability: Cacheability::Cached,
-        grants: &[read_write("store"), read_only("management")],
+        grants: &[
+            read_write("store"),
+            read_only("management"),
+            read_only("crypto"),
+        ],
         withheld: Some(ENDPOINT_WITHHELD),
     },
     RegionRule {
@@ -1517,7 +1526,7 @@ const REGIONS: &[RegionRule] = &[
 /// `pds/crypto` is a binary and cannot be depended on, so the number crosses
 /// as a literal and this rule is what holds the two equal — the same shape the
 /// log regions' sizes cross in.
-const ARENA_BYTES: usize = 0x20_0000;
+const ARENA_BYTES: usize = 0x40_0000;
 
 /// Every shard is one page of the same type, so the eleven rules share one
 /// expectation rather than restating it eleven times.

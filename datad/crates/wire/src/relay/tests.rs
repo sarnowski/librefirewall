@@ -65,7 +65,7 @@ fn records_cross_in_both_directions_under_one_sequence() {
     assert_eq!(
         channel
             .responder
-            .answered(demand, b"\x16\x03\x03back", false),
+            .answered(demand, b"\x16\x03\x03back", false, false),
         7
     );
     assert_eq!(channel.responder.answers(), 1);
@@ -75,6 +75,7 @@ fn records_cross_in_both_directions_under_one_sequence() {
         RelayPoll::Answered {
             records,
             closed,
+            agreed: _,
             answered,
         } => {
             assert_eq!(records, &b"\x16\x03\x03back"[..]);
@@ -91,7 +92,7 @@ fn a_poll_answered_with_nothing_is_an_answer_and_not_a_refusal() {
     let mut channel = Channel::new();
     let pending = ask(&mut channel, RelayOperation::Poll, &[]);
     let demand = channel.responder.take().expect("outstanding");
-    assert_eq!(channel.responder.answered(demand, &[], false), 0);
+    assert_eq!(channel.responder.answered(demand, &[], false, false), 0);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     match channel.requester.poll(pending, &mut into) {
         RelayPoll::Answered {
@@ -108,7 +109,7 @@ fn a_poll_answered_with_nothing_is_an_answer_and_not_a_refusal() {
 #[test]
 fn the_window_holds_one_item_and_a_second_is_refused_rather_than_overwriting() {
     let mut channel = Channel::new();
-    let pending = ask(&mut channel, RelayOperation::Open, &[]);
+    let pending = ask(&mut channel, RelayOperation::Open(Half::Onboarding), &[]);
     // The bytes of the first item are still in the region and the responder may
     // be mid-read of them; a second write would be the corruption this refuses.
     assert_eq!(
@@ -121,7 +122,7 @@ fn the_window_holds_one_item_and_a_second_is_refused_rather_than_overwriting() {
         })
     );
     let demand = channel.responder.take().expect("outstanding");
-    channel.responder.answered(demand, &[], false);
+    channel.responder.answered(demand, &[], false, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     assert!(matches!(
         channel.requester.poll(pending, &mut into),
@@ -189,7 +190,7 @@ fn a_fault_frees_the_window_too() {
 #[test]
 fn an_abandoned_item_frees_the_window_and_its_late_answer_is_ignored() {
     let mut channel = Channel::new();
-    let pending = ask(&mut channel, RelayOperation::Open, &[]);
+    let pending = ask(&mut channel, RelayOperation::Open(Half::Onboarding), &[]);
     let given_up = pending.sequence();
     channel.requester.abandon(pending);
     assert!(
@@ -199,13 +200,13 @@ fn an_abandoned_item_frees_the_window_and_its_late_answer_is_ignored() {
 
     // The far end answers it late, into a region nothing is polling.
     let demand = channel.responder.take().expect("the abandoned item");
-    channel.responder.answered(demand, b"late", false);
+    channel.responder.answered(demand, b"late", false, false);
 
     // And the next item is issued and answered on its own number. The late reply
     // carries a sequence no item is held against, so nothing about it is read.
     let next = channel
         .requester
-        .request(RelayOperation::Open, &[])
+        .request(RelayOperation::Open(Half::Onboarding), &[])
         .expect("the window was freed");
     assert_ne!(next.sequence(), given_up);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
@@ -253,7 +254,7 @@ fn one_demand_is_taken_per_change_of_the_sequence() {
         channel.responder.take().is_none(),
         "the same item produced a second demand"
     );
-    channel.responder.answered(demand, &[9; 4], false);
+    channel.responder.answered(demand, &[9; 4], false, false);
     assert!(
         channel.responder.take().is_none(),
         "an answered item produced another demand"
@@ -295,8 +296,13 @@ fn an_operation_word_the_far_end_does_not_know_is_refused_rather_than_ignored() 
     let pending = requester
         .request(RelayOperation::Deliver, b"m")
         .expect("free");
-    // A peer that writes a word neither side has a meaning for.
-    store_request_operation(request, 7);
+    // A peer that writes a word neither side has a meaning for: the one past the
+    // whole vocabulary, derived rather than written down so that adding an
+    // operation moves it instead of quietly making this case a valid word.
+    store_request_operation(
+        request,
+        RelayOperation::CLOSE_BASE + RelayEnding::COUNT as u32,
+    );
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.operation(), None);
     responder.refuse(demand, RelayRefusal::NoSuchOperation);
@@ -351,7 +357,7 @@ fn a_reply_answering_the_wrong_question_is_a_fault() {
         operation: Some(RelayOperation::Poll),
         len: demand.stated_len(),
     };
-    channel.responder.answered(mistaken, &[1, 2], false);
+    channel.responder.answered(mistaken, &[1, 2], false, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     assert_eq!(
         channel.requester.poll(pending, &mut into),
@@ -463,9 +469,10 @@ fn records_longer_than_the_region_publish_only_what_was_written() {
     let mut channel = Channel::new();
     let pending = ask(&mut channel, RelayOperation::Poll, &[]);
     let demand = channel.responder.take().expect("outstanding");
-    let published = channel
-        .responder
-        .answered(demand, &vec![0xEE; MAX_RELAY_PAYLOAD + 16], false);
+    let published =
+        channel
+            .responder
+            .answered(demand, &vec![0xEE; MAX_RELAY_PAYLOAD + 16], false, false);
     assert_eq!(published, MAX_RELAY_PAYLOAD);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     match channel.requester.poll(pending, &mut into) {
@@ -479,7 +486,9 @@ fn a_closing_answer_carries_its_last_records_with_it() {
     let mut channel = Channel::new();
     let pending = ask(&mut channel, RelayOperation::Deliver, b"bye");
     let demand = channel.responder.take().expect("outstanding");
-    channel.responder.answered(demand, b"\x15\x03\x03", true);
+    channel
+        .responder
+        .answered(demand, b"\x15\x03\x03", true, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     match channel.requester.poll(pending, &mut into) {
         RelayPoll::Answered {
@@ -498,7 +507,7 @@ fn the_sequence_steps_over_zero_when_it_wraps() {
     for _ in 0..2 {
         let pending = ask(&mut channel, RelayOperation::Poll, &[]);
         let demand = channel.responder.take().expect("outstanding");
-        channel.responder.answered(demand, &[], false);
+        channel.responder.answered(demand, &[], false, false);
         let mut into = [0_u8; MAX_RELAY_PAYLOAD];
         drop(channel.requester.poll(pending, &mut into));
     }
@@ -510,14 +519,14 @@ fn the_sequence_steps_over_zero_when_it_wraps() {
 
 #[test]
 fn every_status_and_operation_bit_pattern_round_trips_or_is_refused() {
-    for bits in 0_u32..9 {
+    for bits in 0_u32..10 {
         match RelayStatus::from_bits(bits) {
             Some(status) => assert_eq!(status.to_bits(), bits),
             None => assert!(bits >= 5),
         }
         match RelayOperation::from_bits(bits) {
             Some(operation) => assert_eq!(operation.to_bits(), bits),
-            None => assert!(bits >= 7),
+            None => assert!(bits >= 8),
         }
         match RelayEnding::from_bits(bits) {
             Some(ending) => assert_eq!(ending.to_bits(), bits),
@@ -551,7 +560,7 @@ fn every_close_ending_crosses_as_itself_and_is_echoed_as_itself() {
             Some(RelayOperation::Close(ending)),
             "the far end read a close and lost how the session ended"
         );
-        channel.responder.answered(demand, &[], true);
+        channel.responder.answered(demand, &[], true, false);
         let mut into = [0_u8; MAX_RELAY_PAYLOAD];
         // The echo is compared whole, ending included, so a responder that
         // answered a close with some other ending is a mismatched echo rather
@@ -578,7 +587,7 @@ fn a_close_answered_with_another_ending_is_a_mismatched_echo() {
         operation: Some(RelayOperation::Close(RelayEnding::Forgotten)),
         len: demand.stated_len(),
     };
-    channel.responder.answered(mistaken, &[], true);
+    channel.responder.answered(mistaken, &[], true, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
     assert_eq!(
         channel.requester.poll(pending, &mut into),
@@ -684,6 +693,13 @@ proptest! {
         if let Some(RelayOperation::Close(ending)) = demand.operation() {
             prop_assert_eq!(RelayOperation::Close(ending).to_bits(), operation);
             prop_assert!(ending.to_bits() < RelayEnding::COUNT as u32);
+        }
+        // And an open arrives naming one of the two halves or does not arrive at
+        // all: the half is decoded from the word rather than defaulted, so no
+        // session begins on a half this side chose.
+        if let Some(RelayOperation::Open(half)) = demand.operation() {
+            prop_assert_eq!(RelayOperation::Open(half).to_bits(), operation);
+            prop_assert!(matches!(half, Half::Onboarding | Half::Channel));
         }
         let mut scratch = std::boxed::Box::new([0_u8; MAX_RELAY_PAYLOAD]);
         let payload = demand.payload(&responder, &mut scratch);

@@ -86,7 +86,7 @@ mod tests;
 
 pub use arena::{ArenaExhausted, Bump, MAX_ALIGN};
 pub use chain::DeliveredAnchor;
-pub use client::{ChannelClient, ClientOutcome};
+pub use client::{CHANNEL_OUTCOME_RECORDS, ChannelClient, ClientOutcome};
 pub use identity::{Identity, IdentityError};
 // Two types this crate's public signature carries but does not declare: the
 // kind of certificate an identity binds, and the assembled provider a session

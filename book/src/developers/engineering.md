@@ -274,7 +274,7 @@ The decisions that constrain all observability code:
   the technical facts that place the fault without the wire: where the frames were sent and which
   part of the addressing chose that, what the link answered and what it refused, and what the
   connection itself did. Where a fact tells two causes apart, it is on the console. This holds for
-  the transport dial today and for the TLS channel above it when that arrives. Two bounds keep it
+  the transport dial and for the TLS session and the framing above it alike. Two bounds keep it
   honest: no packet payload, secret or key reaches these records — counts, addresses, ports and
   sequence numbers are system state and belong there, and a byte the peer sent does not — and the
   record count is bounded by the shape of the outcome rather than by anything that happened on the

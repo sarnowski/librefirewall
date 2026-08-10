@@ -1,5 +1,6 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 
+use lfw_log::{ChannelOutcome, DomainDetail, TlsCertificateRefusal};
 use rustls::{
     AlertDescription, CertificateError, ClientConfig, Error, PeerIncompatible, PeerMisbehaved,
     RootCertStore,
@@ -41,12 +42,11 @@ use crate::{
 /// former — it carries an `f32` in one arm this crate cannot reach.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientOutcome {
-    /// The handshake completed **and the peer went on with the session**,
-    /// which on this end are two different moments: a TLS 1.3 client finishes
-    /// before the server has judged the certificate it just sent, and the
-    /// protocol has no message for "accepted". So this is settled on the peer's
-    /// first record under the traffic keys or its goodbye, and an appliance the
-    /// management server refuses reads [`Self::AlertReceived`] rather than this.
+    /// The handshake completed **and the peer went on with the session**, which
+    /// on this end are two moments: a TLS 1.3 client finishes before the server
+    /// has judged the certificate it just sent, and the protocol has no message
+    /// for "accepted". A server refusing inside the handshake never reaches
+    /// this; one giving up later reaches it, then [`ChannelClient::ending`].
     Established(Established),
     /// The peer took the connection and sent no byte at all, so there was no
     /// server hello to read. A management server that is listening and not
@@ -102,7 +102,7 @@ pub enum ClientOutcome {
     /// This end refused the session, in the library's own error vocabulary, for
     /// a reason none of the arms above names.
     Refused(Error),
-    /// The peer went away before the handshake completed.
+    /// The peer went away, before the handshake completed or after it.
     PeerClosed,
     /// The arena had less than one phase's reserve free. The session is over
     /// and nothing partial is left behind it.
@@ -137,7 +137,8 @@ pub enum ClientOutcome {
 /// Which of the two ends judged what is the whole of why the outcome vocabulary
 /// splits the way it does: what this end decided about the peer is a
 /// [`ClientOutcome::ServerCertificateRejected`], and what the peer decided about
-/// this end arrives as a [`ClientOutcome::AlertReceived`] and in no other form.
+/// this end arrives as a [`ClientOutcome::AlertReceived`] and in no other form,
+/// on [`Self::ending`] rather than [`Self::outcome`].
 ///
 /// # There is no protocol above it here
 ///
@@ -158,6 +159,8 @@ pub struct ChannelClient<'arena> {
     /// Plaintext the protocol above gave, not yet encrypted.
     pending: Vec<u8>,
     outcome: Option<ClientOutcome>,
+    /// The second and last outcome slot: see [`Self::record`].
+    ending: Option<ClientOutcome>,
     /// The three code points this end settled on, once it has them. Held rather
     /// than reported on sight: what they mean is that *this* end finished, and
     /// that is not yet the handshake's outcome.
@@ -251,6 +254,7 @@ impl<'arena> ChannelClient<'arena> {
             plaintext: Vec::new(),
             pending: Vec::new(),
             outcome: None,
+            ending: None,
             negotiated: None,
             heard: false,
             handshaked: false,
@@ -332,7 +336,7 @@ impl<'arena> ChannelClient<'arena> {
     /// A session whose handshake this end had finished is settled as finished
     /// even where the peer never said another word: the transport going away is
     /// the transport's account, and a handshake that got that far did get that
-    /// far.
+    /// far, and [`Self::ending`] stays empty for the same reason.
     pub fn ended(&mut self) {
         if self.handshaked {
             self.confirmed();
@@ -349,12 +353,20 @@ impl<'arena> ChannelClient<'arena> {
 
     /// How the handshake ended, once it has.
     ///
-    /// The handshake, and not the session: a session that established and was
-    /// then dropped reads [`ClientOutcome::Established`] here, because what
-    /// became of it afterwards is the transport's account and not this one's.
+    /// The handshake, and not the session: one that established and was then
+    /// refused, closed or flooded still reads [`ClientOutcome::Established`]
+    /// here, and [`Self::ending`] carries what became of it.
     #[must_use]
     pub fn outcome(&self) -> Option<&ClientOutcome> {
         self.outcome.as_ref()
+    }
+
+    /// How a session that established then ended, once it has. **The only place
+    /// a refused appliance becomes legible**, a server's verdict on a device
+    /// certificate arriving too late to be the handshake's own outcome.
+    #[must_use]
+    pub fn ending(&self) -> Option<&ClientOutcome> {
+        self.ending.as_ref()
     }
 
     /// Drive the library until it wants bytes from the peer or has nothing left
@@ -491,7 +503,9 @@ impl<'arena> ChannelClient<'arena> {
         if ran_out {
             self.settle(ClientOutcome::Stalled);
         }
-        if self.peer_closed && !self.handshaked {
+        // A goodbye accounts for the session whether or not the handshake had
+        // finished — after one it is what tells a clean close from an alert.
+        if self.peer_closed {
             self.settle(ClientOutcome::PeerClosed);
         }
     }
@@ -534,6 +548,10 @@ impl<'arena> ChannelClient<'arena> {
     /// pair of code points here is the library contradicting itself rather than
     /// a session that never got that far.
     fn confirmed(&mut self) {
+        if self.outcome.is_some() {
+            // Once: a second would take the slot the session's ending is owed.
+            return;
+        }
         let Some(established) = self.negotiated else {
             // The library said it could encrypt application data and did not
             // say what it negotiated. Reported in its own vocabulary rather
@@ -550,11 +568,16 @@ impl<'arena> ChannelClient<'arena> {
         self.over = true;
     }
 
-    /// Keep the **first** outcome: what happened first is what an operator has
-    /// to look at, and a later consequence of it would displace the cause.
+    /// Keep the **first** outcome, and — only where that was a session that came
+    /// up — the one that ended it. Two slots and never a third, neither a peer's
+    /// to multiply: a later consequence never displaces the cause.
     fn record(&mut self, outcome: ClientOutcome) {
-        if self.outcome.is_none() {
-            self.outcome = Some(outcome);
+        match &self.outcome {
+            None => self.outcome = Some(outcome),
+            Some(ClientOutcome::Established(_)) if self.ending.is_none() => {
+                self.ending = Some(outcome);
+            }
+            Some(_) => (),
         }
     }
 
@@ -602,5 +625,160 @@ fn stopped(held: Held) -> ClientOutcome {
         Held::Backlogged(held) => ClientOutcome::Backlogged { held },
         Held::Refused(error) => ClientOutcome::Refused(error),
         Held::Stalled => ClientOutcome::Stalled,
+    }
+}
+
+/// The most console records one channel outcome owes.
+///
+/// Two, and it is the exhausted arena that decides it: the outcome itself, and
+/// what was asked for against what was left. Every other outcome takes one.
+///
+/// One fewer than the onboarding server's, and the difference is the whole
+/// asymmetry between the two ends: a server that finds nothing in common has a
+/// client's two offer lists to print, and this end has none — a client lists
+/// what it has and a server picks one, so what this end learns is that the pick
+/// was wrong.
+pub const CHANNEL_OUTCOME_RECORDS: usize = 2;
+
+impl ClientOutcome {
+    /// The console records this outcome owes, in the order they are emitted.
+    ///
+    /// Here rather than in the protection domain that emits them, on
+    /// [`crate::ServerOutcome::records`]'s terms: the two vocabularies it maps
+    /// from are the adopted library's and this is the only crate that sees them,
+    /// so a release that renames a variant fails this build rather than a domain
+    /// nothing host-tests.
+    ///
+    /// **The discriminant travels and the context never does.** Three of the
+    /// library's certificate errors come in two shapes, one bare and one
+    /// carrying what the peer presented, the instant it was judged against, or
+    /// an algorithm identifier — and the pair share one token here, because the
+    /// cause is the same and the context is a peer's own bytes. Nothing an
+    /// adversary chose reaches a console line as itself, from any arm.
+    #[must_use]
+    pub fn records(&self) -> [Option<DomainDetail>; CHANNEL_OUTCOME_RECORDS] {
+        let one = |detail| [Some(detail), None];
+        match self {
+            Self::Established(Established {
+                version,
+                suite,
+                group,
+            }) => one(DomainDetail::ChannelHandshake {
+                outcome: ChannelOutcome::Established,
+                version: *version,
+                suite: *suite,
+                group: *group,
+            }),
+            Self::NoServerHello => one(ended(ChannelOutcome::NoServerHello)),
+            Self::PeerClosed => one(ended(ChannelOutcome::PeerClosed)),
+            Self::Stalled => one(ended(ChannelOutcome::Stalled)),
+            Self::AnchorRejected => one(ended(ChannelOutcome::AnchorRejected)),
+            // The library's own account of which field of which message a
+            // server got wrong is deliberately not carried. Dozens of members
+            // name the shape of one broken or hostile peer, and an
+            // administrator answers every one of them the same way; where the
+            // distinction is actionable the library puts it in a different
+            // error, which the arms around this one carry.
+            Self::Misbehaved(_) => one(ended(ChannelOutcome::Misbehaved)),
+            Self::Incompatible(incompatible) => one(DomainDetail::ChannelIncompatible {
+                outcome: ChannelOutcome::Incompatible,
+                incompatible: crate::server::named(incompatible),
+            }),
+            Self::ServerCertificateRejected(error) => one(DomainDetail::ChannelCertificate {
+                outcome: ChannelOutcome::ServerCertificateRejected,
+                refusal: certificate(error),
+            }),
+            // The alert as the registry numbers it and not as the library
+            // spells it, on the code points above's terms.
+            Self::AlertReceived(alert) => one(DomainDetail::ChannelAlert {
+                outcome: ChannelOutcome::AlertReceived,
+                alert: u16::from(u8::from(*alert)),
+            }),
+            Self::Refused(error) => one(DomainDetail::ChannelRefused {
+                outcome: ChannelOutcome::Refused,
+                refusal: crate::server::refusal(error),
+            }),
+            // Two: the outcome, and what was asked for against what was left —
+            // the record this appliance already states an arena's shortfall on,
+            // so a starved session at boot, one under an onboarding peer and one
+            // under a management server all read the same way.
+            Self::ArenaExhausted(ArenaExhausted {
+                requested,
+                remaining,
+            }) => [
+                Some(ended(ChannelOutcome::ArenaExhausted)),
+                Some(DomainDetail::Arena {
+                    bytes: *remaining as u64,
+                    bound: *requested as u64,
+                }),
+            ],
+            Self::Backlogged { held } => one(DomainDetail::ChannelBacklogged {
+                outcome: ChannelOutcome::Backlogged,
+                held: *held as u64,
+            }),
+        }
+    }
+}
+
+/// An outcome whose whole fact is the way it ended.
+const fn ended(outcome: ChannelOutcome) -> DomainDetail {
+    DomainDetail::ChannelEnded { outcome }
+}
+
+/// The way the delivered anchor refused a server's certificate, as the console
+/// names it.
+///
+/// Every member is matched explicitly, so a release that renames one fails this
+/// build; the wildcard is the library's type being open, on
+/// [`crate::server::named`]'s terms exactly. **A member carrying context shares
+/// its bare sibling's token**: the cause is the same, and the context is the
+/// name a peer presented, the instant it was judged against, or the algorithm
+/// identifier it used — a peer's own bytes, which no console line repeats.
+#[expect(
+    deprecated,
+    reason = "the library has deprecated six of its bare members in favour of the context-bearing \
+              siblings matched beside them. Both shapes are still constructible by a custom \
+              verifier and both still name a cause, so a mirror that dropped the bare ones would \
+              land them on the token that says this build cannot name what happened"
+)]
+fn certificate(error: &CertificateError) -> TlsCertificateRefusal {
+    match error {
+        CertificateError::BadEncoding => TlsCertificateRefusal::BadEncoding,
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            TlsCertificateRefusal::Expired
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            TlsCertificateRefusal::NotValidYet
+        }
+        CertificateError::Revoked => TlsCertificateRefusal::Revoked,
+        CertificateError::UnhandledCriticalExtension => {
+            TlsCertificateRefusal::UnhandledCriticalExtension
+        }
+        CertificateError::UnknownIssuer => TlsCertificateRefusal::UnknownIssuer,
+        CertificateError::UnknownRevocationStatus => TlsCertificateRefusal::UnknownRevocationStatus,
+        CertificateError::ExpiredRevocationList
+        | CertificateError::ExpiredRevocationListContext { .. } => {
+            TlsCertificateRefusal::ExpiredRevocationList
+        }
+        CertificateError::BadSignature => TlsCertificateRefusal::BadSignature,
+        CertificateError::UnsupportedSignatureAlgorithm
+        | CertificateError::UnsupportedSignatureAlgorithmContext { .. } => {
+            TlsCertificateRefusal::UnsupportedSignatureAlgorithm
+        }
+        CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
+            TlsCertificateRefusal::UnsupportedSignatureAlgorithmForPublicKey
+        }
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            TlsCertificateRefusal::NotValidForName
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            TlsCertificateRefusal::InvalidPurpose
+        }
+        CertificateError::InvalidOcspResponse => TlsCertificateRefusal::InvalidOcspResponse,
+        CertificateError::ApplicationVerificationFailure => {
+            TlsCertificateRefusal::ApplicationVerificationFailure
+        }
+        CertificateError::Other(_) => TlsCertificateRefusal::Other,
+        _ => TlsCertificateRefusal::Unrecognized,
     }
 }

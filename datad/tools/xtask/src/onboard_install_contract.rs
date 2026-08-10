@@ -494,7 +494,7 @@ fn issue_to(root: &Path, into: &Path, fetched: &Attempt, device: &str) -> Result
 /// Generated on demand rather than by a build step, because only a run that
 /// issues needs one: a checkout that never boots a scenario never mints a
 /// certification authority at all.
-fn authority(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+pub(crate) fn authority(root: &Path) -> Result<(PathBuf, PathBuf), String> {
     let home = root.join(BUILD_DEV_CA_DIR);
     let key = home.join(CA_KEY);
     let certificate = home.join(CA_CERTIFICATE);
