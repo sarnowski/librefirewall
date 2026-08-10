@@ -9,6 +9,14 @@ defmodule Ctrld.PKI.Certificate do
   contents of what is issued, so this module takes a public key and a name and
   never a requested extension.
 
+  The instant of issuance is one fact and the validity window is another two.
+  A certificate runs for the profile's lifetime measured from issuance, and it
+  opens earlier than that — by the profile's clock skew allowance — so that a
+  verifier reading a clock a little behind the issuer's still sees a
+  certificate that has begun. `issued_at` is what a record stores as the moment
+  of issuance; `not_before` is what the certificate itself says, and the two
+  are deliberately not the same instant.
+
   Issuance can be refused, and there is one reason it is: the DER came out
   longer than the profile bounds a certificate at. That is checked here, on the
   issuing side, rather than left for an appliance to discover when it is handed
@@ -36,6 +44,7 @@ defmodule Ctrld.PKI.Certificate do
   @type issued :: %{
           der: binary(),
           serial: pos_integer(),
+          issued_at: DateTime.t(),
           not_before: DateTime.t(),
           not_after: DateTime.t(),
           subject_common_name: String.t(),
@@ -91,8 +100,9 @@ defmodule Ctrld.PKI.Certificate do
 
   defp issue(kind, subject, subject_point, issuer, issuer_key, now) do
     serial = serial()
-    not_before = DateTime.truncate(now, :second)
-    not_after = shift_years(not_before, Profile.validity_years())
+    issued_at = DateTime.truncate(now, :second)
+    not_before = DateTime.add(issued_at, -Profile.clock_skew_seconds(), :second)
+    not_after = shift_years(issued_at, Profile.validity_years())
 
     certificate =
       tbs(
@@ -119,6 +129,7 @@ defmodule Ctrld.PKI.Certificate do
        %{
          der: der,
          serial: serial,
+         issued_at: issued_at,
          not_before: not_before,
          not_after: not_after,
          subject_common_name: subject,

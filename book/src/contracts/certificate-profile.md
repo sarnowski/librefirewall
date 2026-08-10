@@ -40,6 +40,15 @@ mechanism and a short lifetime would buy nothing but a fleet-wide re-issuance cl
 matching non-remotable trust anchor — CA rollover means visiting every appliance — is recorded with
 that decision in the [management design](../design/management.md#lifecycle-rules).
 
+The ten years are measured from the instant of signing, but the window **opens one hour before**
+it. Every issuer under this profile backdates `notBefore` by that hour, and no verifier may treat a
+certificate dated in the recent past as suspect. The reason is that the two ends read clocks neither
+can check against the other: an appliance times itself by an unauthenticated real-time clock, and it
+validates a device certificate moments after the management server signed it. A window opening at
+the exact instant of signing is a window that is shut for anyone a second behind — a rejection that
+looks like a broken certificate and is really a broken clock. An hour is far more skew than a
+working deployment has and far less than the lifetime notices.
+
 | Artifact | Subject | Issuer | Key usage | Extended key usage | Subject alternative name |
 |---|---|---|---|---|---|
 | Onboarding certificate | CN = device id | self-signed | digitalSignature | serverAuth | none |

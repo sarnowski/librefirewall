@@ -96,7 +96,7 @@ defmodule Ctrld.Appliances do
           certificate_authority_id: authority.id,
           certificate_der: issued.der,
           certificate_serial: Integer.to_string(issued.serial),
-          certificate_issued_at: issued.not_before,
+          certificate_issued_at: issued.issued_at,
           certificate_not_after: issued.not_after,
           endpoint: ChannelEndpoint.to_string(endpoint),
           onboarded_by_id: actor.id

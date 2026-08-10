@@ -17,7 +17,8 @@ defmodule Ctrld.PKITest do
       assert authority.subject_common_name == "an authority"
       assert Regex.match?(~r/^[0-9a-f]{64}$/, authority.spki_fingerprint)
       assert String.to_integer(authority.serial) > 0
-      assert authority.not_after.year - authority.not_before.year == Profile.validity_years()
+      issued_at = DateTime.add(authority.not_before, Profile.clock_skew_seconds(), :second)
+      assert authority.not_after == DateTime.shift(issued_at, year: Profile.validity_years())
     end
 
     test "stores the private key sealed and nothing else" do

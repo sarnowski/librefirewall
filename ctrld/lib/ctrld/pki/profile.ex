@@ -27,6 +27,7 @@ defmodule Ctrld.PKI.Profile do
   @client_auth_oid {1, 3, 6, 1, 5, 5, 7, 3, 2}
 
   @validity_years 10
+  @clock_skew_seconds 3600
   @serial_bits 128
   @device_id_hex_length 32
   @max_certificate_der_bytes 768
@@ -54,6 +55,22 @@ defmodule Ctrld.PKI.Profile do
 
   @doc "How long an issued certificate is valid for, in years."
   def validity_years, do: @validity_years
+
+  @doc """
+  How far before issuance a certificate becomes valid, in seconds.
+
+  A window that opens at the instant of signing is a window that is closed for
+  every verifier whose clock is behind the issuer's, and there is always one:
+  an appliance times itself by an unauthenticated real-time clock, and the
+  first thing it does with a device certificate is validate it moments after
+  the server signed it. Even the issuer's own runtime reads two clocks that
+  disagree — the certificate is dated from the operating system's clock and
+  validated against the BEAM's, which trails it by milliseconds — so a
+  certificate valid from exactly now is one that can be rejected by the process
+  that made it. The hour is the profile's allowance for that skew, and it is
+  the same hour the appliance backdates its own certificates by.
+  """
+  def clock_skew_seconds, do: @clock_skew_seconds
 
   @doc "The width of a serial number, in bits."
   def serial_bits, do: @serial_bits

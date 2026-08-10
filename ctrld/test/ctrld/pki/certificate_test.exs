@@ -41,9 +41,9 @@ defmodule Ctrld.PKI.CertificateTest do
     end
 
     test "is valid for exactly the profile's ten years", %{authority: authority, now: now} do
-      assert authority.not_before == now
+      assert authority.issued_at == now
       assert authority.not_after == DateTime.shift(now, year: Profile.validity_years())
-      assert authority.not_after.year - authority.not_before.year == 10
+      assert authority.not_after.year - authority.issued_at.year == 10
     end
 
     test "carries a serial of the profile's width", %{authority: authority} do
@@ -159,6 +159,48 @@ defmodule Ctrld.PKI.CertificateTest do
 
     test "chains to the authority", %{issued: issued, authority: authority} do
       assert :public_key.pkix_verify(issued.der, public_key(authority.der))
+    end
+  end
+
+  describe "the validity window" do
+    test "opens before issuance, by the profile's allowance for a verifier's clock", %{
+      authority: authority,
+      authority_key: key,
+      now: now
+    } do
+      {:ok, device} =
+        Certificate.issue_under(
+          :device,
+          device_id(),
+          KeyPair.public_point(KeyPair.generate()),
+          authority.subject_common_name,
+          key,
+          now
+        )
+
+      for issued <- [authority, device] do
+        assert DateTime.compare(issued.not_before, issued.issued_at) == :lt
+
+        assert DateTime.diff(issued.issued_at, issued.not_before, :second) ==
+                 Profile.clock_skew_seconds()
+      end
+    end
+
+    test "a certificate validates against its authority the moment it is signed", %{
+      authority: authority,
+      authority_key: key
+    } do
+      {:ok, device} =
+        Certificate.issue_under(
+          :device,
+          device_id(),
+          KeyPair.public_point(KeyPair.generate()),
+          authority.subject_common_name,
+          key,
+          DateTime.utc_now()
+        )
+
+      assert {:ok, _} = :public_key.pkix_path_validation(authority.der, [device.der], [])
     end
   end
 
