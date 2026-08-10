@@ -165,7 +165,9 @@ const DETAIL_CHANNEL_CERTIFICATE: u8 = 49;
 const DETAIL_CHANNEL_ALERT: u8 = 50;
 const DETAIL_CHANNEL_BACKLOGGED: u8 = 51;
 const DETAIL_CHANNEL_FRAMES: u8 = 52;
-const DETAIL_COUNT: u8 = 53;
+const DETAIL_RECORDING_RESUMED: u8 = 53;
+const DETAIL_RECORDING_FRESH: u8 = 54;
+const DETAIL_COUNT: u8 = 55;
 
 /// How many ways a handshake on the management channel may end, and how many
 /// ways a delivered anchor may refuse the certificate a server presented.
@@ -246,12 +248,11 @@ fn narrow_discriminants(record: LogRecord) -> LogRecord {
     narrowed.state = record.state % (LOG_DOMAIN_STATE_COUNT + 2);
     narrowed.detail = record.detail % (DETAIL_COUNT + 1);
     narrowed.operand_count = record.operand_count % (MAX_OPERANDS + 2);
-    // The fourth operand word, which is where this ABI carries the one flag two
-    // details hold — the identity's owner flag and the reset's. Folded to the
-    // band around the two values it admits so both the accepted and the refused
-    // side are reachable on a derived record. The other three words stay whole:
-    // they are unranged, and narrowing them would only make the accepted case
-    // narrower.
+    // The fourth operand word, which is where this ABI carries a detail's flag
+    // wherever the leading word is not one. Folded to the band around the two
+    // values it admits so both the accepted and the refused side are reachable
+    // on a derived record. The other three words stay whole: they are unranged,
+    // and narrowing them would only make the accepted case narrower.
     narrowed.operands[3] = record.operands[3] % 3;
     narrowed.signalled = record.signalled % 3;
     // Zero is the one value of this field a rule refuses and is unreachable by
@@ -655,7 +656,12 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_CHANNEL_CERTIFICATE
                 | DETAIL_CHANNEL_ALERT
                 | DETAIL_CHANNEL_BACKLOGGED
-                | DETAIL_CHANNEL_FRAMES => {
+                | DETAIL_CHANNEL_FRAMES
+                // And the recording superblock's two, on the same terms: each
+                // reads its words out of that array and none of them reaches a
+                // word outside it.
+                | DETAIL_RECORDING_RESUMED
+                | DETAIL_RECORDING_FRESH => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -817,19 +823,30 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // detail in this ABI whose fourth word is a number rather than a flag, so
         // the flag rule below must not reach it and there is nothing here to
         // refuse.
-        | DETAIL_DELEGATED => None,
-        // The two details whose fourth operand word is a flag rather than a
-        // number: every other word they carry is unranged, and a flag that is
-        // neither 0 nor 1 would read as "unowned" — or as a reset of an unowned
-        // appliance — on a record that said something else. Restated here as the
-        // two-value check it is, once, because the ABI carries a flag in one
-        // position and this harness has one rule for it too.
-        // The channel's segment counts join them: their fourth word is the one
-        // flag they carry, in the one position this ABI puts a flag in. So does
-        // the delegated anchor's, whose flag is the whole of what separates an
-        // appliance nobody has taken from a delegation that answered badly, and
-        // whose other three words are a length and two holes.
-        DETAIL_IDENTITY | DETAIL_RESET | DETAIL_DIAL_SEGMENTS | DETAIL_DELEGATED_ANCHOR => {
+        | DETAIL_DELEGATED
+        // The recording extent a boot continued joins them: a sector and the
+        // three counters the medium itself held, and every bit pattern of each
+        // is one a disk somebody is holding could really carry. Whether a
+        // *stored* ring is believable is asked of the geometry this side built,
+        // which is a different question from the shape of this record — so a
+        // range here would refuse a recording the appliance really resumed.
+        | DETAIL_RECORDING_RESUMED => None,
+        // The details whose fourth operand word is a flag rather than a number
+        // and which range nothing ahead of it: every other word each carries is
+        // unranged, so that flag is the whole of what any of them can be refused
+        // for. A word there that is neither 0 nor 1 would read as an appliance
+        // nobody owns, as a reset of one, as a link that answered nothing, as an
+        // anchor that was never delivered, or as an extent that held no
+        // stranger's ring — each of them on a record that said something else.
+        // Restated once as the two-value check it is, because the fourth word is
+        // where this ABI puts a flag; the details that read one out of the
+        // leading word instead, or that range a word before reaching it, carry
+        // the same check in their own arms below.
+        DETAIL_IDENTITY
+        | DETAIL_RESET
+        | DETAIL_DIAL_SEGMENTS
+        | DETAIL_DELEGATED_ANCHOR
+        | DETAIL_RECORDING_FRESH => {
             (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
                 value: record.operands[3],
             })
@@ -2006,6 +2023,36 @@ mod tests {
                     // settled on, and two tallies that differ so a direction
                     // read out of the wrong word is visible.
                     operands: [1, 1, 9, 7],
+                    ..domain_record()
+                }),
+            ),
+            // The two a boot's reading of the **recording superblock**
+            // produces, committed for the reason the channel's eight are and
+            // one sharper: between them these two can be refused for a single
+            // word, so a cold run reaches their accepted shape — the one the
+            // render path walks — only by drawing the discriminant.
+            (
+                "valid_domain_recording_resumed",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_RECORDING_RESUMED,
+                    // The extent's first sector and the three counters the
+                    // medium held, no two alike so a counter read out of the
+                    // wrong word is visible rather than symmetric.
+                    operands: [2048, 6, 41, 12],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_recording_fresh",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_RECORDING_FRESH,
+                    // A different sector from the resumed seed's, and the flag
+                    // at 1 — the reading that is *not* the ordinary first boot,
+                    // and the value a uniform draw over `u64` never lands on.
+                    // The two words between them are the zeros a writer of this
+                    // detail really leaves, so the seed is the region a boot
+                    // publishes rather than a shape only this harness builds.
+                    operands: [4096, 0, 0, 1],
                     ..domain_record()
                 }),
             ),
