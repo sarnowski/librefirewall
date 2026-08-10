@@ -932,6 +932,16 @@ impl<'ring> EndpointStage<'ring> {
             .map_or(0, |endpoint| endpoint.push_outbound(bytes))
     }
 
+    /// The room the channel's session has for what is pushed onto it next. Zero
+    /// where the port has no addressing or no session, on [`Self::dial_push`]'s
+    /// terms: bytes with nowhere to go have no room waiting for them either.
+    #[must_use]
+    pub fn dial_send_room(&self) -> usize {
+        self.endpoint
+            .as_ref()
+            .map_or(0, Endpoint::outbound_send_room)
+    }
+
     /// End the channel's session from this end. The close goes out once
     /// everything pushed onto it has.
     pub fn end_dial_session(&mut self) {

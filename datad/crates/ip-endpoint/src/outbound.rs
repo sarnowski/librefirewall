@@ -31,7 +31,9 @@
 //! sent and the consumer has not taken, because a consumer is driven on a wakeup
 //! and bytes arrive on a frame. Neither grows and neither is sized by anything a
 //! peer sends: what does not fit is **counted and refused**, never dropped
-//! silently and never allowed to displace what came before it.
+//! silently and never allowed to displace what came before it. Both **slide**:
+//! what the consumer has read and what the peer has acknowledged leave the front,
+//! so a session of any length fits two arrays of a fixed size.
 //!
 //! The receive window is kept equal to the room actually left, so a peer that
 //! keeps to the window cannot overflow the inbound array at all; the overflow
@@ -48,17 +50,19 @@ use net_headers::{Ipv4Address, MacAddress};
 
 use crate::route::{Hop, RouteRefusal};
 
-/// Bytes the consumer has answered with and the transport has not finished
-/// with.
+/// Bytes the consumer has answered with that the peer has not acknowledged.
 ///
-/// It must outlast the send rather than the answer: the transport keeps no copy
-/// of a range it may ask for again, so these bytes are held until the peer has
-/// acknowledged them. Sized for the **records** a session over this connection
-/// composes and not for any fixed message — the largest one end of such a
-/// session sends in a single flight is a key-exchange greeting of about
-/// thirteen hundred bytes, and the room here is that with a whole flight's
-/// margin over it.
-pub const SEND_CAPACITY: usize = 2048;
+/// A **window**, not a budget for the session: an acknowledgement releases the
+/// bytes it covers and the room is reused, so one array of this size carries a
+/// session of any length, and what it bounds is only what may be outstanding at
+/// once — the transport keeping no copy of a range it may ask for again.
+///
+/// **One whole run the consumer hands down has to fit**, one split across a
+/// window that must drain first being a hole in the middle of a stream; that floor
+/// is held to the consumer's own bound by an assertion sited where both numbers
+/// are, and behind it is one more run's worth of queue. Deliberately not a TLS
+/// record's size, the record layer handing its bytes down a run at a time.
+pub const SEND_CAPACITY: usize = 8192;
 
 /// Bytes read off the peer and held until the consumer takes them.
 ///
@@ -306,8 +310,8 @@ pub struct OutboundCounters {
     /// rather than an endpoint that ran out.
     pub overflowed: u64,
     /// Bytes the consumer answered with that there was no room for. **Ours**,
-    /// not the peer's: the consumer is another domain, and this is the count
-    /// that says its answer outgrew the room this end keeps for one.
+    /// not the peer's: the consumer is another domain, and this says its answer
+    /// met a window still full of bytes the peer had not acknowledged.
     pub refused: u64,
     /// Sessions whose connection came up. Counted where the handshake completes
     /// and not where the session ends, a channel that is still running having no
@@ -434,12 +438,13 @@ pub struct Session {
     /// How much of `outbound` the transport has taken. A window smaller than
     /// what is held is why this is a position rather than a flag.
     sent: usize,
-    /// The sequence number the first byte the consumer answered with occupies,
-    /// learned from the transport once it has taken one. It is what turns a
-    /// range the transport asks for again into an offset into the bytes held
-    /// here — without it a retransmission would be a guess, and a guess would
-    /// put the wrong bytes on the wire under a sequence number the peer would
-    /// accept them at.
+    /// The sequence number the **first byte still held** occupies, learned from
+    /// the transport once it has taken one and moved forward by every release
+    /// after that. It is what turns a range the transport asks for again into an
+    /// offset into the bytes here — without it a retransmission would be a guess
+    /// under a number the peer would accept the wrong bytes at. A moving origin
+    /// is what makes the release representable: offset zero is wherever the
+    /// window now starts.
     base: Option<SeqNumber>,
     inbound: [u8; RECEIVE_CAPACITY],
     inbound_len: usize,
@@ -572,6 +577,12 @@ impl Session {
         RECEIVE_CAPACITY.saturating_sub(self.inbound_len)
     }
 
+    /// The room left for what the consumer answers with next.
+    #[must_use]
+    pub const fn send_room(&self) -> usize {
+        SEND_CAPACITY.saturating_sub(self.outbound_len)
+    }
+
     /// Whether the peer has closed its half.
     #[must_use]
     pub const fn peer_closed(&self) -> bool {
@@ -591,11 +602,8 @@ impl Session {
         self.sent < self.outbound_len
     }
 
-    /// Drop the first `bytes` the consumer has taken, keeping the rest.
-    ///
-    /// A copy inside one fixed array and bounded by it: the alternative is a
-    /// read position that grows until the array is full of bytes nobody wants,
-    /// which is the same overflow with a longer fuse.
+    /// Drop the first `bytes` the consumer has taken, keeping the rest. A copy
+    /// inside one fixed array and bounded by it, which is this half of the slide.
     pub fn consumed(&mut self, bytes: usize) {
         let taken = bytes.min(self.inbound_len);
         let left = self.inbound_len.saturating_sub(taken);
@@ -610,8 +618,8 @@ impl Session {
             .unwrap_or(&[])
     }
 
-    /// The `len` bytes at offset `at`, for a range the transport asks for
-    /// again. `None` where this session never sent them.
+    /// The `len` bytes at offset `at` from the window's origin, for a range the
+    /// transport asks for again. `None` past what was sent, or once acknowledged.
     pub(crate) fn range(&self, at: usize, len: usize) -> Option<&[u8]> {
         let end = at.checked_add(len)?;
         if end > self.sent {
@@ -620,9 +628,9 @@ impl Session {
         self.outbound.get(at..end)
     }
 
-    /// Where in the outbound bytes `sequence` falls, or `None` for a number this
-    /// session never sent — which is what a range asked for before the first
-    /// byte went out, or one past everything that did, is.
+    /// Where in the bytes still held `sequence` falls, or `None` for one not held.
+    /// Total over every number a peer can drive: one behind the origin measures as
+    /// the enormous complement, outside what is held exactly as one ahead of it.
     pub(crate) fn offset_of(&self, sequence: SeqNumber) -> Option<usize> {
         let base = self.base?;
         let ahead = sequence.distance_from(base) as usize;
@@ -631,11 +639,43 @@ impl Session {
 
     /// Learn where the first outbound byte sits in the connection's sequence
     /// space. Taken once: the transport reports the oldest range it still holds,
-    /// and after the first send that range *is* that byte's place.
+    /// and after the first send that range *is* that byte's place; every later
+    /// move is a [`release`](Self::release).
     pub(crate) fn note_base(&mut self, sequence: SeqNumber) {
         if self.base.is_none() {
             self.base = Some(sequence);
         }
+    }
+
+    /// Give up every held byte before `unreleased`, answering how many left, and
+    /// move the window's origin over them.
+    ///
+    /// The boundary is the transport's own — the oldest number it may still ask
+    /// for a range at — and it is the only thing that may decide this: a byte
+    /// released is one no retransmission can ask for again. Saturating at what was
+    /// *sent* is what makes a close acknowledged along with the bytes in front of
+    /// it release those and no more.
+    pub(crate) fn release(&mut self, unreleased: SeqNumber) -> usize {
+        let Some(base) = self.base else {
+            return 0;
+        };
+        // Unconditional, a peer pacing this, and what stops a distance measured
+        // backwards from reading as an enormous run of released bytes.
+        if unreleased.precedes_or_equals(base) {
+            return 0;
+        }
+        let held = self.outbound_len;
+        let released = (unreleased.distance_from(base) as usize).min(self.sent);
+        // And past what is held reaches outside the array rather than into it.
+        if released == 0 || released > held {
+            return 0;
+        }
+        self.outbound.copy_within(released..held, 0);
+        self.outbound_len = held.saturating_sub(released);
+        self.sent = self.sent.saturating_sub(released);
+        // Lossless: bounded by `SEND_CAPACITY`.
+        self.base = Some(base.add(released as u32));
+        released
     }
 
     pub(crate) const fn peer_mac(&self) -> Option<MacAddress> {
@@ -709,11 +749,13 @@ impl Session {
         self.closing = true;
     }
 
-    /// Put `bytes` on the wire, answering how many there was room for.
+    /// Put `bytes` on the wire, answering how many there was room for and how
+    /// many there was not.
     ///
-    /// Fewer than offered is a refusal this end owns and counts: the caller
-    /// decides what to do about it, and every caller in this workspace ends the
-    /// session, a stream missing a run of its middle being no stream at all.
+    /// Fewer than offered is the **window full** rather than the end of anything,
+    /// the room coming back as the peer acknowledges what is in it. Still this
+    /// end's own refusal and counted as one: a caller that cannot re-offer has to
+    /// end the session, a stream missing its middle being no stream.
     pub fn push(&mut self, bytes: &[u8]) -> (usize, usize) {
         let held = self.outbound_len;
         let Some(room) = self.outbound.get_mut(held..) else {

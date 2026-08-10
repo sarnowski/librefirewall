@@ -189,10 +189,9 @@ use lfw_metrics::StatsShard;
 use pd_runtime::{
     CalibrationRefused, ChannelStream, ClockCalibration, ConfigHandover, ConfigReply,
     ConfigRequest, Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage,
-    ForwardRings, Half, Hop, Ipv4Address, IsnSecret, ONBOARD_OUTBOUND_CAPACITY, OnboardCounters,
-    OpenError, PdClock, Pool, RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport,
-    Resolutions, ReturnRing, StatsRegions, Via, Wait, attach_region, log_sample,
-    read_timestamp_counter,
+    ForwardRings, Half, Hop, Ipv4Address, IsnSecret, OnboardCounters, OpenError, PdClock, Pool,
+    RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
+    StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -288,11 +287,10 @@ fn relay_refusal(failure: RelayFailure) -> Refusal {
             RefusalDetail::One(RELAY_ANSWER_TIMEOUT.as_nanos() / 1_000_000),
         ),
         RelayFailure::Busy => ("relay-window-busy", RefusalDetail::None),
-        // What there was no room for, against the room there is: a byte count
-        // with no bound beside it is a number nobody can read.
-        RelayFailure::AnswerTooLong { refused } => (
+        // What there was no room for against the room there was, neither readable alone.
+        RelayFailure::AnswerTooLong { refused, room } => (
             "relay-answer-too-long",
-            RefusalDetail::Two(refused as u64, ONBOARD_OUTBOUND_CAPACITY as u64),
+            RefusalDetail::Two(refused as u64, room as u64),
         ),
     };
     Refusal {

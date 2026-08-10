@@ -1070,6 +1070,24 @@ impl Station {
         out
     }
 
+    /// A frame acknowledging `acknowledgement` rather than what this station has
+    /// really read, for the cases about what a peer may claim.
+    ///
+    /// What it has read is left alone, so the claim is one segment's and the
+    /// station goes on acknowledging honestly afterwards.
+    fn acknowledging(
+        &mut self,
+        acknowledgement: lfw_tcp::SeqNumber,
+        flags: lfw_tcp::Flags,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let honest = self.expect;
+        self.expect = acknowledgement;
+        let frame = self.frame(flags, payload);
+        self.expect = honest;
+        frame
+    }
+
     /// Read a frame the endpoint sent, learning what to acknowledge from it and
     /// answering its segment's fields.
     fn read(&mut self, frame: &[u8]) -> (lfw_tcp::Flags, lfw_tcp::SeqNumber, Vec<u8>) {
@@ -1121,6 +1139,16 @@ fn open(
         .receive(at(0), STATION_ADDRESS, packet.payload(), out)
         .connection
         .expect("a connection")
+}
+
+/// The sequence number a frame's segment carries, which is the name a
+/// retransmission has to re-send its range under.
+fn sequence_of(frame: &[u8]) -> lfw_tcp::SeqNumber {
+    let ethernet = Ethernet::parse(frame).expect("a frame");
+    let packet = Ipv4Packet::parse(ethernet.payload).expect("a datagram");
+    lfw_tcp::Segment::parse(OUR_ADDRESS, STATION_ADDRESS, packet.payload())
+        .expect("a segment")
+        .sequence
 }
 
 /// The window a frame's segment advertises.
@@ -4962,6 +4990,352 @@ fn a_resolved_entry_stops_being_an_answer_once_its_lifetime_runs_out() {
     assert_eq!(asked.len(), 1);
     assert_eq!(asked_about(&asked[0]), STATION_ADDRESS);
     assert_eq!(endpoint.neighbour_counters().requested, 2);
+}
+
+// ---------------------------------------------------------------------------
+// The send window: what the peer acknowledges leaves, and the room comes back
+
+/// A session up against a station that answered everything, which is where every
+/// case about the send window starts. `iss` is the station's own initial
+/// sequence number, so a case can put the origin anywhere in the space —
+/// including where moving it wraps.
+fn established_dial(iss: u32) -> (Endpoint, Station, Monotonic) {
+    let mut endpoint = endpoint();
+    let now = at(0);
+    endpoint
+        .open_outbound(STATION_ADDRESS, PEER_PORT)
+        .expect("an on-link destination");
+    assert_eq!(pump(&mut endpoint, now).len(), 1, "the resolution is asked");
+    let syn = resolve_and_take_syn(&mut endpoint, now, STATION_MAC, STATION_ADDRESS);
+    let later = after(now, lfw_tcp::INITIAL_RTO);
+    let mut station = Station::new(PEER_PORT, iss);
+    let (flags, _, _) = station.read(&syn);
+    assert!(flags.contains(lfw_tcp::Flags::SYN));
+    let synack = station.frame(lfw_tcp::Flags::SYN.with(lfw_tcp::Flags::ACK), &[]);
+    deliver(&mut endpoint, later, &synack);
+    assert!(pump(&mut endpoint, later).is_empty());
+    (endpoint, station, later)
+}
+
+/// Offer `bytes` to the session and carry them across to `station`, which
+/// acknowledges every segment it reads, answering the payload that crossed in
+/// order.
+///
+/// The rounds are bounded by the bytes offered and not by a clock: each one
+/// hands the window whatever room it has, takes every segment the peer's window
+/// allows, and acknowledges them — so a round that moved nothing with bytes
+/// still in hand is the stall this reports rather than a test that spins.
+fn stream_acknowledged(
+    endpoint: &mut Endpoint,
+    station: &mut Station,
+    now: Monotonic,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut crossed = Vec::new();
+    let mut offered = 0usize;
+    for _ in 0..bytes.len().div_ceil(64) + 8 {
+        // Only what the window says it has room for, which is what a consumer
+        // that asks first does — and what makes a refusal here a defect rather
+        // than this helper over-offering. That the answer is exact is pinned
+        // on the way past.
+        let want = bytes
+            .len()
+            .saturating_sub(offered)
+            .min(endpoint.outbound_send_room());
+        let taken = endpoint.push_outbound(bytes.get(offered..offered + want).unwrap_or_default());
+        assert_eq!(taken, want, "the room answered was the room there was");
+        offered += taken;
+        let frames = pump(endpoint, now);
+        if frames.is_empty() {
+            break;
+        }
+        for frame in &frames {
+            let (_, _, payload) = station.read(frame);
+            crossed.extend_from_slice(&payload);
+        }
+        let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
+        deliver(endpoint, now, &ack);
+    }
+    assert_eq!(offered, bytes.len(), "every byte was taken by the window");
+    crossed
+}
+
+/// A run of `len` bytes no two of which are equal by position, so a byte served
+/// from the wrong offset is visible rather than merely plausible.
+fn marked(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| {
+            // Two bytes of the index folded into one, which repeats every 65536
+            // — far past any run these cases stream.
+            let index = index as u32;
+            ((index & 0xff) ^ ((index >> 8) & 0xff) ^ 0x5a) as u8
+        })
+        .collect()
+}
+
+proptest! {
+    /// **The window drains, so the session is not bounded by it.** A run many
+    /// times the window's own size crosses whole, byte for byte and in order,
+    /// and not one byte of it is ever refused: what the peer acknowledges leaves
+    /// the array and the room it occupied takes the bytes behind it.
+    ///
+    /// The multiple is the property. At one window's worth this would pass
+    /// against an array that never drained at all, which is exactly the defect
+    /// it exists to catch.
+    #[test]
+    fn a_run_many_windows_long_crosses_whole_and_is_never_refused(
+        windows in 2usize..=6,
+        trailing in 0usize..1024,
+    ) {
+        let (mut endpoint, mut station, now) = established_dial(0x5000_0000);
+        let bytes = marked(SEND_CAPACITY * windows + trailing);
+        let crossed = stream_acknowledged(&mut endpoint, &mut station, now, &bytes);
+        prop_assert_eq!(crossed.len(), bytes.len());
+        prop_assert!(crossed == bytes, "the stream crossed in order and unaltered");
+        prop_assert_eq!(endpoint.outbound_counters().refused, 0);
+        prop_assert_eq!(endpoint.outbound_counters().sent, bytes.len() as u64);
+        // And the window is empty again, so the next run has the whole of it.
+        prop_assert_eq!(endpoint.outbound_send_room(), SEND_CAPACITY);
+    }
+}
+
+/// **A retransmission after the origin has moved serves the bytes it names.**
+/// The whole hazard of a sliding window is here: offset zero is no longer stream
+/// byte zero, so a range asked for again must be found relative to where the
+/// window now starts and not to where it once did.
+#[test]
+fn a_retransmission_across_a_moved_origin_serves_the_bytes_it_names() {
+    let (mut endpoint, mut station, now) = established_dial(0x6000_0000);
+    // First, a run the station acknowledges, which moves the origin off byte
+    // zero. Nothing about the case works if this does not happen, so it is
+    // asserted rather than assumed.
+    let first = marked(3000);
+    assert_eq!(
+        stream_acknowledged(&mut endpoint, &mut station, now, &first),
+        first
+    );
+    assert_eq!(endpoint.outbound_send_room(), SEND_CAPACITY);
+
+    // Then a run the station reads and never acknowledges.
+    let second: Vec<u8> = marked(4096).into_iter().map(|byte| !byte).collect();
+    assert_eq!(endpoint.push_outbound(&second), second.len());
+    let sent = pump(&mut endpoint, now);
+    assert!(!sent.is_empty(), "the second run goes out");
+    let mut across = Vec::new();
+    let mut sequences = Vec::new();
+    for frame in &sent {
+        let (_, _, payload) = station.read(frame);
+        sequences.push(sequence_of(frame));
+        across.extend_from_slice(&payload);
+    }
+
+    // The transport asks for the oldest of them again, and what comes back must
+    // be that very range under that very number.
+    let mut out = vec![0u8; ROOMY];
+    let len = endpoint
+        .poll_timeouts(after(now, times(lfw_tcp::INITIAL_RTO, 4)), &mut out)
+        .frame()
+        .expect("the oldest unacknowledged range is re-sent");
+    out.truncate(len);
+    let (_, _, again) = station.read(&out);
+    assert_eq!(
+        sequence_of(&out),
+        sequences[0],
+        "the retransmission names the range it is re-sending"
+    );
+    assert_eq!(
+        again,
+        second.get(..again.len()).expect("a prefix of the run"),
+        "and carries that range's own bytes, not the ones that used to sit there"
+    );
+}
+
+/// **An acknowledgement landing inside a segment releases nothing of it.** A peer
+/// may acknowledge any byte boundary it likes, and one in the middle of a segment
+/// advances the transport's acknowledgement while leaving that whole segment on
+/// its books — so a window released to the acknowledgement would drop bytes a
+/// retransmission is still owed and then have nothing to answer it with. The
+/// boundary is therefore the oldest range the transport may still ask for, not the
+/// number the peer named.
+#[test]
+fn an_acknowledgement_inside_a_segment_leaves_that_segment_retransmittable() {
+    let (mut endpoint, mut station, now) = established_dial(0x9000_0000);
+    let bytes = marked(1200);
+    assert_eq!(endpoint.push_outbound(&bytes), bytes.len());
+    let sent = pump(&mut endpoint, now);
+    assert_eq!(sent.len(), 1, "the run fits one segment");
+    let first = sequence_of(&sent[0]);
+    let (_, _, payload) = station.read(&sent[0]);
+    assert_eq!(payload, bytes);
+
+    // Half of that segment, which is a boundary the peer is entitled to name and
+    // which retires nothing.
+    let half = station.acknowledging(first.add(600), lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &half);
+    assert_eq!(
+        endpoint.outbound_send_room(),
+        SEND_CAPACITY - bytes.len(),
+        "nothing left the window, the whole segment still being owed"
+    );
+
+    // And the retransmission still has every byte it names.
+    let mut out = vec![0u8; ROOMY];
+    let len = endpoint
+        .poll_timeouts(after(now, times(lfw_tcp::INITIAL_RTO, 4)), &mut out)
+        .frame()
+        .expect("the segment is re-sent");
+    out.truncate(len);
+    assert_eq!(sequence_of(&out), first);
+    let (_, _, again) = station.read(&out);
+    assert_eq!(again, bytes, "and carries the whole of what it named");
+
+    // Once the peer acknowledges the segment's end, it leaves.
+    let whole = station.acknowledging(first.add(1200), lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &whole);
+    assert_eq!(endpoint.outbound_send_room(), SEND_CAPACITY);
+}
+
+/// **A peer that acknowledges nothing fills the window and leaves it full**, and
+/// that is backpressure rather than a failure: the session is still established,
+/// nothing is counted as lost, and the moment one acknowledgement arrives the
+/// room comes back.
+#[test]
+fn a_peer_that_acknowledges_nothing_fills_the_window_and_that_is_not_a_failure() {
+    let (mut endpoint, mut station, now) = established_dial(0x7000_0000);
+    let bytes = marked(SEND_CAPACITY);
+    assert_eq!(endpoint.push_outbound(&bytes), SEND_CAPACITY);
+    assert_eq!(endpoint.outbound_send_room(), 0);
+    // Everything the peer's window allows goes out and is never acknowledged.
+    let sent = pump(&mut endpoint, now);
+    assert!(!sent.is_empty());
+    for frame in &sent {
+        station.read(frame);
+    }
+    // A full window refuses what will not fit and says how much, and the session
+    // is untouched by it.
+    assert_eq!(endpoint.push_outbound(b"more"), 0);
+    assert_eq!(endpoint.outbound_counters().refused, 4);
+    assert_eq!(
+        endpoint.outbound().map(Session::phase),
+        Some(Phase::Established)
+    );
+    assert_eq!(endpoint.outbound_counters().ended, 0);
+    assert_eq!(endpoint.outbound_send_room(), 0);
+
+    // And one acknowledgement is all it takes for the room to come back.
+    let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &ack);
+    let freed = endpoint.outbound_send_room();
+    assert!(freed > 0, "the acknowledged bytes left the window");
+    assert_eq!(endpoint.push_outbound(b"more"), 4);
+}
+
+/// **A peer cannot make the window give up a byte it has not acknowledged.** A
+/// duplicate acknowledgement, one behind the origin, and one past everything
+/// sent are the three shapes it has, and none of them moves the window further
+/// than the transport's own boundary — which the transport refuses to put past
+/// what went out.
+#[test]
+fn no_acknowledgement_a_peer_can_send_releases_a_byte_it_did_not_cover() {
+    let (mut endpoint, mut station, now) = established_dial(0x8000_0000);
+    let bytes = marked(2048);
+    assert_eq!(endpoint.push_outbound(&bytes), bytes.len());
+    let sent = pump(&mut endpoint, now);
+    assert!(!sent.is_empty());
+    let first = sequence_of(&sent[0]);
+    for frame in &sent {
+        station.read(frame);
+    }
+    let room_before = endpoint.outbound_send_room();
+
+    // An acknowledgement of the very first byte's number acknowledges nothing:
+    // it is where the window already starts.
+    let stale = station.acknowledging(first, lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &stale);
+    assert_eq!(endpoint.outbound_send_room(), room_before);
+
+    // One behind that is a number this end has never held. It releases nothing
+    // either, rather than reading as an enormous run of released bytes.
+    let behind = station.acknowledging(first.sub(64), lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &behind);
+    assert_eq!(endpoint.outbound_send_room(), room_before);
+
+    // And one far past everything sent is refused by the transport — the same
+    // refusal a station claiming a number that was never sent has always drawn
+    // — so the window never sees it at all, and the session records it as the
+    // thing an operator has to go and look at.
+    let ahead = station.acknowledging(first.add(1 << 20), lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &ahead);
+    assert_eq!(endpoint.outbound_send_room(), room_before);
+    assert!(
+        matches!(
+            endpoint.outbound().map(Session::ending),
+            Some(Ended::UnacceptableAcknowledgement { .. })
+        ),
+        "the claim of a number never sent is the refusal it has always been"
+    );
+
+    // What the peer really acknowledged is still what leaves, and only that.
+    let honest = station.frame(lfw_tcp::Flags::ACK, &[]);
+    deliver(&mut endpoint, now, &honest);
+    assert!(endpoint.outbound_send_room() > room_before);
+}
+
+/// **The origin moves correctly across the wrap, and no number a peer can name
+/// takes more than the window holds.** Sequence space is a circle, so an origin
+/// just below 2^32 releases bytes whose numbers are on the other side of it, and
+/// the arithmetic that finds them must be the sequence space's rather than an
+/// integer's.
+///
+/// Driven on the session directly, because this end's own initial sequence
+/// number is the generator's: no dial can be steered to the wrap from outside,
+/// so a case that only asked a station for one would prove nothing about the
+/// side of the space the origin is on.
+#[test]
+fn a_window_whose_origin_crosses_the_wrap_releases_and_finds_the_right_bytes() {
+    let mut session = Session::new(
+        STATION_ADDRESS,
+        PEER_PORT,
+        Hop {
+            address: STATION_ADDRESS,
+            via: Via::Prefix,
+        },
+    );
+    let bytes = marked(600);
+    assert_eq!(session.push(&bytes), (600, 0));
+    // The window starts 100 short of the top of the space, so releasing 200 puts
+    // the origin 100 past it.
+    let base = lfw_tcp::SeqNumber::new(u32::MAX - 99);
+    session.note_base(base);
+    session.took(600);
+    assert_eq!(session.release(base.add(200)), 200);
+
+    // Offset zero is now the stream's 200th byte, whose number is on the far
+    // side of the wrap, and every held byte is found at its own number.
+    assert_eq!(session.offset_of(base.add(200)), Some(0));
+    assert_eq!(session.range(0, 8), bytes.get(200..208));
+    assert_eq!(session.offset_of(base.add(599)), Some(399));
+    assert_eq!(session.range(399, 1), bytes.get(599..600));
+
+    // What left is gone rather than hidden: the numbers it occupied answer
+    // nothing, which is what keeps a retransmission from serving a byte that has
+    // been acknowledged and overwritten.
+    assert_eq!(session.offset_of(base), None);
+    assert_eq!(session.offset_of(base.add(199)), None);
+
+    // A number behind the origin releases nothing. This is the one way unsigned
+    // sequence arithmetic can hand a peer the whole window — a distance measured
+    // backwards is the enormous complement — and the ordering test in front of it
+    // is what stops it.
+    assert_eq!(session.release(base.add(199)), 0);
+    assert_eq!(session.offset_of(base.add(200)), Some(0));
+
+    // And a number past everything sent takes what was sent and not one byte
+    // more, which is both the close acknowledged along with the bytes in front
+    // of it and the bound that keeps a release inside the array.
+    assert_eq!(session.release(base.add(1 << 20)), 400);
+    assert_eq!(session.send_room(), SEND_CAPACITY);
+    assert_eq!(session.offset_of(base.add(600)), None);
 }
 
 // ---------------------------------------------------------------------------

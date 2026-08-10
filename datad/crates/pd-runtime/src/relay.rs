@@ -131,10 +131,12 @@ pub enum RelayFailure {
     /// paces.
     Busy,
     /// The records the terminating end answered with outgrew the room the
-    /// stream keeps for what goes on the wire, so the session cannot be carried
-    /// on without a hole in the middle of it. **Ours** rather than the peer's,
-    /// and the number is what there was no room for.
-    AnswerTooLong { refused: usize },
+    /// stream had for what goes on the wire, so the session cannot be carried
+    /// on without a hole in the middle of it. **Ours** rather than the peer's.
+    ///
+    /// A wire merely full is not this: what reaches here outgrew a half's one
+    /// buffer, or is a far end answering past what it was offered.
+    AnswerTooLong { refused: usize, room: usize },
 }
 
 /// What one onboarding session carried, for the domain that reports it.
@@ -198,6 +200,13 @@ pub trait Relayed {
     fn peer_closed(&self) -> bool;
     /// Put `bytes` on the wire, answering how many there was room for.
     fn push(&mut self, bytes: &[u8]) -> usize;
+    /// Whether the wire has room for a whole answer — as *offered* — so an item
+    /// may be issued at all: the answer is claimed out of the region whether or
+    /// not the wire can take it, and a run taken and not placed is a hole in a
+    /// stream. A half whose room comes back on an acknowledgement answers `false`
+    /// while it is full; one holding a single bounded exchange has none to wait
+    /// for and answers `true`.
+    fn room_for_an_answer(&self) -> bool;
     /// End the session running on `session`, answering whether that was still
     /// the session this stream held.
     fn end_session(&mut self, session: RelaySession) -> bool;
@@ -229,6 +238,12 @@ impl Relayed for EndpointStage<'_> {
 
     fn push(&mut self, bytes: &[u8]) -> usize {
         Self::onboard_push(self, bytes)
+    }
+
+    /// Always: this stream holds its answers until the session is over, so there
+    /// is no release for a wait to end on.
+    fn room_for_an_answer(&self) -> bool {
+        true
     }
 
     fn end_session(&mut self, session: RelaySession) -> bool {
@@ -280,6 +295,13 @@ impl Relayed for ChannelStream<'_, '_> {
 
     fn push(&mut self, bytes: &[u8]) -> usize {
         self.0.dial_push(bytes)
+    }
+
+    /// **The half the question is for.** Its window slides, so a full one is a
+    /// pass to come back on rather than a session to end — which is what lets
+    /// this half carry more bytes than it holds at once.
+    fn room_for_an_answer(&self) -> bool {
+        self.0.dial_send_room() >= ANSWER_ROOM
     }
 
     fn end_session(&mut self, session: RelaySession) -> bool {
@@ -524,10 +546,13 @@ impl<'chan> Relay<'chan> {
                 self.agreed |= agreed;
                 if kept < offered {
                     self.far = Far::Closed;
+                    // The room there was is exactly what was kept, `Relayed::push`
+                    // taking every byte it has room for.
                     self.fail(
                         stream,
                         RelayFailure::AnswerTooLong {
                             refused: offered.saturating_sub(kept),
+                            room: kept,
                         },
                     );
                     return first;
@@ -622,11 +647,15 @@ impl<'chan> Relay<'chan> {
             // still closing. Nothing is owed until it is gone.
             return (false, None);
         }
+        // Asked once, so the two decisions below rest on one reading. A full wire
+        // holds the item back rather than ending anything; the close is outside
+        // it, carrying no records and having to be possible however full it is.
+        let room = stream.room_for_an_answer();
         let handed = {
             let waiting = stream.received();
             let len = waiting.len().min(MAX_RELAY_PAYLOAD);
             match waiting.get(..len) {
-                Some(bytes) if !bytes.is_empty() => {
+                Some(bytes) if room && !bytes.is_empty() => {
                     let issued = self.requester.request(RelayOperation::Deliver, bytes);
                     Some((issued, len))
                 }
@@ -647,7 +676,7 @@ impl<'chan> Relay<'chan> {
         if stream.peer_closed() {
             return (self.close(stream, now), None);
         }
-        if self.polled {
+        if self.polled || !room {
             return (false, None);
         }
         self.polled = true;
@@ -801,24 +830,20 @@ pub const DEMANDS_PER_WAKEUP: usize = 2;
 /// left over goes on the turn after: a bounded answer that continues is the
 /// difference between a slow flight and a lost session.
 ///
-/// It is the stream's whole room and not the room free in it, because there is
-/// no word in either direction of the ABI for how much is free — so an answer
-/// inside this can still meet a stream that has unsent bytes in it, and that is
-/// [`RelayFailure::AnswerTooLong`]: one session ended, the peer whose own
-/// session stopped being read being the party that caused it.
-///
-/// **That stands**, now that a protocol really answers here and the case is
-/// reachable rather than hypothetical. What a peer can provoke by not reading
-/// is bounded — one answer's worth past a stream it stopped draining — typed,
-/// and confined to the session it opened; no other session, no other port and
-/// no other domain is touched, and the peer that caused it is the one that
-/// loses. Widening the ABI with a free-space word would put a number the
-/// network end writes and this end acts on into a path that has none today, to
-/// convert a self-inflicted refusal into a slower one. The refusal is the
-/// better answer.
+/// It is the stream's whole room and not the room free in it, and the ABI needs
+/// no word for how much is free: whether there is enough is read by the
+/// **network** end off the stream it holds ([`Relayed::room_for_an_answer`]), and
+/// an item is not issued until a whole answer could leave. So a full wire costs a
+/// session that can drain one a pass rather than the session, and
+/// [`RelayFailure::AnswerTooLong`] is what is left — typed, confined to one.
 const ANSWER_ROOM: usize = lfw_ip_endpoint::onboard::OUTBOUND_CAPACITY;
 
-const _: () = assert!(ANSWER_ROOM <= MAX_RELAY_PAYLOAD);
+const _: () = {
+    assert!(ANSWER_ROOM <= MAX_RELAY_PAYLOAD);
+    // The dialled window must hold a whole answer or the channel issues nothing.
+    // Held here, this being where both crates' constants are visible.
+    assert!(ANSWER_ROOM <= lfw_ip_endpoint::outbound::SEND_CAPACITY);
+};
 
 /// What one turn of the protocol left for the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

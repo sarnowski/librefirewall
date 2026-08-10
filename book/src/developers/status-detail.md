@@ -1702,8 +1702,14 @@ established one.
   dials without being rebooted.
 - **The outbound half is a byte stream, and the channel's TLS session now puts the bytes on it.**
   What the transport carries is whatever the consumer above it pushes and whatever the peer sends
-  back, moved and never read — two fixed arrays sized for the records a TLS session composes rather
-  than for any fixed message, with the receive window kept equal to the room actually left. The
+  back, moved and never read — two fixed arrays with the receive window kept equal to the room
+  actually left. **Both of them slide, so neither bounds how much a session may carry**: what the
+  consumer has read leaves the inbound array, and what the peer has **acknowledged** leaves the
+  outbound one and the room it occupied is reused, the release being keyed on the transport's own
+  oldest unacknowledged number so a byte is given up only once no retransmission can ask for it
+  again. A window that is momentarily full is therefore backpressure and not an ending: the relay
+  issues no item until the wire can take a whole answer to it, and the acknowledgement that opens the
+  window brings the next pass back with room. The
   consumer is the **cryptography** domain, reached over the relay this domain already held for the
   onboarding port: this domain never sees a plaintext byte, and the open that starts a session now
   names which half it is so the far end answers an outbound connection with a client and an inbound

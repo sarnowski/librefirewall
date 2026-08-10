@@ -447,6 +447,17 @@ impl Connection {
         self.timer.timeout()
     }
 
+    /// The oldest sequence number this connection may still ask a caller for, so
+    /// everything before it may be released: `snd_una` held back to the start of
+    /// any range still recorded, an acknowledgement inside a segment retiring none.
+    #[must_use]
+    pub fn unreleased(&self) -> SeqNumber {
+        match self.oldest_unacked() {
+            Some(record) if record.sequence.precedes(self.snd_una) => record.sequence,
+            _ => self.snd_una,
+        }
+    }
+
     /// The oldest unacknowledged range, for a caller that must still hold its
     /// bytes.
     #[must_use]

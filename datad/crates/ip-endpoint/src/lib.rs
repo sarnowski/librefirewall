@@ -781,9 +781,10 @@ impl Endpoint {
     /// for.
     ///
     /// Fewer than offered is this end's own refusal and is counted as such: the
-    /// consumer above is another domain, and what its answer outgrew is the room
-    /// this end keeps for one. Zero where no session is running, which is a
-    /// consumer whose bytes arrived after the session they belonged to was gone.
+    /// consumer above is another domain, and what its answer met is a window
+    /// already full of bytes the peer has not acknowledged. Zero where no session
+    /// is running, which is a consumer whose bytes arrived after the session they
+    /// belonged to was gone.
     pub fn push_outbound(&mut self, bytes: &[u8]) -> usize {
         let Some(session) = self.outbound.as_mut() else {
             OutboundCounters::add(&mut self.outbound_counters.refused, bytes.len());
@@ -792,6 +793,12 @@ impl Endpoint {
         let (kept, refused) = session.push(bytes);
         OutboundCounters::add(&mut self.outbound_counters.refused, refused);
         kept
+    }
+
+    /// The room the outbound session has for what the consumer answers with next.
+    #[must_use]
+    pub fn outbound_send_room(&self) -> usize {
+        self.outbound.as_ref().map_or(0, Session::send_room)
     }
 
     /// Drop the first `bytes` of the outbound session's received stream, which
@@ -1766,10 +1773,16 @@ impl Endpoint {
                 })) => Some((claimed.raw(), expected.raw())),
                 _ => None,
             };
+            // Read after the transport processed the segment, this being the
+            // instant its boundary moves; a connection it dropped releases nothing.
+            let released = self.tcp.connection(connection).map(Connection::unreleased);
             if let Some(session) = self.outbound.as_mut() {
                 session.segment_arrived(received.peer_reset, received.reset_sent);
                 if let Some((claimed, expected)) = misacknowledged {
                     session.note_misacknowledged(claimed, expected);
+                }
+                if let Some(released) = released {
+                    session.release(released);
                 }
             }
             if !received.data.is_empty() {

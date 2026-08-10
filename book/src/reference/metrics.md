@@ -185,7 +185,7 @@ is down.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_endpoint_outbound_answers_refused_total` | counter | `management` | — | Bytes the domain above this port answered with that there was no room for. Ours rather than a peer's: it says a first-party answer outgrew the room this end keeps for one. |
+| `librefirewall_endpoint_outbound_answers_refused_total` | counter | `management` | — | Bytes the domain above this port answered with that there was no room for. Ours rather than a peer's: it says a first-party answer met a send window still full of bytes the peer had not acknowledged. |
 | `librefirewall_endpoint_outbound_bytes_total` | counter | `management` | `direction`&nbsp;(`received`, `sent`) | Bytes handed to the transport for the stream this appliance originated, and bytes taken off its peer and kept. |
 | `librefirewall_endpoint_outbound_dials_total` | counter | `management` | — | `SYN`s the transport composed for an originated connection. |
 | `librefirewall_endpoint_outbound_overflowed_total` | counter | `management` | — | Bytes a peer sent past the room one session keeps, dropped rather than allowed to displace what came before them. Unreachable while the window is honoured, so a number here is a peer that ignored the one it was given. |

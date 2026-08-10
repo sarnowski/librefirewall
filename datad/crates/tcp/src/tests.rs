@@ -1961,6 +1961,57 @@ fn the_oldest_range_is_found_whatever_slot_holds_it() {
     );
 }
 
+/// The boundary a caller may release its held bytes against is the oldest range
+/// this connection may still ask for — never merely what the peer acknowledged.
+///
+/// A peer may acknowledge any byte boundary, and one *inside* a recorded segment
+/// advances the acknowledgement while leaving that segment on the books for a
+/// retransmission. A caller that released to the acknowledgement would drop bytes
+/// it is still owed, so the two are held apart here.
+#[test]
+fn the_release_boundary_is_held_back_by_a_range_still_recorded() {
+    let mut stack = stack();
+    let mut peer = Peer::new(40000, 0x1f_0000);
+    peer.window = 4096;
+    let mut out = [0u8; 2048];
+    let id = handshake(&mut stack, at(0), &mut peer);
+
+    // With nothing outstanding the boundary is the acknowledgement itself.
+    let start = peer.expect;
+    assert_eq!(
+        stack.connection(id).map(Connection::unreleased),
+        Some(start)
+    );
+
+    stack
+        .send(at(1_000), id, b"abcdef", &mut out)
+        .expect("a segment");
+    // Three of its six bytes, which retires nothing.
+    peer.expect = start.add(3);
+    let ack = peer.ack();
+    stack.receive(at(2_000), STATION, &ack, &mut out);
+    assert_eq!(
+        stack.outstanding(id),
+        1,
+        "the segment is still on the books"
+    );
+    assert_eq!(
+        stack.connection(id).map(Connection::unreleased),
+        Some(start),
+        "so nothing before it may be released"
+    );
+
+    // The rest of it retires the range, and the boundary moves the whole way.
+    peer.expect = start.add(6);
+    let ack = peer.ack();
+    stack.receive(at(3_000), STATION, &ack, &mut out);
+    assert_eq!(stack.outstanding(id), 0);
+    assert_eq!(
+        stack.connection(id).map(Connection::unreleased),
+        Some(start.add(6))
+    );
+}
+
 /// A slot that holds no connection cannot be advanced. Driven directly because
 /// `receive` reaches `advance` only through a lookup that has already found one,
 /// so the refusal is defensive rather than reachable from the wire — and a

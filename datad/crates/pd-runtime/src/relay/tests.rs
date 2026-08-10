@@ -97,6 +97,11 @@ struct Stream {
     last_ending: Option<Ended>,
     /// Closes this stream refused for naming a session it no longer held.
     refused_closes: usize,
+    /// Whether the wire has no room left for a whole answer, which is the
+    /// channel half's backpressure. `false` by default, so every case that is
+    /// not about a full wire runs against one that always has room — which is
+    /// the onboarding half exactly.
+    wire_full: bool,
 }
 
 impl Stream {
@@ -162,6 +167,10 @@ impl Relayed for Stream {
         self.pushed.extend_from_slice(&bytes[..kept]);
         self.room = self.room.map(|room| room.saturating_sub(kept));
         kept
+    }
+
+    fn room_for_an_answer(&self) -> bool {
+        !self.wire_full
     }
 
     /// The real stream refuses a name it does not hold, and so does this one: it
@@ -525,6 +534,102 @@ fn a_far_end_that_never_answers_is_given_up_on() {
     assert_eq!(report.failure, Some(RelayFailure::Unanswered));
 }
 
+/// **A wire with no room for a whole answer holds the item back, and the session
+/// carries on.** The pass issues nothing and asks for no wakeup — there is
+/// nothing to wake for — and the moment the wire has room again the very next
+/// pass hands over what was waiting. Nothing is refused, nothing is reported, and
+/// the bytes the peer sent are still there to be delivered.
+///
+/// This is the whole difference between backpressure and death: a half whose
+/// window drains meets a full wire on the way to sending more, and a relay that
+/// treated it as an answer that could never fit would end the channel every time
+/// a management server was slow to acknowledge.
+#[test]
+fn a_wire_with_no_room_holds_the_item_back_rather_than_ending_the_session() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream {
+        waiting: b"records".to_vec(),
+        ..Stream::dialled()
+    };
+
+    relay.poll(at(0), &mut stream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open(Half::Channel)
+    );
+
+    // The wire is full, so the pass that would have delivered issues nothing.
+    stream.wire_full = true;
+    let pass = relay.poll(at(1), &mut stream);
+    assert!(!pass.notify, "no item was written, so no wakeup is owed");
+    assert!(pass.report.is_none(), "and no session ended");
+    assert!(!relay.outstanding());
+    assert_eq!(
+        stream.received(),
+        b"records",
+        "what the peer sent is still waiting rather than taken and lost"
+    );
+
+    // A further pass changes nothing: a full wire is a state to come back from,
+    // not one that decays.
+    assert!(!relay.poll(at(2), &mut stream).notify);
+    assert!(relay.poll(at(3), &mut stream).report.is_none());
+
+    // The peer acknowledged, so the room came back — and the item goes over on
+    // the very next pass.
+    stream.wire_full = false;
+    let pass = relay.poll(at(4), &mut stream);
+    assert!(
+        pass.notify,
+        "the delivery is issued once there is room for it"
+    );
+    assert_eq!(serve(&mut far, b"answer", false), RelayOperation::Deliver);
+    let pass = relay.poll(at(5), &mut stream);
+    assert!(pass.report.is_none(), "the session is still running");
+    assert_eq!(stream.pushed, b"answer");
+    assert!(stream.received().is_empty(), "and the delivery was taken");
+
+    // Nothing about it was ever a refusal: the session ends the ordinary way,
+    // the far end being given its close before the account is made.
+    stream.forgotten();
+    relay.poll(at(6), &mut stream);
+    serve(&mut far, &[], true);
+    let report = relay
+        .poll(at(7), &mut stream)
+        .report
+        .expect("the session's account");
+    assert_eq!(report.failure, None);
+    assert_eq!(report.received, 7);
+    assert_eq!(report.sent, 6);
+}
+
+/// A full wire never holds a **close** back. A session whose peer hung up has to
+/// be able to end however full the wire is: the close carries no records, so
+/// there is no answer for the wire to have no room for, and gating it would leave
+/// the far end holding a session nothing would ever close.
+#[test]
+fn a_full_wire_does_not_hold_back_the_close_of_a_session_the_peer_ended() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream::dialled();
+
+    relay.poll(at(0), &mut stream);
+    serve(&mut far, &[], false);
+
+    stream.wire_full = true;
+    stream.peer_closed = true;
+    stream.ending = Some(Ended::ByPeer);
+    let pass = relay.poll(at(1), &mut stream);
+    assert!(pass.notify, "the close is issued regardless of the wire");
+    assert_eq!(
+        serve(&mut far, &[], true),
+        RelayOperation::Close(RelayEnding::Peer)
+    );
+}
+
 #[test]
 fn an_answer_the_stream_has_no_room_for_ends_the_session() {
     let channel = Channel::zero();
@@ -545,7 +650,10 @@ fn an_answer_the_stream_has_no_room_for_ends_the_session() {
     let report = pass.report.expect("the session's account");
     assert_eq!(
         report.failure,
-        Some(RelayFailure::AnswerTooLong { refused: 2 })
+        Some(RelayFailure::AnswerTooLong {
+            refused: 2,
+            room: 2
+        })
     );
     assert_eq!(report.sent, 2, "what did fit is still counted");
 }
