@@ -211,6 +211,28 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             start_sector,
             sectors,
         } => write!(cursor, " start={start_sector} sectors={sectors}"),
+        // `recording=` is a constant field on `proven`'s terms: the variant is
+        // the answer, so a value reading the other way would be a state the type
+        // cannot carry. The extent's first sector leads both, so a reader pairs
+        // each with its `start=` record by value rather than by counting lines.
+        DomainDetail::RecordingResumed {
+            start_sector,
+            generation,
+            sequence,
+            opened,
+        } => write!(
+            cursor,
+            " recording-start={start_sector} recording=resumed \
+             recording-generation={generation} recording-sequence={sequence} \
+             recording-opened={opened}"
+        ),
+        DomainDetail::RecordingFresh {
+            start_sector,
+            rebound,
+        } => write!(
+            cursor,
+            " recording-start={start_sector} recording=fresh recording-rebound={rebound}"
+        ),
         // `proven` is written as two constant fields rather than derived from a
         // payload, because the variant is the proof: it is constructible only
         // by the domain whose every pass held both known answers, so a value
@@ -1639,6 +1661,20 @@ mod tests {
                 start_sector: u64::MAX,
                 sectors: u64::MAX,
             },
+            DomainDetail::RecordingResumed {
+                start_sector: u64::MAX,
+                generation: u64::MAX,
+                sequence: u64::MAX,
+                opened: u64::MAX,
+            },
+            DomainDetail::RecordingFresh {
+                start_sector: u64::MAX,
+                rebound: true,
+            },
+            DomainDetail::RecordingFresh {
+                start_sector: 0,
+                rebound: false,
+            },
             DomainDetail::Proven {
                 preemptions: u64::MAX,
                 iterations: u64::MAX,
@@ -1869,6 +1905,18 @@ mod tests {
             any::<(u64, u64)>().prop_map(|(start_sector, sectors)| DomainDetail::Extent {
                 start_sector,
                 sectors,
+            }),
+            any::<(u64, u64, u64, u64)>().prop_map(
+                |(start_sector, generation, sequence, opened)| DomainDetail::RecordingResumed {
+                    start_sector,
+                    generation,
+                    sequence,
+                    opened,
+                },
+            ),
+            any::<(u64, bool)>().prop_map(|(start_sector, rebound)| DomainDetail::RecordingFresh {
+                start_sector,
+                rebound,
             }),
             any::<(u64, u64)>().prop_map(|(preemptions, iterations)| DomainDetail::Proven {
                 preemptions,

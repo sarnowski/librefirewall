@@ -302,6 +302,30 @@ fn every_domain_detail_shape_survives_the_crossing() {
             start_sector: 0,
             sectors: u64::MAX,
         },
+        // Four words no two of which are equal, so a word read out of the wrong
+        // slot is a different record rather than the same one.
+        DomainDetail::RecordingResumed {
+            start_sector: 2048,
+            generation: 9,
+            sequence: 3,
+            opened: 4,
+        },
+        DomainDetail::RecordingResumed {
+            start_sector: 0,
+            generation: u64::MAX,
+            sequence: 1,
+            opened: 2,
+        },
+        // Both readings of a fresh extent, the flag carrying the whole of the
+        // difference between an unwritten medium and a stranger's ring.
+        DomainDetail::RecordingFresh {
+            start_sector: 34816,
+            rebound: true,
+        },
+        DomainDetail::RecordingFresh {
+            start_sector: 2048,
+            rebound: false,
+        },
         DomainDetail::Reset {
             generation: u64::MAX,
             documents: 0,

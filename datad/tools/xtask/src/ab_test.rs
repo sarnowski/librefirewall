@@ -382,6 +382,11 @@ fn run_scenario(
                     // one copy per scenario means none of them can decide
                     // another's verdict.
                     store: crate::qemu::StoreMedium::CopiedFrom(qemu::OWNED_MEDIUM_SOURCE),
+                    // A fresh recorder medium, like every boot but the one whose
+                    // subject is the reboot: the witness sector each of these is
+                    // judged on is evidence only because no earlier guest wrote
+                    // it.
+                    data: crate::qemu::DataMedium::Fresh,
                     owner,
                 },
             )

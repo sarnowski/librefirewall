@@ -78,14 +78,37 @@ fn seed_pattern() -> [u8; SECTOR_SIZE] {
     sector
 }
 
-/// One run's data device: a raw image created fresh, attached to QEMU, and read
-/// back afterwards.
+/// What one recording extent held **before** a boot that inherits the medium.
 ///
-/// One per run rather than one shared file, on the same terms as the run log and
-/// the OVMF variable store beside it: a scenario must not be able to pass on a
-/// sector some earlier scenario's guest wrote.
+/// Captured on the host side, from the file, so the claim the boot after it is
+/// held to is about the disk and not about anything the guest said.
+struct Inherited {
+    start_sector: u64,
+    state: lfw_capture_ring::RingState,
+    /// The payload bytes the superblock's durable cursor accounted for, which is
+    /// exactly the prefix a reader holding this disk would have been promised.
+    /// It is what a boot that started the ring over would have written on.
+    durable: Vec<u8>,
+}
+
+/// One run's data device: a raw image created fresh — or the one an earlier
+/// boot left — attached to QEMU, and read back afterwards.
+///
+/// Fresh per run by default, on the same terms as the run log and the OVMF
+/// variable store beside it: a scenario must not be able to pass on a sector some
+/// earlier scenario's guest wrote. The exception is the boot whose whole subject
+/// **is** the medium: a recording that did not survive a reboot is not a
+/// recording, so the only way to judge one is to boot the same file twice and
+/// hold the second boot's answer to what the first left — which means one file
+/// outliving one invocation, deliberately, and a scenario saying so
+/// ([`DataMedium`]).
+///
+/// [`DataMedium`]: crate::qemu::DataMedium
 pub(crate) struct DataDisk {
     path: PathBuf,
+    /// What each extent held going into this boot, on a boot that inherits the
+    /// medium; empty on every boot that made its own.
+    inherited: Vec<Inherited>,
 }
 
 impl DataDisk {
@@ -95,9 +118,7 @@ impl DataDisk {
     /// # Errors
     /// Anything that stops the file being created at exactly its size.
     pub(crate) fn create(root: &Path, run_label: &str) -> Result<Self, String> {
-        let path = root
-            .join("build/image")
-            .join(format!("data-{run_label}.img"));
+        let path = Self::path_for(root, run_label);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("create {}: {error}", parent.display()))?;
@@ -112,7 +133,94 @@ impl DataDisk {
             .map_err(|error| format!("seed {}: {error}", path.display()))?;
         file.sync_all()
             .map_err(|error| format!("flush {}: {error}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            inherited: Vec::new(),
+        })
+    }
+
+    fn path_for(root: &Path, label: &str) -> PathBuf {
+        root.join("build/image").join(format!("data-{label}.img"))
+    }
+
+    /// The medium an earlier boot left behind — the file itself, not a copy —
+    /// for the scenario whose whole subject is that a recording survives a
+    /// reboot.
+    ///
+    /// A copy would prove nothing: the claim is about one medium read twice, and
+    /// the second reading has to be of the bytes the first left. What each extent
+    /// held is captured here, before the boot, because afterwards there is
+    /// nothing to compare against — a boot that started the rings over leaves a
+    /// medium that is internally consistent and has lost the evidence.
+    ///
+    /// # Errors
+    /// The file not being there, which names the boot that was supposed to leave
+    /// it; and an extent that carries no decodable superblock, which would make
+    /// the resumption this boot is judged on vacuously true.
+    pub(crate) fn carried(root: &Path, source_label: &str) -> Result<Self, String> {
+        let path = Self::path_for(root, source_label);
+        if !path.exists() {
+            return Err(format!(
+                "the data medium {} is not there, and this boot's whole subject is resuming the \
+                 recordings the {source_label} boot left on it. On a full run that means the two \
+                 scenarios are out of order — the boot that writes the medium must precede the \
+                 one that resumes it. On a diagnostic re-run of this scenario alone it is \
+                 expected: the writing boot is a different scenario and was not re-run, so run \
+                 the pair",
+                path.display()
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let mut inherited = Vec::new();
+        for (start_sector, _) in Deck::extents() {
+            let mut superblock = [0u8; SUPERBLOCK_BYTES];
+            read_at(
+                &mut file,
+                start_sector * SECTOR_SIZE as u64,
+                &mut superblock,
+            )
+            .map_err(|error| format!("read the superblock at sector {start_sector}: {error}"))?;
+            let state = decode_superblock(&superblock).ok_or_else(|| {
+                format!(
+                    "the extent at sector {start_sector} of {} carries no decodable superblock, \
+                     so this boot would have nothing to resume and the claim it is judged on \
+                     would be vacuously true",
+                    path.display()
+                )
+            })?;
+            let durable = durable_payload_bytes(&state).ok_or_else(|| {
+                format!(
+                    "the extent at sector {start_sector} places its durable cursor past the \
+                     first wrap, and this comparison reads the payload in device order — extend \
+                     it before a run gets this far"
+                )
+            })?;
+            if durable == 0 {
+                return Err(format!(
+                    "the extent at sector {start_sector} of {} says no byte of its recording is \
+                     durable, so there is nothing for the boot after it to preserve and the \
+                     comparison would hold whatever that boot did",
+                    path.display()
+                ));
+            }
+            let mut payload = vec![0u8; durable];
+            let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
+            read_at(
+                &mut file,
+                (start_sector + segment_sectors) * SECTOR_SIZE as u64,
+                &mut payload,
+            )
+            .map_err(|error| format!("read the extent at sector {start_sector}: {error}"))?;
+            inherited.push(Inherited {
+                start_sector,
+                state,
+                durable: payload,
+            });
+        }
+        Ok(Self { path, inherited })
     }
 
     /// Attach this image to a QEMU invocation as the modern virtio-blk device at
@@ -367,6 +475,157 @@ impl DataDisk {
             lines.join("\n")
         ))
     }
+}
+
+impl DataDisk {
+    /// Assert that a boot which inherited this medium **continued** each
+    /// recording instead of starting it over, and said so on the console.
+    ///
+    /// `Ok(None)` on every boot that made its own medium, which is every boot
+    /// but the one whose subject is the reboot.
+    ///
+    /// # Two halves, and neither is the other
+    ///
+    /// The disk half is the one that cannot be faked from inside the guest: the
+    /// bytes the previous boot made durable are compared byte for byte against
+    /// what is there now, and the superblock's generation and writer sequence
+    /// must both have advanced past what they were. A recorder that started the
+    /// ring over satisfies every console assertion — it comes up, it records, it
+    /// checkpoints — and fails here on the first segment, which is exactly where
+    /// it would have written.
+    ///
+    /// The console half is the one the disk cannot give: an operator with no
+    /// shell learns whether a reboot kept the evidence only from what the node
+    /// said, so the record has to be there and its numbers have to be the ones
+    /// this harness read off the medium before the boot. A node that resumed
+    /// silently would leave a deployment unable to tell this case from the
+    /// defect.
+    ///
+    /// # Errors
+    /// A recording that did not resume, one whose console record is missing or
+    /// carries numbers the medium does not bear out, a generation or sequence
+    /// that did not advance, or any byte of the inherited prefix that moved.
+    pub(crate) fn judge_resumed(&self, serial: &[u8]) -> Result<Option<String>, String> {
+        if self.inherited.is_empty() {
+            return Ok(None);
+        }
+        let transcript = String::from_utf8_lossy(serial);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|error| format!("open {}: {error}", self.path.display()))?;
+        let mut lines = Vec::new();
+        for held in &self.inherited {
+            let start_sector = held.start_sector;
+            let before = &held.state;
+
+            // What the node said, before what the disk shows: a resumption
+            // nobody can read off the console is one a deployment cannot act on.
+            let record = format!(
+                " recording-start={start_sector} recording=resumed recording-generation={} \
+                 recording-sequence={} recording-opened={}",
+                before.write_generation(),
+                before.writer().sequence,
+                before.writer().sequence.saturating_add(1),
+            );
+            if !transcript.contains(&record) {
+                return Err(format!(
+                    "the console does not carry \"{}\" for the extent at sector {start_sector}. \
+                     The medium held generation {} at writer sequence {} going into this boot, so \
+                     that is what a resuming node owes an operator — and a node with no shell has \
+                     no other way to say it{}",
+                    record.trim(),
+                    before.write_generation(),
+                    before.writer().sequence,
+                    fresh_hint(&transcript, start_sector),
+                ));
+            }
+
+            let mut superblock = [0u8; SUPERBLOCK_BYTES];
+            read_at(
+                &mut file,
+                start_sector * SECTOR_SIZE as u64,
+                &mut superblock,
+            )
+            .map_err(|error| format!("read the superblock at sector {start_sector}: {error}"))?;
+            let after = decode_superblock(&superblock).ok_or_else(|| {
+                format!("the extent at sector {start_sector} lost its superblock over this boot")
+            })?;
+            if after.write_generation() <= before.write_generation() {
+                return Err(format!(
+                    "the extent at sector {start_sector} came out of this boot at generation {} \
+                     and went into it at {}. A resumed ring checkpoints past the generation it \
+                     adopted, so one that did not is a ring that was written afresh",
+                    after.write_generation(),
+                    before.write_generation()
+                ));
+            }
+            if after.writer().sequence <= before.writer().sequence {
+                return Err(format!(
+                    "the extent at sector {start_sector} came out of this boot writing segment {} \
+                     and went into it at segment {}. A resumed recording opens the segment after \
+                     the one it read — the previous boot's was left unsealed — so a sequence that \
+                     did not advance is a boot that reopened it",
+                    after.writer().sequence,
+                    before.writer().sequence
+                ));
+            }
+
+            // And the bytes themselves: the prefix the previous boot made
+            // durable, still where it put them.
+            let mut payload = vec![0u8; held.durable.len()];
+            let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
+            read_at(
+                &mut file,
+                (start_sector + segment_sectors) * SECTOR_SIZE as u64,
+                &mut payload,
+            )
+            .map_err(|error| format!("read the extent at sector {start_sector}: {error}"))?;
+            if let Some(at) = payload
+                .iter()
+                .zip(&held.durable)
+                .position(|(now, before)| now != before)
+            {
+                return Err(format!(
+                    "the extent at sector {start_sector} lost the recording it carried: payload \
+                     byte {at} of the {} the previous boot had made durable was overwritten by \
+                     this one. That is the defect a resumed ring exists to prevent — a reboot \
+                     that starts a fresh ring over a customer's evidence\n  image: {}",
+                    held.durable.len(),
+                    self.path.display()
+                ));
+            }
+            lines.push(format!(
+                "  sector {start_sector}: resumed at generation {} segment {}, opened segment {}, \
+                 now at generation {} segment {}; the {} byte(s) the previous boot made durable \
+                 are byte for byte where it left them",
+                before.write_generation(),
+                before.writer().sequence,
+                before.writer().sequence.saturating_add(1),
+                after.write_generation(),
+                after.writer().sequence,
+                held.durable.len(),
+            ));
+        }
+        Ok(Some(format!(
+            "both recordings survived the reboot, as the console said and the disk shows:\n{}",
+            lines.join("\n")
+        )))
+    }
+}
+
+/// What to add to a missing-resumption message when the node said the opposite,
+/// which is the whole defect this pair of boots exists to catch.
+fn fresh_hint(transcript: &str, start_sector: u64) -> String {
+    let fresh = format!(" recording-start={start_sector} recording=fresh");
+    if transcript.contains(&fresh) {
+        return format!(
+            ". The console says \"{}\" instead, so this boot started the recording over rather \
+             than continuing it",
+            fresh.trim()
+        );
+    }
+    String::new()
 }
 
 /// How many bytes of the payload area the superblock's durable cursor accounts

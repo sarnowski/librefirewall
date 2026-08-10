@@ -43,7 +43,8 @@
 use lfw_clock::{Calibration, Ticks};
 
 use lfw_capture_ring::{
-    Geometry, GeometryError, SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES,
+    Geometry, GeometryError, RingState, RingStateError, SECTOR_SIZE, SUPERBLOCK_BYTES,
+    SUPERBLOCK_COPY_BYTES,
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadRefusal, DownloadSink, TAP_SNAP_LEN,
@@ -208,11 +209,16 @@ impl Which {
         }
     }
 
-    const fn geometry(self, capacity_sectors: u64) -> Result<Geometry, GeometryError> {
-        let (start, sectors) = match self {
+    #[must_use]
+    pub const fn extent(self) -> (u64, u64) {
+        match self {
             Self::Log => (LOG_START_SECTOR, LOG_SECTORS),
             Self::Capture => (CAPTURE_START_SECTOR, CAPTURE_SECTORS),
-        };
+        }
+    }
+
+    pub(crate) const fn geometry(self, capacity_sectors: u64) -> Result<Geometry, GeometryError> {
+        let (start, sectors) = self.extent();
         Geometry::new(start, sectors, SEGMENT_BYTES, capacity_sectors)
     }
 
@@ -249,6 +255,9 @@ impl Which {
 /// decision this side took rather than to anything the device said.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Job {
+    /// A recording's superblock coming back at boot, naming its recording for
+    /// [`Self::Barrier`]'s reason: the two reads share one staging area.
+    Preload(Which),
     /// A recording's staged sectors going to the medium.
     Flush(Which),
     /// A device barrier between a recording's payload reaching the medium and the
@@ -393,6 +402,24 @@ pub struct RecorderCounters {
     pub completions_unexpected: u64,
 }
 
+/// How one recording's extent was opened at boot — a fresh ring looking exactly
+/// like a continued one on every surface a node with no shell has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opened {
+    /// A superblock a previous boot left. `generation`/`sequence` are the medium's;
+    /// `opened` is the segment after the one read, its predecessor being unsealed.
+    Resumed {
+        generation: u64,
+        sequence: u64,
+        opened: u64,
+    },
+    /// Neither copy decoded: an unwritten extent, or one beyond use.
+    FreshMedium,
+    /// A superblock describing some other ring: the extent was rebound, or this is
+    /// not the device it was. Recorded fresh **over it** and loudly.
+    Rebound(RingStateError),
+}
+
 /// Why the recordings could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -426,36 +453,62 @@ struct Recording {
 }
 
 impl Recording {
+    /// Build one recording, continuing `stored` where it describes this ring. A
+    /// state describing a *different* ring is not an error: the sink is built fresh
+    /// over it — overwriting *both* copies — and the disagreement is returned.
     fn new(
         which: Which,
         capacity_sectors: u64,
+        stored: Option<RingState>,
         interfaces: InterfaceNames,
         interface_count: usize,
         staging: &mut [u8],
-    ) -> Result<Self, DeckError> {
+    ) -> Result<(Self, Opened), DeckError> {
         let geometry = which
             .geometry(capacity_sectors)
             .map_err(|error| DeckError::Extent { which, error })?;
-        let sink = Sink::new(
-            SinkConfig {
-                geometry,
-                snap_len: which.snap_len(),
-                interfaces,
-                interface_count,
+        let config = SinkConfig {
+            geometry,
+            snap_len: which.snap_len(),
+            interfaces,
+            interface_count,
+        };
+        let (sink, opened) = match stored {
+            None => (Sink::new(config, staging), Opened::FreshMedium),
+            Some(state) => match Sink::resume(config, &state, staging) {
+                Ok(sink) => {
+                    let opened = sink.cursor().sequence;
+                    (
+                        Ok(sink),
+                        Opened::Resumed {
+                            generation: state.write_generation(),
+                            sequence: state.writer().sequence,
+                            opened,
+                        },
+                    )
+                }
+                // Only a geometry disagreement survives.
+                Err(SinkError::State(error)) => {
+                    (Sink::new(config, staging), Opened::Rebound(error))
+                }
+                Err(error) => (Err(error), Opened::FreshMedium),
             },
-            staging,
-        )
-        .map_err(|error| DeckError::Sink { which, error })?;
-        Ok(Self {
-            which,
-            sink,
-            in_flight: None,
-            submitted: false,
-            rolling: false,
-            // The extent identifies itself on the medium from the first pass,
-            // so a reader that finds the disk knows what the bytes past it are.
-            checkpoint_due: true,
-        })
+        };
+        let sink = sink.map_err(|error| DeckError::Sink { which, error })?;
+        Ok((
+            Self {
+                which,
+                sink,
+                in_flight: None,
+                submitted: false,
+                rolling: false,
+                // The extent identifies itself on the medium from the first
+                // pass, so a reader that finds the disk knows what the bytes
+                // past it are.
+                checkpoint_due: true,
+            },
+            opened,
+        ))
     }
 }
 
@@ -569,47 +622,55 @@ impl Deck {
     /// Build both recordings over a device of `capacity_sectors` and compose
     /// their opening prologues into the staging window.
     ///
+    /// `stored` is what the medium said about each recording, in [`Which::ALL`]
+    /// order. How each went is the second half of the return, nothing else on the
+    /// node being able to supply that fact.
+    ///
     /// # Errors
     /// [`DeckError`], naming the recording and what it refused.
     pub fn new(
         capacity_sectors: u64,
+        stored: [Option<RingState>; 2],
         interfaces: InterfaceNames,
         interface_count: usize,
         medium: &mut impl Medium,
-    ) -> Result<Self, DeckError> {
-        let log = Recording::new(
+    ) -> Result<(Self, [Opened; 2]), DeckError> {
+        let [log_state, capture_state] = stored;
+        let (log, log_opened) = Recording::new(
             Which::Log,
             capacity_sectors,
+            log_state,
             interfaces,
             interface_count,
             medium.staging(Area::Log),
         )?;
-        let capture = Recording::new(
+        let (capture, capture_opened) = Recording::new(
             Which::Capture,
             capacity_sectors,
+            capture_state,
             interfaces,
             interface_count,
             medium.staging(Area::Capture),
         )?;
-        Ok(Self {
-            recordings: [log, capture],
-            pending: None,
-            pinned: None,
-            download: Download::Idle,
-            clock: None,
-            checkpointing: Checkpointing::Idle,
-            counters: RecorderCounters::default(),
-        })
+        Ok((
+            Self {
+                recordings: [log, capture],
+                pending: None,
+                pinned: None,
+                download: Download::Idle,
+                clock: None,
+                checkpointing: Checkpointing::Idle,
+                counters: RecorderCounters::default(),
+            },
+            [log_opened, capture_opened],
+        ))
     }
 
     /// Both extents as `(start_sector, sectors)`, for the record a boot owes an
     /// operator.
     #[must_use]
     pub const fn extents() -> [(u64, u64); 2] {
-        [
-            (LOG_START_SECTOR, LOG_SECTORS),
-            (CAPTURE_START_SECTOR, CAPTURE_SECTORS),
-        ]
+        [Which::Log.extent(), Which::Capture.extent()]
     }
 
     #[must_use]
@@ -659,6 +720,7 @@ impl Deck {
                 .map(Flush::len),
             // A barrier moves no bytes, so there is no length to fall short of.
             Job::Barrier(_) => None,
+            Job::Preload(_) => None,
             // The smaller length a `SuperblockWrite` names, so both copies
             // replaced and one moved still reads as short.
             Job::Checkpoint(which) => (self.checkpointing == Checkpointing::Written(which))
@@ -694,6 +756,10 @@ impl Deck {
             self.counters.medium_failures = self.counters.medium_failures.saturating_add(1);
         }
         match job {
+            Job::Preload(_) => {
+                self.counters.completions_unexpected =
+                    self.counters.completions_unexpected.saturating_add(1);
+            }
             Job::Flush(which) => {
                 let index = which.index();
                 let staging = medium.staging(which.area());

@@ -63,15 +63,16 @@ use std::{collections::VecDeque, string::String, vec, vec::Vec};
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_capture_ring::{
     Append, Copies, Cursor, Fit, Geometry, Located, MAX_READERS, Placement, ReaderCursor, Ring,
-    SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES, SUPERBLOCK_MAGIC, SUPERBLOCK_VERSION,
-    decode_superblock, encode_superblock,
+    RingState, SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES, SUPERBLOCK_MAGIC,
+    SUPERBLOCK_VERSION, decode_superblock, encode_superblock,
 };
 use lfw_recorder::deck::{
-    Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Polled, Refused, STAGING_END,
-    Served, TAP_BUDGET, Transfer,
+    Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Polled, Refused, SEGMENT_BYTES,
+    STAGING_END, Served, TAP_BUDGET, Transfer,
 };
 use lfw_recorder::{
     Flush, InterfaceName, Locate, MAX_INTERFACES, Recorded, Sink, SinkConfig, prologue_len,
+    read_superblocks,
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReply, DownloadRequest, DownloadSink, TAP_SNAP_LEN,
@@ -249,6 +250,16 @@ impl Disk {
             fetch_overlap: false,
             replays_taken: 0,
             forged: 0,
+        }
+    }
+
+    /// Put `bytes` on the medium at `sector`, as whatever held the disk before
+    /// this boot left them. Bounded by the device rather than by the caller, so
+    /// a seed past the end writes nothing instead of growing the disk.
+    fn seed(&mut self, sector: u64, bytes: &[u8]) {
+        let at = sector as usize * SECTOR_SIZE;
+        for (slot, byte) in self.disk.iter_mut().skip(at).zip(bytes) {
+            *slot = *byte;
         }
     }
 }
@@ -492,6 +503,63 @@ fn drop_reason(bits: u8) -> TapDropReason {
     all[bits as usize % all.len()]
 }
 
+/// Put one extent's superblock region on the medium, as whatever held the disk
+/// before this boot.
+///
+/// Four shapes, and the input picks: nothing at all (a device the harness left
+/// zeroed), bytes nobody this decoder recognises wrote, a superblock naming
+/// **this** extent — which is what a previous run of this ring leaves and the
+/// only one a resume may adopt — and one naming a *different* extent, which is
+/// the medium rebound to somebody else's ring and must be recorded over rather
+/// than resumed into. The last shape is generated deliberately: a harness that
+/// could only produce well-formed bytes for the right extent would delete
+/// precisely the case the geometry check exists for.
+fn seed_superblock(
+    unstructured: &mut Unstructured<'_>,
+    medium: &mut Disk,
+    start_sector: u64,
+    sectors: u64,
+) {
+    let Some(shape) = next_op(unstructured) else {
+        return;
+    };
+    let mut region = [0u8; SUPERBLOCK_BYTES];
+    match shape % 4 {
+        0 => return,
+        1 => {
+            for byte in &mut region {
+                *byte = next_op(unstructured).unwrap_or(0);
+            }
+        }
+        other => {
+            // A start one segment along for the rebound shape: still a legal
+            // geometry inside the device, and still not this extent's.
+            let stored_start = if other == 3 {
+                start_sector.saturating_add(SEGMENT_BYTES as u64 / SECTOR_SIZE as u64)
+            } else {
+                start_sector
+            };
+            let Ok(geometry) = Geometry::new(
+                stored_start,
+                sectors,
+                SEGMENT_BYTES,
+                stored_start.saturating_add(sectors),
+            ) else {
+                return;
+            };
+            let cursor = Cursor {
+                sequence: any_u64(unstructured),
+                offset: (any_u64(unstructured) as usize) % (SEGMENT_BYTES + 1),
+            };
+            let Ok(state) = RingState::new(geometry, any_u64(unstructured), cursor, &[]) else {
+                return;
+            };
+            let _ = encode_superblock(&mut region, &state, Copies::Both);
+        }
+    }
+    medium.seed(start_sector, &region);
+}
+
 /// Drive the pass with everything three adversaries can express.
 pub fn recording_pass(data: &[u8]) {
     let mut unstructured = Unstructured::new(data);
@@ -502,11 +570,22 @@ pub fn recording_pass(data: &[u8]) {
     let reply = Box::new(DownloadReply::zero());
 
     let mut medium = Disk::new();
+    // What a boot finds on the medium before it places a record. Seeded before
+    // the read so the pass boots through the same path the domain does, and by
+    // the input rather than by this harness so the whole authority somebody
+    // holding the disk has is reachable: a fresh extent, one an earlier run of
+    // this ring left, one another deployment left, and one nobody wrote.
+    for (start_sector, sectors) in Deck::extents() {
+        seed_superblock(&mut unstructured, &mut medium, start_sector, sectors);
+    }
     let mut names = [InterfaceName::new(""); MAX_INTERFACES];
     if let Some(slot) = names.get_mut(0) {
         *slot = InterfaceName::new("port0");
     }
-    let Ok(mut deck) = Deck::new(CAPACITY_SECTORS, names, 1, &mut medium) else {
+    let Ok(stored) = read_superblocks(CAPACITY_SECTORS, &mut medium) else {
+        return;
+    };
+    let Ok((mut deck, _opened)) = Deck::new(CAPACITY_SECTORS, stored, names, 1, &mut medium) else {
         return;
     };
     let mut writer = records.writer(&consume);

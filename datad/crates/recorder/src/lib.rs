@@ -938,11 +938,13 @@ pub fn prologue_len(config: &SinkConfig) -> Result<usize, SinkError> {
 }
 
 pub mod deck;
+pub mod preload;
 
 pub use deck::{
-    Area, COMPLETION_BUDGET, Completion, Deck, DeckError, Ended, Job, Medium, Polled,
+    Area, COMPLETION_BUDGET, Completion, Deck, DeckError, Ended, Job, Medium, Opened, Polled,
     RecorderCounters, Refused, Served, TAP_BUDGET, Transfer, Which,
 };
+pub use preload::{POLL_BUDGET, PreloadError, read_superblocks};
 
 #[cfg(test)]
 mod tests;

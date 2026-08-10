@@ -119,6 +119,7 @@
 "crates/queue/src/lib.rs" = 0.4260
 "crates/recorder/src/deck.rs" = 0.2770
 "crates/recorder/src/lib.rs" = 0.2326
+"crates/recorder/src/preload.rs" = 0.4270
 "crates/routing/src/lib.rs" = 0.3270
 "crates/rtc/src/lib.rs" = 0.5119
 "crates/store/src/identity.rs" = 0.4926

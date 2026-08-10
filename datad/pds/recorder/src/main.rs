@@ -89,9 +89,10 @@ use lfw_blk::{
 use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use lfw_recorder::deck::{
-    Area, Completion, Deck, DeckError, Ended, InterfaceNames, Job, Medium, Polled,
-    RESERVED_SECTORS, Refused, STAGING_END, Served, Transfer,
+    Area, Completion, Deck, DeckError, Ended, InterfaceNames, Job, Medium, Opened, Polled,
+    RESERVED_SECTORS, Refused, STAGING_END, Served, Transfer, Which,
 };
+use lfw_recorder::preload::{self, PreloadError};
 use lfw_recorder::{InterfaceName, MAX_INTERFACES};
 use pd_runtime::{BlockCounters, PdClock, attach_region, log_sample, recorder_sample};
 use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
@@ -131,6 +132,13 @@ enum StartupError {
     Device(BringUpError),
     /// The device came up and the path to the medium did not work.
     Proof(SmokeError),
+    /// A recording's superblock could not be read back, so this boot cannot say
+    /// whether the extent holds an earlier run of its ring. Refused rather than
+    /// recorded fresh: the boot proof has already moved a sector each way by
+    /// then, so a device that will not answer here has stopped answering, and
+    /// overwriting evidence on the strength of a read that failed is the one
+    /// thing a recording appliance must not do.
+    Preload(PreloadError),
     /// The device came up and is too small — or otherwise unfit — for the
     /// recordings this build is configured with.
     Recordings(DeckError),
@@ -154,6 +162,12 @@ impl From<DeckError> for StartupError {
     }
 }
 
+impl From<PreloadError> for StartupError {
+    fn from(error: PreloadError) -> Self {
+        Self::Preload(error)
+    }
+}
+
 impl StartupError {
     /// This refusal as the console record of it.
     fn refusal(&self) -> Refusal {
@@ -168,6 +182,7 @@ impl StartupError {
             },
             Self::Device(error) => convert(error.refusal()),
             Self::Proof(error) => convert(error.refusal()),
+            Self::Preload(error) => preload_refusal(*error),
             Self::Recordings(error) => recordings_refusal(*error),
         }
     }
@@ -187,6 +202,83 @@ fn convert(refusal: BlkRefusal) -> Refusal {
             BlkRefusalDetail::Two(first, second) => RefusalDetail::Two(first, second),
         },
         signalled: refusal.signalled,
+    }
+}
+
+/// A superblock that could not be read back, in the same vocabulary.
+///
+/// **The first number is always the extent's first sector**, which is what says
+/// which of the two recordings the read was for — the tokens name the failure
+/// and the recordings share them, exactly as the two virtio bring-up trees share
+/// theirs and `domain=` tells them apart.
+///
+/// An extent that is not a ring is reported with the token
+/// [`recordings_refusal`] already gives it: it is the same fact, found earlier
+/// only because the superblock's address comes from the same geometry, and a
+/// second token for it would ask an operator to learn one condition twice.
+fn preload_refusal(error: PreloadError) -> Refusal {
+    let (start_sector, _) = error.which().extent();
+    let (cause, detail) = match error {
+        PreloadError::Extent { error, .. } => ("recording-extent-unusable", extent_detail(error)),
+        PreloadError::Refused { .. } => (
+            "recording-superblock-refused",
+            RefusalDetail::One(start_sector),
+        ),
+        PreloadError::Silent { .. } => (
+            "recording-superblock-silent",
+            RefusalDetail::Two(start_sector, u64::from(preload::POLL_BUDGET)),
+        ),
+        PreloadError::Misattributed { .. } => (
+            "recording-superblock-misattributed",
+            RefusalDetail::One(start_sector),
+        ),
+        PreloadError::Failed { .. } => (
+            "recording-superblock-failed",
+            RefusalDetail::One(start_sector),
+        ),
+        PreloadError::Short { delivered, .. } => (
+            "recording-superblock-short",
+            RefusalDetail::Two(start_sector, delivered as u64),
+        ),
+        PreloadError::Unstaged { len, .. } => (
+            "recording-superblock-unstaged",
+            RefusalDetail::Two(start_sector, len as u64),
+        ),
+    };
+    Refusal {
+        cause,
+        detail,
+        // The device is live by then — the boot proof moved a sector each way
+        // through it — and nothing here writes `STATUS_FAILED` to it.
+        signalled: true,
+    }
+}
+
+/// The extent this boot recorded **over**: a superblock that decoded and
+/// described some other ring.
+///
+/// Not a start-up refusal — the domain goes on recording, which is the whole
+/// decision — so it is announced on a `Ready` record like the store domain's
+/// refused package. It is loud because it has to be: what was overwritten was
+/// somebody's evidence, and the two numbers are what disagreed.
+fn rebound_refusal(start_sector: u64, error: lfw_capture_ring::RingStateError) -> Refusal {
+    Refusal {
+        cause: "recording-extent-rebound",
+        detail: match error {
+            lfw_capture_ring::RingStateError::StartSectorMismatch { stored, .. }
+            | lfw_capture_ring::RingStateError::SectorsMismatch { stored, .. } => {
+                RefusalDetail::Two(start_sector, stored)
+            }
+            lfw_capture_ring::RingStateError::SegmentBytesMismatch { stored, .. } => {
+                RefusalDetail::Two(start_sector, stored as u64)
+            }
+            // `RingState::check` compares the three fields above and nothing
+            // else, so a variant here is one added upstream: it reaches the
+            // console as its cause and this extent's sector, which is a smaller
+            // loss than a second number that means nothing.
+            _ => RefusalDetail::One(start_sector),
+        },
+        signalled: true,
     }
 }
 
@@ -292,8 +384,8 @@ fn init() -> Recorder {
             blocks,
         }) => {
             let (names, count) = interface_names();
-            match Deck::new(report.capacity_sectors, names, count, &mut device) {
-                Ok(deck) => {
+            match open_recordings(report.capacity_sectors, names, count, &mut device) {
+                Ok((deck, opened)) => {
                     announce(
                         &sink,
                         DomainState::Ready,
@@ -303,17 +395,13 @@ fn init() -> Recorder {
                         },
                     );
                     // Where each recording is, so an operator with the disk can
-                    // find it. There is no other way to learn it: the node
-                    // has no shell and no CLI.
-                    for (start_sector, sectors) in Deck::extents() {
-                        announce(
-                            &sink,
-                            DomainState::Ready,
-                            DomainDetail::Extent {
-                                start_sector,
-                                sectors,
-                            },
-                        );
+                    // find it — and, beside it, whether this boot continued what
+                    // was already there. There is no other way to learn either:
+                    // the node has no shell and no CLI, and an appliance that
+                    // silently started fresh over a customer's evidence looks
+                    // exactly like one that carried it on.
+                    for (which, opened) in Which::ALL.into_iter().zip(opened) {
+                        announce_recording(&sink, which, opened);
                     }
                     run(
                         Loop {
@@ -328,10 +416,70 @@ fn init() -> Recorder {
                         &sink,
                     )
                 }
-                Err(error) => refuse(&sink, StartupError::from(error)),
+                Err(error) => refuse(&sink, error),
             }
         }
         Err(error) => refuse(&sink, error),
+    }
+}
+
+/// Read what the medium already says about each recording, then build both over
+/// it.
+///
+/// The read comes first because its answer is what decides whether a ring is
+/// continued or written over, and it is synchronous because there is nothing
+/// yet to interleave with: `init` has not returned, no tap is being drained, and
+/// the boot proof has just done the same thing one sector at a time. Every wait
+/// inside it is bounded by a constant of `lfw_recorder`'s.
+fn open_recordings(
+    capacity_sectors: u64,
+    names: InterfaceNames,
+    count: usize,
+    device: &mut BlockMedium<'_>,
+) -> Result<(Deck, [Opened; 2]), StartupError> {
+    let stored = preload::read_superblocks(capacity_sectors, device)?;
+    Ok(Deck::new(capacity_sectors, stored, names, count, device)?)
+}
+
+/// One recording's extent and how this boot opened it, as the two — or three —
+/// records an operator gets.
+fn announce_recording(sink: &dyn Sink, which: Which, opened: Opened) {
+    let (start_sector, sectors) = which.extent();
+    announce(
+        sink,
+        DomainState::Ready,
+        DomainDetail::Extent {
+            start_sector,
+            sectors,
+        },
+    );
+    let detail = match opened {
+        Opened::Resumed {
+            generation,
+            sequence,
+            opened,
+        } => DomainDetail::RecordingResumed {
+            start_sector,
+            generation,
+            sequence,
+            opened,
+        },
+        Opened::FreshMedium => DomainDetail::RecordingFresh {
+            start_sector,
+            rebound: false,
+        },
+        Opened::Rebound(_) => DomainDetail::RecordingFresh {
+            start_sector,
+            rebound: true,
+        },
+    };
+    announce(sink, DomainState::Ready, detail);
+    if let Opened::Rebound(error) = opened {
+        announce(
+            sink,
+            DomainState::Ready,
+            DomainDetail::Refusal(rebound_refusal(start_sector, error)),
+        );
     }
 }
 

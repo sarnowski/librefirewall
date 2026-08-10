@@ -329,7 +329,9 @@ fn clock() -> Option<lfw_clock::Calibration> {
 
 fn deck(medium: &mut Fake) -> Deck {
     let (names, count) = interfaces();
-    Deck::new(CAPACITY_SECTORS, names, count, medium).expect("a 64 MiB device holds both extents")
+    Deck::new(CAPACITY_SECTORS, [None; 2], names, count, medium)
+        .expect("a 64 MiB device holds both extents")
+        .0
 }
 
 /// One demand, minted the way the management domain's requester mints one.
@@ -455,7 +457,13 @@ fn the_two_extents_are_disjoint_and_inside_a_64_mib_device() {
 fn a_device_too_small_for_the_capture_extent_is_refused_by_name() {
     let mut medium = Fake::new();
     let (names, count) = interfaces();
-    let built = Deck::new(CAPTURE_START_SECTOR + 8, names, count, &mut medium);
+    let built = Deck::new(
+        CAPTURE_START_SECTOR + 8,
+        [None; 2],
+        names,
+        count,
+        &mut medium,
+    );
     assert!(matches!(
         built.err(),
         Some(DeckError::Extent {
@@ -463,6 +471,228 @@ fn a_device_too_small_for_the_capture_extent_is_refused_by_name() {
             ..
         })
     ));
+}
+
+/// One whole boot over `medium`: read what is there, build both recordings on
+/// it, run `frames` observations through them and seal both so the last
+/// part-sector reaches the device.
+///
+/// The read is `preload`'s, not a shortcut past it: what a second boot resumes
+/// from must be what the domain's own boot sequence would have found.
+fn boot(medium: &mut Fake, ring: &Ring, frames: usize) -> [Opened; 2] {
+    let stored = crate::preload::read_superblocks(CAPACITY_SECTORS, medium)
+        .expect("the fake answers every read");
+    let (names, count) = interfaces();
+    let (mut deck, opened) = Deck::new(CAPACITY_SECTORS, stored, names, count, medium)
+        .expect("a 64 MiB device holds both extents");
+    let mut reader = ring.reader();
+    run(&mut deck, medium, ring, &mut reader, frames, 600, 8);
+    for sink in [DownloadSink::Log, DownloadSink::Capture] {
+        let _ = download(&mut deck, medium, &mut reader, sink);
+    }
+    opened
+}
+
+/// Each extent's superblock as a reader holding the disk would decode it.
+fn superblocks(medium: &Fake) -> [lfw_capture_ring::RingState; 2] {
+    Deck::extents().map(|(start, _)| {
+        let image = medium.extent(start, (SUPERBLOCK_BYTES / SECTOR_SIZE) as u64);
+        let image: &[u8; SUPERBLOCK_BYTES] = image.try_into().expect("two sectors");
+        lfw_capture_ring::decode_superblock(image).expect("a decodable superblock")
+    })
+}
+
+#[test]
+fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() {
+    // The defect this whole path exists to close, stated end to end: two boots
+    // share one device, and the second must come up on the segment after the
+    // one the first left open — with the first boot's bytes still where it put
+    // them.
+    let mut medium = Fake::new();
+    let first = boot(&mut medium, &Ring::new(), 24);
+    assert_eq!(first, [Opened::FreshMedium, Opened::FreshMedium]);
+    let after_first = superblocks(&medium);
+
+    // What a reader holding only the disk can see of the first boot, kept for
+    // the comparison below: the disk is what the claim is about.
+    let carried: Vec<Vec<u8>> = Deck::extents()
+        .iter()
+        .map(|(start, sectors)| medium.extent(*start, *sectors).to_vec())
+        .collect();
+
+    let second = boot(&mut medium, &Ring::new(), 24);
+    for (index, resumed) in second.into_iter().enumerate() {
+        let Opened::Resumed {
+            generation,
+            sequence,
+            opened,
+        } = resumed
+        else {
+            panic!("recording {index} did not resume: {resumed:?}");
+        };
+        assert_eq!(
+            generation,
+            after_first[index].write_generation(),
+            "the generation the second boot resumed at is the one the first left"
+        );
+        assert_eq!(sequence, after_first[index].writer().sequence);
+        assert_eq!(
+            opened,
+            sequence + 1,
+            "a resumed recording opens the segment after the one it read, the \
+             previous boot's having been left unsealed"
+        );
+    }
+
+    // The second boot advanced the ring rather than restarting it: a higher
+    // generation, and a write cursor past where the first boot stopped.
+    let after_second = superblocks(&medium);
+    for (index, (before, after)) in after_first.iter().zip(&after_second).enumerate() {
+        assert!(
+            after.write_generation() > before.write_generation(),
+            "recording {index} did not checkpoint past the generation it resumed"
+        );
+        assert!(
+            after.writer().sequence > before.writer().sequence,
+            "recording {index} reopened the segment the first boot had written"
+        );
+    }
+
+    // And the first boot's payload is still on the medium: the second boot
+    // opened the next segment, so nothing it wrote landed on the bytes the
+    // first left. Compared over the first boot's own written prefix, which is
+    // what its durable cursor names.
+    for (index, ((start, _), before)) in Deck::extents().iter().zip(&after_first).enumerate() {
+        let written = before.writer().sequence as usize * SEGMENT_BYTES + before.writer().offset;
+        let payload_at = SEGMENT_BYTES;
+        let now = medium.extent(*start, LOG_SECTORS.max(CAPTURE_SECTORS));
+        assert_eq!(
+            now.get(payload_at..payload_at + written),
+            carried[index].get(payload_at..payload_at + written),
+            "recording {index} lost bytes the first boot had made durable"
+        );
+    }
+}
+
+#[test]
+fn a_superblock_describing_another_ring_is_recorded_over_and_said_so() {
+    // The decision this states: not recording at all is the worse failure for
+    // an appliance whose recordings are its evidence, so a rebound extent is
+    // recorded fresh — and loudly, because what it overwrote was somebody's.
+    let mut medium = Fake::new();
+    let (start_sector, sectors) = Which::Log.extent();
+    let elsewhere = Geometry::new(
+        start_sector + SEGMENT_SECTORS,
+        sectors,
+        SEGMENT_BYTES,
+        CAPACITY_SECTORS,
+    )
+    .expect("a legal geometry that is not this extent's");
+    let state = lfw_capture_ring::RingState::new(
+        elsewhere,
+        11,
+        lfw_capture_ring::Cursor {
+            sequence: 4,
+            offset: 0,
+        },
+        &[],
+    )
+    .expect("a cursor inside the geometry");
+
+    let (names, count) = interfaces();
+    let (mut deck, opened) = Deck::new(
+        CAPACITY_SECTORS,
+        [Some(state), None],
+        names,
+        count,
+        &mut medium,
+    )
+    .expect("the deck is built either way");
+    assert!(
+        matches!(opened[0], Opened::Rebound(_)),
+        "the log extent held another ring: {:?}",
+        opened[0]
+    );
+    assert_eq!(opened[1], Opened::FreshMedium);
+
+    // Fresh means fresh: the recording starts at sequence zero and its first
+    // checkpoint replaces **both** copies, so no copy of the stranger's ring is
+    // left for a later boot to prefer.
+    let ring = Ring::new();
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 4, 600, 8);
+    let _ = download(&mut deck, &mut medium, &mut reader, DownloadSink::Log);
+    let [log, _] = superblocks(&medium);
+    assert_eq!(log.geometry().start_sector(), start_sector);
+    assert_eq!(log.writer().sequence, 0);
+    let image = medium.extent(start_sector, (SUPERBLOCK_BYTES / SECTOR_SIZE) as u64);
+    let (first, second) = image.split_at(SUPERBLOCK_COPY_BYTES);
+    let decode = |bytes: &[u8]| {
+        let bytes: &[u8; SUPERBLOCK_COPY_BYTES] = bytes.try_into().expect("one sector");
+        let mut region = [0u8; SUPERBLOCK_BYTES];
+        region[..SUPERBLOCK_COPY_BYTES].copy_from_slice(bytes);
+        region[SUPERBLOCK_COPY_BYTES..].copy_from_slice(bytes);
+        lfw_capture_ring::decode_superblock(&region).expect("a decodable copy")
+    };
+    for copy in [decode(first), decode(second)] {
+        assert_eq!(
+            copy.geometry().start_sector(),
+            start_sector,
+            "a copy of the stranger's ring survived the first checkpoint"
+        );
+    }
+}
+
+#[test]
+fn a_stored_state_this_deployment_cannot_use_never_stops_the_other_recording() {
+    // Both extents are independent: one rebound must not cost the other its
+    // resume, and neither must cost the deck its build.
+    let mut medium = Fake::new();
+    let first = boot(&mut medium, &Ring::new(), 8);
+    assert_eq!(first, [Opened::FreshMedium, Opened::FreshMedium]);
+    let [_, capture] = superblocks(&medium);
+
+    let (start_sector, sectors) = Which::Log.extent();
+    let elsewhere = Geometry::new(start_sector, sectors * 2, SEGMENT_BYTES, CAPACITY_SECTORS)
+        .expect("a legal geometry that is not this extent's");
+    let rebound = lfw_capture_ring::RingState::new(
+        elsewhere,
+        3,
+        lfw_capture_ring::Cursor {
+            sequence: 1,
+            offset: 0,
+        },
+        &[],
+    )
+    .expect("a cursor inside the geometry");
+
+    let (names, count) = interfaces();
+    let (_deck, opened) = Deck::new(
+        CAPACITY_SECTORS,
+        [Some(rebound), Some(capture)],
+        names,
+        count,
+        &mut medium,
+    )
+    .expect("the deck is built either way");
+    assert!(matches!(opened[0], Opened::Rebound(_)));
+    assert!(matches!(opened[1], Opened::Resumed { .. }));
+}
+
+#[test]
+fn a_completion_for_a_boot_time_read_reaching_the_pass_is_counted_and_never_settled() {
+    // The reads finish before the pass exists, so one answered inside it is a
+    // device replaying its used ring — counted like every other completion
+    // nothing is waiting on, and never taken as an answer to anything.
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    medium.forge(Job::Preload(Which::Log));
+    medium.forge(Job::Preload(Which::Capture));
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    assert_eq!(deck.counters().completions_unexpected, 2);
 }
 
 #[test]

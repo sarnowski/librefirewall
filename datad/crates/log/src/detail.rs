@@ -177,6 +177,33 @@ pub enum DomainDetail<C = &'static str> {
         start_sector: u64,
         sectors: u64,
     },
+    /// A recording extent this boot **continued** rather than started over.
+    /// Appended, never inserted. The four travel together because none answers the
+    /// operator's question alone. The first says which extent — the same sector
+    /// [`Self::Extent`] names, so a reader pairs the two by value rather than by
+    /// counting records. `generation` and `sequence` are what the **medium** said,
+    /// checkable against a disk somebody is holding; `opened` is where this boot
+    /// went, the segment after the one read. No stored byte offset: a resumed
+    /// recording serves nothing before the segment it opened.
+    ///
+    /// **No byte of a recording has a representation here**: a sector number and
+    /// three counters are system state, and the traffic reaches no console line.
+    RecordingResumed {
+        start_sector: u64,
+        generation: u64,
+        sequence: u64,
+        opened: u64,
+    },
+    /// A recording extent this boot **started over**, and which of the two reasons.
+    /// The flag is not redundant with the record's presence: an extent nothing ever
+    /// wrote and one holding a stranger's ring are otherwise the same line, and are
+    /// opposite facts. `false` is the ordinary first boot; `true` is a superblock
+    /// that decoded and described another deployment's geometry, recorded **over**
+    /// — so the record beside this one carries the refusal group.
+    RecordingFresh {
+        start_sector: u64,
+        rebound: bool,
+    },
     /// What the hardware probe proved about this part: the AES and carry-less
     /// multiply known answers held on every pass, and a live XMM pattern
     /// survived each preemption the counter gaps below observed. The two

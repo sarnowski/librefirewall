@@ -775,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 53,
+                detail: 55,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 53 },
+            LogRecordError::DetailKindUnknown { detail: 55 },
         ),
         // The dialled channel's own two token words, on the onboarding port's
         // terms: an outcome or a certificate refusal past its set names nothing
@@ -1334,10 +1334,12 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::ChannelAlert,
         LogDetailKind::ChannelBacklogged,
         LogDetailKind::ChannelFrames,
+        LogDetailKind::RecordingResumed,
+        LogDetailKind::RecordingFresh,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(53), None);
+    assert_eq!(LogDetailKind::from_bits(55), None);
 
     for value in [
         LogValueKind::Absent,

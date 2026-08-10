@@ -318,6 +318,11 @@ pub enum LogDetailKind {
     ChannelAlert,
     ChannelBacklogged,
     ChannelFrames,
+    /// The two a boot's reading of a **recording's superblock** produces: an extent
+    /// continued from where a previous boot left it, and one opened fresh. Appended,
+    /// never inserted, and two discriminants for [`Self::DialRoute`]'s reason.
+    RecordingResumed,
+    RecordingFresh,
 }
 
 impl LogDetailKind {
@@ -377,6 +382,8 @@ impl LogDetailKind {
             Self::ChannelAlert => 50,
             Self::ChannelBacklogged => 51,
             Self::ChannelFrames => 52,
+            Self::RecordingResumed => 53,
+            Self::RecordingFresh => 54,
         }
     }
 
@@ -436,6 +443,8 @@ impl LogDetailKind {
             50 => Some(Self::ChannelAlert),
             51 => Some(Self::ChannelBacklogged),
             52 => Some(Self::ChannelFrames),
+            53 => Some(Self::RecordingResumed),
+            54 => Some(Self::RecordingFresh),
             _ => None,
         }
     }
@@ -1042,6 +1051,20 @@ impl LogRecord {
                 version: code_point(self.operands[1])?,
                 sent: self.operands[2],
                 received: self.operands[3],
+            },
+            // Four numbers, none ranged: what makes a *stored* one acceptable is
+            // `lfw_capture_ring::RingState::check` against a geometry this side built.
+            Some(LogDetailKind::RecordingResumed) => CheckedDetail::RecordingResumed {
+                start_sector: self.operands[0],
+                generation: self.operands[1],
+                sequence: self.operands[2],
+                opened: self.operands[3],
+            },
+            // A sector and a flag, the flag in the fourth word where this ABI puts
+            // every one, so a word that is neither 0 nor 1 makes it unreadable.
+            Some(LogDetailKind::RecordingFresh) => CheckedDetail::RecordingFresh {
+                start_sector: self.operands[0],
+                rebound: flag(self.operands[3])?,
             },
             // A token and three counts, in `Dialled`'s order: the token takes
             // the leading word wherever a detail's first word names a
@@ -1848,6 +1871,18 @@ pub enum CheckedDetail {
         version: u16,
         sent: u64,
         received: u64,
+    },
+    /// A recording extent a boot continued, and where its superblock stood.
+    RecordingResumed {
+        start_sector: u64,
+        generation: u64,
+        sequence: u64,
+        opened: u64,
+    },
+    /// A recording extent a boot opened fresh, and whether over another ring.
+    RecordingFresh {
+        start_sector: u64,
+        rebound: bool,
     },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.

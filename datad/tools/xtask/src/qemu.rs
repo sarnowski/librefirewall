@@ -245,6 +245,9 @@ struct Bench {
     /// boot of the same run minted an identity on — reset or not — or a copy of
     /// one an earlier boot was onboarded on.
     store: StoreMedium,
+    /// Which recorder medium it attaches: a fresh one, or the one an earlier boot
+    /// left its recordings on.
+    data: DataMedium,
     /// Whether the appliance on that medium **has an owner**, which the scenario
     /// table derives and the boot cannot: a node without one forwards nothing,
     /// so this decides what the boot's own recordings can hold as well as what
@@ -264,6 +267,7 @@ pub(crate) struct ForwardBench {
     pub(crate) dial: DialContract,
     pub(crate) onboard: OnboardContract,
     pub(crate) store: StoreMedium,
+    pub(crate) data: DataMedium,
     pub(crate) owner: Ownership,
 }
 
@@ -703,6 +707,33 @@ pub(crate) enum StoreMedium {
     ResetRequestedOn(&'static str),
 }
 
+/// The two block media one boot attaches, which are chosen together and travel
+/// together for the reason [`Bench`]'s other fields do.
+#[derive(Clone, Copy)]
+pub(crate) struct Media {
+    pub(crate) store: StoreMedium,
+    pub(crate) data: DataMedium,
+}
+
+/// Which recorder medium a boot attaches at 00:05.0 — the one the two recordings
+/// live on.
+///
+/// [`StoreMedium`]'s shape for the other block device, and here for the reason
+/// that one is a field: a recording that did not survive a reboot is not a
+/// recording, and the only way to judge one is to boot the same file twice.
+/// Everything else takes a fresh medium, and must: the witness sector every boot
+/// is judged on is evidence only because no earlier guest could have written it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataMedium {
+    /// A fresh, zero-filled image with the seed pattern in sector 0. Every boot
+    /// but one.
+    Fresh,
+    /// The medium the named scenario's *shipping* boot left behind — the file
+    /// itself, not a copy of it, because the claim is one medium read twice and
+    /// a copy would prove nothing about the reboot.
+    CarriedFrom(&'static str),
+}
+
 /// What a boot owes the raw device at 00:05.0, which follows from its contract
 /// and from nothing the run observed.
 enum DataDiskVerdict {
@@ -954,6 +985,19 @@ pub(crate) enum Console {
     /// that returned — the same appliance, now with an owner — and every
     /// address the surface once had is asked for and found gone.
     JudgedOnTheOwnedApplianceServingNothing,
+    /// **That the two recordings on the medium this boot inherited were
+    /// continued rather than started over**, and nothing else on the console.
+    ///
+    /// The narrow shape once more, for the one boot whose subject is a medium
+    /// read twice. The transcript, the clock, the hardware probe and the
+    /// cryptography domain are facts about the image that other boots state; what
+    /// only this one can settle is whether a reboot keeps what the node before it
+    /// recorded — a claim about a medium, not about a boot.
+    ///
+    /// The routed contract still runs, and is not a second subject: an owned node
+    /// forwards, so its recorder has observations to place, and the boot that
+    /// carries the claim is a boot in which the node was working.
+    JudgedOnTheResumedRecordings,
 }
 
 /// One system scenario: which disk, which configuration document the appliance
@@ -994,6 +1038,9 @@ pub(crate) struct Scenario {
     /// table rather than a subject of it. [`ownership_at_boot`] derives the second
     /// answer from this field, so a scenario cannot state one and boot the other.
     store: StoreMedium,
+    /// Which recorder medium it attaches. Fresh on every boot but the one whose
+    /// subject is that a recording outlives the node that wrote it.
+    data: DataMedium,
 }
 
 /// Boot the deployable disk through OVMF/GRUB and prove the complete system
@@ -1192,6 +1239,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // Fresh, necessarily: the whole subject is an appliance that has never
         // had an owner being given one.
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "routed-forwarding",
@@ -1205,6 +1253,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "generation-swap",
@@ -1218,6 +1267,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "alternate-configuration",
@@ -1231,6 +1281,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "metrics-endpoint",
@@ -1248,6 +1299,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The same scrape against a disk built from the second document, and the
     // one thing the scenario above cannot show: that the identity the
@@ -1273,6 +1325,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The recording milestone's own scenario. It is no longer the only one
     // that pulls the recordings — every [`ManagementRole::Client`] scenario
@@ -1295,6 +1348,50 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
+    },
+    // And the second boot of that one medium, which is the only place the gate
+    // can say a recording OUTLIVES THE NODE THAT WROTE IT.
+    //
+    // A recorder that starts a fresh ring on every boot satisfies every
+    // assertion the boot above makes — it comes up, it records, it checkpoints,
+    // and the extent it leaves parses — and it silently destroys a customer's
+    // evidence on the first restart. Only a second boot of the *same file* sees
+    // it, which is why `DataMedium` is a field on this table rather than a fresh
+    // image per invocation like every other boot's.
+    //
+    // Three things hold, and none of them stands in for another. The console
+    // must carry a `recording=resumed` record per extent, naming the generation
+    // and the segment the medium actually held — a node with no shell has no
+    // other way to tell an operator which of the two happened. The superblock
+    // must come out at a higher generation and a later segment than it went in
+    // at. And the bytes the previous boot made durable must be byte for byte
+    // where it left them, which is the assertion a fresh ring fails on its first
+    // segment, exactly where it would have written.
+    //
+    // It attaches an owned appliance and injects the shipped probe set for one
+    // reason: an owned node forwards, so its recorder has observations to place
+    // and its extents move rather than sitting where the previous boot left
+    // them. The routed contract is met here too, which is not a second subject
+    // — it is what says the node was healthy while the claim above was being
+    // made.
+    Scenario {
+        name: "recording-medium-resumed",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheResumedRecordings,
+        // Socket-backed: this boot takes no client, the download surfaces being
+        // the boot above's subject, and what is read here is the medium.
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::Untouched,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        // The medium the boot above wrote. It must precede this one in this
+        // table, and `DataDisk::carried` says so by name when it does not.
+        data: DataMedium::CarriedFrom("recording-download"),
     },
     // The filter's own two scenarios, and the reason there are two of them
     // rather than one: the three outcomes have to be shown to follow from the
@@ -1320,6 +1417,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "policy-filter-alternate",
@@ -1333,6 +1431,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The one contract a stateless filter cannot meet, on both documents.
     //
@@ -1363,6 +1462,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "stateful-tracking-alternate",
@@ -1376,6 +1476,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The one thing a connection history needs that no other scenario can
     // produce: a conversation that **opens and closes**.
@@ -1435,6 +1536,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The landing that closed the model's one real hole, and the only scenario
     // that states what a policy commit did to the conversations the appliance
@@ -1476,6 +1578,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The scenario that proves an ICMP error the tracker RELATES to a live
     // conversation is still the filter's to decide — which is what keeps
@@ -1511,6 +1614,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "connection-lifecycle",
@@ -1524,6 +1628,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The one scenario that puts a **flood** across the appliance, and the only
     // one whose contract is about how much state a burst of traffic can make
@@ -1568,6 +1673,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The only scenario that boots a node onto **generation 0** — the fail-closed
     // empty configuration — and the only one whose contract is that the appliance
@@ -1625,6 +1731,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // box has no owner and no committed configuration, and it must carry
         // nothing under either.
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // The only scenario that chooses its accelerator, and the only one whose
     // subject is the accelerator rather than the appliance.
@@ -1668,6 +1775,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::Emulated,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // The two boots that are one scenario, and the only pair in this table whose
     // contract neither of them can meet alone.
@@ -1708,6 +1816,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "store-identity-reloaded",
@@ -1723,6 +1832,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // The medium the boot above minted on. It must precede this one in this
         // table, and `StoreDisk::carried` says so by name when it does not.
         store: StoreMedium::CarriedFrom("store-identity-minted"),
+        data: DataMedium::Fresh,
     },
     // And the third boot of that one medium: the only ownership transfer the
     // appliance has.
@@ -1756,6 +1866,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // boot takes away is an identity rather than a first mint nothing depended
         // on.
         store: StoreMedium::ResetRequestedOn("store-identity-minted"),
+        data: DataMedium::Fresh,
     },
     // The four boots whose subject is a management station that MISBEHAVES, and
     // the only ones in this table where the appliance's own channel is required
@@ -1801,6 +1912,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "dial-reset",
@@ -1814,6 +1926,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     Scenario {
         name: "dial-misacknowledged",
@@ -1827,6 +1940,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // And the one where nothing reaches a connection at all: the station answers
     // every resolution for an address nobody asked about, so nothing is learned
@@ -1849,6 +1963,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The three boots whose subject is the appliance's ONBOARDING PORT — the
     // second port its management endpoint listens on, which carries a byte
@@ -1892,6 +2007,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // The same session up to the acknowledgement of its payload, ended by a
     // reset rather than a close. Neither end of the session said it was over, so
@@ -1911,6 +2027,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // And the one whose subject is a SECOND connection while the first is
     // established. The port holds one and an established connection is not
@@ -1931,6 +2048,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // And the boot whose subject is the TLS server behind that port, driven by
     // clients nothing in this repository wrote.
@@ -1967,6 +2085,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // And the boot whose subject is the SURFACE above that handshake: what an
     // administrator actually does once their client has connected.
@@ -2003,6 +2122,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Untouched,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::Fresh,
+        data: DataMedium::Fresh,
     },
     // And the pair that puts the whole of onboarding on a booted image: the
     // harness stops reading what the appliance serves and starts being the
@@ -2055,6 +2175,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         // The medium the boot above was adopted on. It must precede this one in
         // this table, and `StoreDisk::carried` says so by name when it does not.
         store: StoreMedium::CarriedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // THE FOUR BOOTS WHOSE SUBJECT IS THE CHANNEL THE APPLIANCE DIALS, and they
     // come last because every one of them needs the medium the first boot left:
@@ -2081,6 +2202,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Established,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // The delivered anchor refusing the server, which is the channel's most
     // likely failure and the one whose token sends an operator to the package
@@ -2097,6 +2219,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::AnchorRejectsTheServer,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
     // And the other direction: a server that will not have this appliance. TLS
     // 1.3 gives a client no message saying its certificate was accepted, so the
@@ -2115,6 +2238,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::RejectsTheAppliance,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
     },
 ];
 
@@ -2294,28 +2418,40 @@ fn ownership_at_boot(scenarios: &[Scenario], scenario: &Scenario) -> Result<Owne
 /// # Errors
 /// A source declared after the boot that takes its medium, or not at all.
 fn check_media_order(scenarios: &[Scenario]) -> Result<(), String> {
-    for (at, scenario) in scenarios.iter().enumerate() {
-        let (source, how) = match scenario.store {
-            StoreMedium::Fresh => continue,
-            StoreMedium::CarriedFrom(source) => (source, "carries"),
-            StoreMedium::CopiedFrom(source) => (source, "copies"),
-            StoreMedium::ResetRequestedOn(source) => (source, "requests a factory reset on"),
+    let sources = scenarios.iter().enumerate().flat_map(|(at, scenario)| {
+        let store = match scenario.store {
+            StoreMedium::Fresh => None,
+            StoreMedium::CarriedFrom(source) => Some((source, "carries the store medium")),
+            StoreMedium::CopiedFrom(source) => Some((source, "copies the store medium")),
+            StoreMedium::ResetRequestedOn(source) => {
+                Some((source, "requests a factory reset on the store medium"))
+            }
         };
+        let data = match scenario.data {
+            DataMedium::Fresh => None,
+            DataMedium::CarriedFrom(source) => Some((source, "carries the recorder medium")),
+        };
+        [store, data]
+            .into_iter()
+            .flatten()
+            .map(move |(source, how)| (at, scenario, source, how))
+    });
+    for (at, scenario, source, how) in sources {
         let found = scenarios
             .iter()
             .position(|other| other.name == source)
             .ok_or_else(|| {
                 format!(
-                    "system scenario {} {how} the store medium the {source} boot leaves, and this \
-                     table declares no scenario by that name",
+                    "system scenario {} {how} the {source} boot leaves, and this table declares \
+                     no scenario by that name",
                     scenario.name
                 )
             })?;
         if found >= at {
             return Err(format!(
-                "system scenario {} {how} the store medium the {source} boot leaves, and {source} \
-                 is declared at position {} of this table against its own {}. The medium has to \
-                 exist before a boot can take it, so the source must come first",
+                "system scenario {} {how} the {source} boot leaves, and {source} is declared at \
+                 position {} of this table against its own {}. The medium has to exist before a \
+                 boot can take it, so the source must come first",
                 scenario.name,
                 found + 1,
                 at + 1
@@ -2564,7 +2700,8 @@ fn run_scenario(
         | Console::JudgedOnTheOnboardingRequests
         | Console::JudgedOnTheOnboardingInstall
         | Console::JudgedOnTheDialledChannelSession
-        | Console::JudgedOnTheOwnedApplianceServingNothing => {}
+        | Console::JudgedOnTheOwnedApplianceServingNothing
+        | Console::JudgedOnTheResumedRecordings => {}
     }
 
     let log_name = format!("{}.log", scenario_run_label(name, run));
@@ -2603,6 +2740,7 @@ fn run_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            data: scenario.data,
             owner,
         },
     )
@@ -2760,6 +2898,11 @@ fn run_scenario(
         // all: the frame injection needs a socket-backed port, and a boot that
         // dials a server on the host cannot have one.
         Console::JudgedOnTheDialledChannelSession => String::new(),
+        // And nothing here either: this boot's claim is about the medium it
+        // inherited, and it is stated where the two readings of that medium meet
+        // — on the disk itself, inside the boot ([`DataDisk::judge_resumed`]),
+        // which is the only place both the bytes and the console are in reach.
+        Console::JudgedOnTheResumedRecordings => String::new(),
         Console::JudgedOnTheDialledChannelAndThePortsCount => {
             // The appliance's own account of the channel, held to the one
             // outcome this boot's station can produce.
@@ -3029,6 +3172,7 @@ fn run_cryptography_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            data: scenario.data,
             owner,
         },
     )
@@ -3084,6 +3228,7 @@ fn run_store_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             store: scenario.store,
+            data: scenario.data,
             owner,
         },
     )
@@ -3137,7 +3282,10 @@ fn run_fail_closed_scenario(
         &log_name,
         topology,
         &transcript,
-        scenario.store,
+        Media {
+            store: scenario.store,
+            data: scenario.data,
+        },
         owner,
     )
     .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -3181,6 +3329,7 @@ pub(crate) fn boot_and_forward(
         dial,
         onboard,
         store,
+        data,
         owner,
     } = bench;
     boot(
@@ -3199,6 +3348,7 @@ pub(crate) fn boot_and_forward(
             dial,
             onboard,
             store,
+            data,
             owner,
         },
     )
@@ -3395,9 +3545,10 @@ pub(crate) fn boot_and_fail_closed(
     log_name: &str,
     topology: &Topology,
     transcript: &crate::config_transcript::RefusedContract,
-    store: StoreMedium,
+    media: Media,
     owner: Ownership,
 ) -> Result<Booted, String> {
+    let Media { store, data } = media;
     boot(
         root,
         disk,
@@ -3420,6 +3571,7 @@ pub(crate) fn boot_and_fail_closed(
             dial: DialContract::Answered,
             onboard: OnboardContract::Untouched,
             store,
+            data,
             owner,
         },
     )
@@ -3455,6 +3607,11 @@ pub(crate) fn boot_and_halt(
             // A fresh medium, so the appliance on it has no owner — which decides
             // nothing here: no slot boots, so no domain reads the word.
             store: StoreMedium::Fresh,
+            // Likewise fresh, and for the reason the witness sector is judged
+            // untouched here at all: a boot with no bootable slot must leave a
+            // medium nothing wrote, which a medium some earlier guest wrote
+            // cannot be.
+            data: DataMedium::Fresh,
             owner: Ownership::Unowned,
         },
     )
@@ -3475,6 +3632,7 @@ fn boot(
         dial,
         onboard,
         store,
+        data: data_medium,
         owner,
     } = bench;
     let run_label = log_name.strip_suffix(".log").unwrap_or(log_name);
@@ -3489,7 +3647,15 @@ fn boot(
         acceleration,
         data,
         store: store_disk,
-    } = qemu_base(root, "stdio", disk, run_label, accelerator, store)?;
+    } = qemu_base(
+        root,
+        "stdio",
+        disk,
+        run_label,
+        accelerator,
+        store,
+        data_medium,
+    )?;
     command.arg("-monitor").arg("none");
     backends.apply(&mut command, topology)?;
 
@@ -3611,6 +3777,22 @@ fn boot(
     {
         println!("  store medium {run_label}: {verdict}");
     }
+    // And, on the one boot that inherited a medium an earlier boot recorded on,
+    // the claim no single boot can make: that the recordings were continued
+    // rather than started over. The disk half and the console half together,
+    // because neither is the other — a recorder that started fresh leaves a
+    // medium that parses and a console that reads healthy.
+    if let Some(verdict) = data
+        .judge_resumed(&booted.serial)
+        .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?
+    {
+        println!("  data disk {run_label}: {verdict}");
+        append_evidence(
+            &log,
+            "the recordings the previous boot left, read off the disk image after this one",
+            &verdict,
+        )?;
+    }
     // And, on every boot that pulled the recordings, the medium itself: the
     // extents the appliance wrote, read by a process the guest cannot reach.
     if recordings {
@@ -3657,6 +3839,7 @@ pub(crate) fn run_system(root: &Path) -> Result<(), String> {
         // A fresh medium, so an interactive run mints an identity rather than
         // inheriting whichever scenario ran last.
         StoreMedium::Fresh,
+        DataMedium::Fresh,
     )?;
     println!("QEMU run: {}", acceleration.describe());
     // Interactive runs have no harness peer to dial into, so back every NIC
@@ -3766,6 +3949,7 @@ fn qemu_base(
     run_label: &str,
     accelerator: Accelerator,
     store: StoreMedium,
+    data: DataMedium,
 ) -> Result<Invocation, String> {
     require_file(disk)?;
 
@@ -3781,7 +3965,14 @@ fn qemu_base(
     copy_file(&vars_template, &vars)?;
 
     let acceleration = Acceleration::choose(accelerator);
-    let data = DataDisk::create(root, run_label)?;
+    // Fresh on every boot but the one whose subject is the medium, which takes
+    // the file an earlier boot left so its recordings can be read twice.
+    let data = match data {
+        DataMedium::Fresh => DataDisk::create(root, run_label)?,
+        DataMedium::CarriedFrom(source) => {
+            DataDisk::carried(root, &scenario_run_label(source, Run::Shipping))?
+        }
+    };
     // The appliance's own medium: created fresh, carried from the boot that minted
     // an identity on it, or copied from the boot that was given an owner. Which one
     // is the scenario's decision, so a boot cannot accidentally inherit an identity

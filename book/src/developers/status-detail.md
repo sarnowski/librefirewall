@@ -668,6 +668,28 @@ segments and the capture recording 31. The 256 KiB `blk_io` staging window is ca
 one sector, so a window can start mid-sector) and a 1 KiB superblock buffer, each sector-aligned, and
 every DMA address is `io_paddr` plus one of those offsets.
 
+**A boot reads those superblocks back before it places a record**, which is what makes a recording
+outlive the node that wrote it. Between the proof of the medium and the first pass, the domain reads
+each extent's superblock region synchronously — one request outstanding at a time, so a completion
+is attributable to the read that produced it, and the wait for each bounded by a poll budget of this
+crate's own rather than by anything the device controls, exactly as the boot proof's is. What
+decodes is a `RingState` and not yet something a ring may resume from: only `RingState::check`,
+against a geometry the domain that owns the device built, turns it into one. Both copies failing to
+decode is the ordinary first boot and is not an error. A superblock that decodes and describes
+**another ring** — the extent rebound, or a different device — is recorded *over*: an appliance that
+records nothing has failed worse than one that overwrote a stranger's bytes, and a fresh sink is
+also what replaces both copies rather than leaving one of the stranger's for a later boot to prefer.
+A read the device refuses, fails, answers short or never answers at all is a refusal to start, on
+the boot proof's terms and with a console token per cause.
+
+A resumed recording opens the segment **after** the one the superblock names, and serves nothing
+before it: the previous boot's segment was never sealed, so its tail is unpadded and a locate would
+report the whole `segment_bytes` as readable, including bytes from the wrap before it. Each
+recording says on the console which of the three happened — resumed with the generation and segment
+the medium held and the segment this boot opened, or fresh with a flag separating an unwritten
+extent from a rebound one — because a node with no shell has no other way to tell an operator, and
+the two look identical on every other surface.
+
 Each pass of the recorder's loop settles up to eight completions, drains up to sixteen tap records
 into both recordings, hands the medium whatever is ready, and services at most one download. A
 record a recording cannot take yet is **held**, not dropped: `wire::TapReader` consumes a slot
@@ -710,7 +732,7 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 19 of the 34 system
+**What the gate proves.** Every scenario whose management port is reachable — 19 of the 35 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
 scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
 three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
@@ -823,12 +845,12 @@ and wall-clock times. An independent parse of the two files established:
   [recording design](../design/recording.md) requires a time bound as well; there is none, so how
   long a node holds traffic is whatever its ring yields at the offered rate. Nothing is erased when
   recording stops, and nothing erases an extent on decommission.
-- **Nothing resumes, and nothing rotates or checkpoints on a schedule.** A superblock is written
-  when the recorder decides to — at bring-up and after a segment closes — never on a clock; and no
-  boot reads one back. `Sink::resume` is host-tested and correct as far as it can be shown to be —
-  a resumed recording's download starts at the segment *this* boot opened rather than the previous
-  boot's unsealed one, and there is no separate `open` for it to be called out of order with — but
-  it is called by no protection domain, so a restart begins a fresh ring over the old bytes.
+- **Nothing rotates or checkpoints on a schedule.** A superblock is written when the recorder
+  decides to — at bring-up, and after a flush the device acknowledged — never on a clock. Resuming
+  across a boot is no longer on this list: the domain reads each extent back before it places a
+  record and continues the ring it finds, and two boots of one medium in the system gate hold it to
+  the console record, to a superblock that advanced, and to the previous boot's durable bytes being
+  byte for byte where it left them.
 - **One reader, and it holds no durable cursor.** The superblock carries four reader-cursor slots
   and nothing registers one. The [management](../design/management.md) and
   [recording](../design/recording.md) designs make the channel the ring's cursor-holding reader —
@@ -973,7 +995,7 @@ Held by the tests in `datad/crates/config` and `datad/crates/log`, by the handov
 `enabled` bytes, an image round-tripping through the region — and by the 500,000-frame pipeline
 test, which now exchanges the forwarding table at poll boundaries throughout and asserts that no
 frame is rewritten out of a blend of two, that the pool comes back whole across every commit
-boundary, and that payloads arrive in order under those rewritten headers. Two of the 34 QEMU
+boundary, and that payloads arrive in order under those rewritten headers. Two of the 35 QEMU
 system scenarios assert the console transcript, and one of those boots an image built from a second
 document that shares no address and no MAC with the first.
 
@@ -1233,7 +1255,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 34 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 35 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1457,7 +1479,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Six of the 34 system scenarios additionally hold the console's own record to the frames and the bytes
+Six of the 35 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of them boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1900,7 +1922,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 30 console cause tokens. Two of the 34 system scenarios assert that record
+one of 30 console cause tokens. Two of the 35 system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -3246,7 +3268,7 @@ for on the medium and takes effect on the boot after it. The console says so at 
 for the same reason: a peer rewriting the word cannot choose how many lines this domain writes.
 
 On the image, every boot states the word once and it is the word its medium carried — the domain
-that holds the identity publishes before the forwarding domain reads, on every one of the 34 boots.
+that holds the identity publishes before the forwarding domain reads, on every one of the 35 boots.
 So the *transition* is exercised on the host and not on the image: the boot that installs a package
 does so as the last thing it does, after its own frames have been injected and decided, and it ends
 before the forwarding domain's next wakeup. What that leaves unproven on a booted node is the second
@@ -3260,7 +3282,7 @@ as well, so ownership cannot become a table composed by the parser that reads an
 document, and from the management domain, which can already ask the store domain for the identity.
 
 The system gate is arranged around it, at the cost of no extra boot. The scenario that onboards
-an appliance now runs **first**, and **22 scenarios boot a copy of an owned medium** — which is what
+an appliance now runs **first**, and **23 scenarios boot a copy of an owned medium** — which is what
 a deployed appliance is: onboarded once, long ago, running ever since.
 They cannot onboard during their own boot instead, because an accepted package shuts the onboarding
 surface for good and so an install has to be the last thing a boot does. The scenarios that stay
@@ -3401,7 +3423,12 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 31 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (34 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 19 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **4 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued — while the other three are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
+| QEMU end-to-end gate (35 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 19 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). One pair shares the **recorder's** medium across boots — the only place the gate can say a recording
+outlives the node that wrote it, a recorder that started a fresh ring on every boot satisfying every
+assertion a single boot makes — and the second of the pair is held three ways: the console record
+naming the generation and segment the medium held, a superblock that came out at a higher generation
+and a later segment than it went in at, and the previous boot's durable bytes still byte for byte
+where it left them. Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **4 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued — while the other three are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
 | Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 30 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |

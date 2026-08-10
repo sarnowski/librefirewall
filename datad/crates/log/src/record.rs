@@ -453,6 +453,23 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::Extent.to_bits();
                     record.operands = [*start_sector, *sectors, 0, 0];
                 }
+                DomainDetail::RecordingResumed {
+                    start_sector,
+                    generation,
+                    sequence,
+                    opened,
+                } => {
+                    record.detail = LogDetailKind::RecordingResumed.to_bits();
+                    record.operands = [*start_sector, *generation, *sequence, *opened];
+                }
+                DomainDetail::RecordingFresh {
+                    start_sector,
+                    rebound,
+                } => {
+                    record.detail = LogDetailKind::RecordingFresh.to_bits();
+                    // The flag in the fourth word, where this ABI puts every one.
+                    record.operands = [*start_sector, 0, 0, u64::from(*rebound)];
+                }
                 DomainDetail::Proven {
                     preemptions,
                     iterations,
@@ -921,6 +938,30 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             start_sector: *start_sector,
             sectors: *sectors,
         },
+        // And here: a sector, a generation and two segment sequences, every bit
+        // pattern of which a medium could hold. Whether the stored state is
+        // *this* ring's is settled where the geometry is, not where the record
+        // is read.
+        CheckedDetail::RecordingResumed {
+            start_sector,
+            generation,
+            sequence,
+            opened,
+        } => DomainDetail::RecordingResumed {
+            start_sector: *start_sector,
+            generation: *generation,
+            sequence: *sequence,
+            opened: *opened,
+        },
+        // The flag was ranged when the record was checked, so what is left is a
+        // sector nothing can make unreadable.
+        CheckedDetail::RecordingFresh {
+            start_sector,
+            rebound,
+        } => DomainDetail::RecordingFresh {
+            start_sector: *start_sector,
+            rebound: *rebound,
+        },
         // And here: two counts the emitting domain claims about its own run.
         CheckedDetail::Proven {
             preemptions,
@@ -1317,6 +1358,24 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                     } => DomainDetail::Extent {
                         start_sector,
                         sectors,
+                    },
+                    DomainDetail::RecordingResumed {
+                        start_sector,
+                        generation,
+                        sequence,
+                        opened,
+                    } => DomainDetail::RecordingResumed {
+                        start_sector,
+                        generation,
+                        sequence,
+                        opened,
+                    },
+                    DomainDetail::RecordingFresh {
+                        start_sector,
+                        rebound,
+                    } => DomainDetail::RecordingFresh {
+                        start_sector,
+                        rebound,
                     },
                     DomainDetail::Proven {
                         preemptions,
