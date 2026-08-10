@@ -128,7 +128,7 @@ mod upload;
 use core::arch::x86_64::{__cpuid, __cpuid_count};
 use core::hint::black_box;
 
-use lfw_channel::MAX_FRAME_LEN;
+use lfw_channel::{MAX_FRAME_LEN, Ring};
 use lfw_clock::Monotonic;
 use lfw_crypto::{
     Aes256Gcm, ChaCha20Poly1305, Drbg, Entropy, EntropyError, KEY_LEN, MlKem768DecapsulationKey,
@@ -149,12 +149,12 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    ClockCalibration, InstallStaging, LogConsume, LogRecords, ManagementEndpoint, RelayRefusal,
-    RelayReply, RelayRequest, SignReply, SignRequest,
+    ClockCalibration, DownloadSink, InstallStaging, LogConsume, LogRecords, ManagementEndpoint,
+    RelayRefusal, RelayReply, RelayRequest, SignReply, SignRequest,
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
-use channel::{CHANNEL_RECORDS, ChannelIdentity, ManagementChannel};
+use channel::{CHANNEL_RECORDS, ChannelIdentity, ManagementChannel, Shipment};
 
 use delegate::{Delegated, DelegationError, HeldAnchor, HeldCertificate, HeldKey};
 use upload::PackageUpload;
@@ -1687,6 +1687,34 @@ impl Terminator for Management {
                 agreed: false,
             },
         }
+    }
+
+    /// Compose an upstream frame, whichever half is running.
+    ///
+    /// Routed to the channel unconditionally and not through [`Self::carrying`]:
+    /// a shipment on an onboarding session is a neighbour asking the wrong
+    /// protocol for a frame, and the channel's own answer to a shipment with no
+    /// session behind it is already the right one — nothing goes out, and the
+    /// session ends. A second arm here would be a second way to say that.
+    fn ship(
+        &mut self,
+        recording: DownloadSink,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        let ring = match recording {
+            DownloadSink::Log => Ring::Log,
+            DownloadSink::Capture => Ring::Capture,
+        };
+        self.channel.ship(
+            Shipment {
+                ring,
+                position,
+                bytes,
+            },
+            answer,
+        )
     }
 
     fn agreed(&self) -> bool {

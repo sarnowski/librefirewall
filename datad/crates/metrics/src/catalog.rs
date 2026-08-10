@@ -953,7 +953,7 @@ pub const RECORDING_TAP_DROPPED_BY_WRITER: Metric = metric(
 pub const RECORDING_DOWNLOADS: Metric = metric(
     "librefirewall_recording_downloads_total",
     Kind::Counter,
-    "Download windows the recorder answered, by whether it served bytes or refused.",
+    "Windows of a recording the recorder answered, by whether it served or refused.",
 );
 
 pub const RECORDING_RECORDS_UNCLOCKED: Metric = metric(

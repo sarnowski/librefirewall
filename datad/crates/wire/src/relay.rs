@@ -124,7 +124,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::{LOG_ONBOARD_END_COUNT, MAPPING_ALIGN};
+use crate::{DownloadSink, LOG_ONBOARD_END_COUNT, MAPPING_ALIGN};
 
 /// Bytes of opaque record data one item may carry, in either direction.
 ///
@@ -224,10 +224,10 @@ pub enum Half {
 
 /// What a request asks the terminating end to do with *the* connection.
 ///
-/// Four operations, and the set is closed deliberately: it is the whole vocabulary
-/// a network end has, and no member of it asks for a plaintext byte. Two carry a
-/// value and are the only two that could: an ending exists where a session ends, a
-/// half where one begins.
+/// Five operations, and the set is closed deliberately: it is the whole vocabulary
+/// a network end has, and no member of it asks for a plaintext byte. Three carry a
+/// value and are the only three that could: an ending exists where a session ends,
+/// a half where one begins, and a recording where ring bytes are shipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayOperation {
     /// A connection was accepted on the named half; begin a session over it. The
@@ -248,11 +248,27 @@ pub enum RelayOperation {
     /// The connection ended at the network end, the way the [`RelayEnding`] says.
     /// The session is over whatever the reply says.
     Close(RelayEnding),
+    /// Ship these ring bytes up the channel, from the position beside them, as a
+    /// frame of the named recording.
+    ///
+    /// **The semantic fields and not a composed frame.** A request carrying a
+    /// length prefix the terminating end then trusted would let a defect at the
+    /// network end be reported, on the appliance's own console, as the
+    /// management server breaking the protocol — so the recording, the position
+    /// and the bytes travel, and the frame is composed where the framing's
+    /// vocabulary lives. What that leaves is real and is not this word's to
+    /// close: the network end still chooses the bytes, so it can ship the wrong
+    /// content under a right-looking position.
+    Ship(DownloadSink),
 }
 
 impl RelayOperation {
     /// The words before a close's own encoding: an open per half, a deliver, a poll.
     const CLOSE_BASE: u32 = 4;
+
+    /// The words before a ship's own encoding: everything above, the four
+    /// endings included.
+    const SHIP_BASE: u32 = Self::CLOSE_BASE + RelayEnding::COUNT as u32;
 
     #[must_use]
     pub const fn to_bits(self) -> u32 {
@@ -262,6 +278,7 @@ impl RelayOperation {
             Self::Deliver => 2,
             Self::Poll => 3,
             Self::Close(ending) => Self::CLOSE_BASE + ending.to_bits(),
+            Self::Ship(recording) => Self::SHIP_BASE + recording.to_bits(),
         }
     }
 
@@ -282,7 +299,10 @@ impl RelayOperation {
             3 => Some(Self::Poll),
             _ => match RelayEnding::from_bits(bits.wrapping_sub(Self::CLOSE_BASE)) {
                 Some(ending) => Some(Self::Close(ending)),
-                None => None,
+                None => match DownloadSink::from_bits(bits.wrapping_sub(Self::SHIP_BASE)) {
+                    Some(recording) => Some(Self::Ship(recording)),
+                    None => None,
+                },
             },
         }
     }
@@ -388,8 +408,14 @@ pub struct RelayRequest {
     sequence: AtomicU32,
     operation: AtomicU32,
     len: AtomicU32,
-    /// Alignment only. Nothing is placed here and nothing reads it.
+    /// Alignment only, so the position below is naturally aligned. Nothing is
+    /// placed here and nothing reads it.
     _pad: AtomicU32,
+    /// Where in its ring's own append space a [`RelayOperation::Ship`]'s bytes
+    /// begin, reachable only through [`RelayDemand::shipping`] and with the
+    /// recording that gives it meaning: beside any other operation the word
+    /// names nothing.
+    position: AtomicU64,
     /// One atomic per byte rather than packed into words, on
     /// [`crate::SignRequest`]'s terms: these are record bytes, so packing them
     /// would make the byte order of the region a thing this crate chooses.
@@ -407,6 +433,7 @@ impl RelayRequest {
             operation: AtomicU32::new(0),
             len: AtomicU32::new(0),
             _pad: AtomicU32::new(0),
+            position: AtomicU64::new(0),
             payload: [const { AtomicU8::new(0) }; MAX_RELAY_PAYLOAD],
         }
     }
@@ -592,6 +619,10 @@ mod peer {
             self.0.len.load(Ordering::Relaxed)
         }
 
+        pub(super) fn position(&self) -> u64 {
+            self.0.position.load(Ordering::Relaxed)
+        }
+
         pub(super) fn copy_payload(&self, into: &mut [u8]) {
             for (byte, cell) in into.iter_mut().zip(&self.0.payload) {
                 *byte = cell.load(Ordering::Relaxed);
@@ -735,6 +766,32 @@ impl RelayRequester<'_> {
         operation: RelayOperation,
         payload: &[u8],
     ) -> Result<PendingRelay, RelayBusy> {
+        self.issue(operation, 0, payload)
+    }
+
+    /// Ship `bytes` of `recording` beginning at ring position `position`.
+    ///
+    /// A door of its own onto [`Self::request`]'s path rather than a position
+    /// parameter on it: a caller that could state a position for a poll would be
+    /// writing a word the far end never reads.
+    ///
+    /// # Errors
+    /// [`RelayBusy`], on [`Self::request`]'s terms.
+    pub fn ship(
+        &mut self,
+        recording: DownloadSink,
+        position: u64,
+        bytes: &[u8],
+    ) -> Result<PendingRelay, RelayBusy> {
+        self.issue(RelayOperation::Ship(recording), position, bytes)
+    }
+
+    fn issue(
+        &mut self,
+        operation: RelayOperation,
+        position: u64,
+        payload: &[u8],
+    ) -> Result<PendingRelay, RelayBusy> {
         if self.outstanding {
             return Err(RelayBusy {
                 sequence: self.sequence,
@@ -755,6 +812,9 @@ impl RelayRequester<'_> {
         self.request
             .len
             .store(clamp_u32(payload.len()), Ordering::Relaxed);
+        // Written on every item and not only on a ship, so the word a demand
+        // reads is this item's rather than one left behind by an older one.
+        self.request.position.store(position, Ordering::Relaxed);
         // Release, and last: the words above must be visible to the terminating
         // end before the sequence that makes them a request is.
         self.request
@@ -895,6 +955,7 @@ pub struct RelayDemand {
     sequence: u32,
     operation: Option<RelayOperation>,
     len: u32,
+    position: u64,
 }
 
 impl RelayDemand {
@@ -909,6 +970,17 @@ impl RelayDemand {
     #[must_use]
     pub const fn operation(&self) -> Option<RelayOperation> {
         self.operation
+    }
+
+    /// The recording and ring position a [`RelayOperation::Ship`] names, and
+    /// `None` for every other operation — which is the only way either is
+    /// reachable, so no position can be read off an operation that stated none.
+    #[must_use]
+    pub const fn shipping(&self) -> Option<(DownloadSink, u64)> {
+        match self.operation {
+            Some(RelayOperation::Ship(recording)) => Some((recording, self.position)),
+            _ => None,
+        }
     }
 
     /// The payload length the requester stated, **unclamped**: a length past
@@ -973,6 +1045,7 @@ impl RelayResponder<'_> {
             sequence,
             operation: RelayOperation::from_bits(self.request.operation()),
             len: self.request.len(),
+            position: self.request.position(),
         })
     }
 
@@ -1101,16 +1174,28 @@ const _: () = {
     assert!(RelayEnding::COUNT == LOG_ONBOARD_END_COUNT as usize);
     assert!(RelayOperation::CLOSE_BASE as usize + RelayEnding::COUNT == 8);
     assert!(RelayOperation::from_bits(7).is_some());
-    assert!(RelayOperation::from_bits(8).is_none());
     assert!(RelayEnding::from_bits(RelayEnding::COUNT as u32).is_none());
+    // A ship's words sit immediately after the four endings, so the whole
+    // vocabulary has no gap and ends exactly where the recordings do.
+    assert!(RelayOperation::SHIP_BASE == 8);
+    assert!(RelayOperation::from_bits(RelayOperation::SHIP_BASE).is_some());
+    assert!(
+        RelayOperation::from_bits(RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32 - 1)
+            .is_some()
+    );
+    assert!(
+        RelayOperation::from_bits(RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32).is_none()
+    );
 
     assert!(offset_of!(RelayRequest, sequence) == 0);
     assert!(offset_of!(RelayRequest, operation) == 4);
     assert!(offset_of!(RelayRequest, len) == 8);
     assert!(offset_of!(RelayRequest, _pad) == 12);
-    assert!(offset_of!(RelayRequest, payload) == 16);
-    assert!(align_of::<RelayRequest>() == 4);
-    assert!(size_of::<RelayRequest>() == 16 + MAX_RELAY_PAYLOAD);
+    assert!(offset_of!(RelayRequest, position) == 16);
+    assert!(offset_of!(RelayRequest, payload) == 24);
+    assert!(align_of::<RelayRequest>() == 8);
+    assert!(size_of::<RelayRequest>() == 24 + MAX_RELAY_PAYLOAD);
+    assert!(offset_of!(RelayRequest, position).is_multiple_of(align_of::<u64>()));
 
     assert!(offset_of!(RelayReply, sequence) == 0);
     assert!(offset_of!(RelayReply, status) == 4);

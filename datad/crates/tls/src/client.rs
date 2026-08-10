@@ -309,6 +309,15 @@ impl<'arena> ChannelClient<'arena> {
         drop_front(&mut self.plaintext, bytes);
     }
 
+    /// Whether this session is holding nothing on its way out — no plaintext to
+    /// seal and no ciphertext waiting for the wire. What a caller composing a
+    /// whole message asks first: [`Self::push`] takes what it has room for and
+    /// reports it, which for such a message is a shortfall found too late.
+    #[must_use]
+    pub fn drained(&self) -> bool {
+        self.pending.is_empty() && self.outgoing.is_empty()
+    }
+
     /// Give the peer `plaintext`, answering how much there was room for.
     ///
     /// A count and not a refusal, on the transport's own terms: the protocol

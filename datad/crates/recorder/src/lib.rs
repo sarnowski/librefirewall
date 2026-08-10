@@ -292,14 +292,15 @@ impl Span {
     }
 }
 
-/// What a snapshot offset resolves to.
+/// What a reader's position resolves to, in whichever coordinate it asked in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Locate {
     Live(Span),
-    /// Past the end of the snapshot: the download is complete.
+    /// Past the last byte the reader may have: the end of its snapshot, or of
+    /// what the medium took. Nothing there **yet**.
     PastEnd,
-    /// The ring wrapped over these bytes while the download was in flight.
-    /// The response cannot be completed, and the caller must abandon it.
+    /// The ring wrapped over these bytes, so the caller must abandon what it was
+    /// reading rather than continue from a byte it did not ask for.
     Overrun,
 }
 
@@ -696,6 +697,54 @@ impl Sink {
             .saturating_mul(segment)
             .saturating_add(self.durable.offset as u64);
         Snapshot { first, total }
+    }
+
+    /// One past the last byte of this ring the medium has taken, as an absolute
+    /// position in its own append space. The append cursor runs ahead by
+    /// everything staged, which a reader must not cross: the sectors under those
+    /// bytes still hold the previous wrap.
+    #[must_use]
+    pub const fn durable_position(&self) -> u64 {
+        let segment = self.ring.geometry().segment_bytes() as u64;
+        self.durable
+            .sequence
+            .saturating_mul(segment)
+            .saturating_add(self.durable.offset as u64)
+    }
+
+    /// Where absolute ring position `position` lives on the device. The
+    /// coordinate is `sequence * segment_bytes + offset`, which a restart
+    /// preserves — unlike [`Self::locate`]'s recomputed origin.
+    pub fn find(&mut self, position: u64) -> Locate {
+        let durable = self.durable_position();
+        if position >= durable {
+            return Locate::PastEnd;
+        }
+        let segment = self.ring.geometry().segment_bytes() as u64;
+        // `Geometry::new` refuses a segment of no bytes; answered rather than
+        // divided by, no fault being admissible here.
+        if segment == 0 {
+            return Locate::PastEnd;
+        }
+        let sequence = position / segment;
+        let within = (position % segment) as usize;
+        let (oldest, _) = self.ring.readable();
+        // The floor a snapshot is pinned under: a resumed sink left its
+        // predecessor's last segment unsealed.
+        if sequence < oldest.max(self.first_claimable) {
+            return Locate::Overrun;
+        }
+        match self.ring.locate(sequence, within) {
+            Located::Live(placement) => Locate::Live(Span {
+                sector: placement
+                    .sector()
+                    .saturating_add((within / SECTOR_SIZE) as u64),
+                skip: within % SECTOR_SIZE,
+                len: (placement.len() as u64).min(durable.saturating_sub(position)) as usize,
+            }),
+            Located::Overrun { .. } => Locate::Overrun,
+            Located::Unwritten => Locate::PastEnd,
+        }
     }
 
     /// Where body byte `offset` of `snapshot` lives on the device.

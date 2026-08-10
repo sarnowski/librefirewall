@@ -17,6 +17,14 @@
 //! holding every recorded payload, which is the one grant this split exists to
 //! withhold.
 //!
+//! # Two readers over one channel, telling each other's coordinates apart
+//!
+//! The same domain also feeds the management channel, which ships ring bytes
+//! upstream, so one window serves two readers whose offsets mean different
+//! things — [`DownloadReader`] carries which. One channel rather than two: the
+//! recorder has one staging area and one request in flight, so that request
+//! *is* the arbitration, decided where both readers are visible.
+//!
 //! # Two regions, because a region is the unit of grant
 //!
 //! [`DownloadRequest`] is management's to write and the recorder's to read;
@@ -124,7 +132,49 @@ pub enum DownloadSink {
     Capture,
 }
 
+/// Which reader is asking, and so what [`DownloadDemand::offset`] counts from.
+///
+/// Not a convenience: a snapshot offset resolves against an origin the recorder
+/// recomputes at every boot, so the same number names a different byte after a
+/// restart — unusable to a reader keeping a cursor across one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadReader {
+    /// An operator downloading over HTTP: the offset counts from the start of
+    /// the snapshot pinned when the download began.
+    Snapshot,
+    /// The management channel shipping the ring upstream: the offset is an
+    /// absolute position in the ring's own append space, the coordinate its
+    /// superblock keeps and the channel's cursors are in.
+    Ring,
+}
+
+impl DownloadReader {
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::Snapshot => 0,
+            Self::Ring => 1,
+        }
+    }
+
+    /// `None` for every other bit pattern, on [`DownloadSink::from_bits`]'s
+    /// terms: an offset read in the wrong coordinate is a byte nobody asked for,
+    /// so it is [`DownloadRefusal::NoSuchReader`] rather than a guess.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Snapshot),
+            1 => Some(Self::Ring),
+            _ => None,
+        }
+    }
+}
+
 impl DownloadSink {
+    /// Recordings this appliance has. Exposed so the relay, whose ship operation
+    /// ends where this vocabulary does, derives that rather than restating it.
+    pub const COUNT: usize = 2;
+
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
@@ -173,6 +223,10 @@ pub enum DownloadStatus {
     DeviceError,
     /// The request named no sink this appliance has.
     NoSuchSink,
+    /// The request named no reader this appliance has, so what its offset counts
+    /// from is unknown. Its own status beside [`Self::NoSuchSink`]: answering it
+    /// as a bad sink would send an operator after the wrong field.
+    NoSuchReader,
 }
 
 impl DownloadStatus {
@@ -185,6 +239,7 @@ impl DownloadStatus {
             Self::Overrun => 3,
             Self::DeviceError => 4,
             Self::NoSuchSink => 5,
+            Self::NoSuchReader => 6,
         }
     }
 
@@ -199,6 +254,7 @@ impl DownloadStatus {
             3 => Some(Self::Overrun),
             4 => Some(Self::DeviceError),
             5 => Some(Self::NoSuchSink),
+            6 => Some(Self::NoSuchReader),
             _ => None,
         }
     }
@@ -216,6 +272,7 @@ pub enum DownloadRefusal {
     Overrun,
     DeviceError,
     NoSuchSink,
+    NoSuchReader,
 }
 
 impl DownloadRefusal {
@@ -227,6 +284,7 @@ impl DownloadRefusal {
             Self::Overrun => DownloadStatus::Overrun,
             Self::DeviceError => DownloadStatus::DeviceError,
             Self::NoSuchSink => DownloadStatus::NoSuchSink,
+            Self::NoSuchReader => DownloadStatus::NoSuchReader,
         }
     }
 
@@ -240,6 +298,7 @@ impl DownloadRefusal {
             DownloadStatus::Overrun => Some(Self::Overrun),
             DownloadStatus::DeviceError => Some(Self::DeviceError),
             DownloadStatus::NoSuchSink => Some(Self::NoSuchSink),
+            DownloadStatus::NoSuchReader => Some(Self::NoSuchReader),
         }
     }
 }
@@ -256,11 +315,9 @@ pub struct DownloadRequest {
     sink: AtomicU32,
     offset: AtomicU64,
     len: AtomicU32,
-    /// Alignment only. Nothing is placed here and nothing reads it, so the
-    /// bytes a peer leaves in it name nothing — unlike [`crate::TapAnnotation`]'s
-    /// reserved words, which are held at zero because they are expected to be
-    /// given a meaning.
-    _pad: AtomicU32,
+    /// Which reader is asking, which is what says whether [`Self::offset`] is a
+    /// snapshot offset or an absolute ring position.
+    reader: AtomicU32,
 }
 
 impl DownloadRequest {
@@ -276,7 +333,7 @@ impl DownloadRequest {
             sink: AtomicU32::new(0),
             offset: AtomicU64::new(0),
             len: AtomicU32::new(0),
-            _pad: AtomicU32::new(0),
+            reader: AtomicU32::new(0),
         }
     }
 
@@ -431,6 +488,10 @@ mod peer {
         pub(super) fn len(&self) -> u32 {
             self.0.len.load(Ordering::Relaxed)
         }
+
+        pub(super) fn reader(&self) -> u32 {
+            self.0.reader.load(Ordering::Relaxed)
+        }
     }
 }
 
@@ -531,8 +592,11 @@ impl DownloadRequester<'_> {
         DOWNLOAD_WINDOW_LEN
     }
 
-    /// Ask for `len` bytes of `sink` at `offset`, and take the handle the
-    /// answer must be claimed with.
+    /// Ask `reader` for `len` bytes of `sink` at `offset`, and take the handle
+    /// the answer must be claimed with.
+    ///
+    /// `reader` is what `offset` is counted in, so a caller cannot state one
+    /// without the other.
     ///
     /// `len` is clamped to [`DOWNLOAD_WINDOW_LEN`] here rather than refused:
     /// asking for more than a window is not an error, it is a download that
@@ -540,7 +604,13 @@ impl DownloadRequester<'_> {
     /// holds a reply to. Issuing a second request abandons the first — the
     /// responder will answer a sequence nothing is waiting on, and the old
     /// [`PendingDownload`] can then only ever come back [`DownloadPoll::Outstanding`].
-    pub fn request(&mut self, sink: DownloadSink, offset: u64, len: usize) -> PendingDownload {
+    pub fn request(
+        &mut self,
+        reader: DownloadReader,
+        sink: DownloadSink,
+        offset: u64,
+        len: usize,
+    ) -> PendingDownload {
         let requested = if len < DOWNLOAD_WINDOW_LEN {
             // Below the window, so the cast keeps every bit.
             len as u32
@@ -554,10 +624,13 @@ impl DownloadRequester<'_> {
             next => next,
         };
 
+        self.request
+            .reader
+            .store(reader.to_bits(), Ordering::Relaxed);
         self.request.sink.store(sink.to_bits(), Ordering::Relaxed);
         self.request.offset.store(offset, Ordering::Relaxed);
         self.request.len.store(requested, Ordering::Relaxed);
-        // Release, and last: the three words above must be visible to the
+        // Release, and last: the four words above must be visible to the
         // recorder before the sequence that makes them a request is.
         self.request
             .sequence
@@ -652,6 +725,7 @@ impl DownloadRequester<'_> {
 pub struct DownloadDemand {
     sequence: u32,
     sink: Option<DownloadSink>,
+    reader: Option<DownloadReader>,
     offset: u64,
     len: u32,
 }
@@ -672,9 +746,15 @@ impl DownloadDemand {
         self.sink
     }
 
-    /// Where in the snapshot to read. A claim, and the recorder's own extent is
-    /// what bounds it — nothing here can, because only the recorder knows how
-    /// long the snapshot is.
+    /// Which reader is asking, or `None` for a word naming none this appliance
+    /// has — [`DownloadRefusal::NoSuchReader`], on [`Self::sink`]'s terms.
+    #[must_use]
+    pub const fn reader(&self) -> Option<DownloadReader> {
+        self.reader
+    }
+
+    /// Where to read, in whichever coordinate [`Self::reader`] names. A claim,
+    /// bounded by the recorder's own extent and nowhere else.
     #[must_use]
     pub const fn offset(&self) -> u64 {
         self.offset
@@ -731,6 +811,7 @@ impl DownloadResponder<'_> {
         Some(DownloadDemand {
             sequence,
             sink: DownloadSink::from_bits(self.request.sink()),
+            reader: DownloadReader::from_bits(self.request.reader()),
             offset: self.request.offset(),
             len,
         })
@@ -812,8 +893,12 @@ const _: () = {
     assert!(DownloadStatus::Ok.to_bits() == 0);
     assert!(DownloadSink::Log.to_bits() == 0);
     assert!(DownloadRefusal::from_status(DownloadStatus::Ok).is_none());
-    assert!(DownloadStatus::from_bits(6).is_none());
-    assert!(DownloadSink::from_bits(2).is_none());
+    assert!(DownloadStatus::from_bits(7).is_none());
+    assert!(DownloadSink::from_bits(DownloadSink::COUNT as u32).is_none());
+    // Zero is the snapshot reader, so a zeroed region names the reader the HTTP
+    // download has always been rather than one nothing implements.
+    assert!(DownloadReader::Snapshot.to_bits() == 0);
+    assert!(DownloadReader::from_bits(2).is_none());
 
     assert!(size_of::<DownloadRequest>() == 24);
     assert!(align_of::<DownloadRequest>() == 8);
@@ -821,7 +906,7 @@ const _: () = {
     assert!(offset_of!(DownloadRequest, sink) == 4);
     assert!(offset_of!(DownloadRequest, offset) == 8);
     assert!(offset_of!(DownloadRequest, len) == 16);
-    assert!(offset_of!(DownloadRequest, _pad) == 20);
+    assert!(offset_of!(DownloadRequest, reader) == 20);
     // Naturally aligned, which is what makes each store and load a single
     // access rather than two a reader could tear across.
     assert!(offset_of!(DownloadRequest, offset).is_multiple_of(align_of::<u64>()));

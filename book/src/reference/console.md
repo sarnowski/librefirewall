@@ -708,9 +708,16 @@ node: an operator holding a silent appliance still has only the external act.
   | `other` | the verifier had no better name for it. |
   | `unrecognized` | **the library grew a member this build cannot name**, on the incompatibility table's terms. |
 - `channel-agreed=<true|false> channel-version=<n> channel-frames-sent=<n>
-  channel-frames-received=<n>` — **what the framing above one channel session carried.** One record
-  per session, written when the two ends agree a greeting, or at the close for a session that never
-  did.
+  channel-frames-received=<n>` — **what the framing above one channel session carried.** At most two
+  records per session: one when the two ends agree a greeting — or at the close, for a session that
+  never did — and one the first time the tally passes the greeting, which is this appliance saying it
+  has begun shipping its recordings upstream. There is no third, whatever happens on the wire: these
+  are two states of a channel and not an event per frame.
+
+  Reading them together is the point. A greeted channel and a shipping channel are different things
+  to look for, and the first says nothing about the second: a node that agrees a greeting and then
+  never ships is exactly the fault that would otherwise be invisible, because everything about the
+  session reads healthy.
 
   `channel-agreed=` is the fact this whole record exists for: it is the **only** thing that starts
   the appliance's redial schedule afresh. A connection that came up is deliberately not enough — a
@@ -752,15 +759,15 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 21 the `management` domain raises, 46
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 157 the `crypto` domain
+`nic-driver` domain raises, 30 the `clock` domain raises, 23 the `management` domain raises, 46
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 160 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **One of those eight tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
-raise, so its table names both and its tokens are counted in each domain's total — 87 of the 157
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 160
 and 87 of the 155. Listing it twice would make a reader learn one vocabulary twice; attributing it
 to one domain would leave the other's records looking unnamed.
 
@@ -885,6 +892,16 @@ anything.
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
 | an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown` |
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
+| a recording the traffic outran while the channel was shipping it (a `ready` record, no `detail=`) | `upstream-log-ring-overrun`, `upstream-capture-ring-overrun` |
+
+**The two `upstream-*` tokens say this node has stopped shipping a recording**, and nothing in this
+build starts it again — a cursor the ring wrapped past has no place to continue from, and carrying
+on from anywhere else would put one part of the recording on the wire under another part's position.
+Each is said once per boot. They are two tokens rather than one carrying which ring because the two
+are different losses: the log ring is this appliance's connection and policy history, and the capture
+ring is the traffic itself. Either means the appliance recorded faster than its channel shipped, so
+the thing to look at is the link to the management plane and the rate the recordings are being
+written at — not the recordings, which are intact on the medium and still downloadable.
 
 **`recorder`.** Its first token is the domain's own, raised before the device is touched at all. The
 four groups after it are `lfw_blk`'s bring-up tree, which is `nic-driver`'s with the differences a
@@ -961,6 +978,7 @@ of a vector's contents.
 | composing the identity the onboarding surface serves, which happens once at bring-up and never per request (none carries a `detail=`) | `onboarding-key-unencodable`, `onboarding-request-unsignable`, `onboarding-request-unarmourable` |
 | taking delivery of an onboarding package, before a rule of it is read (`detail=` is the arena an upload needs and the arena that was free, on the first; the second carries none) | `upload-window-unavailable`, `upload-unprepared` |
 | the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
+| a shipment of ring bytes this end would not compose into a frame (none carries a `detail=`) | `channel-shipment-too-long`, `channel-shipment-before-greeting`, `channel-shipment-not-taken` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
@@ -969,6 +987,18 @@ key holder produced no trust anchor — the two halves of an ownership disagreei
 to go and look at rather than a channel that failed. `channel-buffer-unavailable` is the megabyte
 the framing reassembles into having never been allocated, which is this appliance's own defect and
 should never appear.
+
+**The three `channel-shipment-*` tokens are this appliance too, and each ends the session that met
+it.** The recordings travel upstream as ring bytes handed over by the domain that reads the medium,
+and the frame around them is composed by the domain that holds the session — so a shipment that
+cannot be composed is one half of this appliance disagreeing with the other, never anything a server
+did. `channel-shipment-too-long` is a run of ring bytes longer than one frame may carry;
+`channel-shipment-before-greeting` is ring bytes offered before the two ends have greeted, which is
+a frame the far end would refuse; and `channel-shipment-not-taken` is a session already holding more
+on its way out than this design allows, so a whole frame would not fit behind what is queued. Each
+ends the session rather than dropping the shipment, and the reason is that the cursor moves on the
+answer: a shipment dropped quietly would be a gap in the recording the management server has no way
+to notice. A re-dial ships the same bytes again.
 
 **The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
 rule of the channel's own protocol that the far end broke, and the context the code has for each —

@@ -72,8 +72,9 @@ use lfw_ip_endpoint::{ConnectionId, onboard::Ended};
 use lfw_log::{OnboardEnd, RefusalDetail};
 pub use wire::Half;
 use wire::{
-    MAX_RELAY_PAYLOAD, PendingRelay, RelayDemand, RelayEnding, RelayFault, RelayOperation,
-    RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester, RelayResponder,
+    DownloadSink, MAX_RELAY_PAYLOAD, PendingRelay, RelayDemand, RelayEnding, RelayFault,
+    RelayOperation, RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester,
+    RelayResponder,
 };
 
 use crate::endpoint::EndpointStage;
@@ -456,15 +457,32 @@ impl<'chan> Relay<'chan> {
         }
     }
 
+    /// Whether ring bytes are worth reading for this relay to ship: the session
+    /// running now is the dialled channel, and a greeting has been agreed on it.
+    ///
+    /// Both halves of the condition the shipping arm applies, answered where
+    /// they are known. The reader that fills the shipment buffer asks rather
+    /// than guessing, a guess being a read of the medium for a channel that is
+    /// not there.
+    #[must_use]
+    pub const fn shipping(&self) -> bool {
+        matches!(self.carrying(), Some(Half::Channel)) && self.agreed
+    }
+
     /// One bounded pass: claim the answer if one has arrived, then issue at most
     /// one item.
     ///
     /// Never blocks and never spins. A pass with nothing to do returns a
     /// [`RelayPass`] that asks for nothing, which is the whole of the contract
     /// with the event loop.
-    pub fn poll(&mut self, now: Option<Monotonic>, stream: &mut impl Relayed) -> RelayPass {
-        let agreed = self.claim(now, stream);
-        let (notify, report) = self.issue(now, stream);
+    pub fn poll(
+        &mut self,
+        now: Option<Monotonic>,
+        stream: &mut impl Relayed,
+        upstream: &mut impl Upstream,
+    ) -> RelayPass {
+        let agreed = self.claim(now, stream, upstream);
+        let (notify, report) = self.issue(now, stream, upstream);
         RelayPass {
             notify,
             report,
@@ -477,7 +495,12 @@ impl<'chan> Relay<'chan> {
     ///
     /// Answers whether this claim is the one on which the protocol above first
     /// agreed a greeting.
-    fn claim(&mut self, now: Option<Monotonic>, stream: &mut impl Relayed) -> bool {
+    fn claim(
+        &mut self,
+        now: Option<Monotonic>,
+        stream: &mut impl Relayed,
+        upstream: &mut impl Upstream,
+    ) -> bool {
         let Some(Outstanding { pending, deadline }) = self.outstanding.take() else {
             return false;
         };
@@ -562,6 +585,11 @@ impl<'chan> Relay<'chan> {
                     // answer to every item until it is closed.
                     RelayOperation::Open(_) => self.far = Far::Open,
                     RelayOperation::Close(_) => self.far = Far::Closed,
+                    // The shipment was answered, so the bytes on it reached the
+                    // end that composes the frame and the reader may move past
+                    // them. Here and nowhere earlier: an item that faulted or
+                    // was never answered leaves the cursor where it was.
+                    RelayOperation::Ship(_) => upstream.shipped(),
                     RelayOperation::Deliver | RelayOperation::Poll => {}
                 }
                 if closed {
@@ -607,6 +635,7 @@ impl<'chan> Relay<'chan> {
         &mut self,
         now: Option<Monotonic>,
         stream: &mut impl Relayed,
+        upstream: &mut impl Upstream,
     ) -> (bool, Option<RelayReport>) {
         if self.outstanding.is_some() {
             return (false, None);
@@ -675,6 +704,27 @@ impl<'chan> Relay<'chan> {
         }
         if stream.peer_closed() {
             return (self.close(stream, now), None);
+        }
+        // **After the delivery and never before it.** What arrives on the wire
+        // carries the acknowledgements this appliance's cursors move on, so an
+        // end that shipped whenever it had bytes would never hear how far the
+        // far end had got. The window is one item, so priority here is the whole
+        // of the fairness there is. Only on the dialled half and only once a
+        // greeting is agreed: the onboarding half has no upstream, and a frame
+        // in front of the greeting is one the far end refuses.
+        if carried.half == Half::Channel
+            && self.agreed
+            && room
+            && let Some((recording, position, bytes)) = upstream.waiting()
+            && !bytes.is_empty()
+        {
+            let Ok(pending) = self.requester.ship(recording, position, bytes) else {
+                self.refuse_window(stream);
+                return (false, None);
+            };
+            self.park(now, pending);
+            self.polled = false;
+            return (true, None);
         }
         if self.polled || !room {
             return (false, None);
@@ -845,6 +895,65 @@ const _: () = {
     assert!(ANSWER_ROOM <= lfw_ip_endpoint::outbound::SEND_CAPACITY);
 };
 
+/// Bytes a TLS 1.3 record adds to the plaintext inside it: five of header, one
+/// of inner content type, sixteen of tag — a constant of the record format
+/// rather than of any implementation, which is why it can be counted with here.
+const TLS_RECORD_OVERHEAD: usize = 5 + 1 + 16;
+
+/// Bytes of channel-frame header, and of ring position, in front of an upstream
+/// frame's ring bytes. Restated rather than taken from the framing crate, which
+/// this one does not depend on and must not: every protection domain links this
+/// crate, the dataplane ones included. What keeps the numbers together is that
+/// the composing domain refuses a shipment it cannot encode.
+const CHANNEL_HEADER_LEN: usize = 8;
+const RING_POSITION_LEN: usize = 8;
+
+/// Ring bytes one [`RelayOperation::Ship`] may carry.
+///
+/// **The bound is the answer buffer, not the item.** An item is wide enough for
+/// a maximal record either way, but the answer is written into the single
+/// [`ANSWER_ROOM`] buffer the terminating end holds — so the arithmetic runs
+/// backwards from there: one whole frame's ciphertext must fit it.
+///
+/// Bounding it here rather than streaming a segment-sized frame across many
+/// round trips removes partial-frame state from every domain: a frame is
+/// composed only when the whole of it fits, so no half of one is ever on a
+/// length-prefixed stream. What makes a small frame whole information rather
+/// than a fragment is the ring position it carries.
+pub const SHIPPED_RING_BYTES: usize =
+    ANSWER_ROOM - (TLS_RECORD_OVERHEAD + CHANNEL_HEADER_LEN + RING_POSITION_LEN);
+
+const _: () = {
+    // The arithmetic above, read back the other way.
+    assert!(
+        TLS_RECORD_OVERHEAD + CHANNEL_HEADER_LEN + RING_POSITION_LEN + SHIPPED_RING_BYTES
+            == ANSWER_ROOM
+    );
+    assert!(SHIPPED_RING_BYTES <= MAX_RELAY_PAYLOAD);
+    assert!(SHIPPED_RING_BYTES > 0);
+};
+
+/// Where the ring bytes waiting to go up the channel come from.
+///
+/// A trait rather than the concrete reader for [`Terminator`]'s reason: what
+/// holds those bytes is the download channel's other half, which this crate is
+/// not where it lives. Nothing here reads one — a shipment is a length and a
+/// position this crate copies into a region and counts.
+pub trait Upstream {
+    /// Which recording, the absolute ring position, and the bytes themselves.
+    fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])>;
+
+    /// The far end answered the shipment those bytes were on, so the reader may
+    /// move past them.
+    ///
+    /// Called on the **answer** and never on the issue, which keeps a hole out
+    /// of the shipped stream: an item refused, faulted or never answered leaves
+    /// the cursor where it was and the next session ships that position again. A
+    /// frame can cross twice and never be skipped, and the position makes the
+    /// repetition harmless.
+    fn shipped(&mut self);
+}
+
 /// What one turn of the protocol left for the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Answered {
@@ -890,6 +999,26 @@ pub trait Terminator {
     /// whether there is anything to send — and write what goes back into
     /// `answer`.
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered;
+
+    /// Compose a frame carrying `bytes` of `recording` from ring position
+    /// `position`, and write whatever the session then owes the wire into
+    /// `answer`.
+    ///
+    /// **The semantic fields, and the framing is this end's.** Giving the
+    /// network end a vocabulary for a frame would put the framing's own refusals
+    /// on the console under the name of the far end of the wire, which is the
+    /// wrong end of it for anyone reading a node that has no shell.
+    ///
+    /// A shipment this end cannot compose whole **ends the session**, rather
+    /// than being dropped: the network end moves its cursor on the answer, so a
+    /// shipment that vanished here would be a hole nothing can notice.
+    fn ship(
+        &mut self,
+        recording: DownloadSink,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered;
 
     /// Whether the protocol has agreed a greeting with the peer in the session
     /// it holds now.
@@ -1083,6 +1212,7 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             // with nothing delivered rather than an answer of nothing.
             RelayOperation::Open(_) | RelayOperation::Poll => self.turn(demand, 0),
             RelayOperation::Deliver => self.deliver(demand),
+            RelayOperation::Ship(recording) => self.ship(demand, recording),
             RelayOperation::Close(ending) => {
                 // Answered as closed, which is what makes the network end stop
                 // rather than wait for a session this end no longer holds. The
@@ -1127,6 +1257,53 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
         self.turn(demand, taken)
     }
 
+    /// Take a shipment's ring bytes and give them to the protocol to frame.
+    ///
+    /// Bounded by [`SHIPPED_RING_BYTES`] and not merely by what an item holds: a
+    /// longer shipment composes a frame whose ciphertext does not fit the one
+    /// answer buffer, leaving the remainder inside the record layer — in an
+    /// arena a neighbour would then decide how much of. Refused rather than
+    /// shortened, on the same terms as a payload past the region: a silently
+    /// shortened run of ring bytes would look like success at both ends.
+    fn ship(&mut self, demand: RelayDemand, recording: DownloadSink) -> TerminatingPass {
+        let stated = demand.stated_len();
+        if stated as usize > SHIPPED_RING_BYTES {
+            return self.refuse(
+                demand,
+                RelayRefusal::PayloadTooLong,
+                RefusalDetail::One(u64::from(stated)),
+            );
+        }
+        let position = match demand.shipping() {
+            Some((_, position)) => position,
+            // Unreachable: this arm is reached off the very operation that
+            // carries one. Answered rather than asserted, no fault being
+            // admissible on a path a peer paces.
+            None => {
+                return self.refuse(demand, RelayRefusal::NoSuchOperation, RefusalDetail::None);
+            }
+        };
+        let Self {
+            responder, records, ..
+        } = self;
+        let Some(taken) = demand.payload(responder, records).map(<[u8]>::len) else {
+            return self.refuse(
+                demand,
+                RelayRefusal::PayloadTooLong,
+                RefusalDetail::One(u64::from(stated)),
+            );
+        };
+        let Self {
+            terminator,
+            records,
+            answer,
+            ..
+        } = self;
+        let bytes = records.get(..taken).unwrap_or_default();
+        let answered = terminator.ship(recording, position, bytes, answer);
+        self.settle(demand, answered)
+    }
+
     /// Give the protocol the first `taken` bytes of what was copied out, and put
     /// its answer on the channel.
     ///
@@ -1144,11 +1321,18 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             ..
         } = self;
         let received = records.get(..taken).unwrap_or_default();
+        let answered = terminator.advance(received, answer);
+        self.settle(demand, answered)
+    }
+
+    /// Put what the protocol answered on the channel, and account for the
+    /// session it may have ended.
+    fn settle(&mut self, demand: RelayDemand, answered: Answered) -> TerminatingPass {
         let Answered {
             sent,
             finished,
             agreed,
-        } = terminator.advance(received, answer);
+        } = answered;
         // Clamped rather than trusted: a length past the buffer is this
         // appliance's own defect, and no panic is admissible on a path a peer
         // paces.

@@ -113,7 +113,7 @@ pub use clock::{CLOCK_CALIBRATION_REGION_SIZE, CalibrationImage, ClockCalibratio
 pub use config_rule::{ConfigRule, Enforcement};
 pub use download::{
     DOWNLOAD_REPLY_REGION_SIZE, DOWNLOAD_REQUEST_REGION_SIZE, DOWNLOAD_WINDOW_LEN, DownloadDemand,
-    DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply, DownloadRequest,
+    DownloadFault, DownloadPoll, DownloadReader, DownloadRefusal, DownloadReply, DownloadRequest,
     DownloadRequester, DownloadResponder, DownloadSink, DownloadStatus, PendingDownload,
 };
 pub use endpoint::{ENDPOINT_REGION_SIZE, ENDPOINT_TAG, ManagementDestination, ManagementEndpoint};

@@ -301,7 +301,7 @@ fn an_operation_word_the_far_end_does_not_know_is_refused_rather_than_ignored() 
     // operation moves it instead of quietly making this case a valid word.
     store_request_operation(
         request,
-        RelayOperation::CLOSE_BASE + RelayEnding::COUNT as u32,
+        RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
     );
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.operation(), None);
@@ -356,6 +356,7 @@ fn a_reply_answering_the_wrong_question_is_a_fault() {
         sequence: demand.sequence(),
         operation: Some(RelayOperation::Poll),
         len: demand.stated_len(),
+        position: 0,
     };
     channel.responder.answered(mistaken, &[1, 2], false, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
@@ -379,8 +380,10 @@ fn a_status_or_operation_word_outside_its_vocabulary_is_a_fault() {
         ),
         (
             RelayStatus::Ok.to_bits(),
-            9,
-            RelayFault::OperationUnknown { operation: 9 },
+            RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
+            RelayFault::OperationUnknown {
+                operation: RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
+            },
         ),
     ] {
         let request: &'static RelayRequest = Box::leak(Box::new(RelayRequest::zero()));
@@ -586,6 +589,7 @@ fn a_close_answered_with_another_ending_is_a_mismatched_echo() {
         sequence: demand.sequence(),
         operation: Some(RelayOperation::Close(RelayEnding::Forgotten)),
         len: demand.stated_len(),
+        position: 0,
     };
     channel.responder.answered(mistaken, &[], true, false);
     let mut into = [0_u8; MAX_RELAY_PAYLOAD];
@@ -706,6 +710,72 @@ proptest! {
         prop_assert_eq!(payload.is_some(), (len as usize) <= MAX_RELAY_PAYLOAD);
         if let Some(payload) = payload {
             prop_assert_eq!(payload.len(), len as usize);
+        }
+    }
+}
+
+// --- shipping ring bytes -----------------------------------------------------
+
+#[test]
+fn a_shipment_carries_its_recording_and_its_ring_position() {
+    for recording in [DownloadSink::Log, DownloadSink::Capture] {
+        let mut channel = Channel::new();
+        let bytes = vec![0xA5_u8; 96];
+        let pending = channel
+            .requester
+            .ship(recording, 0x1234_5678_9ABC_DEF0, &bytes)
+            .expect("the window is free");
+        assert_eq!(pending.operation(), RelayOperation::Ship(recording));
+        let demand = channel.responder.take().expect("an item is outstanding");
+        assert_eq!(demand.shipping(), Some((recording, 0x1234_5678_9ABC_DEF0)));
+        let mut scratch = [0_u8; MAX_RELAY_PAYLOAD];
+        assert_eq!(
+            demand.payload(&channel.responder, &mut scratch),
+            Some(bytes.as_slice())
+        );
+        channel.responder.answered(demand, &[], false, false);
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        let _ = channel.requester.poll(pending, &mut into);
+    }
+}
+
+#[test]
+fn no_operation_but_a_shipment_carries_a_position() {
+    let mut channel = Channel::new();
+    // A ship first, so the word in the region is a real one rather than the
+    // zero a fresh region holds: what is under test is that the next item
+    // overwrites it rather than leaving the last one's position readable.
+    let shipped = channel
+        .requester
+        .ship(DownloadSink::Capture, 4096, b"ring")
+        .expect("the window is free");
+    let demand = channel.responder.take().expect("an item is outstanding");
+    assert_eq!(demand.shipping(), Some((DownloadSink::Capture, 4096)));
+    channel.responder.answered(demand, &[], false, false);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    let _ = channel.requester.poll(shipped, &mut into);
+
+    let polled = ask(&mut channel, RelayOperation::Poll, &[]);
+    let demand = channel.responder.take().expect("an item is outstanding");
+    assert_eq!(demand.shipping(), None);
+    channel.responder.answered(demand, &[], false, false);
+    let _ = channel.requester.poll(polled, &mut into);
+}
+
+proptest! {
+    /// Every operation word round-trips, and the ship words are the last two of
+    /// the vocabulary — so a peer choosing a number cannot introduce an
+    /// operation this appliance has none of.
+    #[test]
+    fn the_operation_vocabulary_ends_where_the_recordings_do(bits in any::<u32>()) {
+        match RelayOperation::from_bits(bits) {
+            Some(operation) => {
+                prop_assert_eq!(operation.to_bits(), bits);
+                prop_assert!(bits < RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32);
+            }
+            None => prop_assert!(
+                bits >= RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32
+            ),
         }
     }
 }

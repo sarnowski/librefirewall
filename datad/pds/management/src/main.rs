@@ -195,7 +195,7 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    DownloadReply, DownloadRequest, LogConsume, LogRecords, ManagementDestination,
+    DownloadReply, DownloadRequest, DownloadSink, LogConsume, LogRecords, ManagementDestination,
     ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest,
 };
 
@@ -761,6 +761,25 @@ const fn chosen_via(via: Via) -> NextHopVia {
     }
 }
 
+/// A recording whose ring wrapped past the channel's own cursor, as a console
+/// line spells it.
+///
+/// A token per recording rather than one carrying which: the log ring is this
+/// appliance's connection history and the capture ring is the traffic itself, so
+/// losing one is not losing the other and an operator acts on the two
+/// differently. Neither is a peer's doing — it is this node producing recorded
+/// bytes faster than its channel shipped them.
+const fn refusal_for_lost_ring(recording: DownloadSink) -> Refusal {
+    Refusal {
+        cause: match recording {
+            DownloadSink::Log => "upstream-log-ring-overrun",
+            DownloadSink::Capture => "upstream-capture-ring-overrun",
+        },
+        detail: RefusalDetail::None,
+        signalled: false,
+    }
+}
+
 /// The clock domain's refusals, in the vocabulary a console line speaks.
 fn clock_refusal(refusal: CalibrationRefused) -> Refusal {
     match refusal {
@@ -1000,7 +1019,11 @@ impl Handler for Management {
         // Before the frames, so a window the recorder answered between wakeups
         // is in the transport's hands by the time this pass composes a segment.
         // It never blocks: a pass with no reply yet does nothing.
-        running.downloads.poll(now, &mut running.stage);
+        // `shipping` says whether the dialled channel is up and greeted, which
+        // is the only state in which reading ring bytes for it is worth a round
+        // trip to the recorder.
+        let shipping = running.relay.shipping();
+        running.downloads.poll(now, &mut running.stage, shipping);
         // And the configuration channel, on the download channel's terms exactly:
         // an answer that landed between wakeups is in the endpoint's hands by the
         // time this pass composes a segment.
@@ -1011,7 +1034,7 @@ impl Handler for Management {
         let moved = running.stage.poll(ticks, log);
         // And after them, because a request parsed in this very pass is what puts
         // a stream in `pending_stream` or a document in `submission`.
-        running.downloads.poll(now, &mut running.stage);
+        running.downloads.poll(now, &mut running.stage, shipping);
         if running.configurations.poll(now, &mut running.stage) {
             CONFIG.notify();
         }
@@ -1049,10 +1072,16 @@ impl Handler for Management {
             // channel's window is one — and the wakeup it owes is sent here
             // because the capability is this domain's.
             let pass = match half {
-                Half::Channel => running
-                    .relay
-                    .poll(Some(now), &mut ChannelStream(&mut running.stage)),
-                Half::Onboarding => running.relay.poll(Some(now), &mut running.stage),
+                Half::Channel => running.relay.poll(
+                    Some(now),
+                    &mut ChannelStream(&mut running.stage),
+                    &mut running.downloads,
+                ),
+                Half::Onboarding => {
+                    running
+                        .relay
+                        .poll(Some(now), &mut running.stage, &mut running.downloads)
+                }
             };
             if pass.notify {
                 CRYPTO.notify();
@@ -1065,6 +1094,18 @@ impl Handler for Management {
             }
             if let Some(report) = pass.report {
                 announce_session(&running.sink, &report, running.stage.onboard_counters());
+            }
+            // A ring the traffic outran while the channel's cursor stood in it.
+            // Said once per recording and never again: nothing in this build
+            // resynchronises a lost cursor, so what an operator is being told is
+            // that this appliance has stopped shipping that recording for the
+            // rest of this boot.
+            while let Some(lost) = running.downloads.take_lost() {
+                announce(
+                    &running.sink,
+                    DomainState::Ready,
+                    DomainDetail::Refusal(refusal_for_lost_ring(lost)),
+                );
             }
             // Both halves, because the relay just pushed onto one of them and a
             // pass that drove only the other would leave the answer waiting for

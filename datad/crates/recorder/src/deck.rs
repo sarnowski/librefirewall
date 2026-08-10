@@ -47,8 +47,8 @@ use lfw_capture_ring::{
     SUPERBLOCK_COPY_BYTES,
 };
 use wire::{
-    CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadRefusal, DownloadSink, TAP_SNAP_LEN,
-    TapReader,
+    CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader, DownloadRefusal, DownloadSink,
+    TAP_SNAP_LEN, TapReader,
 };
 
 use crate::{
@@ -1130,7 +1130,19 @@ impl Deck {
             };
             return;
         };
+        let Some(reader) = demand.reader() else {
+            self.download = Download::Answered {
+                demand,
+                reason: Some(DownloadRefusal::NoSuchReader),
+                total_len: 0,
+            };
+            return;
+        };
         let which = Which::named(sink);
+        if matches!(reader, DownloadReader::Ring) {
+            self.find(demand, which);
+            return;
+        }
         if demand.offset() == 0 {
             self.download = Download::Sealing {
                 demand,
@@ -1287,6 +1299,69 @@ impl Deck {
                 Err(Refused) => {
                     self.counters.medium_refusals = self.counters.medium_refusals.saturating_add(1);
                 }
+            }
+        }
+    }
+
+    /// Resolve one absolute ring position and either answer it or put a read out
+    /// for it.
+    ///
+    /// Nothing is sealed and nothing is pinned. A seal pads the open sector so
+    /// that what a download promises is a whole file, and it is a **write** to
+    /// the recording — performed on the reader's account, and bounded only by
+    /// how often that reader asks. The channel reads whatever the medium has
+    /// already taken instead, so a ring cursor costs the recording nothing; what
+    /// it gives up is that a frame may end mid-block, which the wire does not
+    /// care about because what travels is a byte stream and not a block.
+    fn find(&mut self, demand: DownloadDemand, which: Which) {
+        let Some(recording) = self.recordings.get_mut(which.index()) else {
+            self.download = Download::Answered {
+                demand,
+                reason: Some(DownloadRefusal::NotReady),
+                total_len: 0,
+            };
+            return;
+        };
+        let total_len = recording.sink.durable_position();
+        match recording.sink.find(demand.offset()) {
+            Locate::PastEnd => {
+                self.download = Download::Answered {
+                    demand,
+                    reason: None,
+                    total_len,
+                };
+            }
+            // Counted by the reader that lost its place rather than here: this
+            // side knows a position went missing, and the domain holding the
+            // cursor is the one that knows which reader it belonged to.
+            Locate::Overrun => {
+                self.download = Download::Answered {
+                    demand,
+                    reason: Some(DownloadRefusal::Overrun),
+                    total_len,
+                };
+            }
+            Locate::Live(span) => {
+                let len = span.len().min(demand.len());
+                if len == 0 {
+                    self.download = Download::Answered {
+                        demand,
+                        reason: None,
+                        total_len,
+                    };
+                    return;
+                }
+                self.download = Download::Fetching {
+                    demand,
+                    total_len,
+                    skip: span.skip(),
+                    len,
+                    sector: span.sector(),
+                    // `skip` is below a sector and `len` at most a window, so
+                    // the sum is at most `DOWNLOAD_STAGING_BYTES`.
+                    sectors: (span.skip().saturating_add(len)).div_ceil(SECTOR_SIZE) as u64,
+                    submitted: false,
+                };
             }
         }
     }

@@ -26,14 +26,24 @@
 //! `lfw_channel`'s, and what is written here is which of their answers reaches
 //! the console and when the greeting has been agreed.
 //!
-//! # The greeting is the only thing this build says, and that is the point
+//! # What this build says, and what composes it
 //!
-//! The channel's contract has ten frames; nine of them carry recordings,
-//! configuration and their acknowledgements, and none of them is this commit's.
-//! What is here is the exchange that makes a session worth anything: this end
-//! sends its greeting the moment the record layer will carry one, and the
-//! server's greeting is what sets [`ManagementChannel::agreed`] — the single fact the
-//! redial schedule in the domain that owns the network may start afresh on.
+//! The greeting, and the two upstream frames that carry the recording rings.
+//! The greeting is the exchange that makes a session worth anything: this end
+//! sends it the moment the record layer will carry one, and the server's is what
+//! sets [`ManagementChannel::agreed`] — the single fact the redial schedule in
+//! the domain that owns the network may start afresh on.
+//!
+//! **The frames are composed here and the ring bytes come from elsewhere.** The
+//! domain that owns the network reads the recorder's window and has no
+//! vocabulary for a frame, so what crosses the relay is the recording, the
+//! position and the bytes, and the header goes on here — where the framing's
+//! refusals belong. Were a length stated over there, a defect at that end would
+//! print on this appliance's own console as the management server breaking the
+//! protocol, and send an operator to the far end of a wire they cannot reach.
+//!
+//! What that does not buy is honesty about content: the bytes and the position
+//! are still that domain's. What the split bounds is the frame **type**.
 //!
 //! **A frame that is not the greeting is counted and dropped.** It is not a
 //! violation: a server that speaks the rest of the protocol to an appliance that
@@ -51,22 +61,25 @@
 use alloc::sync::Arc;
 
 use lfw_channel::{
-    Decoded, Frame, FrameDecoder, Hello, MAX_FRAME_LEN, Side, VERSION, Violation, encode,
+    Decoded, Frame, FrameDecoder, Hello, MAX_FRAME_LEN, Ring, Side, VERSION, Violation, encode,
     encoded_len,
 };
 use lfw_log::{DomainDetail, Refusal, RefusalDetail};
 use lfw_tls::{Bump, CHANNEL_OUTCOME_RECORDS, ChannelClient, CryptoProvider, Turn};
-use pd_runtime::Answered;
+use pd_runtime::{Answered, SHIPPED_RING_BYTES};
 
 use crate::delegate::{HeldAnchor, HeldCertificate};
 
 /// The most console records one channel session owes.
 ///
 /// Two outcomes' worth — the handshake's, and how a session that came up then
-/// ended — plus the framing's account and the one rule a peer may have broken. A
-/// sum and not a bound anybody guesses at, and none of its terms a peer's to
-/// multiply: there is no third outcome, whatever a server does on the wire.
-pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 2;
+/// ended — plus the framing's account at each of the two states it has, the one
+/// rule a peer may have broken, and the one shipment this end may have refused
+/// to compose. A sum and not a bound anybody guesses at, and none of its terms a
+/// peer's to multiply: there is no third outcome, whatever a server does on the
+/// wire, the framing has no third state, and a refused shipment ends the session
+/// that carried it.
+pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 4;
 
 /// Bytes of plaintext this end composes for its own greeting.
 ///
@@ -76,6 +89,30 @@ pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 2;
 const APPLIANCE_GREETING_LEN: usize = lfw_channel::HEADER_LEN + lfw_channel::APPLIANCE_HELLO_LEN;
 
 const _: () = assert!(APPLIANCE_GREETING_LEN == 10);
+
+/// Bytes of plaintext one upstream frame occupies, and the ring position in
+/// front of its ring bytes. Sized by the relay's bound rather than the framing's
+/// megabyte: what decides one frame's size is the answer buffer's room.
+const UPSTREAM_FRAME_LEN: usize = lfw_channel::HEADER_LEN + RING_POSITION_LEN + SHIPPED_RING_BYTES;
+const RING_POSITION_LEN: usize = 8;
+
+const _: () = {
+    // A maximal shipment composes into the array below, so the encoder has
+    // nothing to refuse for want of room on any shipment this end accepts.
+    assert!(UPSTREAM_FRAME_LEN <= lfw_channel::MAX_FRAME_LEN);
+    assert!(SHIPPED_RING_BYTES <= lfw_channel::MAX_PAYLOAD_LEN - RING_POSITION_LEN);
+};
+
+/// One recording's bytes to put on the wire, as the relay handed them over.
+///
+/// A value rather than three parameters because the three are one fact: bytes
+/// without the ring name no frame, and either without the position is a run of
+/// pcapng an ingest cannot place.
+pub struct Shipment<'bytes> {
+    pub ring: Ring,
+    pub position: u64,
+    pub bytes: &'bytes [u8],
+}
 
 /// Everything this domain needs to open one channel session.
 ///
@@ -134,11 +171,19 @@ struct Dialogue<'arena> {
     /// about the one state an operator most wants to see, and would say it only
     /// once the thing they were looking for had already gone wrong.
     ///
-    /// Each latches on its own, so a session says each of the three once and a
-    /// peer cannot make it say any of them twice.
+    /// Each latches on its own, so a session says each of them once and a peer
+    /// cannot make it say any of them twice.
     reported_outcome: bool,
     reported_ending: bool,
     reported_framing: bool,
+    /// Whether the framing's account has been said a second time, for the state
+    /// the first cannot show: this appliance has begun shipping its recordings.
+    ///
+    /// **Two states and not a record per frame.** A greeted channel and a
+    /// shipping channel are different things to look for, and a node that greets
+    /// and never ships is the fault worth seeing. It stays bounded by being a
+    /// state: the second record is owed once, whatever the wire does after.
+    reported_shipping: bool,
 }
 
 /// The channel as the relay drives it: the identity a session is opened with,
@@ -159,6 +204,10 @@ pub struct ManagementChannel {
     /// decides how often is claimed.
     spare: Option<&'static mut [u8; MAX_FRAME_LEN]>,
     session: Option<Dialogue<'static>>,
+    /// Where one upstream frame is composed before the record layer takes it. A
+    /// field because it is one frame's worth and a protection domain's stack is
+    /// not where that belongs.
+    composed: [u8; UPSTREAM_FRAME_LEN],
     /// What the last pass left for the console, taken by the domain after the
     /// pass that produced it.
     staged: [Option<DomainDetail>; CHANNEL_RECORDS],
@@ -179,6 +228,7 @@ impl ManagementChannel {
             identity: None,
             spare: held,
             session: None,
+            composed: [0; UPSTREAM_FRAME_LEN],
             staged: [None; CHANNEL_RECORDS],
         }
     }
@@ -266,6 +316,7 @@ impl ManagementChannel {
                     reported_outcome: false,
                     reported_ending: false,
                     reported_framing: false,
+                    reported_shipping: false,
                 });
             }
             Err(outcome) => {
@@ -281,7 +332,29 @@ impl ManagementChannel {
     /// One turn: give the record layer what arrived, read what it decrypted as
     /// frames, and put back what this end owes.
     pub fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
-        let Some(dialogue) = self.session.as_mut() else {
+        self.turn(received, None, answer)
+    }
+
+    /// One turn that also composes an upstream frame out of `shipment`.
+    ///
+    /// A shipment this end will not compose **ends the session**, and the token
+    /// beside it says which rule stopped it. It cannot be dropped instead: the
+    /// domain that handed it over moves its ring cursor on the answer, so one
+    /// that went nowhere quietly would be a hole nothing can notice.
+    pub fn ship(&mut self, shipment: Shipment<'_>, answer: &mut [u8]) -> Answered {
+        self.turn(&[], Some(shipment), answer)
+    }
+
+    fn turn(
+        &mut self,
+        received: &[u8],
+        shipment: Option<Shipment<'_>>,
+        answer: &mut [u8],
+    ) -> Answered {
+        let Self {
+            session, composed, ..
+        } = self;
+        let Some(dialogue) = session.as_mut() else {
             // Nothing opened, so there is nothing to say and nothing to wait
             // for. Finished rather than silent, on the onboarding server's
             // terms: a session this domain cannot carry is one the transport
@@ -295,6 +368,7 @@ impl ManagementChannel {
         let first = dialogue.client.advance(received, answer);
         dialogue.read_frames();
         dialogue.greet();
+        let refused = shipment.and_then(|shipment| dialogue.compose(shipment, composed));
         // A second turn, which is what encrypts anything the frame reading just
         // pushed and takes it toward the wire. The room is what the first turn
         // left. A single call would answer every greeting one delivery late,
@@ -303,9 +377,12 @@ impl ManagementChannel {
         let agreed = dialogue.agreed;
         let settled = dialogue.settled();
         self.stage(settled.into_iter().flatten());
+        if let Some(cause) = refused {
+            self.stage([DomainDetail::Refusal(refusal(cause))]);
+        }
         Answered {
             sent: second.sent,
-            finished: second.finished,
+            finished: second.finished || refused.is_some(),
             agreed,
         }
     }
@@ -400,6 +477,59 @@ impl Dialogue<'_> {
         }
     }
 
+    /// Compose one upstream frame and hand it to the record layer, answering the
+    /// token of the rule that stopped it where one did.
+    ///
+    /// Three rules with a token each, because each sends an operator somewhere
+    /// different: a shipment past what one frame carries is the reading domain
+    /// asking for more than the relay's bound; one before the greeting is that
+    /// domain speaking out of turn; and a record layer that will not take a
+    /// frame whole is a session already holding too much.
+    fn compose(
+        &mut self,
+        shipment: Shipment<'_>,
+        composed: &mut [u8; UPSTREAM_FRAME_LEN],
+    ) -> Option<&'static str> {
+        let Shipment {
+            ring,
+            position,
+            bytes,
+        } = shipment;
+        if bytes.len() > SHIPPED_RING_BYTES {
+            return Some("channel-shipment-too-long");
+        }
+        if !self.agreed || !self.greeted || self.violation.is_some() {
+            return Some("channel-shipment-before-greeting");
+        }
+        let frame = match ring {
+            Ring::Log => Frame::UpRecords { position, bytes },
+            Ring::Capture => Frame::UpCapture { position, bytes },
+        };
+        // Settled before a byte is pushed: `push` takes what it has room for and
+        // says how much, which for a length-prefixed frame is a shortfall found
+        // with the front of it already queued.
+        if !self.client.drained() {
+            return Some("channel-shipment-not-taken");
+        }
+        let written = match encode(Side::Appliance, &frame, composed) {
+            Ok(written) => written,
+            // Unreachable while the array is sized by the bound checked above,
+            // which the assertions at the head of this file hold it to.
+            // Answered rather than asserted: this runs on a path a peer paces.
+            Err(_) => return Some("channel-shipment-too-long"),
+        };
+        debug_assert_eq!(written, encoded_len(&frame));
+        if self
+            .client
+            .push(composed.get(..written).unwrap_or_default())
+            != written
+        {
+            return Some("channel-shipment-not-taken");
+        }
+        self.sent = self.sent.saturating_add(1);
+        None
+    }
+
     /// Read everything the record layer decrypted as frames.
     ///
     /// Bounded by the plaintext in hand rather than by a count: the decoder takes
@@ -475,6 +605,15 @@ impl Dialogue<'_> {
         }
         if !self.reported_framing && self.agreed {
             self.reported_framing = true;
+            if let Some(slot) = taken.get_mut(at) {
+                *slot = Some(self.framing());
+                at = at.saturating_add(1);
+            }
+        }
+        // The greeting is one frame each way, so a tally past it is this
+        // appliance's own statement that a recording has left it.
+        if self.reported_framing && !self.reported_shipping && self.sent > 1 {
+            self.reported_shipping = true;
             if let Some(slot) = taken.get_mut(at) {
                 *slot = Some(self.framing());
             }

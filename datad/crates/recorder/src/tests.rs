@@ -15,6 +15,10 @@ const CAPACITY_SECTORS: u64 = 512;
 /// A block device that remembers every sector ever written, and refuses a
 /// second write to one — the property the sink claims and the one whose failure
 /// would silently corrupt a recording.
+///
+/// Cloneable because a reboot does not clear a medium: what a resumed sink
+/// reads is the bytes the previous boot left there.
+#[derive(Clone)]
 struct Device {
     bytes: Vec<u8>,
     /// The segment sequence each sector was last written under. A ring rewrites
@@ -131,6 +135,21 @@ impl Harness {
             sink,
             staging,
             device: Device::new(),
+        }
+    }
+
+    /// The same extent after a reboot: a sink resumed from `state`, over the
+    /// medium the previous boot left. The device is carried across because that
+    /// is what a reboot does not clear, and a resumed sink reading a fresh one
+    /// would prove nothing about the bytes still on it.
+    fn resumed(snap_len: u32, segments: u64, state: &RingState, device: Device) -> Self {
+        let mut staging = vec![0u8; STAGING];
+        let sink =
+            Sink::resume(config(snap_len, segments), state, &mut staging).expect("a resumed sink");
+        Self {
+            sink,
+            staging,
+            device,
         }
     }
 
@@ -1215,4 +1234,160 @@ mod properties {
             prop_assert_eq!(offset, snapshot.total_len());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The absolute ring coordinate, which is what a channel cursor is kept in.
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    /// Everything the medium has taken, gathered the way the management domain
+    /// gathers it for the channel: one `find` and one read at a time, from the
+    /// beginning of the ring.
+    fn shipped(&mut self, from: u64) -> Vec<u8> {
+        let durable = self.sink.durable_position();
+        let mut body = Vec::new();
+        let mut at = from;
+        while at < durable {
+            match self.sink.find(at) {
+                Locate::Live(span) => {
+                    let bytes = self
+                        .device
+                        .read(span.sector(), span.sectors() as usize * SECTOR_SIZE);
+                    body.extend_from_slice(&bytes[span.skip()..span.skip() + span.len()]);
+                    at += span.len() as u64;
+                }
+                Locate::PastEnd => break,
+                Locate::Overrun => panic!("overrun in a ring nothing has wrapped"),
+            }
+        }
+        body
+    }
+}
+
+#[test]
+fn the_ring_coordinate_is_the_append_space_and_starts_at_the_prologue() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(512, 4);
+    while harness.sink.counters().segments_closed < 1 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.record(&tap(2, 0, bytes.len() as u32), &bytes);
+    harness.seal();
+
+    // Position zero is the first segment's prologue, so what a reader starting
+    // there is handed is a pcapng file from its Section Header Block.
+    let body = harness.shipped(0);
+    assert!(!body.is_empty());
+    assert_eq!(parse(&body).sections, 2, "one section header per segment");
+    // And the seam is at exactly one segment, which is what makes the
+    // coordinate `sequence * segment_bytes + offset` rather than a running
+    // count of what happens to be readable.
+    let Locate::Live(seam) = harness.sink.find(SEGMENT as u64) else {
+        panic!("the second segment's first byte is live");
+    };
+    assert_eq!(seam.skip(), 0, "a segment starts on a sector");
+}
+
+#[test]
+fn an_unsealed_ring_ships_a_stream_that_opens_on_a_section_header() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(400, 7);
+    for _ in 0..6 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    // No seal: the channel reads what the medium has taken and writes nothing
+    // on the reader's account, so the durable end is a flushed sector boundary
+    // and may fall inside a block. That is a stream and not a file, which is
+    // what the wire carries — and what an ingest still has to be able to open
+    // is the section header at the front of it.
+    harness.drain();
+    let body = harness.shipped(0);
+    assert!(body.len() >= 12);
+    assert_eq!(le32(&body, 0), 0x0A0D_0D0A, "a section header block");
+    assert_eq!(le32(&body, 8), 0x1A2B_3C4D, "byte-order magic");
+}
+
+#[test]
+fn a_ring_position_past_what_the_medium_took_is_not_there_yet() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(400, 7);
+    for _ in 0..8 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.drain();
+    let durable = harness.sink.durable_position();
+    assert!(durable > 0);
+    assert_eq!(harness.sink.find(durable), Locate::PastEnd);
+    assert_eq!(harness.sink.find(u64::MAX), Locate::PastEnd);
+    // The append cursor runs ahead of the medium by everything staged, and a
+    // reader must not cross that: the sectors under those bytes still hold the
+    // previous wrap.
+    harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    assert_eq!(harness.sink.find(durable), Locate::PastEnd);
+}
+
+#[test]
+fn a_span_stops_at_the_durable_end_rather_than_at_the_append_cursor() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(400, 7);
+    for _ in 0..8 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.drain();
+    let durable = harness.sink.durable_position();
+    let Locate::Live(span) = harness.sink.find(0) else {
+        panic!("the beginning of the ring is live");
+    };
+    assert_eq!(
+        span.len() as u64,
+        durable,
+        "the span reaches the medium's end"
+    );
+}
+
+#[test]
+fn a_ring_position_the_writer_wrapped_past_is_an_overrun_and_not_other_bytes() {
+    let mut harness = Harness::new(2048, 3);
+    let bytes = frame(400, 9);
+    while harness.sink.counters().wraps < 2 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.drain();
+    // Position zero belongs to a segment two wraps ago. Answering it with
+    // whatever occupies that segment now would be shipping one part of the
+    // recording under another part's position.
+    assert_eq!(harness.sink.find(0), Locate::Overrun);
+    // And the overrun is the reader's to count, not this side's: the download
+    // reader's own tally is untouched by a ring cursor losing its place.
+    let before = harness.sink.counters().download_overruns;
+    assert_eq!(harness.sink.find(0), Locate::Overrun);
+    assert_eq!(harness.sink.counters().download_overruns, before);
+}
+
+#[test]
+fn a_resumed_ring_refuses_the_positions_the_previous_boot_left() {
+    let mut harness = Harness::new(2048, 6);
+    let bytes = frame(400, 3);
+    for _ in 0..12 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+    let state = harness.checkpoint();
+
+    let device = harness.device.clone();
+    let mut resumed = Harness::resumed(2048, 6, &state, device);
+    for _ in 0..6 {
+        resumed.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    resumed.seal();
+    // The segment this boot opened is where its claimable history begins: the
+    // previous boot left its last segment unsealed, so those bytes are not this
+    // recording's to hand over even though the ring still holds them.
+    assert_eq!(resumed.sink.find(0), Locate::Overrun);
+    let opened = resumed.sink.cursor().sequence * SEGMENT as u64;
+    assert!(matches!(resumed.sink.find(opened), Locate::Live(_)));
+    let body = resumed.shipped(opened);
+    assert!(!body.is_empty());
+    assert_eq!(parse(&body).sections, 1, "the segment this boot opened");
 }

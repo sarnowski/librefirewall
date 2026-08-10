@@ -851,13 +851,18 @@ and wall-clock times. An independent parse of the two files established:
   record and continues the ring it finds, and two boots of one medium in the system gate hold it to
   the console record, to a superblock that advanced, and to the previous boot's durable bytes being
   byte for byte where it left them.
-- **One reader, and it holds no durable cursor.** The superblock carries four reader-cursor slots
-  and nothing registers one. The [management](../design/management.md) and
-  [recording](../design/recording.md) designs make the channel the ring's cursor-holding reader —
-  resuming from the server-acknowledged cursor after a reconnect — and no channel exists; the
-  ring's only reader is the download path. That unregistered cursor is why no series says how much
-  history a recording still holds: a wrap count states that a segment was evicted, and there is no
-  cursor for it to have been evicted past.
+- **Two readers, and neither holds a durable cursor.** The superblock carries four reader-cursor
+  slots and nothing registers one. The [management](../design/management.md) and
+  [recording](../design/recording.md) designs make the channel the ring's cursor-holding reader,
+  resuming from the server-acknowledged cursor after a reconnect. The channel now **is** a reader —
+  it ships each ring upstream from a cursor of its own, in the ring's absolute append coordinate
+  rather than the download's per-snapshot offset — but that cursor lives in the domain that holds
+  it and nowhere else, so a reboot starts it at the beginning of the ring and re-ships what a
+  previous boot already sent. That unregistered cursor is also why no series says how much history
+  a recording still holds: a wrap count states that a segment was evicted, and there is no cursor
+  for it to have been evicted past. A ring that wraps past the channel's cursor stops being shipped
+  for the rest of the boot, under a console token per recording, because nothing here
+  resynchronises one.
 - **A download is the whole recording.** No `Range`, no `If-Match`, no `ETag`, and no way to ask for
   one segment or a byte extent — the [management design](../design/management.md) serves recording
   range reads over the channel, and the download it replaces cannot even express one. A body over
@@ -2982,8 +2987,8 @@ coverage. What the target cannot reach is stated where it lives: four encoder re
 *this end* composed wrongly, so no peer's stream produces one, and they are held in the crate's own
 suite instead.
 
-**The cryptography domain runs it over the channel's record layer, and only the greeting is
-implemented above it.** The client and the decoder are one value because they are one session: the
+**The cryptography domain runs it over the channel's record layer, and the greeting and the two
+upstream recording frames are implemented above it.** The client and the decoder are one value because they are one session: the
 reassembly buffer is handed on from session to session, and a decoder that outlived its client would
 be reading the next server's bytes against the last one's greeting state. This end sends its greeting
 the moment the record layer will carry one; the server's greeting is what latches
@@ -2996,17 +3001,31 @@ violation, by contrast, closes the connection and nothing else happens — there
 resynchronisation, because where the next header starts is exactly what has been lost — and the
 appliance re-dials under its own schedule.
 
-**Fourteen console tokens on this domain and no metric.** Twelve are rules of the framing a
+**The upstream frames are composed here, out of semantic fields the domain that owns the network
+hands over.** That domain reads the recorder's window and has no vocabulary for a frame, so what
+crosses the relay is the recording, the ring position and the bytes; the header goes on here. A
+length stated over there would put the framing's own refusals on the console under the name of the
+management server, which is the wrong end of the wire for anyone reading a node with no shell. What
+it does not buy is honesty about content — that domain chooses the bytes and can ship the wrong ones
+under a plausible position, and nothing at this layer can tell — and what it does buy is that the
+frame **type** is this end's alone. A shipment this end will not compose ends the session rather
+than being dropped, because the cursor at the other end moves on the answer: one that vanished
+quietly would be a gap in the recording nothing could notice, where ending the session costs a
+redial and re-ships the same position.
+
+**Seventeen console tokens on this domain and no metric.** Twelve are rules of the framing a
 management server broke, one per `Violation` variant and carrying no number, the context each has
-being a peer's own bytes; the two above them are this appliance's own state — a node whose store
-published somewhere to dial and whose key holder produced no anchor, which is the two halves of an
-ownership disagreeing, and the reassembly buffer having never been allocated, which is this domain's
-own defect and should never appear. **No metric counts a violation yet**, and no scenario drives one:
+being a peer's own bytes; two are this appliance's own state — a node whose store published
+somewhere to dial and whose key holder produced no anchor, which is the two halves of an ownership
+disagreeing, and the reassembly buffer having never been allocated, which is this domain's own
+defect and should never appear; and three are shipments this end refused to compose, each ending
+the session that carried it. **No metric counts a violation yet**, and no scenario drives one:
 the counting the contract asks of a violation belongs with the domain that has a metric to count
 into, and the four boots that judge the channel point a real `openssl s_server` or a deliberate
 silence at the appliance — a peer that breaks the framing is not one `s_server` can be made to play.
-What is still missing above the greeting is the rest of the session: which frame is sent when, the
-flush cadence and the acknowledgement cursors, and the commit-confirm over a fresh connection.
+What is still missing above the greeting and the upstream frames is the rest of the session: the
+acknowledgement cursor, which is decoded and dropped rather than advancing anything, the flush
+cadence, and the commit-confirm over a fresh connection.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two

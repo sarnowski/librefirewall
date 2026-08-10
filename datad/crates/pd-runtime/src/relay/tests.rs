@@ -222,6 +222,56 @@ struct Spoken {
     /// because it is the one thing about a session this end does not work out
     /// for itself.
     opened_on: Option<Half>,
+    /// Every shipment the protocol was asked to frame, as it was told it.
+    shipped: Vec<(DownloadSink, u64, Vec<u8>)>,
+}
+
+/// A reader with nothing to ship, which is every case whose subject is not the
+/// shipping arm.
+struct Idle;
+
+impl Upstream for Idle {
+    fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])> {
+        None
+    }
+
+    fn shipped(&mut self) {
+        unreachable!("a reader with nothing waiting is never told a shipment went")
+    }
+}
+
+/// A reader holding one run of ring bytes, and a tally of how often the relay
+/// said they had gone.
+///
+/// The cursor is not moved on a shipment: what these cases are about is *when*
+/// the relay says a shipment went, and a reader that emptied itself would answer
+/// the second question — how often it may say so — with silence.
+struct Held {
+    recording: DownloadSink,
+    position: u64,
+    bytes: Vec<u8>,
+    shipped: usize,
+}
+
+impl Held {
+    fn new(recording: DownloadSink, position: u64, bytes: Vec<u8>) -> Self {
+        Self {
+            recording,
+            position,
+            bytes,
+            shipped: 0,
+        }
+    }
+}
+
+impl Upstream for Held {
+    fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])> {
+        (!self.bytes.is_empty()).then_some((self.recording, self.position, self.bytes.as_slice()))
+    }
+
+    fn shipped(&mut self) {
+        self.shipped += 1;
+    }
 }
 
 /// The protocol the far end terminates with. It answers what it was handed, so
@@ -248,6 +298,28 @@ impl Terminator for Protocol {
         let mut spoken = self.0.borrow_mut();
         spoken.opens += 1;
         spoken.opened_on = Some(half);
+    }
+
+    fn ship(
+        &mut self,
+        recording: DownloadSink,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        let mut spoken = self.0.borrow_mut();
+        spoken.turns += 1;
+        spoken.shipped.push((recording, position, bytes.to_vec()));
+        // Answered with the bytes themselves, which is what lets a case follow
+        // one shipment across and back without a framing this module has none
+        // of.
+        let len = bytes.len().min(answer.len());
+        answer[..len].copy_from_slice(&bytes[..len]);
+        Answered {
+            sent: spoken.overstate.unwrap_or(len),
+            finished: spoken.finish_on == Some(spoken.turns),
+            agreed: spoken.agreed,
+        }
     }
 
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
@@ -298,7 +370,7 @@ fn a_session_opens_delivers_and_closes() {
     let mut stream = Stream::running();
 
     // The pass that finds a session issues an `Open` and asks for a wakeup.
-    let pass = relay.poll(at(0), &mut stream);
+    let pass = relay.poll(at(0), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert!(pass.report.is_none());
     assert_eq!(
@@ -307,22 +379,22 @@ fn a_session_opens_delivers_and_closes() {
     );
 
     // With nothing to deliver, the next pass polls once — and only once.
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert_eq!(serve(&mut far, &[], false), RelayOperation::Poll);
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     assert!(!pass.notify, "a second poll would answer its own answer");
 
     // Bytes off the wire cross whole, and the far end's answer goes back out.
     stream.waiting.extend_from_slice(b"client hello");
-    let pass = relay.poll(at(3), &mut stream);
+    let pass = relay.poll(at(3), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert!(stream.waiting.is_empty(), "the bytes were handed over");
     assert_eq!(
         serve(&mut far, b"server hello", false),
         RelayOperation::Deliver
     );
-    let pass = relay.poll(at(4), &mut stream);
+    let pass = relay.poll(at(4), &mut stream, &mut Idle);
     assert_eq!(stream.pushed, b"server hello");
     assert!(pass.report.is_none());
     // Records came back, so the one poll between two events is due again.
@@ -333,7 +405,7 @@ fn a_session_opens_delivers_and_closes() {
     // the transport has given the connection back.
     stream.peer_closed = true;
     stream.ending = Some(Ended::ByPeer);
-    let pass = relay.poll(at(5), &mut stream);
+    let pass = relay.poll(at(5), &mut stream, &mut Idle);
     assert!(pass.notify);
     // The close carries how the session ended, so the far end reports the same
     // party this end will.
@@ -341,10 +413,10 @@ fn a_session_opens_delivers_and_closes() {
         serve(&mut far, &[], true),
         RelayOperation::Close(RelayEnding::Peer)
     );
-    let pass = relay.poll(at(6), &mut stream);
+    let pass = relay.poll(at(6), &mut stream, &mut Idle);
     assert!(pass.report.is_none(), "the connection is still closing");
     stream.forgotten();
-    let pass = relay.poll(at(7), &mut stream);
+    let pass = relay.poll(at(7), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert_eq!(report.received, b"client hello".len() as u64);
     assert_eq!(report.sent, b"server hello".len() as u64);
@@ -373,7 +445,7 @@ fn the_half_a_session_opens_on_is_stated_on_the_wire_and_pins_this_end() {
     let mut stream = Stream::dialled();
 
     assert_eq!(relay.carrying(), None, "nothing is carried before the open");
-    let pass = relay.poll(at(0), &mut stream);
+    let pass = relay.poll(at(0), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert_eq!(
         relay.carrying(),
@@ -400,7 +472,7 @@ fn the_half_a_session_opens_on_is_stated_on_the_wire_and_pins_this_end() {
     stream.forgotten();
     let mut passes = 0;
     let report = loop {
-        let pass = relay.poll(at(1 + passes), &mut stream);
+        let pass = relay.poll(at(1 + passes), &mut stream, &mut Idle);
         if let Some(report) = pass.report {
             break report;
         }
@@ -425,18 +497,18 @@ fn the_far_end_may_end_the_session_itself() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
-    relay.poll(at(1), &mut stream);
+    relay.poll(at(1), &mut stream, &mut Idle);
     // The answer to the poll says the session is over and carries its last
     // records: both must reach the stream.
     serve(&mut far, b"alert", true);
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     assert_eq!(stream.pushed, b"alert");
     assert!(stream.ended);
     assert!(pass.report.is_none(), "the connection is still closing");
     stream.forgotten();
-    let pass = relay.poll(at(3), &mut stream);
+    let pass = relay.poll(at(3), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert_eq!(report.ended, OnboardEnd::Consumer);
     assert!(report.failure.is_none());
@@ -449,13 +521,13 @@ fn a_refusal_ends_the_session_and_names_itself() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     let demand = far.take().expect("the open");
     far.refuse(demand, RelayRefusal::SessionFailed);
-    relay.poll(at(1), &mut stream);
+    relay.poll(at(1), &mut stream, &mut Idle);
     assert!(stream.ended, "the connection is taken down at once");
     stream.forgotten();
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert_eq!(
         report.failure,
@@ -491,11 +563,11 @@ fn a_reply_that_answers_the_wrong_question_is_a_fault() {
 
     // The open goes out and is overwritten with a deliver before the far end
     // reads it, so the answer echoes an operation this end never asked for.
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     overwrite(&channel, RelayOperation::Deliver);
     assert_eq!(serve(&mut far, &[], false), RelayOperation::Deliver);
 
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(pass.report.is_none(), "the connection is still closing");
     assert!(stream.ended, "the connection is taken down at once");
     assert_eq!(relay.faults(), 1);
@@ -504,7 +576,7 @@ fn a_reply_that_answers_the_wrong_question_is_a_fault() {
     assert!(!relay.outstanding());
 
     stream.forgotten();
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert!(matches!(
         report.failure,
@@ -519,17 +591,17 @@ fn a_far_end_that_never_answers_is_given_up_on() {
     let mut relay = channel.network();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     // Well inside the bound: the item stands.
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(pass.report.is_none());
     assert!(relay.outstanding());
     let past = ANSWER_TIMEOUT.as_nanos().saturating_add(1);
-    relay.poll(at(past), &mut stream);
+    relay.poll(at(past), &mut stream, &mut Idle);
     assert!(!relay.outstanding(), "the one slot is free again");
     assert!(stream.ended, "the connection is taken down with it");
     stream.forgotten();
-    let pass = relay.poll(at(past + 1), &mut stream);
+    let pass = relay.poll(at(past + 1), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert_eq!(report.failure, Some(RelayFailure::Unanswered));
 }
@@ -554,7 +626,7 @@ fn a_wire_with_no_room_holds_the_item_back_rather_than_ending_the_session() {
         ..Stream::dialled()
     };
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     assert_eq!(
         serve(&mut far, &[], false),
         RelayOperation::Open(Half::Channel)
@@ -562,7 +634,7 @@ fn a_wire_with_no_room_holds_the_item_back_rather_than_ending_the_session() {
 
     // The wire is full, so the pass that would have delivered issues nothing.
     stream.wire_full = true;
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(!pass.notify, "no item was written, so no wakeup is owed");
     assert!(pass.report.is_none(), "and no session ended");
     assert!(!relay.outstanding());
@@ -574,19 +646,19 @@ fn a_wire_with_no_room_holds_the_item_back_rather_than_ending_the_session() {
 
     // A further pass changes nothing: a full wire is a state to come back from,
     // not one that decays.
-    assert!(!relay.poll(at(2), &mut stream).notify);
-    assert!(relay.poll(at(3), &mut stream).report.is_none());
+    assert!(!relay.poll(at(2), &mut stream, &mut Idle).notify);
+    assert!(relay.poll(at(3), &mut stream, &mut Idle).report.is_none());
 
     // The peer acknowledged, so the room came back — and the item goes over on
     // the very next pass.
     stream.wire_full = false;
-    let pass = relay.poll(at(4), &mut stream);
+    let pass = relay.poll(at(4), &mut stream, &mut Idle);
     assert!(
         pass.notify,
         "the delivery is issued once there is room for it"
     );
     assert_eq!(serve(&mut far, b"answer", false), RelayOperation::Deliver);
-    let pass = relay.poll(at(5), &mut stream);
+    let pass = relay.poll(at(5), &mut stream, &mut Idle);
     assert!(pass.report.is_none(), "the session is still running");
     assert_eq!(stream.pushed, b"answer");
     assert!(stream.received().is_empty(), "and the delivery was taken");
@@ -594,10 +666,10 @@ fn a_wire_with_no_room_holds_the_item_back_rather_than_ending_the_session() {
     // Nothing about it was ever a refusal: the session ends the ordinary way,
     // the far end being given its close before the account is made.
     stream.forgotten();
-    relay.poll(at(6), &mut stream);
+    relay.poll(at(6), &mut stream, &mut Idle);
     serve(&mut far, &[], true);
     let report = relay
-        .poll(at(7), &mut stream)
+        .poll(at(7), &mut stream, &mut Idle)
         .report
         .expect("the session's account");
     assert_eq!(report.failure, None);
@@ -616,13 +688,13 @@ fn a_full_wire_does_not_hold_back_the_close_of_a_session_the_peer_ended() {
     let mut far = channel.terminating();
     let mut stream = Stream::dialled();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
 
     stream.wire_full = true;
     stream.peer_closed = true;
     stream.ending = Some(Ended::ByPeer);
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(pass.notify, "the close is issued regardless of the wire");
     assert_eq!(
         serve(&mut far, &[], true),
@@ -640,13 +712,13 @@ fn an_answer_the_stream_has_no_room_for_ends_the_session() {
         ..Stream::running()
     };
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
-    relay.poll(at(1), &mut stream);
+    relay.poll(at(1), &mut stream, &mut Idle);
     serve(&mut far, b"four", false);
-    relay.poll(at(2), &mut stream);
+    relay.poll(at(2), &mut stream, &mut Idle);
     stream.forgotten();
-    let pass = relay.poll(at(3), &mut stream);
+    let pass = relay.poll(at(3), &mut stream, &mut Idle);
     let report = pass.report.expect("the session's account");
     assert_eq!(
         report.failure,
@@ -665,15 +737,15 @@ fn a_connection_replaced_between_passes_closes_the_far_end_first() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
-    relay.poll(at(1), &mut stream);
+    relay.poll(at(1), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
 
     // A different peer, on a handle the transport issued for a fresh
     // connection: the far end still holds the old session and must be told.
     stream.reconnected();
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     assert!(pass.notify);
     // Neither end of the old session said it was over, which is what the close
     // carries — and the far end reports it as that rather than as a peer close.
@@ -681,10 +753,10 @@ fn a_connection_replaced_between_passes_closes_the_far_end_first() {
         serve(&mut far, &[], true),
         RelayOperation::Close(RelayEnding::Forgotten)
     );
-    let pass = relay.poll(at(3), &mut stream);
+    let pass = relay.poll(at(3), &mut stream, &mut Idle);
     assert!(pass.report.is_some(), "the old session's account");
     // And only then is the new one opened.
-    let pass = relay.poll(at(4), &mut stream);
+    let pass = relay.poll(at(4), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert_eq!(
         serve(&mut far, &[], false),
@@ -702,16 +774,16 @@ fn a_close_for_a_session_that_is_gone_leaves_the_new_one_alone() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     serve(&mut far, &[], false);
-    relay.poll(at(1), &mut stream);
+    relay.poll(at(1), &mut stream, &mut Idle);
 
     // The far end says the session is over — and between that answer and the
     // pass that claims it the peer resets and opens another. One segment and a
     // handshake, which is a peer's own pacing rather than a race.
     serve(&mut far, &[], true);
     stream.reconnected();
-    let pass = relay.poll(at(2), &mut stream);
+    let pass = relay.poll(at(2), &mut stream, &mut Idle);
     assert!(
         !stream.ended,
         "the old session's close ended the connection that replaced it"
@@ -727,13 +799,13 @@ fn a_close_for_a_session_that_is_gone_leaves_the_new_one_alone() {
     assert!(report.failure.is_none());
 
     // And the new connection is then opened rather than inheriting anything.
-    let pass = relay.poll(at(3), &mut stream);
+    let pass = relay.poll(at(3), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert_eq!(
         serve(&mut far, &[], false),
         RelayOperation::Open(Half::Onboarding)
     );
-    let pass = relay.poll(at(4), &mut stream);
+    let pass = relay.poll(at(4), &mut stream, &mut Idle);
     assert!(
         pass.report.is_none(),
         "the new session was reported at once"
@@ -750,10 +822,10 @@ fn a_failure_ends_the_session_it_was_about_and_no_other() {
     let mut relay = channel.network();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     stream.reconnected();
     let past = ANSWER_TIMEOUT.as_nanos().saturating_add(1);
-    let pass = relay.poll(at(past), &mut stream);
+    let pass = relay.poll(at(past), &mut stream, &mut Idle);
     assert!(
         !stream.ended,
         "a far end that went quiet took down the connection after it"
@@ -781,9 +853,9 @@ fn an_open_after_a_dropped_answer_begins_a_new_session() {
 
     // The open goes out and is never answered inside the bound, so this end
     // drops the handle and gives up on the session.
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     let past = ANSWER_TIMEOUT.as_nanos().saturating_add(1);
-    relay.poll(at(past), &mut stream);
+    relay.poll(at(past), &mut stream, &mut Idle);
     assert!(stream.ended);
     // And the far end answers it late, into a region nothing is polling: it now
     // holds a session this end has already given up on.
@@ -792,16 +864,16 @@ fn an_open_after_a_dropped_answer_begins_a_new_session() {
     // The next connection. Nothing is owed to the far end first — the open is
     // itself the end of what it still believed in.
     stream.reconnected();
-    let pass = relay.poll(at(past + 1), &mut stream);
+    let pass = relay.poll(at(past + 1), &mut stream, &mut Idle);
     assert!(pass.report.is_some(), "the abandoned session's account");
-    let pass = relay.poll(at(past + 2), &mut stream);
+    let pass = relay.poll(at(past + 2), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert_eq!(
         serve(&mut far, &[], false),
         RelayOperation::Open(Half::Onboarding),
         "the next session opened with something other than an open"
     );
-    let pass = relay.poll(at(past + 3), &mut stream);
+    let pass = relay.poll(at(past + 3), &mut stream, &mut Idle);
     assert!(pass.report.is_none(), "the new session was refused");
     assert!(!stream.ended, "the new session was ended before it began");
 }
@@ -812,7 +884,7 @@ fn a_port_with_no_session_asks_for_nothing() {
     let mut relay = channel.network();
     let mut stream = Stream::default();
     for tick in 0..4 {
-        let pass = relay.poll(at(tick), &mut stream);
+        let pass = relay.poll(at(tick), &mut stream, &mut Idle);
         assert_eq!(pass, RelayPass::default());
     }
     assert!(!relay.outstanding());
@@ -826,12 +898,12 @@ fn a_pass_with_no_clock_arms_no_deadline_and_still_carries_the_session() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    let pass = relay.poll(None, &mut stream);
+    let pass = relay.poll(None, &mut stream, &mut Idle);
     assert!(pass.notify);
     serve(&mut far, &[], false);
     // No deadline was armed, so no pass can expire it however far it is from
     // the one before.
-    let pass = relay.poll(None, &mut stream);
+    let pass = relay.poll(None, &mut stream, &mut Idle);
     assert!(pass.report.is_none());
     assert!(pass.notify);
 }
@@ -975,7 +1047,7 @@ fn both_ends_count_the_same_handovers_for_one_session() {
             stream.peer_closed = true;
             stream.ending = Some(Ended::ByPeer);
         }
-        let pass = relay.poll(at(step), &mut stream);
+        let pass = relay.poll(at(step), &mut stream, &mut Idle);
         if pass.notify {
             let demand = far.take().expect("the item that was written");
             let answered = far.answer(demand);
@@ -1224,7 +1296,7 @@ fn a_greeting_the_far_end_agrees_is_reported_once_and_never_again() {
 
     // The open, which agrees nothing: an end that has heard nothing from the
     // peer has agreed nothing with it.
-    let pass = relay.poll(at(0), &mut stream);
+    let pass = relay.poll(at(0), &mut stream, &mut Idle);
     assert!(pass.notify);
     assert!(!pass.agreed);
     assert_eq!(
@@ -1232,20 +1304,20 @@ fn a_greeting_the_far_end_agrees_is_reported_once_and_never_again() {
         RelayOperation::Open(Half::Onboarding)
     );
     // The pass that claims the open issues a poll, which agrees nothing either.
-    assert!(!relay.poll(at(1), &mut stream).agreed);
+    assert!(!relay.poll(at(1), &mut stream, &mut Idle).agreed);
     assert_eq!(serve(&mut far, &[], false), RelayOperation::Poll);
-    assert!(!relay.poll(at(2), &mut stream).agreed);
+    assert!(!relay.poll(at(2), &mut stream, &mut Idle).agreed);
 
     // A delivery whose answer says a greeting was agreed. The edge is reported
     // on the pass that claims it and on no pass after it, however many answers
     // repeat the level.
     stream.waiting.extend_from_slice(b"greeting");
-    assert!(relay.poll(at(3), &mut stream).notify);
+    assert!(relay.poll(at(3), &mut stream, &mut Idle).notify);
     assert_eq!(
         serve_agreeing(&mut far, b"back", false, true),
         RelayOperation::Deliver
     );
-    let pass = relay.poll(at(4), &mut stream);
+    let pass = relay.poll(at(4), &mut stream, &mut Idle);
     assert!(
         pass.agreed,
         "the pass that claims the answer reports the edge"
@@ -1257,7 +1329,7 @@ fn a_greeting_the_far_end_agrees_is_reported_once_and_never_again() {
         RelayOperation::Poll
     );
     assert!(
-        !relay.poll(at(5), &mut stream).agreed,
+        !relay.poll(at(5), &mut stream, &mut Idle).agreed,
         "the level is latched, so a second answer carrying it is not a second edge"
     );
 }
@@ -1269,12 +1341,225 @@ fn a_refused_item_agrees_nothing() {
     let mut far = channel.terminating();
     let mut stream = Stream::running();
 
-    relay.poll(at(0), &mut stream);
+    relay.poll(at(0), &mut stream, &mut Idle);
     let demand = far.take().expect("the open");
     far.refuse(demand, RelayRefusal::NoConnection);
-    let pass = relay.poll(at(1), &mut stream);
+    let pass = relay.poll(at(1), &mut stream, &mut Idle);
     assert!(
         !pass.agreed,
         "a refusal is the far end saying it never had a session to speak over"
     );
+}
+
+// --- shipping ring bytes -----------------------------------------------------
+
+/// Open a dialled session and agree a greeting on it, which is the state the
+/// shipping arm is reachable from and no other.
+/// Driven with a reader holding nothing, so the pass that latches the greeting
+/// does not also carry the first shipment: what these cases are about is the
+/// arm, and a helper that had already used it would leave every one of them
+/// asserting on the pass after the interesting one.
+fn agreed_channel<'chan>(
+    channel: &'chan Channel,
+    stream: &mut Stream,
+) -> (Relay<'chan>, RelayResponder<'chan>) {
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    relay.poll(at(0), stream, &mut Idle);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open(Half::Channel)
+    );
+    // The greeting is agreed on the far end's answer, and the network end reads
+    // it as a level on the pass that claims it.
+    stream.waiting.extend_from_slice(b"server greeting");
+    relay.poll(at(1), stream, &mut Idle);
+    assert_eq!(
+        serve_agreeing(&mut far, &[], false, true),
+        RelayOperation::Deliver
+    );
+    relay.poll(at(2), stream, &mut Idle);
+    assert_eq!(serve(&mut far, &[], false), RelayOperation::Poll);
+    assert!(relay.shipping(), "a greeted dialled session ships");
+    (relay, far)
+}
+
+#[test]
+fn ring_bytes_go_up_a_greeted_channel_and_the_cursor_moves_on_the_answer() {
+    let channel = Channel::zero();
+    let mut stream = Stream::dialled();
+    let mut upstream = Held::new(DownloadSink::Log, 8192, vec![0x5A; 64]);
+    let (mut relay, mut far) = agreed_channel(&channel, &mut stream);
+
+    let pass = relay.poll(at(3), &mut stream, &mut upstream);
+    assert!(pass.notify);
+    let demand = far.take().expect("the shipment");
+    assert_eq!(
+        demand.shipping(),
+        Some((DownloadSink::Log, 8192)),
+        "the recording and the position travel with the bytes"
+    );
+    let mut scratch = [0_u8; MAX_RELAY_PAYLOAD];
+    assert_eq!(
+        demand.payload(&far, &mut scratch).map(<[u8]>::len),
+        Some(64)
+    );
+    assert_eq!(upstream.shipped, 0, "nothing has been answered yet");
+    far.answered(demand, &[], false, true);
+    relay.poll(at(4), &mut stream, &mut upstream);
+    assert_eq!(
+        upstream.shipped, 1,
+        "the cursor moves on the answer and not on the issue"
+    );
+}
+
+#[test]
+fn a_shipment_nobody_answered_leaves_the_cursor_where_it_was() {
+    let channel = Channel::zero();
+    let mut stream = Stream::dialled();
+    let mut upstream = Held::new(DownloadSink::Capture, 0, vec![7; 32]);
+    let (mut relay, mut far) = agreed_channel(&channel, &mut stream);
+
+    relay.poll(at(3), &mut stream, &mut upstream);
+    let demand = far.take().expect("the shipment");
+    // Dropped rather than answered, which is a far end that has stopped
+    // answering: the session dies of the deadline and the shipment is one the
+    // next session makes again.
+    drop(demand);
+    let past = ANSWER_TIMEOUT.as_nanos();
+    relay.poll(at(3 + past), &mut stream, &mut upstream);
+    assert_eq!(upstream.shipped, 0, "an unanswered shipment moved a cursor");
+}
+
+#[test]
+fn what_arrives_on_the_wire_is_handed_over_before_anything_is_shipped() {
+    let channel = Channel::zero();
+    let mut stream = Stream::dialled();
+    let mut upstream = Held::new(DownloadSink::Log, 0, vec![1; 16]);
+    let (mut relay, mut far) = agreed_channel(&channel, &mut stream);
+
+    // Both are owed on the same pass. The delivery carries the acknowledgements
+    // this appliance's cursors move on, so an end that shipped first would be an
+    // end that never heard how far the far end had got.
+    stream.waiting.extend_from_slice(b"an acknowledgement");
+    relay.poll(at(3), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Deliver,
+        "the shipment took the window ahead of the wire"
+    );
+    relay.poll(at(4), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Ship(DownloadSink::Log),
+        "and the shipment goes on the pass after it"
+    );
+}
+
+#[test]
+fn nothing_is_shipped_before_a_greeting_or_on_the_onboarding_half() {
+    // The onboarding half carries no channel, so a reader holding bytes is
+    // never asked for them.
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream::running();
+    let mut upstream = Held::new(DownloadSink::Log, 0, vec![3; 8]);
+    relay.poll(at(0), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open(Half::Onboarding)
+    );
+    assert!(!relay.shipping());
+    relay.poll(at(1), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Poll,
+        "an onboarding session polls rather than ships"
+    );
+
+    // And a dialled session that has agreed nothing yet does not either: a
+    // frame in front of the greeting is one the far end refuses.
+    let dialled = Channel::zero();
+    let mut relay = dialled.network();
+    let mut far = dialled.terminating();
+    let mut stream = Stream::dialled();
+    relay.poll(at(0), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open(Half::Channel)
+    );
+    assert!(!relay.shipping());
+    relay.poll(at(1), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Poll,
+        "an ungreeted channel polls rather than ships"
+    );
+}
+
+#[test]
+fn a_shipment_past_what_one_frame_carries_is_refused_rather_than_shortened() {
+    let channel = Channel::zero();
+    let protocol = Protocol::default();
+    let mut far = Terminating::attach(&channel.request, &channel.reply, protocol.clone());
+    let mut requester = channel.request.requester(&channel.reply);
+    let opening = requester
+        .request(RelayOperation::Open(Half::Channel), &[])
+        .expect("the window is free");
+    let open = far.take().expect("the open");
+    far.answer(open);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    let _ = requester.poll(opening, &mut into);
+
+    let long = vec![0x11_u8; SHIPPED_RING_BYTES + 1];
+    let pending = requester
+        .ship(DownloadSink::Log, 0, &long)
+        .expect("the window is free");
+    let demand = far.take().expect("the shipment");
+    let pass = far.answer(demand);
+    assert!(
+        pass.refused.is_some(),
+        "a shipment longer than a frame is refused"
+    );
+    assert!(
+        protocol.spoken().shipped.is_empty(),
+        "and the protocol was never handed a run it would have to cut"
+    );
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        RelayPoll::Refused(RelayRefusal::PayloadTooLong)
+    );
+}
+
+#[test]
+fn a_shipment_reaches_the_protocol_with_its_recording_and_position() {
+    let channel = Channel::zero();
+    let protocol = Protocol::default();
+    let mut far = Terminating::attach(&channel.request, &channel.reply, protocol.clone());
+    let mut requester = channel.request.requester(&channel.reply);
+    let opening = requester
+        .request(RelayOperation::Open(Half::Channel), &[])
+        .expect("the window is free");
+    let open = far.take().expect("the open");
+    far.answer(open);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    let _ = requester.poll(opening, &mut into);
+
+    let bytes = vec![0xC3_u8; 128];
+    let pending = requester
+        .ship(DownloadSink::Capture, 1_048_576, &bytes)
+        .expect("the window is free");
+    let demand = far.take().expect("the shipment");
+    let pass = far.answer(demand);
+    assert!(pass.refused.is_none());
+    assert_eq!(
+        protocol.spoken().shipped.as_slice(),
+        &[(DownloadSink::Capture, 1_048_576, bytes.clone())],
+        "the semantic fields cross whole and the framing is the far end's"
+    );
+    match requester.poll(pending, &mut into) {
+        RelayPoll::Answered { records, .. } => assert_eq!(records, bytes.as_slice()),
+        other => panic!("a shipment is answered: {other:?}"),
+    }
 }

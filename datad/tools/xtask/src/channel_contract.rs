@@ -464,18 +464,19 @@ pub(crate) fn judge(
                     ChannelOutcome::Established
                 ),
             )?;
-            expect_channel(
-                log,
-                "channel-agreed=true channel-version=1 channel-frames-sent=1 \
-                 channel-frames-received=1",
-            )?;
             expect_certificate(&verification, device)?;
             expect_greeting(&transcript)?;
+            let records = expect_records(&transcript)?;
+            // The frame tally is read after the frames themselves, so a boot
+            // that shipped nothing fails on the missing frame rather than on a
+            // number.
+            expect_frames_beyond_the_greeting(log)?;
             Ok(format!(
                 "  answered   channel               appliance->server  {}:{DIAL_PORT}  \
                  TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768; the server validated \
                  CN={device} against the authority this run issued, both greetings crossed at \
-                 version 1, and the appliance held the connection",
+                 version 1, and the appliance shipped {records} bytes of its log ring from \
+                 position 0 as UP_RECORDS",
                 ipv4(DIAL_DESTINATION)
             ))
         }
@@ -643,6 +644,91 @@ fn expect_greeting(transcript: &[u8]) -> Result<(), String> {
     ))
 }
 
+/// The appliance's own account of the framing, once it has shipped something.
+///
+/// The greeting is one frame each way, so a boot that only greeted reports one
+/// sent. What this holds is that the tally moved past it — which is the
+/// appliance's own statement that it put a recording frame on the wire, beside
+/// the server's statement that one arrived.
+fn expect_frames_beyond_the_greeting(log: &str) -> Result<(), String> {
+    let written = channel_records(log);
+    let owed = field("channel-agreed", "true");
+    for record in &written {
+        if !record.contains(&owed) {
+            continue;
+        }
+        let Some(sent) = value(record, "channel-frames-sent") else {
+            continue;
+        };
+        let sent: u64 = sent.parse().map_err(|_| {
+            format!("the appliance stated a frame tally that is not a number: {record}")
+        })?;
+        if sent > 1 {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "the appliance never reported sending a frame beyond its own greeting. What the domain \
+         that terminates the session wrote:\n  {}",
+        written.join("\n  ")
+    ))
+}
+
+/// The first upstream log-ring frame the appliance sent, as the server received
+/// it, answering how many ring bytes it carried.
+///
+/// Composed by hand rather than through the appliance's own encoder, on
+/// [`SERVER_GREETING`]'s terms: what is asserted is the wire. The header is four
+/// bytes of payload length, the `UP_RECORDS` type byte and three reserved
+/// zeroes; the payload is a big-endian ring position and then the ring's own
+/// bytes, verbatim.
+///
+/// Two things are held, and both matter. The position is **zero**, which is the
+/// beginning of the ring's own append space rather than of whatever the
+/// appliance happened to have on hand — a frame that started anywhere else would
+/// be one a server could not place. And the ring bytes begin with a pcapng
+/// Section Header Block, which is what makes them a recording an ingest can open
+/// rather than a run of bytes the appliance called one.
+fn expect_records(transcript: &[u8]) -> Result<usize, String> {
+    let mut at = 0;
+    while let Some(found) = transcript
+        .get(at..)
+        .and_then(|tail| tail.windows(HEADER_LEN).position(is_up_records))
+    {
+        let start = at + found;
+        let Some(header) = transcript.get(start..start + HEADER_LEN) else {
+            break;
+        };
+        let stated = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let body = transcript.get(start + HEADER_LEN..start + HEADER_LEN + stated);
+        if let Some(body) = body
+            && let Some(position) = body.get(..RING_POSITION_LEN)
+            && let Some(ring) = body.get(RING_POSITION_LEN..)
+            && position == [0; RING_POSITION_LEN]
+            && ring.len() >= SECTION_HEADER_PREFIX_LEN
+            && ring.get(..4) == Some(&SECTION_HEADER_BLOCK)
+            && ring.get(8..12) == Some(&BYTE_ORDER_MAGIC)
+        {
+            return Ok(ring.len());
+        }
+        at = start + 1;
+    }
+    Err(format!(
+        "the appliance never shipped a well-formed UP_RECORDS frame from ring position 0 whose \
+         bytes open on a pcapng Section Header Block. The framing puts one on the wire as four \
+         bytes of payload length, the type byte {:#04x}, three reserved zeroes, a big-endian ring \
+         position and then the ring's own bytes. The server's transcript was:\n{}",
+        UP_RECORDS_TYPE,
+        String::from_utf8_lossy(transcript)
+    ))
+}
+
+/// Whether these eight bytes are an `UP_RECORDS` header: the type byte, and the
+/// three reserved bytes this protocol holds at zero.
+fn is_up_records(window: &[u8]) -> bool {
+    window.get(4) == Some(&UP_RECORDS_TYPE) && window.get(5..8) == Some(&[0, 0, 0][..])
+}
+
 /// The records the domain that terminates the session wrote.
 fn crypto(log: &str) -> Vec<&str> {
     domain_records(log, Domain::Crypto)
@@ -684,6 +770,23 @@ fn dial_records(log: &str) -> Vec<&str> {
 /// idea of it.
 const HEADER_LEN: usize = 8;
 
+/// The type byte of a frame carrying log-ring bytes.
+const UP_RECORDS_TYPE: u8 = 0x02;
+
+/// The ring position an upstream frame carries in front of its ring bytes.
+const RING_POSITION_LEN: usize = 8;
+
+/// pcapng's Section Header Block type, and the byte-order magic eight bytes
+/// after it. Written out for the same reason the frames are: what is asserted is
+/// that a recording arrived, not that this appliance agrees with itself about
+/// what one looks like.
+const SECTION_HEADER_BLOCK: [u8; 4] = [0x0A, 0x0D, 0x0D, 0x0A];
+const BYTE_ORDER_MAGIC: [u8; 4] = [0x4D, 0x3C, 0x2B, 0x1A];
+
+/// Bytes of a Section Header Block a reader must see before it can say so: the
+/// block type, its total length, and the byte-order magic.
+const SECTION_HEADER_PREFIX_LEN: usize = 12;
+
 /// The whole of what the harness sends, restated where both halves are visible:
 /// the greeting and the bytes of a frame that never completes.
 ///
@@ -692,14 +795,3 @@ const HEADER_LEN: usize = 8;
 /// it waits for.
 const _: () = assert!(SERVER_GREETING.len() == GREETING_LEN + 4);
 const _: () = assert!(SERVER_GREETING.len() - GREETING_LEN < HEADER_LEN);
-
-// The value helper is used by the records above through `field`; naming it here
-// keeps the import honest where a future assertion reads one back.
-#[expect(
-    dead_code,
-    reason = "the console-record helpers are imported as a set and this half of the pair is what \
-              a verdict reaching for a record's own value will use"
-)]
-fn read(record: &str, key: &str) -> Option<String> {
-    value(record, key).map(str::to_owned)
-}

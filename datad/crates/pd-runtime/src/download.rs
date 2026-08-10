@@ -13,6 +13,21 @@
 //! what survives that is a byte range handed to the transport unread. Nothing
 //! in this crate parses a recording.
 //!
+//! # Two readers, and which of them yields
+//!
+//! The same channel also feeds the management channel, which ships ring bytes
+//! upstream from a cursor of its own. They share one window because the recorder
+//! has one staging area and one outstanding request, so the question is not how
+//! to run both but which waits — and **the download wins**. It is bounded, an
+//! operator is waiting on it, and the staging it pins is single-tenant; the
+//! channel's cursor is unbounded and loses nothing by standing still, because
+//! the position it will ask for next is the same position either way.
+//!
+//! The two coordinates are not interchangeable and `wire::DownloadReader` is what
+//! keeps them apart: a download offset is resolved against an origin the recorder
+//! recomputes at each boot, and a cursor a management server holds across one
+//! could not survive that.
+//!
 //! # Why a body is a window and not a buffer
 //!
 //! A recording is megabytes and the domain that serves it has kilobytes. The
@@ -25,11 +40,11 @@
 use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ContentType, http::WINDOW_LEN};
 use wire::{
-    DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadRefusal, DownloadReply,
-    DownloadRequest, DownloadRequester, DownloadSink, PendingDownload,
+    DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadReader, DownloadRefusal,
+    DownloadReply, DownloadRequest, DownloadRequester, DownloadSink, PendingDownload,
 };
 
-use crate::endpoint::EndpointStage;
+use crate::{endpoint::EndpointStage, relay::SHIPPED_RING_BYTES, relay::Upstream};
 
 // The two window lengths this module sits between, tied together where both are
 // visible: the transport's sliding window is what a reply must fit into, so a
@@ -40,6 +55,10 @@ use crate::endpoint::EndpointStage;
 const _: () = {
     assert!(WINDOW_LEN <= DOWNLOAD_WINDOW_LEN);
     assert!(WINDOW_LEN > 0);
+    // And the channel's own, for the same reason in the other direction: a
+    // shipment is asked for out of this window, so one that could not fit in it
+    // would be a frame this domain asked for and could not carry.
+    assert!(SHIPPED_RING_BYTES <= DOWNLOAD_WINDOW_LEN);
 };
 
 /// The streamed-response half of an HTTP endpoint, as a download needs it.
@@ -147,9 +166,36 @@ pub fn sink_for(target: &str) -> Option<DownloadSink> {
 /// [`WINDOW_LEN`] bytes off storage that may be retrying.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(10_000);
 
+/// The recordings, in the order this module indexes its per-ring state by.
+const RINGS: [DownloadSink; 2] = [DownloadSink::Log, DownloadSink::Capture];
+
+/// Which slot of that state a recording is.
+const fn ring_index(recording: DownloadSink) -> usize {
+    match recording {
+        DownloadSink::Log => 0,
+        DownloadSink::Capture => 1,
+    }
+}
+
+/// How long a ring whose cursor has caught up is left alone before it is asked
+/// again.
+///
+/// The channel's contract is that unsent ring bytes go up at least once a
+/// second, so a cursor with nothing to send need be asked no more often than
+/// that — and a caught-up reader that asked on every wakeup would be a round
+/// trip to the recorder for an empty answer at whatever rate the management
+/// port happens to be woken.
+const RING_HOLDOFF: Duration = Duration::from_millis(1_000);
+
 /// A request out to the recorder, and what its answer is for.
 struct Outstanding {
     pending: PendingDownload,
+    /// Which reader asked, so the answer is read in the coordinate it was asked
+    /// in and handed to the half that wanted it.
+    reader: DownloadReader,
+    /// For a ring request, which recording — the reader's own state is per
+    /// recording, and the demand is the only thing that says which.
+    recording: DownloadSink,
     offset: u64,
     /// True for the offset-zero request that opens a response: its answer
     /// carries the length the response commits to, so it is the only one that
@@ -176,7 +222,39 @@ pub struct Downloads<'chan> {
     /// rather than by the transport's window, because `DownloadRequester::poll`
     /// copies into the whole of it.
     window: [u8; DOWNLOAD_WINDOW_LEN],
+    /// The ring bytes read for the channel and not yet shipped.
+    ///
+    /// A buffer of its own rather than a claim on [`Self::window`], because the
+    /// download wins: an operator's `GET` may arrive at any moment and would
+    /// otherwise overwrite a shipment mid-flight, which is the one way the two
+    /// readers could corrupt each other rather than merely wait for each other.
+    shipment: [u8; SHIPPED_RING_BYTES],
+    /// How much of it is a shipment, and where in its ring it came from.
+    held: Option<Shipment>,
+    /// Where the channel's cursor stands in each ring, in [`RINGS`] order. It
+    /// starts at the beginning of the ring and moves only on a shipment the far
+    /// end answered, so nothing this domain forgets can skip a byte.
+    cursors: [u64; 2],
+    /// Which rings the ring wrapped past, in [`RINGS`] order. Latched: nothing
+    /// this build has resynchronises a lost cursor, so the honest answer is to
+    /// stop shipping that ring rather than to ship bytes from somewhere else,
+    /// and to say so once.
+    lost: [bool; 2],
+    /// Lost rings this domain has not yet reported.
+    unreported: [bool; 2],
+    /// When each ring may be asked again after catching up, in [`RINGS`] order.
+    holdoff: [Option<Monotonic>; 2],
+    /// Which ring the next ring request is for, so neither starves the other.
+    next: usize,
     counters: DownloadCounters,
+}
+
+/// Ring bytes waiting for the relay's next free item.
+#[derive(Clone, Copy)]
+struct Shipment {
+    recording: DownloadSink,
+    position: u64,
+    len: usize,
 }
 
 impl<'chan> Downloads<'chan> {
@@ -190,6 +268,13 @@ impl<'chan> Downloads<'chan> {
             outstanding: None,
             serving: None,
             window: [0; DOWNLOAD_WINDOW_LEN],
+            shipment: [0; SHIPPED_RING_BYTES],
+            held: None,
+            cursors: [0; 2],
+            lost: [false; 2],
+            unreported: [false; 2],
+            holdoff: [None; 2],
+            next: 0,
             counters: DownloadCounters {
                 started: 0,
                 windows: 0,
@@ -219,10 +304,33 @@ impl<'chan> Downloads<'chan> {
     /// Never blocks and never spins. A pass with nothing to do returns having
     /// done nothing, which is the whole of the contract with the event loop:
     /// the recorder notifies this domain when a reply lands.
-    pub fn poll(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
+    /// One bounded pass, `shipping` saying whether there is a channel to ship
+    /// ring bytes up.
+    ///
+    /// A parameter and not a thing this module works out, for the reason the
+    /// relay's own half is told rather than deduced: only the domain holding the
+    /// relay knows whether the session up now is the dialled one and whether its
+    /// greeting has been agreed, and a reader that guessed would read the medium
+    /// on behalf of a channel that is not there.
+    pub fn poll(&mut self, now: Option<Monotonic>, stage: &mut impl Stream, shipping: bool) {
         self.claim(now, stage);
-        self.ask(now, stage);
+        self.ask(now, stage, shipping);
         stage.note_downloads(self.counters);
+    }
+
+    /// A ring the channel has lost its place in, reported once each.
+    ///
+    /// Taken by the domain rather than counted here, because what an operator
+    /// needs is the console: a cursor the traffic outran means this appliance
+    /// has stopped shipping that recording, and nothing in this build starts it
+    /// again.
+    pub fn take_lost(&mut self) -> Option<DownloadSink> {
+        let at = self.unreported.iter().position(|lost| *lost)?;
+        let recording = *RINGS.get(at)?;
+        if let Some(slot) = self.unreported.get_mut(at) {
+            *slot = false;
+        }
+        Some(recording)
     }
 
     /// Look once for the answer to the outstanding request, giving up on one that
@@ -230,6 +338,8 @@ impl<'chan> Downloads<'chan> {
     fn claim(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
         let Some(Outstanding {
             pending,
+            reader,
+            recording,
             offset,
             opening,
             deadline,
@@ -237,6 +347,10 @@ impl<'chan> Downloads<'chan> {
         else {
             return;
         };
+        if matches!(reader, DownloadReader::Ring) {
+            self.claim_ring(now, pending, recording, offset, deadline);
+            return;
+        }
         match self.requester.poll(pending, &mut self.window) {
             DownloadPoll::Outstanding(pending) => {
                 if expired(now, deadline) {
@@ -251,6 +365,8 @@ impl<'chan> Downloads<'chan> {
                 }
                 self.outstanding = Some(Outstanding {
                     pending,
+                    reader,
+                    recording,
                     offset,
                     opening,
                     deadline,
@@ -299,8 +415,81 @@ impl<'chan> Downloads<'chan> {
         }
     }
 
+    /// Claim the answer to a ring request, and hold whatever it brought.
+    ///
+    /// Every ending here leaves the cursor alone. A refusal, a fault and a
+    /// deadline are all answers this reader can come back from by asking for the
+    /// same position again, and an overrun is the one that cannot — the bytes
+    /// are gone, and continuing from anywhere else would be shipping a
+    /// recording's contents under a position that is not theirs.
+    fn claim_ring(
+        &mut self,
+        now: Option<Monotonic>,
+        pending: PendingDownload,
+        recording: DownloadSink,
+        offset: u64,
+        deadline: Option<Monotonic>,
+    ) {
+        let at = ring_index(recording);
+        match self.requester.poll(pending, &mut self.window) {
+            DownloadPoll::Outstanding(pending) => {
+                if expired(now, deadline) {
+                    return;
+                }
+                self.outstanding = Some(Outstanding {
+                    pending,
+                    reader: DownloadReader::Ring,
+                    recording,
+                    offset,
+                    opening: false,
+                    deadline,
+                });
+            }
+            DownloadPoll::Delivered { bytes, .. } => {
+                if bytes.is_empty() {
+                    // Caught up with what the medium has taken. Left alone until
+                    // the hold-off is out rather than asked again on the next
+                    // wakeup, which would be a round trip per wakeup for an
+                    // answer that is empty by construction.
+                    if let Some(slot) = self.holdoff.get_mut(at) {
+                        *slot = now.map(|now| now.saturating_add(RING_HOLDOFF));
+                    }
+                    return;
+                }
+                // Copied out of the shared window, which the other reader may
+                // overwrite at any moment: an operator's download takes this
+                // channel whenever it wants it, and a shipment left pointing
+                // into the window would be that download's bytes shipped under
+                // a ring position.
+                let mut taken = 0_usize;
+                for (slot, byte) in self.shipment.iter_mut().zip(bytes) {
+                    *slot = *byte;
+                    taken = taken.saturating_add(1);
+                }
+                self.held = Some(Shipment {
+                    recording,
+                    position: offset,
+                    len: taken,
+                });
+            }
+            DownloadPoll::Refused { reason, .. } => {
+                if matches!(reason, DownloadRefusal::Overrun) {
+                    if let Some(slot) = self.lost.get_mut(at) {
+                        *slot = true;
+                    }
+                    if let Some(slot) = self.unreported.get_mut(at) {
+                        *slot = true;
+                    }
+                }
+            }
+            DownloadPoll::Faulted(fault) => {
+                let _: DownloadFault = fault;
+            }
+        }
+    }
+
     /// Ask for whatever the transport is waiting on, if nothing is out.
-    fn ask(&mut self, now: Option<Monotonic>, stage: &mut impl Stream) {
+    fn ask(&mut self, now: Option<Monotonic>, stage: &mut impl Stream, shipping: bool) {
         if self.outstanding.is_some() {
             return;
         }
@@ -320,6 +509,11 @@ impl<'chan> Downloads<'chan> {
             return;
         }
         let Some((offset, len)) = stage.stream_wanted() else {
+            // Nothing an operator is waiting for, so the channel may have the
+            // window. This is the whole of the fairness between the two readers:
+            // a download in progress is asked for above and returns, and the
+            // ring is only ever reached on a pass where none is.
+            self.ask_ring(now, shipping);
             return;
         };
         let Some(sink) = self.serving else {
@@ -346,15 +540,61 @@ impl<'chan> Downloads<'chan> {
         len: usize,
         opening: bool,
     ) {
-        let pending = self
-            .requester
-            .request(sink, offset, len.min(DOWNLOAD_WINDOW_LEN));
+        let pending = self.requester.request(
+            DownloadReader::Snapshot,
+            sink,
+            offset,
+            len.min(DOWNLOAD_WINDOW_LEN),
+        );
         self.outstanding = Some(Outstanding {
             pending,
+            reader: DownloadReader::Snapshot,
+            recording: sink,
             offset,
             opening,
             deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
         });
+    }
+
+    /// Ask one ring for the bytes at its cursor.
+    ///
+    /// One recording per pass and the two taken in turn, so a ring the traffic
+    /// keeps busy cannot hold the window against the other. A ring that is lost,
+    /// held off, or already holding a shipment is skipped: there is one shipment
+    /// buffer, and reading a second over it would drop the first.
+    fn ask_ring(&mut self, now: Option<Monotonic>, shipping: bool) {
+        if !shipping || self.held.is_some() {
+            return;
+        }
+        for step in 0..RINGS.len() {
+            let at = self.next.saturating_add(step) % RINGS.len();
+            let Some(recording) = RINGS.get(at) else {
+                continue;
+            };
+            if self.lost.get(at).copied().unwrap_or(true) {
+                continue;
+            }
+            if held_off(now, self.holdoff.get(at).copied().flatten()) {
+                continue;
+            }
+            let offset = self.cursors.get(at).copied().unwrap_or_default();
+            let pending = self.requester.request(
+                DownloadReader::Ring,
+                *recording,
+                offset,
+                SHIPPED_RING_BYTES,
+            );
+            self.outstanding = Some(Outstanding {
+                pending,
+                reader: DownloadReader::Ring,
+                recording: *recording,
+                offset,
+                opening: false,
+                deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
+            });
+            self.next = at.saturating_add(1) % RINGS.len();
+            return;
+        }
     }
 
     fn abandon(&mut self, stage: &mut impl Stream) {
@@ -375,6 +615,48 @@ fn expired(now: Option<Monotonic>, deadline: Option<Monotonic>) -> bool {
     match (now, deadline) {
         (Some(now), Some(deadline)) => now >= deadline,
         _ => false,
+    }
+}
+
+/// Whether a ring is still inside its hold-off at `now`.
+///
+/// A ring with no hold-off armed is free, and so is one on a node whose clock
+/// has published nothing: a reader that treated an unreadable clock as a
+/// hold-off would stop shipping on exactly the node that cannot tell it to
+/// start again.
+fn held_off(now: Option<Monotonic>, until: Option<Monotonic>) -> bool {
+    match (now, until) {
+        (Some(now), Some(until)) => now < until,
+        _ => false,
+    }
+}
+
+impl Upstream for Downloads<'_> {
+    fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])> {
+        let Shipment {
+            recording,
+            position,
+            len,
+        } = self.held?;
+        Some((recording, position, self.shipment.get(..len)?))
+    }
+
+    fn shipped(&mut self) {
+        let Some(Shipment {
+            recording,
+            position,
+            len,
+        }) = self.held.take()
+        else {
+            return;
+        };
+        let at = ring_index(recording);
+        if let Some(cursor) = self.cursors.get_mut(at) {
+            // From the position that was shipped rather than from wherever the
+            // cursor happens to stand: the two are the same on every path that
+            // reaches here, and taking the shipment's own is what keeps them so.
+            *cursor = position.saturating_add(len as u64);
+        }
     }
 }
 

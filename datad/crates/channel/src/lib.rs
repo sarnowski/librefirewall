@@ -88,10 +88,10 @@ pub const HEADER_LEN: usize = 8;
 
 /// Bytes of payload one frame may carry.
 ///
-/// 1 MiB. It is the whole reason a decoder is the size it is, and it is a
-/// protocol constant rather than a tuning knob: the upstream direction ships a
-/// sealed recording segment as one frame, so a bound below a segment would mean
-/// the framing, and not the recording, decided how a ring is shipped.
+/// 1 MiB, matching a recording segment, and the whole reason a decoder is the
+/// size it is. A **receiving** bound rather than a size anything emits: set at
+/// the segment so the framing never decides how a ring is shipped, while an
+/// upstream frame is bounded far below it, by its session's room for one.
 pub const MAX_PAYLOAD_LEN: usize = 1 << 20;
 
 /// Bytes of one whole frame, header and maximal payload.

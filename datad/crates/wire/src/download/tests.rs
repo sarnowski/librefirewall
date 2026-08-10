@@ -52,6 +52,12 @@ fn forge_reply(channel: &Channel, sequence: u32, status: u32, len: u32, total_le
     channel.reply.sequence.store(sequence, Ordering::Release);
 }
 
+/// Write a reader word into the request region, which is what a requester that
+/// is not this crate's own can do and its own cannot.
+fn forge_reader(channel: &Channel, reader: u32) {
+    channel.request.reader.store(reader, Ordering::Relaxed);
+}
+
 #[test]
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(DOWNLOAD_WINDOW_LEN, 32_768);
@@ -75,7 +81,7 @@ fn the_two_headers_occupy_the_bytes_the_recorded_layout_names() {
     assert_eq!(offset_of!(DownloadRequest, sink), 4);
     assert_eq!(offset_of!(DownloadRequest, offset), 8);
     assert_eq!(offset_of!(DownloadRequest, len), 16);
-    assert_eq!(offset_of!(DownloadRequest, _pad), 20);
+    assert_eq!(offset_of!(DownloadRequest, reader), 20);
     assert_eq!(align_of::<DownloadRequest>(), 8);
 
     assert_eq!(offset_of!(DownloadReply, sequence), 0);
@@ -112,7 +118,7 @@ fn a_zeroed_reply_answers_no_request() {
     let channel = Channel::zero();
     let mut requester = channel.requester();
     let mut into = buffer();
-    let pending = requester.request(DownloadSink::Log, 0, 128);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 128);
     assert_eq!(pending.sequence(), 1);
     assert!(matches!(
         requester.poll(pending, &mut into),
@@ -129,7 +135,7 @@ fn a_request_crosses_and_its_answer_comes_back_whole() {
     let mut into = buffer();
     let bytes = snapshot(7, 1000);
 
-    let pending = requester.request(DownloadSink::Capture, 4096, 1000);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Capture, 4096, 1000);
     let demand = responder.take().expect("a request is outstanding");
     assert_eq!(demand.sequence(), pending.sequence());
     assert_eq!(demand.sink(), Some(DownloadSink::Capture));
@@ -160,7 +166,12 @@ fn a_full_window_crosses_byte_for_byte() {
     let mut into = buffer();
     let bytes = snapshot(3, DOWNLOAD_WINDOW_LEN);
 
-    let pending = requester.request(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN);
+    let pending = requester.request(
+        DownloadReader::Snapshot,
+        DownloadSink::Log,
+        0,
+        DOWNLOAD_WINDOW_LEN,
+    );
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.len(), DOWNLOAD_WINDOW_LEN);
     assert_eq!(
@@ -184,7 +195,7 @@ fn a_request_larger_than_the_window_is_clamped_at_both_ends() {
     let mut into = buffer();
     let bytes = snapshot(9, DOWNLOAD_WINDOW_LEN * 2);
 
-    let pending = requester.request(DownloadSink::Log, 0, usize::MAX);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, usize::MAX);
     assert_eq!(pending.requested(), DOWNLOAD_WINDOW_LEN as u32);
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.len(), DOWNLOAD_WINDOW_LEN);
@@ -209,7 +220,7 @@ fn a_short_delivery_says_how_short_it_was() {
     let mut into = buffer();
     let bytes = snapshot(5, 10);
 
-    let pending = requester.request(DownloadSink::Log, 990, 4096);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 990, 4096);
     let demand = responder.take().expect("outstanding");
     assert_eq!(responder.deliver(demand, &bytes, 1000), 10);
     match requester.poll(pending, &mut into) {
@@ -230,7 +241,7 @@ fn a_zero_length_request_delivers_nothing_and_is_not_a_fault() {
     let mut requester = channel.requester();
     let mut responder = channel.responder();
     let mut into = buffer();
-    let pending = requester.request(DownloadSink::Log, 0, 0);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 0);
     let demand = responder.take().expect("outstanding");
     assert!(demand.is_empty());
     assert_eq!(responder.deliver(demand, &snapshot(1, 64), 64), 0);
@@ -257,7 +268,7 @@ fn every_refusal_reaches_the_requester_with_the_snapshot_length() {
         let mut requester = channel.requester();
         let mut responder = channel.responder();
         let mut into = buffer();
-        let pending = requester.request(DownloadSink::Log, 1 << 40, 512);
+        let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 1 << 40, 512);
         let demand = responder.take().expect("outstanding");
         responder.refuse(demand, reason, 4096);
         assert_eq!(
@@ -298,7 +309,7 @@ fn the_responder_takes_each_request_exactly_once() {
     let mut responder = channel.responder();
 
     assert!(responder.take().is_none());
-    let first = requester.request(DownloadSink::Log, 0, 8);
+    let first = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 8);
     let demand = responder.take().expect("outstanding");
     assert!(
         responder.take().is_some(),
@@ -310,7 +321,7 @@ fn the_responder_takes_each_request_exactly_once() {
         "an answered request is not taken again"
     );
 
-    let second = requester.request(DownloadSink::Log, 8, 8);
+    let second = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 8, 8);
     assert_ne!(first.sequence(), second.sequence());
     assert!(responder.take().is_some(), "a new request is taken");
 }
@@ -320,7 +331,7 @@ fn the_sequence_steps_over_zero_when_it_wraps() {
     let channel = Channel::zero();
     let mut requester = channel.requester();
     requester.sequence = u32::MAX;
-    let pending = requester.request(DownloadSink::Log, 0, 8);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 8);
     assert_eq!(pending.sequence(), 1, "zero is reserved for no request");
     assert_eq!(requester.sequence(), 1);
     assert_eq!(channel.request.sequence.load(Ordering::Relaxed), 1);
@@ -333,7 +344,7 @@ fn a_reply_to_another_request_is_ignored_entirely() {
     let channel = Channel::zero();
     let mut requester = channel.requester();
     let mut into = buffer();
-    let mut pending = requester.request(DownloadSink::Log, 0, 64);
+    let mut pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 64);
 
     for wrong in [0, 2, 7, u32::MAX] {
         forge_reply(&channel, wrong, DownloadStatus::Ok.to_bits(), 64, 64);
@@ -369,10 +380,10 @@ fn a_stale_answer_never_matches_a_newer_request() {
     let mut responder = channel.responder();
     let mut into = buffer();
 
-    let first = requester.request(DownloadSink::Log, 0, 32);
+    let first = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 32);
     let demand = responder.take().expect("outstanding");
     // Management gives up on the first and asks again before the answer lands.
-    let second = requester.request(DownloadSink::Log, 32, 32);
+    let second = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 32, 32);
     responder.deliver(demand, &snapshot(1, 32), 64);
 
     assert!(matches!(
@@ -392,11 +403,11 @@ fn a_stale_answer_never_matches_a_newer_request() {
 
 #[test]
 fn a_status_outside_the_closed_set_is_a_fault() {
-    for status in [6, 0x1000, u32::MAX] {
+    for status in [7, 0x1000, u32::MAX] {
         let channel = Channel::zero();
         let mut requester = channel.requester();
         let mut into = buffer();
-        let pending = requester.request(DownloadSink::Log, 0, 64);
+        let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 64);
         forge_reply(&channel, pending.sequence(), status, 0, 0);
         assert_eq!(
             requester.poll(pending, &mut into),
@@ -412,7 +423,12 @@ fn a_length_past_the_window_is_a_fault() {
         let channel = Channel::zero();
         let mut requester = channel.requester();
         let mut into = buffer();
-        let pending = requester.request(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN);
+        let pending = requester.request(
+            DownloadReader::Snapshot,
+            DownloadSink::Log,
+            0,
+            DOWNLOAD_WINDOW_LEN,
+        );
         forge_reply(
             &channel,
             pending.sequence(),
@@ -433,7 +449,7 @@ fn a_length_past_what_was_asked_for_is_a_fault() {
     let channel = Channel::zero();
     let mut requester = channel.requester();
     let mut into = buffer();
-    let pending = requester.request(DownloadSink::Log, 0, 100);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 100);
     forge_reply(
         &channel,
         pending.sequence(),
@@ -456,7 +472,7 @@ fn a_refusal_carrying_bytes_is_a_fault() {
     let channel = Channel::zero();
     let mut requester = channel.requester();
     let mut into = buffer();
-    let pending = requester.request(DownloadSink::Log, 0, 64);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 64);
     forge_reply(
         &channel,
         pending.sequence(),
@@ -480,7 +496,7 @@ fn faults_accumulate_and_saturate() {
     let mut requester = channel.requester();
     let mut into = buffer();
     for expected in 1..=3 {
-        let pending = requester.request(DownloadSink::Log, 0, 8);
+        let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 8);
         forge_reply(&channel, pending.sequence(), 99, 0, 0);
         assert!(matches!(
             requester.poll(pending, &mut into),
@@ -489,7 +505,7 @@ fn faults_accumulate_and_saturate() {
         assert_eq!(requester.faults(), expected);
     }
     requester.faults = u32::MAX;
-    let pending = requester.request(DownloadSink::Log, 0, 8);
+    let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 8);
     forge_reply(&channel, pending.sequence(), 99, 0, 0);
     let _ = requester.poll(pending, &mut into);
     assert_eq!(requester.faults(), u32::MAX, "the tally saturates");
@@ -506,7 +522,12 @@ fn a_sequence_that_never_matches_is_a_stall_and_not_a_read() {
     for cell in &channel.reply.bytes {
         cell.store(0xff, Ordering::Relaxed);
     }
-    let mut pending = requester.request(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN);
+    let mut pending = requester.request(
+        DownloadReader::Snapshot,
+        DownloadSink::Log,
+        0,
+        DOWNLOAD_WINDOW_LEN,
+    );
     for round in 0..200u32 {
         forge_reply(
             &channel,
@@ -603,7 +624,8 @@ fn the_requester_never_writes_the_reply_region() {
     let before = reply_image(&channel.reply);
 
     for round in 0..64u64 {
-        let pending = requester.request(DownloadSink::Capture, round, 128);
+        let pending =
+            requester.request(DownloadReader::Snapshot, DownloadSink::Capture, round, 128);
         let _ = requester.poll(pending, &mut into);
         let _ = requester.faults();
         let _ = requester.sequence();
@@ -662,12 +684,13 @@ fn the_closed_sets_refuse_every_value_outside_them() {
         DownloadStatus::Overrun,
         DownloadStatus::DeviceError,
         DownloadStatus::NoSuchSink,
+        DownloadStatus::NoSuchReader,
     ];
     for (index, status) in statuses.iter().enumerate() {
         assert_eq!(status.to_bits(), index as u32);
         assert_eq!(DownloadStatus::from_bits(status.to_bits()), Some(*status));
     }
-    assert_eq!(DownloadStatus::from_bits(6), None);
+    assert_eq!(DownloadStatus::from_bits(7), None);
     assert_eq!(DownloadStatus::from_bits(u32::MAX), None);
 }
 
@@ -680,6 +703,7 @@ fn a_refusal_is_a_status_without_its_success() {
         DownloadRefusal::Overrun,
         DownloadRefusal::DeviceError,
         DownloadRefusal::NoSuchSink,
+        DownloadRefusal::NoSuchReader,
     ] {
         assert_eq!(
             DownloadRefusal::from_status(reason.to_status()),
@@ -723,7 +747,8 @@ fn a_requesting_and_an_answering_thread_never_splice_two_windows() {
             let mut requester = channel.requester();
             let mut into = buffer();
             for _ in 0..ROUNDS {
-                let mut pending = requester.request(DownloadSink::Log, 0, 4096);
+                let mut pending =
+                    requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 4096);
                 loop {
                     let expected = snapshot(pending.sequence() as u8, 4096);
                     match requester.poll(pending, &mut into) {
@@ -756,7 +781,12 @@ fn a_thread_scribbling_both_regions_cannot_break_either_side() {
             let mut requester = channel.requester();
             let mut into = buffer();
             for round in 0..ROUNDS {
-                let pending = requester.request(DownloadSink::Log, u64::from(round), 1024);
+                let pending = requester.request(
+                    DownloadReader::Snapshot,
+                    DownloadSink::Log,
+                    u64::from(round),
+                    1024,
+                );
                 match requester.poll(pending, &mut into) {
                     DownloadPoll::Delivered { bytes, .. } => {
                         assert!(bytes.len() <= DOWNLOAD_WINDOW_LEN);
@@ -838,7 +868,7 @@ proptest! {
         let mut into = buffer();
 
         for (sequence, status, len, total_len) in replies {
-            let pending = requester.request(DownloadSink::Capture, 0, asked);
+            let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Capture, 0, asked);
             let requested = pending.requested();
             forge_reply(&channel, sequence, status, len, total_len);
 
@@ -907,7 +937,7 @@ proptest! {
         let mut into = buffer();
 
         for (tag, len, answer) in rounds {
-            let pending = requester.request(DownloadSink::Log, 0, len);
+            let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, len);
             let written = snapshot(tag, len);
             if answer {
                 let demand = responder.take().expect("a request is outstanding");
@@ -948,10 +978,62 @@ proptest! {
                 prop_assert!(demand.len() <= DOWNLOAD_WINDOW_LEN);
                 responder.deliver(demand, &bytes, 0);
             }
-            let pending = requester.request(DownloadSink::Log, 0, 4096);
+            let pending = requester.request(DownloadReader::Snapshot, DownloadSink::Log, 0, 4096);
             if let DownloadPoll::Delivered { bytes: got, .. } = requester.poll(pending, &mut into) {
                 prop_assert!(got.len() <= 4096);
             }
+        }
+    }
+}
+
+// --- the two readers ---------------------------------------------------------
+
+#[test]
+fn a_demand_carries_the_reader_the_request_was_made_for() {
+    for reader in [DownloadReader::Snapshot, DownloadReader::Ring] {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let mut responder = channel.responder();
+        let _pending = requester.request(reader, DownloadSink::Capture, 4096, 64);
+        let demand = responder.take().expect("a request was just issued");
+        assert_eq!(demand.reader(), Some(reader));
+        assert_eq!(demand.offset(), 4096);
+        responder.refuse(demand, DownloadRefusal::NotReady, 0);
+    }
+}
+
+#[test]
+fn a_reader_word_the_recorder_does_not_know_is_readable_as_none() {
+    let channel = Channel::zero();
+    let mut requester = channel.requester();
+    let mut responder = channel.responder();
+    let _pending = requester.request(DownloadReader::Ring, DownloadSink::Log, 0, 64);
+    // Written straight into the region, which is the only way a peer that is
+    // not this crate's own requester can name a reader: what an operator would
+    // be shown otherwise is bytes read in a coordinate nobody asked for.
+    forge_reader(&channel, DownloadReader::Ring.to_bits() + 1);
+    let demand = responder.take().expect("a request was just issued");
+    assert_eq!(demand.reader(), None);
+    assert_eq!(demand.sink(), Some(DownloadSink::Log));
+    responder.refuse(demand, DownloadRefusal::NoSuchReader, 0);
+    let mut into = buffer();
+    assert_eq!(
+        requester.poll(_pending, &mut into),
+        DownloadPoll::Refused {
+            reason: DownloadRefusal::NoSuchReader,
+            total_len: 0,
+        }
+    );
+}
+
+proptest! {
+    /// Every reader word round-trips, and every other one is refused rather
+    /// than coerced to a coordinate the requester did not ask in.
+    #[test]
+    fn the_reader_vocabulary_ends_where_it_ends(bits in any::<u32>()) {
+        match DownloadReader::from_bits(bits) {
+            Some(reader) => prop_assert_eq!(reader.to_bits(), bits),
+            None => prop_assert!(bits >= DownloadSink::COUNT as u32),
         }
     }
 }

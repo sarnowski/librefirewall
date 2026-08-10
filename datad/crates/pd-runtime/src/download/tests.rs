@@ -156,7 +156,7 @@ fn a_get_of_a_recording_asks_the_recorder_for_its_first_window() {
         ..FakeStream::default()
     };
 
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     assert_eq!(
         asked(&channel),
@@ -175,10 +175,10 @@ fn the_first_reply_begins_the_stream_at_the_length_the_recorder_stated() {
         ..FakeStream::default()
     };
 
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     let body = vec![0xAB; 128];
     answer(&channel, &body, 4096);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     let (total, content_type) = stream.begun.expect("the stream was begun");
     assert_eq!(total, 4096);
@@ -203,12 +203,12 @@ fn a_later_window_is_asked_for_at_the_offset_the_transport_named() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     answer(&channel, &[1u8; 64], 4096);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     stream.wanted = Some((64, WINDOW_LEN));
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     assert_eq!(
         asked(&channel),
         Some((DownloadSink::Log, 64, WINDOW_LEN)),
@@ -228,12 +228,12 @@ fn a_partly_filled_window_is_asked_for_at_the_length_it_can_still_take() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     answer(&channel, &[1u8; 64], 4_096);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     stream.wanted = Some((64, 300));
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     assert_eq!(
         asked(&channel),
         Some((DownloadSink::Log, 64, 300)),
@@ -249,9 +249,9 @@ fn the_end_of_a_body_supplies_nothing_and_abandons_nothing() {
         pending: Some(LOG_TARGET),
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     answer(&channel, &[], 0);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     assert_eq!(stream.begun.map(|(total, _)| total), Some(0));
     assert!(stream.supplied.is_empty());
@@ -273,13 +273,13 @@ fn every_refusal_ends_the_response_rather_than_retrying_it() {
             pending: Some(LOG_TARGET),
             ..FakeStream::default()
         };
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
         {
             let mut responder = channel.responder();
             let demand = responder.take().expect("a request is out");
             responder.refuse(demand, reason, 0);
         }
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
 
         assert_eq!(stream.abandoned, 1, "{reason:?} must end the response");
         assert!(stream.begun.is_none());
@@ -296,9 +296,9 @@ fn an_endpoint_that_will_not_begin_the_stream_ends_it() {
         refuse_begin: true,
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     answer(&channel, &[1u8; 16], 16);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     assert_eq!(stream.abandoned, 1);
     assert!(stream.supplied.is_empty());
@@ -313,9 +313,9 @@ fn an_endpoint_that_refuses_the_window_it_asked_for_ends_the_stream() {
         refuse_window: true,
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     answer(&channel, &[1u8; 16], 4096);
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     assert_eq!(stream.abandoned, 1);
     assert!(stream.supplied.is_empty());
@@ -329,7 +329,7 @@ fn a_window_wanted_for_a_stream_this_domain_never_began_is_ended() {
         wanted: Some((512, WINDOW_LEN)),
         ..FakeStream::default()
     };
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
 
     assert_eq!(stream.abandoned, 1);
     assert!(
@@ -344,7 +344,7 @@ fn a_pass_with_nothing_to_do_does_nothing_and_asks_nothing() {
     let mut downloads = channel.downloads();
     let mut stream = FakeStream::default();
     for _ in 0..8 {
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
     }
     assert_eq!(stream.abandoned, 0);
     assert!(asked(&channel).is_none());
@@ -365,7 +365,7 @@ fn only_one_request_is_ever_outstanding() {
     // Several passes with no answer: the recorder must see one request, not one
     // per pass, or a slow medium would be a request storm.
     for _ in 0..8 {
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
     }
     let demand = responder.take().expect("one request is outstanding");
     responder.deliver(demand, &[1u8; 8], 64);
@@ -373,7 +373,7 @@ fn only_one_request_is_ever_outstanding() {
         responder.take().is_none(),
         "the sequence never moved while the first was unanswered"
     );
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     assert_eq!(stream.supplied.len(), 1);
     assert!(
         responder.take().is_none(),
@@ -404,7 +404,7 @@ fn a_recording_several_windows_long_is_delivered_whole() {
 
     let mut delivered = 0u64;
     for _ in 0..4096 {
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
         // The recorder answers whatever is outstanding, stopping at the extent
         // boundary and at the end of the snapshot.
         {
@@ -420,7 +420,7 @@ fn a_recording_several_windows_long_is_delivered_whole() {
                 responder.deliver(demand, &bytes, TOTAL);
             }
         }
-        downloads.poll(at(0), &mut stream);
+        downloads.poll(at(0), &mut stream, false);
         // The transport sends what arrived and asks for the rest, which is what
         // the peer's acknowledgement makes it do.
         let taken: u64 = stream
@@ -483,7 +483,7 @@ fn a_recorder_that_never_answers_is_given_up_on() {
         ..FakeStream::default()
     };
 
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     {
         // Taken and never answered, which is a recorder that has stopped.
         let mut responder = channel.responder();
@@ -492,17 +492,17 @@ fn a_recorder_that_never_answers_is_given_up_on() {
     }
 
     let deadline = REPLY_TIMEOUT.as_nanos();
-    downloads.poll(at(deadline - 1), &mut stream);
+    downloads.poll(at(deadline - 1), &mut stream, false);
     assert_eq!(stream.abandoned, 0, "given up on early");
 
-    downloads.poll(at(deadline), &mut stream);
+    downloads.poll(at(deadline), &mut stream, false);
     assert_eq!(stream.abandoned, 1, "the download was never given up on");
     assert_eq!(downloads.counters().abandoned, 1);
 
     // And the slot is free again, so the next `GET` of a recording is asked for
     // rather than being the one this domain never serves.
     stream.pending = Some(CAPTURE_TARGET);
-    downloads.poll(at(deadline), &mut stream);
+    downloads.poll(at(deadline), &mut stream, false);
     assert_eq!(
         asked(&channel),
         Some((DownloadSink::Capture, 0, WINDOW_LEN)),
@@ -522,20 +522,20 @@ fn a_window_that_arrives_after_the_deadline_supplies_nothing() {
         ..FakeStream::default()
     };
 
-    downloads.poll(at(0), &mut stream);
+    downloads.poll(at(0), &mut stream, false);
     let stale = channel
         .responder()
         .take()
         .expect("a request is outstanding");
     let deadline = REPLY_TIMEOUT.as_nanos();
-    downloads.poll(at(deadline), &mut stream);
+    downloads.poll(at(deadline), &mut stream, false);
     assert_eq!(stream.abandoned, 1);
 
     // A fresh download is outstanding by the time the recorder answers the old one.
     stream.pending = Some(CAPTURE_TARGET);
-    downloads.poll(at(deadline), &mut stream);
+    downloads.poll(at(deadline), &mut stream, false);
     channel.responder().deliver(stale, b"stale bytes", 11);
-    downloads.poll(at(deadline), &mut stream);
+    downloads.poll(at(deadline), &mut stream, false);
     assert!(
         stream.begun.is_none() && stream.supplied.is_empty(),
         "a reply to an abandoned request was taken for the new one's"
@@ -554,19 +554,258 @@ fn an_unclocked_pass_gives_up_on_nothing() {
         ..FakeStream::default()
     };
 
-    downloads.poll(None, &mut stream);
+    downloads.poll(None, &mut stream, false);
     let _outstanding = channel
         .responder()
         .take()
         .expect("a request is outstanding");
     for _ in 0..4 {
-        downloads.poll(None, &mut stream);
+        downloads.poll(None, &mut stream, false);
     }
     assert_eq!(stream.abandoned, 0);
 
-    downloads.poll(at(REPLY_TIMEOUT.as_nanos() * 4), &mut stream);
+    downloads.poll(at(REPLY_TIMEOUT.as_nanos() * 4), &mut stream, false);
     assert_eq!(
         stream.abandoned, 0,
         "a request parked unarmed was given up on"
+    );
+}
+
+// --- the channel's ring cursor ----------------------------------------------
+
+/// The recorder's side, held for the life of a case.
+///
+/// One responder rather than a fresh one per look, because a responder *is* a
+/// position: a second would restart at sequence zero and re-take the request the
+/// first has already answered, which reads as a request that was never made.
+struct Recorder<'chan> {
+    responder: DownloadResponder<'chan>,
+}
+
+impl<'chan> Recorder<'chan> {
+    fn new(channel: &'chan Channel) -> Self {
+        Self {
+            responder: channel.responder(),
+        }
+    }
+
+    /// What was asked for, or `None` where nothing was.
+    fn taken(&mut self) -> Option<(DownloadReader, DownloadSink, u64, usize)> {
+        let demand = self.responder.take()?;
+        let seen = (
+            demand.reader()?,
+            demand.sink()?,
+            demand.offset(),
+            demand.len(),
+        );
+        self.responder.refuse(demand, DownloadRefusal::NotReady, 0);
+        Some(seen)
+    }
+
+    /// Answer whatever is outstanding with `body`, and say what it was for.
+    fn deliver(&mut self, body: &[u8], total_len: u64) -> (DownloadReader, DownloadSink, u64) {
+        let demand = self.responder.take().expect("a request is outstanding");
+        let seen = (
+            demand.reader().expect("a reader"),
+            demand.sink().expect("a sink"),
+            demand.offset(),
+        );
+        self.responder.deliver(demand, body, total_len);
+        seen
+    }
+
+    fn refuse(&mut self, reason: DownloadRefusal, total_len: u64) -> DownloadSink {
+        let demand = self.responder.take().expect("a request is outstanding");
+        let sink = demand.sink().expect("a sink");
+        self.responder.refuse(demand, reason, total_len);
+        sink
+    }
+
+    fn quiet(&mut self) -> bool {
+        self.responder.take().is_none()
+    }
+}
+
+#[test]
+fn nothing_is_read_for_a_channel_that_is_not_up() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+    downloads.poll(at(0), &mut stream, false);
+    assert!(
+        recorder.quiet(),
+        "a reader with no channel to ship up asked the recorder anyway"
+    );
+    assert!(downloads.waiting().is_none());
+}
+
+#[test]
+fn a_ring_read_is_asked_in_the_ring_coordinate_and_held_until_it_is_shipped() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.poll(at(0), &mut stream, true);
+    let bytes = vec![0xAB_u8; 512];
+    assert_eq!(
+        recorder.deliver(&bytes, 4096),
+        (DownloadReader::Ring, DownloadSink::Log, 0),
+        "the cursor starts at the beginning of the ring, in its own coordinate"
+    );
+
+    downloads.poll(at(1), &mut stream, true);
+    let (recording, position, held) = downloads.waiting().expect("a shipment is held");
+    assert_eq!(recording, DownloadSink::Log);
+    assert_eq!(position, 0);
+    assert_eq!(held, bytes.as_slice());
+}
+
+#[test]
+fn the_cursor_moves_by_what_was_shipped_and_only_when_it_was() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.poll(at(0), &mut stream, true);
+    recorder.deliver(&vec![1_u8; 300], 4096);
+    downloads.poll(at(1), &mut stream, true);
+    assert!(downloads.waiting().is_some());
+
+    // A pass before the relay has said the shipment went reads nothing more:
+    // there is one shipment buffer, and a second read over it would drop the
+    // first.
+    downloads.poll(at(2), &mut stream, true);
+    assert!(recorder.quiet(), "a second read over a held one");
+
+    downloads.shipped();
+    assert!(downloads.waiting().is_none());
+    downloads.poll(at(3), &mut stream, true);
+    assert_eq!(
+        recorder
+            .taken()
+            .map(|(_, recording, position, _)| (recording, position)),
+        Some((DownloadSink::Capture, 0)),
+        "the other ring is next, and its own cursor has not moved"
+    );
+
+    // And back to the ring that shipped, whose cursor moved by exactly what
+    // went.
+    downloads.poll(at(4), &mut stream, true);
+    downloads.poll(at(5), &mut stream, true);
+    assert_eq!(
+        recorder
+            .taken()
+            .map(|(_, recording, position, _)| (recording, position)),
+        Some((DownloadSink::Log, 300))
+    );
+}
+
+#[test]
+fn a_download_takes_the_window_and_the_ring_cursor_waits_for_it() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream {
+        pending: Some(LOG_TARGET),
+        ..FakeStream::default()
+    };
+
+    // An operator's `GET` and a channel that would ship, on the same pass.
+    downloads.poll(at(0), &mut stream, true);
+    let body = vec![9_u8; 64];
+    assert_eq!(
+        recorder.deliver(&body, 64),
+        (DownloadReader::Snapshot, DownloadSink::Log, 0),
+        "the ring cursor took the window from a download"
+    );
+
+    downloads.poll(at(1), &mut stream, true);
+    assert_eq!(stream.supplied.len(), 1);
+    assert!(
+        downloads.waiting().is_none(),
+        "nothing was read for the channel while a download held the window"
+    );
+}
+
+#[test]
+fn a_ring_the_traffic_outran_stops_shipping_and_is_reported_once() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.poll(at(0), &mut stream, true);
+    let lost = recorder.refuse(DownloadRefusal::Overrun, 1 << 20);
+    downloads.poll(at(1), &mut stream, true);
+
+    assert_eq!(
+        downloads.take_lost(),
+        Some(lost),
+        "the ring whose cursor was outrun is named"
+    );
+    assert_eq!(downloads.take_lost(), None, "and it is said once");
+
+    // And that ring is never asked for again: nothing here resynchronises a
+    // lost cursor, so continuing would be shipping other bytes under its
+    // position.
+    for step in 2..12 {
+        downloads.poll(at(step), &mut stream, true);
+        if let Some((_, recording, _, _)) = recorder.taken() {
+            assert_ne!(recording, lost, "a lost ring was asked for again");
+        }
+    }
+}
+
+#[test]
+fn a_caught_up_ring_is_left_alone_rather_than_asked_on_every_wakeup() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    // Both rings answer empty, which is what a cursor level with the medium
+    // gets.
+    for step in 0..2 {
+        downloads.poll(at(step), &mut stream, true);
+        recorder.deliver(&[], 0);
+    }
+    downloads.poll(at(2), &mut stream, true);
+    assert!(
+        recorder.quiet(),
+        "a caught-up reader asked again inside its hold-off"
+    );
+
+    // And it comes back once the hold-off is out.
+    downloads.poll(at(RING_HOLDOFF.as_nanos() * 2), &mut stream, true);
+    assert!(
+        recorder.taken().is_some(),
+        "a caught-up reader never came back"
+    );
+}
+
+#[test]
+fn the_two_rings_take_turns_so_neither_starves_the_other() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+    let mut seen = Vec::new();
+    for step in 0..4 {
+        downloads.poll(at(step), &mut stream, true);
+        if let Some((_, recording, _, _)) = recorder.taken() {
+            seen.push(recording);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            DownloadSink::Log,
+            DownloadSink::Capture,
+            DownloadSink::Log,
+            DownloadSink::Capture
+        ]
     );
 }

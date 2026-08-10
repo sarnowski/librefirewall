@@ -569,8 +569,8 @@ pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
 pub use relay::{
     ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered, ChannelStream,
     DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Half, Relay, RelayFailure, RelayPass,
-    RelayReport, RelaySession, Relayed, TerminatedSession, Terminating, TerminatingPass,
-    Terminator,
+    RelayReport, RelaySession, Relayed, SHIPPED_RING_BYTES, TerminatedSession, Terminating,
+    TerminatingPass, Terminator, Upstream,
 };
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,

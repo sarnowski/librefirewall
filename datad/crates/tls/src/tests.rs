@@ -3238,3 +3238,57 @@ mod delivered_anchor {
         assert_eq!(expired.verify(&device, &anchor), Err(ChainRejected));
     }
 }
+
+/// A whole-message push has to know it will fit before it queues the front of
+/// itself, and a drained session is what says so.
+///
+/// The channel's upstream frames are length-prefixed, so half of one on the
+/// stream is worse than none of it — and [`ChannelClient::push`] takes what it
+/// has room for and reports how much, which discovers a shortfall with the
+/// header already queued. What the caller therefore asks first is whether this
+/// session is holding anything on its way out at all.
+#[test]
+fn a_session_holding_nothing_on_its_way_out_says_so_before_a_whole_message_is_pushed() {
+    let arena = Bump::new(ROOM);
+    let owned = installed(0x74, ENDPOINT, ENDPOINT_NAME, AUTHORITY);
+    let client = dial(0x75, &arena, NOW, &owned).expect("the client opens");
+    let mut channel = Channel {
+        client,
+        server: Server::new(
+            0x76,
+            std::sync::Arc::clone(&owned.endpoint),
+            Judging::Anchor(owned.anchor.clone()),
+        ),
+        echo: true,
+        out: Vec::new(),
+        spoken: Vec::new(),
+    };
+    channel.round();
+    channel.client.push(b"greeting");
+    channel.round();
+    channel.round();
+    assert!(
+        matches!(
+            channel.client.outcome(),
+            Some(&ClientOutcome::Established(_))
+        ),
+        "the handshake did not settle"
+    );
+    channel.round();
+    channel.client.consumed(channel.client.received().len());
+    assert!(
+        channel.client.drained(),
+        "a session that has sent everything it was given is holding nothing"
+    );
+
+    // Pushed and not yet driven: plaintext is waiting to be sealed, and a whole
+    // message must not be composed on top of it.
+    let message = vec![0x33_u8; 4096];
+    assert_eq!(channel.client.push(&message), message.len());
+    assert!(!channel.client.drained());
+    channel.settle();
+    assert!(
+        channel.client.drained(),
+        "a driven session still held the message it was given"
+    );
+}

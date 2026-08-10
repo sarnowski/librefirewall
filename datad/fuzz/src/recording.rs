@@ -75,9 +75,9 @@ use lfw_recorder::{
     read_superblocks,
 };
 use wire::{
-    CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReply, DownloadRequest, DownloadSink, TAP_SNAP_LEN,
-    TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
-    TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
+    CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReader, DownloadReply, DownloadRequest, DownloadSink,
+    TAP_SNAP_LEN, TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection,
+    TapDropReason, TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
 };
 
 use crate::guard::Guarded;
@@ -107,8 +107,12 @@ enum Step {
         decision: TapDecision,
         frame: Vec<u8>,
     },
-    /// The management domain asks for a window, at any offset and any length.
+    /// The management domain asks for a window, in either reader's coordinate,
+    /// at any offset and any length. The reader is the adversary's too: the two
+    /// coordinates resolve against different origins, so a domain that asked in
+    /// the wrong one is a shape this side must survive.
     Demand {
+        reader: DownloadReader,
         sink: DownloadSink,
         offset: u64,
         len: u32,
@@ -145,6 +149,11 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             },
         },
         1 => Step::Demand {
+            reader: if bool::arbitrary(unstructured).ok()? {
+                DownloadReader::Ring
+            } else {
+                DownloadReader::Snapshot
+            },
             sink: if bool::arbitrary(unstructured).ok()? {
                 DownloadSink::Capture
             } else {
@@ -615,8 +624,13 @@ pub fn recording_pass(data: &[u8]) {
                 let original_len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
                 let _ = writer.write(&annotation, original_len, &frame);
             }
-            Step::Demand { sink, offset, len } => {
-                let _pending = requester.request(sink, offset, len as usize);
+            Step::Demand {
+                reader,
+                sink,
+                offset,
+                len,
+            } => {
+                let _pending = requester.request(reader, sink, offset, len as usize);
                 if let Some(demand) = responder.take() {
                     demands += 1;
                     deck.demand(demand);
