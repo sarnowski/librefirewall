@@ -1,10 +1,25 @@
+# Generated output is ignored inside the component that generates it —
+# datad/.gitignore covers the appliance's build, dist and target trees,
+# datad/fuzz/.gitignore its corpus workspace's, and ctrld/.gitignore the
+# management server's _build, deps and generated assets. Nothing writes any of
+# them at the repository root, and none of them is ignored here on purpose: an
+# artifact tree appearing beside the two components means something ran in the
+# wrong directory, and the right answer to that is for git to say so.
 /book/book/
 
+# Crash dumps are the exception, because neither runtime chooses where to drop
+# one — each writes it into whatever directory it was invoked from, which is a
+# property of the invocation and not of the component. Both patterns are
+# therefore unanchored: an appliance-side compiler crash and a BEAM crash are
+# equally uncommittable wherever they land.
+rustc-ice-*.txt
+erl_crash.dump
+
 # Key material must never reach a commit, whatever path it is dropped at: the
-# development signing keys under datad/build/dev-keys, and any TLS-inspection
-# CA or private key an operator points the build at. These are catch-all
-# patterns rather than specific paths precisely because the paths are
-# configurable.
+# development signing keys under datad/build/dev-keys, the development CA under
+# datad/build/dev-ca, and any TLS-inspection CA or private key an operator
+# points the build at. These are catch-all patterns rather than specific paths
+# precisely because the paths are configurable.
 *.pem
 *.key
 *.p12
