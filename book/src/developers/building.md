@@ -4,7 +4,7 @@ The supported developer interface is GNU Make backed by rootless Podman. Each co
 tests inside its own pinned OCI builder. The appliance builder (Debian 13 by digest, a dated Debian
 snapshot, the Microkit SDK, `rust-sel4`, the project Rust nightly, GRUB, OVMF, QEMU, and the
 coverage/lint/fuzz/SBOM tooling) provides every `datad` build input; the BEAM builder (the
-`hexpm/elixir` image by digest — Erlang/OTP, Elixir and Debian bookworm — plus Hex, rebar3, the
+`hexpm/elixir` image by digest — Erlang/OTP, Elixir and Debian trixie — plus Hex, rebar3, the
 Phoenix generator, and the tailwind and esbuild standalone binaries) provides every `ctrld` one.
 The downloads are sha256-pinned in `datad/third-party/sources.lock` and
 `ctrld/third-party/sources.lock`; each apt package is pinned to an exact version inline in the

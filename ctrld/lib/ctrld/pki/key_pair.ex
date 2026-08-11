@@ -31,11 +31,15 @@ defmodule Ctrld.PKI.KeyPair do
   """
   @spec spki_der(binary()) :: binary()
   def spki_der(point) when is_binary(point) do
-    parameters = :public_key.der_encode(:EcpkParameters, {:namedCurve, Profile.curve_oid()})
-
+    # The curve goes in as the ECParameters term and not as its DER bytes:
+    # `:public_key` encodes this algorithm's parameters itself, so bytes handed
+    # in already encoded are re-encoded as a value of the wrong shape and the
+    # call fails outright. It is the sibling of the open type a PKCS#10 request
+    # carries in the same position, where the bytes are what belongs there.
     :public_key.der_encode(
       :SubjectPublicKeyInfo,
-      {:SubjectPublicKeyInfo, {:AlgorithmIdentifier, Profile.ec_public_key_oid(), parameters},
+      {:SubjectPublicKeyInfo,
+       {:AlgorithmIdentifier, Profile.ec_public_key_oid(), {:namedCurve, Profile.curve_oid()}},
        point}
     )
   end

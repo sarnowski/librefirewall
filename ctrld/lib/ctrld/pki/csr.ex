@@ -220,9 +220,15 @@ defmodule Ctrld.PKI.CSR do
     end
   end
 
-  defp common_name(value) when is_binary(value) do
-    case safely(fn -> :public_key.der_decode(:X520CommonName, value) end) do
-      {:ok, {_string_type, name}} -> check_device_id(to_string(name))
+  # The request decoder resolves the subject attribute's DirectoryString itself,
+  # so what arrives here is the string type the peer chose and the value under
+  # it — not the bytes that carried them, which is why nothing is decoded a
+  # second time. The conversion is still guarded: the type is the peer's choice
+  # and the value under some of them is a character list of whatever it liked,
+  # so this stays a typed refusal rather than a raise on an untrusted subject.
+  defp common_name({_string_type, name}) do
+    case safely(fn -> to_string(name) end) do
+      {:ok, string} -> check_device_id(string)
       :error -> {:error, :malformed}
     end
   end

@@ -26,27 +26,27 @@ defmodule Ctrld.Channel.Listener do
   ## The suite and the group
 
   Exactly one cipher suite is offered — `TLS_CHACHA20_POLY1305_SHA256` — and
-  exactly one key-exchange group, and both are named rather than left to a
-  default so that what a session negotiated is a fact of this module instead of
-  an outcome to go and measure. The suite is the one the contract fixes and the
-  one the appliance's provider offers.
+  exactly one key-exchange group — the hybrid post-quantum `X25519MLKEM768` —
+  and both are named rather than left to a default so that what a session
+  negotiated is a fact of this module instead of an outcome to go and measure.
+  Each is the one the contract fixes and the one the appliance's provider offers,
+  so the intersection with an appliance is the whole of what either end has.
 
-  The group is **`x25519`, and the contract asks for the hybrid
-  `X25519MLKEM768`.** This runtime's TLS implementation has no ML-KEM at all —
-  `:ssl.groups/0` names none on the pinned release — so the hybrid group cannot
-  be offered from here, and `x25519` is the classical half of it.
+  **One group and not two, deliberately.** The appliance offers the hybrid and
+  nothing beside it, and this end matches that rather than widening it: a
+  classical group offered here as well would be one a peer that can reach the
+  port is free to choose, and choosing it hands over the classical half alone and
+  gives up the harvest-now-decrypt-later property the hybrid exchange exists for
+  — on a channel that carries a customer's network history. A narrower
+  intersection cannot be negotiated down, which is the reason to keep it narrow
+  at both ends. The cost is that there is no fallback: a peer without the hybrid
+  gets `insufficient security` and no session, which is the intended answer.
 
-  That deviation is **not yet interoperable with the appliance**, and it is worth
-  being exact about rather than filing as a weaker guarantee. The appliance's
-  provider offers the hybrid group and no other, so against this listener the two
-  ends share no group and the handshake fails before either certificate is
-  looked at. What closes it is one of two changes, and both are somebody's
-  decision rather than this module's: a runtime here that can offer the hybrid
-  group, or an appliance that offers `x25519` beside it — which would let a peer
-  that can reach the port choose the classical half and give up the
-  harvest-now-decrypt-later property the hybrid exchange exists for, on a channel
-  carrying a customer's network history. This listener offers the half it can and
-  says so; it does not pretend the pair is closed.
+  The group needs both halves of the runtime beneath it. `:ssl` implements it
+  from OTP 28, and `:crypto` takes ML-KEM from the OpenSSL it is linked against
+  rather than implementing it — so where that OpenSSL predates 3.5 the group is
+  absent from `:ssl.groups/0` and this listener does not start at all, refusing
+  its options rather than quietly serving something weaker.
 
   ## Which address is bound
 
@@ -147,7 +147,7 @@ defmodule Ctrld.Channel.Listener do
 
   @doc "The key-exchange groups this listener offers, which is one."
   @spec supported_groups() :: [atom()]
-  def supported_groups, do: [:x25519]
+  def supported_groups, do: [:x25519mlkem768]
 
   defp listen(certificate, options) do
     # A live session cannot outlive the process that held one, so every row

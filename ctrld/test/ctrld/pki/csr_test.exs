@@ -149,12 +149,10 @@ defmodule Ctrld.PKI.CSRTest do
         {:rdnSequence,
          [
            [
-             {:AttributeTypeAndValue, Profile.common_name_oid(),
-              :public_key.der_encode(:X520CommonName, {:utf8String, device_id()})}
+             {:AttributeTypeAndValue, Profile.common_name_oid(), {:utf8String, device_id()}}
            ],
            [
-             {:AttributeTypeAndValue, {2, 5, 4, 10},
-              :public_key.der_encode(:X520OrganizationName, {:utf8String, "an owner"})}
+             {:AttributeTypeAndValue, {2, 5, 4, 10}, {:utf8String, "an owner"}}
            ]
          ]}
 
@@ -167,8 +165,7 @@ defmodule Ctrld.PKI.CSRTest do
         {:rdnSequence,
          [
            [
-             {:AttributeTypeAndValue, {2, 5, 4, 10},
-              :public_key.der_encode(:X520OrganizationName, {:utf8String, "an owner"})}
+             {:AttributeTypeAndValue, {2, 5, 4, 10}, {:utf8String, "an owner"}}
            ]
          ]}
 

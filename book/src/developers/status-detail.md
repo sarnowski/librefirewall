@@ -3412,30 +3412,52 @@ delivered anchor and matches the profile in every field.
   a Podman network with no gateway; the gate container refuses to run if it holds a default route,
   and a database that does not answer fails the run rather than shrinking it. The
   [building chapter](building.md) describes it.
+- **The channel listener is real, and an appliance can reach it.** The whole of [the
+  framing](../contracts/channel-framing.md) is implemented on this side of the wire, against the
+  appliance's own codec field by field: the eight-byte header, the ten frames, the direction each may
+  travel, both greeting shapes, the payload floors, the two closed byte vocabularies, and twelve
+  refusals — one per rule broken, read in the order the appliance reads them, so both ends name the
+  same cause for the same bytes. A `ThousandIsland` listener on the endpoint's port serves the
+  endpoint certificate, requires and verifies a client certificate against this server's authority
+  alone, and hands the connection a session that greets first with its two resume cursors. It is
+  proved end to end in the suite over a real TLS 1.3 session: an ephemeral port, an `:ssl` client
+  presenting a device certificate this server's authority issued, greetings both ways, frames
+  reassembled from a stream cut a byte at a time, and three connections refused — a certificate from
+  another authority, one naming no appliance this server holds, and none at all.
+- **The key exchange intersects the appliance's, and the suite holds it there.** The listener offers
+  the hybrid `X25519MLKEM768` and nothing beside it, which is precisely what the appliance's provider
+  offers, so the intersection is the whole of what either end has. Two tests hold it from both sides:
+  a client configured with `supported_groups: [:x25519mlkem768]` and no other group completes the
+  handshake, reads the server's greeting off it and closes cleanly; a client offering only `x25519`,
+  the hybrid's classical half, is refused before either certificate is examined. The second is the one
+  that keeps the offer narrow — `x25519` admitted beside the hybrid would let any peer that reaches
+  the port settle on the classical half and give up the harvest-now-decrypt-later property the hybrid
+  exists for, on a channel carrying a customer's network history — and a narrower intersection cannot
+  be negotiated down, which is why both ends keep it at one. Since the suite's own client takes its
+  group from the listener, every session in that file crosses the hybrid rather than only the two that
+  name it.
+- **That intersection cost a runtime move, and the base image is half of it.** `:ssl` implements the
+  hybrid groups from Erlang/OTP 28, and `:crypto` obtains ML-KEM from the OpenSSL it is linked against
+  rather than implementing it — so OTP 28 on a base whose OpenSSL predates 3.5 reports no KEM, drops
+  every hybrid from `:ssl.groups/0`, and refuses the listener's options outright instead of serving
+  anything weaker. The builder is pinned to a base carrying both halves, and a test asserts the group
+  is in the runtime at all, so a base that loses it fails under a finding naming it rather than as
+  every listener test failing to bind a port. What the runtime does not offer back is the negotiated
+  group: its connection information carries the selected cipher suite and no group at all, so what
+  pins the group is that pair of tests rather than a field read off a session. `openssl s_client`
+  does report it, and against this listener it reports `Negotiated TLS1.3 group: X25519MLKEM768` with
+  `TLS_CHACHA20_POLY1305_SHA256`.
 
 **Missing.** Everything the channel carries, and everything that comes after it.
 
-- **The channel listener exists, and no appliance can reach it yet.** The listener is real and the
-  whole of [the framing](../contracts/channel-framing.md) is implemented on this side of the wire,
-  against the appliance's own codec field by field: the eight-byte header, the ten frames, the
-  direction each may travel, both greeting shapes, the payload floors, the two closed byte
-  vocabularies, and twelve refusals — one per rule broken, read in the order the appliance reads
-  them, so both ends name the same cause for the same bytes. A `ThousandIsland` listener on the
-  endpoint's port serves the endpoint certificate, requires and verifies a client certificate against
-  this server's authority alone, and hands the connection a session that greets first with its two
-  resume cursors. It is proved end to end in the suite over a real TLS 1.3 session: an ephemeral port,
-  an `:ssl` client presenting a device certificate this server's authority issued, greetings both
-  ways, frames reassembled from a stream cut a byte at a time, and three connections refused — a
-  certificate from another authority, one naming no appliance this server holds, and none at all.
-  What is **not** proved is interoperability with the appliance, and it cannot be: the appliance's
-  provider offers the hybrid `X25519MLKEM768` key exchange and no other, `:ssl` on the pinned OTP
-  offers no ML-KEM group at all, so the two ends share no group and the handshake fails before either
-  certificate is examined. This listener offers `x25519`, the classical half of that hybrid, and
-  `openssl s_client` negotiates `TLS_CHACHA20_POLY1305_SHA256` over it. Closing the pair is one of two
-  decisions nobody has taken: a runtime here that can offer the hybrid group, or an appliance that
-  offers the classical one beside it — which gives up the harvest-now-decrypt-later property the
-  hybrid exists for. Until then the appliance's channel is still proved against the `openssl s_server`
-  the gate stands up.
+- **The two implementations have never met.** Each end is held to a peer the other did not write —
+  this listener to an `:ssl` client offering the appliance's own group and suite, the appliance to the
+  `openssl s_server` a booted release image dials — and nothing yet stands rustls up against `:ssl`.
+  What that leaves unproved is what only the pair can show: that the certificate each end issues
+  satisfies the other's profile reader inside one session, and that two independent readings of the
+  framing agree on bytes neither of them composed. The group that blocked such a scenario outright is
+  no longer what stands in the way; what it needs is a boot that dials this server rather than a
+  stand-in.
 - **No pcapng decoder.** Ring bytes arrive and cross a documented seam — a device, a recording, a
   position and the bytes — whose deployed implementation counts them, emits a telemetry event and
   keeps nothing: decoding an appliance's pcapng is parsing an untrusted self-describing format, which

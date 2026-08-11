@@ -136,8 +136,7 @@ defmodule Ctrld.Fixtures do
        {:rdnSequence,
         [
           [
-            {:AttributeTypeAndValue, Profile.common_name_oid(),
-             :public_key.der_encode(:X520CommonName, {:utf8String, subject})}
+            {:AttributeTypeAndValue, Profile.common_name_oid(), {:utf8String, subject}}
           ]
         ]},
        {:CertificationRequestInfo_subjectPKInfo,
@@ -184,8 +183,7 @@ defmodule Ctrld.Fixtures do
        {:rdnSequence,
         [
           [
-            {:AttributeTypeAndValue, Profile.common_name_oid(),
-             :public_key.der_encode(:X520CommonName, {:utf8String, subject})}
+            {:AttributeTypeAndValue, Profile.common_name_oid(), {:utf8String, subject}}
           ]
         ]},
        {:CertificationRequestInfo_subjectPKInfo,

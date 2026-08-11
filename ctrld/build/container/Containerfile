@@ -38,8 +38,8 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
     set -eu; \
     . /tmp/sources.lock; \
     printf '%s\n' \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${CTRLD_DEBIAN_SNAPSHOT}/ bookworm main" \
-      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${CTRLD_DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/${CTRLD_DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/${CTRLD_DEBIAN_SNAPSHOT}/ trixie-security main" \
       > /etc/apt/sources.list; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
     ca_bundle=/etc/ssl/certs/ca-certificates.crt; \
@@ -51,12 +51,12 @@ RUN --mount=type=secret,id=enterprise_ca,required=false \
     DEBIAN_FRONTEND=noninteractive apt-get \
       -o Acquire::https::CaInfo="$ca_bundle" \
       --no-install-recommends install -y \
-      build-essential=12.9 \
-      curl=7.88.1-10+deb12u12 \
-      git=1:2.39.5-0+deb12u2 \
-      inotify-tools=3.22.6.0-4 \
-      pkg-config=1.8.1-1 \
-      unzip=6.0-28; \
+      build-essential=12.12 \
+      curl=8.14.1-2+deb13u3 \
+      git=1:2.47.3-0+deb13u1 \
+      inotify-tools=4.23.9.0-2+b1 \
+      pkg-config=1.8.1-4 \
+      unzip=6.0-29; \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
 # Pin Erlang's TLS client to 1.2 for every invocation: the corporate firewall

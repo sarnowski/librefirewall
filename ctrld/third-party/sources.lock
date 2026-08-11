@@ -1,13 +1,26 @@
 # OCI image and Debian package snapshot. The base image carries Erlang/OTP,
-# Elixir and Debian bookworm; the snapshot freezes the archive that every apt
+# Elixir and Debian trixie; the snapshot freezes the archive that every apt
 # package — and every transitive dependency of one — resolves against, and its
 # date matches the one the base image itself was built from. The exact version
 # of each package we ask for is pinned inline in build/container/Containerfile,
 # where it sits next to the package name. ELIXIR_VERSION names the builder
 # image tag; the digest pins the content.
+#
+# Which Debian release the base is built on is load-bearing rather than a
+# detail, and it is why this is the trixie image and not the bookworm one of
+# the same Elixir, OTP and snapshot date. The channel listener offers the
+# hybrid post-quantum group X25519MLKEM768 and nothing else, because the
+# appliance offers that and nothing else. OTP 28's `ssl` implements the group,
+# but `crypto` obtains ML-KEM from the OpenSSL it is linked against and has no
+# implementation of its own — so on a bookworm base, whose OpenSSL is 3.0.x,
+# `crypto:supports()` reports no KEM at all, `ssl:groups()` omits every hybrid,
+# and configuring the group is rejected outright as `none_valid`. Trixie
+# carries OpenSSL 3.5, which provides ML-KEM. Moving this line back to a base
+# whose OpenSSL predates 3.5 does not degrade the channel, it stops the
+# listener from starting.
 ELIXIR_VERSION=1.18.4
-ELIXIR_IMAGE=docker.io/hexpm/elixir:1.18.4-erlang-27.3.4-debian-bookworm-20250520@sha256:07bc7c136f74e2bc04c499394f66b50d30eee0bc77a0bb416293ee035afca8ea
-CTRLD_DEBIAN_SNAPSHOT=20250520T000000Z
+ELIXIR_IMAGE=docker.io/hexpm/elixir:1.18.4-erlang-28.3.1-debian-trixie-20260610@sha256:affec7dbaaf3b33f290b17f6459a04ec379d9b575a6a4676a077bc9c9fb0fb06
+CTRLD_DEBIAN_SNAPSHOT=20260610T000000Z
 
 # Hex, rebar3, and the Phoenix project generator, installed into MIX_HOME
 # inside the image so the toolchain is read-only at run time. rebar3 is the

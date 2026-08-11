@@ -10,6 +10,11 @@ defmodule Ctrld.Channel.ListenerTest do
   off the peer certificate, the greeting exchange, frames in both directions, and
   the inventory moving with the session.
 
+  Every session here is established over the one key-exchange group the appliance
+  offers, so what the suite exercises is the pair rather than this end alone; the
+  group has a describe block of its own, which holds the hybrid to a client that
+  offers nothing else and holds this end to offering nothing else either.
+
   The suite is not async: a listener binds a real port, and the sandbox
   connection has to be shared with the connection processes the listener spawns,
   which are not the test's own.
@@ -206,11 +211,27 @@ defmodule Ctrld.Channel.ListenerTest do
   end
 
   describe "the suite and the group, as negotiated" do
-    test "TLS 1.3 with TLS_CHACHA20_POLY1305_SHA256 over x25519", %{anchor: anchor} do
+    test "the runtime this listener is built on offers the hybrid group at all" do
+      # Not a restatement of `supported_groups/0` but the capability underneath
+      # it: `:crypto` takes ML-KEM from the OpenSSL it is linked against rather
+      # than implementing it, so a builder base whose OpenSSL predates 3.5
+      # carries no KEM, `:ssl` drops every hybrid group, and the listener stops
+      # starting. Asserted once here so that regression reads as the base image
+      # rather than as every other test in this file failing to bind a port.
+      assert :x25519mlkem768 in :ssl.groups()
+    end
+
+    test "a client offering only X25519MLKEM768 completes the handshake", %{anchor: anchor} do
       port = start_listener()
       %{certificate: certificate, key: key} = onboarded_appliance()
 
-      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      # The appliance's own offer, written out rather than read back off the
+      # listener: what has to hold is that this end meets *that* set, and a
+      # client mirroring the server's option would prove only that this module
+      # agrees with itself.
+      options = client_options(certificate, key, anchor, [:x25519mlkem768])
+
+      assert {:ok, socket} = :ssl.connect(@loopback, port, options, 5_000)
       assert {:ok, information} = :ssl.connection_information(socket)
 
       assert information[:protocol] == :"tlsv1.3"
@@ -222,13 +243,31 @@ defmodule Ctrld.Channel.ListenerTest do
                prf: :sha256
              }
 
-      # The group is a fact of the listener's own options rather than something to
-      # go and measure: it offers exactly one, so this is the group every session
-      # it accepts was established over.
-      assert Listener.supported_groups() == [:x25519]
-      assert Listener.cipher_suites() == [information[:selected_cipher_suite]]
+      # Established is not the same as usable, so the server's greeting has to
+      # cross it too: the whole path an appliance takes, under the group an
+      # appliance actually offers.
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
 
+      # Which group carried it is not in the connection information — OTP names
+      # no negotiated group there — and does not need to be. Both ends offered
+      # exactly one group, and a handshake that completed means those were the
+      # same one; the refusal below is the other half of that argument, holding
+      # this end to offering nothing besides.
       :ok = :ssl.close(socket)
+    end
+
+    test "a client offering only the hybrid's classical half gets no session", %{anchor: anchor} do
+      port = start_listener()
+      %{certificate: certificate, key: key} = onboarded_appliance()
+
+      options = client_options(certificate, key, anchor, [:x25519])
+
+      # No shared group, so the refusal lands before either certificate is
+      # looked at. This is the assertion that widening the listener's group list
+      # has to break: `x25519` offered beside the hybrid would admit this peer
+      # and settle on the classical half alone, which is what offering one group
+      # exists to prevent.
+      assert {:error, _reason} = :ssl.connect(@loopback, port, options, 5_000)
     end
   end
 
@@ -384,7 +423,10 @@ defmodule Ctrld.Channel.ListenerTest do
     %{appliance: appliance, certificate: appliance.certificate_der, key: key}
   end
 
-  defp client_options(certificate, key, anchor) do
+  # The groups are a parameter because the group is the whole subject of one
+  # describe block above: everything else dials with the listener's own set,
+  # while those tests name the set an appliance really offers.
+  defp client_options(certificate, key, anchor, groups \\ Listener.supported_groups()) do
     [
       mode: :binary,
       active: false,
@@ -394,7 +436,7 @@ defmodule Ctrld.Channel.ListenerTest do
       key: {:ECPrivateKey, :public_key.der_encode(:ECPrivateKey, key)},
       versions: [:"tlsv1.3"],
       ciphers: Listener.cipher_suites(),
-      supported_groups: Listener.supported_groups(),
+      supported_groups: groups,
       # An appliance dials an address literal, so it offers no server name. The
       # certificate is held to the address dialled instead, which is checked
       # explicitly above rather than by a name comparison that would prove
