@@ -48,6 +48,13 @@ defmodule Ctrld.Channel.Listener do
   absent from `:ssl.groups/0` and this listener does not start at all, refusing
   its options rather than quietly serving something weaker.
 
+  It is named here rather than left to the runtime even though OTP 29 makes it
+  the most preferred group by default. A default is the runtime's choice and it
+  orders groups rather than restricting them: inheriting one would offer every
+  other group this build happens to carry, behind whatever preference the next
+  OTP ships. What this listener needs is an offer of exactly one, which only
+  stating it can be.
+
   ## Which address is bound
 
   The port is the configured endpoint's, and the address bound is every local

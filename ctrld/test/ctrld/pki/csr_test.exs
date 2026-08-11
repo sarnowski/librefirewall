@@ -238,7 +238,7 @@ defmodule Ctrld.PKI.CSRTest do
       [{:CertificationRequest, der, :not_encrypted}] = :public_key.pem_decode(pem)
 
       for offset <- 0..(byte_size(der) - 1)//5 do
-        <<before::binary-size(offset), byte, rest::binary>> = der
+        <<before::binary-size(^offset), byte, rest::binary>> = der
         flipped = <<before::binary, Bitwise.bxor(byte, 0xFF), rest::binary>>
 
         result =

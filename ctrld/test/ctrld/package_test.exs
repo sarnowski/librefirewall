@@ -273,7 +273,7 @@ defmodule Ctrld.PackageTest do
 
   defp rewrite_and_fix_checksum(archive, offset, replacement) do
     size = byte_size(replacement)
-    <<before::binary-size(offset), _old::binary-size(size), rest::binary>> = archive
+    <<before::binary-size(^offset), _old::binary-size(^size), rest::binary>> = archive
     fix_checksum(before <> replacement <> rest)
   end
 

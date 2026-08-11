@@ -29,7 +29,7 @@ defmodule Ctrld.Channel.DecoderTest do
   defp two_way_splits(bytes), do: for(at <- 0..byte_size(bytes), do: split_at(bytes, at))
 
   defp split_at(bytes, at) do
-    <<head::binary-size(at), tail::binary>> = bytes
+    <<head::binary-size(^at), tail::binary>> = bytes
     [head, tail]
   end
 
@@ -120,7 +120,7 @@ defmodule Ctrld.Channel.DecoderTest do
       size = byte_size(bytes)
 
       for first <- 0..size, second <- first..size do
-        <<head::binary-size(first), middle::binary-size(second - first), tail::binary>> = bytes
+        <<head::binary-size(^first), middle::binary-size(^second - ^first), tail::binary>> = bytes
 
         assert {:ok, ^frames, _decoder} = feed([head, middle, tail]),
                "splits after #{first} and #{second} byte(s) changed what came out"

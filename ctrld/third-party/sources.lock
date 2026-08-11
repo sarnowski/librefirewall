@@ -10,17 +10,24 @@
 # detail, and it is why this is the trixie image and not the bookworm one of
 # the same Elixir, OTP and snapshot date. The channel listener offers the
 # hybrid post-quantum group X25519MLKEM768 and nothing else, because the
-# appliance offers that and nothing else. OTP 28's `ssl` implements the group,
-# but `crypto` obtains ML-KEM from the OpenSSL it is linked against and has no
+# appliance offers that and nothing else. `ssl` implements the group, but
+# `crypto` obtains ML-KEM from the OpenSSL it is linked against and has no
 # implementation of its own — so on a bookworm base, whose OpenSSL is 3.0.x,
 # `crypto:supports()` reports no KEM at all, `ssl:groups()` omits every hybrid,
 # and configuring the group is rejected outright as `none_valid`. Trixie
 # carries OpenSSL 3.5, which provides ML-KEM. Moving this line back to a base
 # whose OpenSSL predates 3.5 does not degrade the channel, it stops the
-# listener from starting.
-ELIXIR_VERSION=1.18.4
-ELIXIR_IMAGE=docker.io/hexpm/elixir:1.18.4-erlang-28.3.1-debian-trixie-20260610@sha256:affec7dbaaf3b33f290b17f6459a04ec379d9b575a6a4676a077bc9c9fb0fb06
-CTRLD_DEBIAN_SNAPSHOT=20260610T000000Z
+# listener from starting. That holds independently of the OTP version: OTP 29
+# additionally makes the group its own most-preferred default, which changes
+# nothing here because the listener names the group explicitly rather than
+# inheriting a default it does not control.
+#
+# Elixir 1.20.0 was never published against OTP 29.0.5 — its newest pairing is
+# OTP 28.4.3 — so 1.20.3 is the 1.20 line's current patch and is what "1.20 on
+# OTP 29" resolves to in practice.
+ELIXIR_VERSION=1.20.3
+ELIXIR_IMAGE=docker.io/hexpm/elixir:1.20.3-erlang-29.0.5-debian-trixie-20260803@sha256:015a284a0b988a5649bc6aa0f43cc0e4973d64bcf6446720cba6f008040691b5
+CTRLD_DEBIAN_SNAPSHOT=20260803T000000Z
 
 # Hex, rebar3, and the Phoenix project generator, installed into MIX_HOME
 # inside the image so the toolchain is read-only at run time. rebar3 is the
@@ -31,11 +38,17 @@ CTRLD_DEBIAN_SNAPSHOT=20260610T000000Z
 # risk: that checksum comes from the registry rather than from a value
 # recorded here — the same standing the datad lock records for its
 # cargo-installed tools. Neither enters a deployed artifact.
+#
+# The rebar3 escript ships as compiled BEAM, so its version is bounded by the
+# OTP it will run under and not only by what it can build: an escript compiled
+# by a sufficiently older compiler is refused at load time by the emulator
+# rather than merely warned about, which takes out every rebar-built dependency
+# in the tree. So this version moves with the OTP above it.
 HEX_VERSION=2.5.1
 PHX_NEW_VERSION=1.8.9
-REBAR3_VERSION=3.24.0
-REBAR3_URL=https://github.com/erlang/rebar3/releases/download/3.24.0/rebar3
-REBAR3_SHA256=d2d31cfb98904b8e4917300a75f870de12cb5167cd6214d1043e973a56668a54
+REBAR3_VERSION=3.27.0
+REBAR3_URL=https://github.com/erlang/rebar3/releases/download/3.27.0/rebar3
+REBAR3_SHA256=af85aab41f9fd74bdd6341ebdf6fe9c88077aab9f8eac82371583fa02f2b0bdf
 
 # Standalone asset compilers, baked into the image at /opt/assets so the
 # offline gate and the development server never download them. The versions

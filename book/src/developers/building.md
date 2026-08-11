@@ -150,6 +150,14 @@ rewritten to its mirror, and one throwaway compile of the dependency tree captur
 dependency would otherwise fetch at compile time (the precompiled NIF tarball `lazy_html` uses).
 A dependency change therefore means rebuilding the builder, exactly as it does for `datad`.
 
+Moving the base image is not only a version bump, because two of those pinned inputs are coupled to
+what the base carries. The apt versions are resolved against the snapshot the new base was built
+from, so a package the old snapshot held may simply not exist in the new one. And rebar3 ships as
+compiled BEAM rather than source: an escript built by a sufficiently older compiler is refused at
+load time by the emulator, not merely warned about, which takes out every rebar-built dependency in
+the tree at once. So a base carrying a newer Erlang/OTP can require a newer rebar3 to build anything
+at all, and that pin moves with it.
+
 There are two invocation modes, because the offline discipline and the development experience pull
 in opposite directions:
 

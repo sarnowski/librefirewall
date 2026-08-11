@@ -3438,9 +3438,13 @@ delivered anchor and matches the profile in every field.
   name it.
 - **That intersection cost a runtime move, and the base image is half of it.** `:ssl` implements the
   hybrid groups from Erlang/OTP 28, and `:crypto` obtains ML-KEM from the OpenSSL it is linked against
-  rather than implementing it — so OTP 28 on a base whose OpenSSL predates 3.5 reports no KEM, drops
+  rather than implementing it — so any OTP on a base whose OpenSSL predates 3.5 reports no KEM, drops
   every hybrid from `:ssl.groups/0`, and refuses the listener's options outright instead of serving
-  anything weaker. The builder is pinned to a base carrying both halves, and a test asserts the group
+  anything weaker. That is a property of the base rather than of the OTP version, and it does not
+  expire as the runtime advances: the pinned runtime is now OTP 29, which additionally makes the group
+  its own most preferred default, and the listener still names the group explicitly — a default orders
+  groups rather than restricting them, so inheriting one would offer every other group the build
+  carries. The builder is pinned to a base carrying both halves, and a test asserts the group
   is in the runtime at all, so a base that loses it fails under a finding naming it rather than as
   every listener test failing to bind a port. What the runtime does not offer back is the negotiated
   group: its connection information carries the selected cipher suite and no group at all, so what

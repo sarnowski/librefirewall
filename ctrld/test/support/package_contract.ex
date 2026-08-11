@@ -148,7 +148,7 @@ defmodule Ctrld.PackageContract do
     padded = padded_length(size)
 
     case rest do
-      <<body::binary-size(size), padding::binary-size(padded - size), remainder::binary>> ->
+      <<body::binary-size(^size), padding::binary-size(^padded - ^size), remainder::binary>> ->
         if zero?(padding),
           do: {:ok, body, remainder},
           else: {:error, :member_padding_is_not_zero}

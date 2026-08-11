@@ -134,7 +134,7 @@ defmodule Ctrld.Channel.Decoder do
   # frame's worth and never two" a property of this line rather than of the
   # reasoning around it.
   defp take(decoder, rest, needed, emitted) do
-    <<taken::binary-size(needed), remaining::binary>> = rest
+    <<taken::binary-size(^needed), remaining::binary>> = rest
     run(%{decoder | buffer: decoder.buffer <> taken}, remaining, emitted)
   end
 

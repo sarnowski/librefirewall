@@ -5,7 +5,12 @@ defmodule Ctrld.MixProject do
     [
       app: :ctrld,
       version: "0.1.0",
-      elixir: "~> 1.17",
+      # The floor is the language this code is actually written against, not the
+      # oldest release it might happen to compile on: bitstring size modifiers
+      # here pin the outer variable they read, which earlier releases reject
+      # outright. The builder image pins the exact version; this states the
+      # boundary below which the source is not valid.
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
