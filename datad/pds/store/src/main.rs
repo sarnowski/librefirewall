@@ -832,17 +832,26 @@ impl DeviceKey {
         self.anchor.get(..self.anchor_len).unwrap_or(&[])
     }
 
-    /// Take the anchor an install has just made durable.
+    /// Take the certificate and the anchor an install has just made durable.
     ///
-    /// The one thing about a held identity that an install changes: the keypair
-    /// and the device certificate are what they were — an appliance is issued
-    /// its certificate before it is owned — and the anchor is what arrives with
-    /// the owner. Written here rather than by rebuilding the whole holder, which
-    /// would read the scalar back out of a record a second time for no reason.
-    fn adopt_anchor(&mut self, delivered: &StoredCertificate) {
+    /// **Both, because an install replaces both.** The keypair is what it was,
+    /// but the package carries a certificate over that key issued by the
+    /// authority it also delivers, and the commit writes it beside the anchor. A
+    /// holder taking only the anchor would go on answering with the self-signed
+    /// certificate this appliance minted for itself, so the boot that onboards
+    /// would present an identity no management server can vouch for. Written here
+    /// rather than by rebuilding the whole holder, which would read the scalar
+    /// back out of a record a second time for no reason.
+    fn adopt_identity(&mut self, certificate: &StoredCertificate, anchor: &StoredCertificate) {
+        self.certificate = [0; MAX_CERTIFICATE_LEN];
+        self.certificate_len = 0;
+        for (slot, byte) in self.certificate.iter_mut().zip(certificate.as_bytes()) {
+            *slot = *byte;
+            self.certificate_len += 1;
+        }
         self.anchor = [0; MAX_CERTIFICATE_LEN];
         self.anchor_len = 0;
-        for (slot, byte) in self.anchor.iter_mut().zip(delivered.as_bytes()) {
+        for (slot, byte) in self.anchor.iter_mut().zip(anchor.as_bytes()) {
             *slot = *byte;
             self.anchor_len += 1;
         }
@@ -1642,6 +1651,10 @@ struct Store {
 /// What one accepted package changed, as the two records an operator reads.
 struct Installed {
     endpoint: StoredEndpoint,
+    /// The certificate the commit made durable, carried back beside the anchor
+    /// and for the same reason: the holder presenting it learns it here, or not
+    /// until the next boot.
+    certificate: StoredCertificate,
     /// The anchor the commit made durable, carried back so the holder this
     /// domain answers delegations out of learns it without reading the record a
     /// second time — and so the scalar is not rebuilt to reach one field beside
@@ -1883,10 +1896,11 @@ impl Store {
                 self.identity.onboarded = true;
                 self.identity.generation = installed.generation;
                 // The holder this domain answers delegations out of learns the
-                // anchor the commit just made durable, so the next boot and this
-                // one give the same answer to "whom does this appliance trust".
+                // certificate and the anchor the commit just made durable, so
+                // the next boot and this one give the same answers to "what does
+                // this appliance present" and "whom does it trust".
                 if let Some(key) = self.key.as_mut() {
-                    key.adopt_anchor(&installed.anchor);
+                    key.adopt_identity(&installed.certificate, &installed.anchor);
                 }
                 // After the record is durable and before the requester is told,
                 // so nothing can observe an appliance that has been told it is
@@ -1962,6 +1976,7 @@ impl Store {
         // of the adoption: what this domain goes on answering with has to be what
         // it is about to make durable, and reading it from the state is what says
         // those are the same bytes.
+        let certificate = *state.device_certificate();
         let anchor = *state.anchor_certificate();
         // The copy the generation's parity selects, so the record the appliance
         // is currently relying on is not the one being written; the barrier
@@ -1975,6 +1990,7 @@ impl Store {
         zeroize(&mut region);
         Ok(Installed {
             endpoint,
+            certificate,
             anchor,
             anchor_fingerprint,
             generation,

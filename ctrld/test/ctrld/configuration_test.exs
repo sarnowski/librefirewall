@@ -34,6 +34,21 @@ defmodule Ctrld.ConfigurationTest do
       assert Configuration.validate(document) == :ok
     end
 
+    test "accepts a document whose prose is not ASCII" do
+      document = """
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!-- Prose an operator writes — an em dash, a Größe, a naïve café. -->
+      <configuration>
+        <interfaces/>
+        <neighbours/>
+        <rules/>
+        <management mac="52:54:00:12:34:52" address="10.0.2.15" prefix-length="24" enabled="true" gateway="10.0.2.2"/>
+      </configuration>
+      """
+
+      assert Configuration.validate(document) == :ok
+    end
+
     test "refuses a document over the package member's bound before parsing it" do
       oversize = String.duplicate("x", Configuration.maximum_bytes() + 1)
       assert {:error, {:too_large, size}} = Configuration.validate(oversize)

@@ -323,7 +323,7 @@ CTRLD_DEV_ENV = --env DATABASE_URL=ecto://ctrld:ctrld-development@127.0.0.1:5432
 	--env CLICKHOUSE_PASSWORD=ctrld-development \
 	--env CLICKHOUSE_DATABASE=ctrld_dev \
 	--env CTRLD_KEY_ENCRYPTION_KEY=$$(cat $(CTRLD_DEV_SECRETS)/key-encryption-key) \
-	--env CTRLD_CHANNEL_ENDPOINT=127.0.0.1:8443 \
+	--env CTRLD_CHANNEL_ENDPOINT=10.0.2.2:4433 \
 	--env CTRLD_ADMIN_EMAIL=admin@librefirewall.invalid \
 	--env CTRLD_ADMIN_PASSWORD=$$(cat $(CTRLD_DEV_SECRETS)/admin-password)
 define ctrld_dev_secrets

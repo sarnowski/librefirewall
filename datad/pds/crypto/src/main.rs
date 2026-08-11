@@ -1590,10 +1590,19 @@ impl Management {
     /// delegation exchange per session would be a spin against the store domain
     /// that an unauthenticated peer could provoke by connecting.
     ///
-    /// A holder that cannot produce the anchor it has just installed leaves the
-    /// channel without an identity, which is the `channel-identity-absent` token
-    /// on the first session that tries: the two halves of an ownership
-    /// disagreeing is a thing to go and look at rather than a silence.
+    /// A holder that cannot produce the certificate or the anchor it has just
+    /// installed leaves the channel without an identity, which is the
+    /// `channel-identity-absent` token on the first session that tries: the two
+    /// halves of an ownership disagreeing is a thing to go and look at rather
+    /// than a silence.
+    ///
+    /// **Both halves of the installed identity are re-read, not just the
+    /// anchor.** An install delivers an authority *and* a certificate this
+    /// appliance's own key was issued under by it; what was established at
+    /// bring-up is the self-signed certificate this appliance minted for itself,
+    /// which no management server has any grounds to accept. Taking the anchor
+    /// alone would leave this boot dialling its owner under the certificate it
+    /// had before that owner existed.
     fn adopted(&mut self) {
         if self.channel.ready() {
             return;
@@ -1607,7 +1616,11 @@ impl Management {
         if !held.owned {
             return;
         }
+        let Ok(certificate) = self.delegated.held_certificate() else {
+            return;
+        };
         established.owned = true;
+        established.certificate = certificate;
         established.anchor = self.delegated.held_anchor().ok();
         if let Some(identity) =
             channel_identity(self.onboarding.established.as_ref(), self.endpoint)

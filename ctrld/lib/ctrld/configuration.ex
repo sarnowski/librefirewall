@@ -85,8 +85,14 @@ defmodule Ctrld.Configuration do
     end
   end
 
+  # The scanner is handed the document's *bytes*, one per list element, and not
+  # its codepoints. It decodes the encoding the declaration names for itself, so
+  # a codepoint list would present it an already-decoded character where it
+  # expects a UTF-8 byte and it would refuse the character as illegal — which
+  # made every document carrying so much as a dash outside ASCII unonboardable,
+  # while the appliance that has to accept it reads bytes and took it happily.
   defp scan(document) do
-    {root, _rest} = :xmerl_scan.string(String.to_charlist(document), quiet: true)
+    {root, _rest} = :xmerl_scan.string(:erlang.binary_to_list(document), quiet: true)
     {:ok, root}
   rescue
     _ -> {:error, :not_well_formed}
