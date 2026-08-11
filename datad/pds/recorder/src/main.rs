@@ -539,14 +539,16 @@ fn run(mut held: Loop<'_>, sink: &RingSink<'_, PdClock<'_>>) -> ! {
                     demand,
                     bytes,
                     total_len,
+                    first,
                 } => {
-                    responder.deliver(demand, bytes, total_len);
+                    responder.deliver(demand, bytes, total_len, first);
                 }
                 Served::Refuse {
                     demand,
                     reason,
                     total_len,
-                } => responder.refuse(demand, reason, total_len),
+                    first,
+                } => responder.refuse(demand, reason, total_len, first),
             }
             // The management domain is `notified`-driven, so a reply nobody is
             // told about waits for whatever wakes that domain next.

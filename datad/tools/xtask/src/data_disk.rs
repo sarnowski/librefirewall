@@ -329,6 +329,14 @@ impl DataDisk {
     /// thing that notices is a process on the host side reading the file the
     /// guest wrote.
     ///
+    /// `resumed` says whether a previous boot wrote this medium, which decides
+    /// **where the walk begins**. A boot that resumed opened the segment after
+    /// the one it read, so the extent's written bytes start there rather than at
+    /// payload byte zero and a walk from zero stops at the unsealed tail its
+    /// predecessor left. It is the harness's own fact — which image was attached
+    /// — rather than one read back off the disk, so no recorder can make its
+    /// extent judged from a later segment by writing one.
+    ///
     /// `conversations` says whether this boot opened one, which decides what the
     /// **history** extent owes and nothing else. A conversation is opened by a
     /// packet the appliance decided to carry, so a boot that carried none wrote
@@ -342,7 +350,11 @@ impl DataDisk {
     /// extent whose payload segments hold no walkable pcapng, one the walk did
     /// not follow to exactly the byte the superblock's durable cursor names, or
     /// an extent that holds no packet block where this boot owed one.
-    pub(crate) fn judge_recordings(&self, conversations: bool) -> Result<String, String> {
+    pub(crate) fn judge_recordings(
+        &self,
+        conversations: bool,
+        resumed: bool,
+    ) -> Result<String, String> {
         let mut file = OpenOptions::new()
             .read(true)
             .open(&self.path)
@@ -395,13 +407,38 @@ impl DataDisk {
                     self.path.display()
                 ));
             }
-            // Past segment 0, which holds the superblock and no record.
+            // Past segment 0, which holds the superblock and no record — and,
+            // on a medium a previous boot wrote, past the segments that boot
+            // left: this one opened the segment after the one it read, so the
+            // bytes in front of it are its predecessor's and end wherever that
+            // boot stopped.
             let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
-            let payload_sectors = sectors.saturating_sub(segment_sectors);
+            let opened = if resumed { state.writer().sequence } else { 0 };
+            let from = usize::try_from(opened)
+                .ok()
+                .and_then(|opened| opened.checked_mul(SEGMENT_BYTES))
+                .unwrap_or(usize::MAX);
+            let Some(durable) = durable.checked_sub(from) else {
+                return Err(format!(
+                    "the superblock at sector {start_sector} places its durable cursor at payload \
+                     byte {durable}, behind the segment {opened} this boot opened\n  image: {}",
+                    self.path.display()
+                ));
+            };
+            // What the two numbers below are counted from, said once so the
+            // verdict cannot claim a coordinate the walk did not use.
+            let walked = if resumed {
+                "byte, of the segment this boot opened,"
+            } else {
+                "payload byte"
+            };
+            let payload_sectors = sectors
+                .saturating_sub(segment_sectors)
+                .saturating_sub(opened.saturating_mul(segment_sectors));
             let mut payload = vec![0u8; payload_sectors as usize * SECTOR_SIZE];
             read_at(
                 &mut file,
-                (start_sector + segment_sectors) * SECTOR_SIZE as u64,
+                (start_sector + segment_sectors + opened * segment_sectors) * SECTOR_SIZE as u64,
                 &mut payload,
             )
             .map_err(|error| format!("read the extent at sector {start_sector}: {error}"))?;
@@ -461,9 +498,9 @@ impl DataDisk {
             }
             lines.push(format!(
                 "  sector {start_sector}: superblock generation {}, {} section header(s), {} \
-                 packet block(s); durable end at payload byte {durable}, written prefix ending at \
-                 {} ({awaiting_checkpoint} byte(s) awaiting a checkpoint), nothing written beyond \
-                 it",
+                 packet block(s); durable end at {walked} {durable}, written prefix ending \
+                 at {} ({awaiting_checkpoint} byte(s) awaiting a checkpoint), nothing written \
+                 beyond it",
                 state.write_generation(),
                 parsed.sections,
                 parsed.packets.len(),

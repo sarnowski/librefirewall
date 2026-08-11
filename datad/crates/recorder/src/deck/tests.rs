@@ -513,6 +513,52 @@ fn superblocks(medium: &Fake) -> [lfw_capture_ring::RingState; 2] {
 }
 
 #[test]
+fn a_resumed_recording_tells_a_channel_cursor_where_to_carry_on_from() {
+    // What a channel reader meets on every appliance that has rebooted once. Its
+    // cursor starts at zero, the segment this boot opened is nowhere near zero,
+    // and the recording refuses the position — so the reply has to carry the one
+    // fact that turns that refusal into progress: where the recording now
+    // begins. Without it the appliance stops shipping that recording for the
+    // rest of the boot and the console says only that a ring was overrun.
+    let mut medium = Fake::new();
+    let _ = boot(&mut medium, &Ring::new(), 24);
+
+    // A ring of this boot's own: a tap ring is one producer and one consumer,
+    // and the boot above has already filled and drained its own.
+    let ring = Ring::new();
+    let stored = crate::preload::read_superblocks(CAPACITY_SECTORS, &mut medium)
+        .expect("the fake answers every read");
+    let (names, count) = interfaces();
+    let (mut deck, opened) = Deck::new(CAPACITY_SECTORS, stored, names, count, &mut medium)
+        .expect("a 64 MiB device holds both extents");
+    assert!(
+        matches!(opened[0], Opened::Resumed { .. }),
+        "this boot must have resumed the medium the first one left"
+    );
+    let mut reader = ring.reader();
+    run(&mut deck, &mut medium, &ring, &mut reader, 24, 600, 8);
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+
+    deck.demand(ring_demand(DownloadSink::Log, 0, 512));
+    let begins = match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
+        Some(Answer::Refused(DownloadRefusal::Overrun, _, first)) => first,
+        other => panic!("a resumed recording refuses position zero as an overrun: {other:?}"),
+    };
+    assert!(begins > 0, "a resumed recording does not begin at zero");
+
+    // And the position it named is one this recording actually serves, which is
+    // the whole of what makes the refusal actionable.
+    deck.demand(ring_demand(DownloadSink::Log, begins, 512));
+    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
+        Some(Answer::Bytes(bytes, _)) => assert!(
+            !bytes.is_empty(),
+            "the position a refused reader is sent to answered nothing"
+        ),
+        other => panic!("the position the refusal named is not readable: {other:?}"),
+    }
+}
+
+#[test]
 fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() {
     // The defect this whole path exists to close, stated end to end: two boots
     // share one device, and the second must come up on the segment after the
@@ -924,6 +970,9 @@ enum Answer {
     Refused(
         DownloadRefusal,
         #[expect(dead_code, reason = "read by the Debug a failing match prints")] u64,
+        /// Where the recording now begins, which is the whole of what makes an
+        /// overrun something a reader carries on from.
+        u64,
     ),
 }
 
@@ -943,8 +992,11 @@ fn pump(
                     bytes, total_len, ..
                 } => Answer::Bytes(bytes.to_vec(), total_len),
                 Served::Refuse {
-                    reason, total_len, ..
-                } => Answer::Refused(reason, total_len),
+                    reason,
+                    total_len,
+                    first,
+                    ..
+                } => Answer::Refused(reason, total_len, first),
             });
         }
     }
@@ -969,7 +1021,7 @@ fn download(
                 offset += bytes.len() as u64;
                 body.extend_from_slice(&bytes);
             }
-            Some(Answer::Refused(reason, _)) => {
+            Some(Answer::Refused(reason, ..)) => {
                 panic!("the recorder refused a download of its own recording: {reason:?}")
             }
             None => panic!("a download went unanswered for thirty-two passes"),
@@ -1044,7 +1096,7 @@ fn a_later_offset_with_no_snapshot_pinned_is_refused_as_not_ready() {
     deck.demand(demand(DownloadSink::Log, 4096, 64));
     let mut scratch = [0u8; TAP_SNAP_LEN];
     match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 4) {
-        Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::NotReady),
+        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::NotReady),
         other => panic!("a download nobody started is refused: {other:?}"),
     }
     assert_eq!(deck.counters().downloads_refused, 1);
@@ -1062,7 +1114,7 @@ fn an_offset_pinned_against_the_other_recording_is_refused_rather_than_answered(
     deck.demand(demand(DownloadSink::Capture, 128, 64));
     let mut scratch = [0u8; TAP_SNAP_LEN];
     match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 4) {
-        Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::NotReady),
+        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::NotReady),
         other => panic!("the snapshot pinned is the log's, not the capture's: {other:?}"),
     }
 }
@@ -1082,7 +1134,7 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
     medium.fail = 1;
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {
-        Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::DeviceError),
+        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::DeviceError),
         other => panic!("a failed read is answered: {other:?}"),
     }
 }
@@ -1112,7 +1164,7 @@ fn a_read_the_device_under_delivers_is_refused_rather_than_served_as_content() {
     medium.short_reads = 1;
     deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
     match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16) {
-        Some(Answer::Refused(reason, _)) => assert_eq!(reason, DownloadRefusal::DeviceError),
+        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::DeviceError),
         other => panic!("a read the device cut short is refused, not served: {other:?}"),
     }
     let counters = deck.counters();
@@ -1656,7 +1708,7 @@ fn ship(
                 position += bytes.len() as u64;
                 body.extend_from_slice(&bytes);
             }
-            Some(Answer::Refused(reason, _)) => {
+            Some(Answer::Refused(reason, ..)) => {
                 panic!("the recorder refused a ring read of its own recording: {reason:?}")
             }
             None => panic!("a ring read went unanswered for thirty-two passes"),

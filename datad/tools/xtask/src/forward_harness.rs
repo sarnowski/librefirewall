@@ -6372,6 +6372,20 @@ fn run_boot(
         // The refusal probes go out once, and the branch that sends them now runs
         // on several passes while the management burst is chunked out.
         let mut refusals_injected = false;
+        // Whether the burst this boot owes its **channel** has gone out: one
+        // further wave of the traffic the recordings are made of, sent once the
+        // appliance has said it shipped everything the medium had taken. What
+        // that ordering buys is the whole of what the channel contract then
+        // asserts — a record shipped after it is a record that did not exist
+        // when the appliance said it had caught up.
+        let mut channel_burst_injected = false;
+        // How many times over that wave goes out. A recording becomes visible to
+        // a reader a **sector** at a time, so a burst that produced less than one
+        // would leave the appliance correctly with nothing new to ship and this
+        // boot waiting for a record it is not owed. One pass of the routed set is
+        // a few hundred bytes of capture records; this many is several sectors,
+        // whichever of them the medium happens to be part way through.
+        const CHANNEL_BURST_PASSES: usize = 8;
         // How many of the management frames have gone out.
         let mut management_sent = 0usize;
         // What the harness's own TCP client owes the management port, waiting for
@@ -6897,6 +6911,24 @@ fn run_boot(
                         inject_probes(&mut endpoints, &probes, |probe| {
                             probe.wave == wave && !probe.waits()
                         });
+                    }
+                    // The channel's own burst, on a boot that holds the appliance
+                    // to going on shipping. It waits on the appliance's own
+                    // record rather than on a duration: the console saying both
+                    // recordings are drained is what makes everything after it
+                    // new, and a burst sent on a timer would land wherever the
+                    // boot happened to be.
+                    Some(_)
+                        if !channel_burst_injected
+                            && test.channel.owes_shipping_after_catching_up(&output) =>
+                    {
+                        channel_burst_injected = true;
+                        last_injection = Instant::now();
+                        for _ in 0..CHANNEL_BURST_PASSES {
+                            inject_probes(&mut endpoints, &probes, |probe| {
+                                probe.wave == wave && probe.expectation.is_routed()
+                            });
+                        }
                     }
                     // AND the console has said what this boot's channel contract
                     // owes, which is the one thing on such a boot that no other

@@ -535,7 +535,9 @@ pub mod tap;
 
 pub use clock::{PdClock, TICK_PERIOD, TICKS_PER_SECOND, read_timestamp_counter};
 pub use configuration::{CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Submissions};
-pub use download::{CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Stream, sink_for};
+pub use download::{
+    CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Shipped, Stream, sink_for,
+};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,
     EndpointStageCounters, MAX_REPLY_LEN, ONBOARD_LIMIT, OUTPUT_LIMIT, TIMER_LIMIT,

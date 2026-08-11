@@ -674,7 +674,12 @@ pub fn recording_pass(data: &[u8]) {
                 if let Some(served) = deck.answer(&mut medium) {
                     answers += 1;
                     match served {
-                        Served::Deliver { demand, bytes, .. } => {
+                        Served::Deliver {
+                            demand,
+                            bytes,
+                            first,
+                            ..
+                        } => {
                             assert!(
                                 bytes.len() <= demand.len(),
                                 "more bytes delivered than were asked for"
@@ -701,10 +706,15 @@ pub fn recording_pass(data: &[u8]) {
                                  filled short",
                                 bytes.len()
                             );
-                            responder.deliver(demand, bytes, 0);
+                            responder.deliver(demand, bytes, 0, first);
                         }
-                        Served::Refuse { demand, reason, .. } => {
-                            responder.refuse(demand, reason, 0);
+                        Served::Refuse {
+                            demand,
+                            reason,
+                            first,
+                            ..
+                        } => {
+                            responder.refuse(demand, reason, 0, first);
                         }
                     }
                 }

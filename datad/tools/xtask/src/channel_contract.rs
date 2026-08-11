@@ -66,6 +66,7 @@ use lfw_log::{ChannelOutcome, Domain, DomainState, TlsCertificateRefusal};
 use crate::console_records::{field, lifecycle_records, value};
 use crate::forward_harness::{DIAL_DESTINATION, DIAL_PORT};
 use crate::util::run_command;
+use lfw_recorder::deck::SEGMENT_BYTES;
 
 /// What a boot holds the appliance's dialled channel to, and which server — if
 /// any — stands at the far end of it.
@@ -142,7 +143,8 @@ impl ChannelContract {
         let log = &String::from_utf8_lossy(serial);
         records.iter().all(|owed| owed.carried(log))
             && (!self.owes_frames_beyond_the_greeting()
-                || expect_frames_beyond_the_greeting(log).is_ok())
+                || (expect_frames_beyond_the_greeting(log).is_ok()
+                    && expect_shipping_after_catching_up(log).is_ok()))
     }
 
     /// One clause naming what this boot is still owed on the channel it dials and
@@ -162,6 +164,11 @@ impl ChannelContract {
             owed.push(String::from(
                 "a `channel-agreed=true` record whose `channel-frames-sent` is past the greeting",
             ));
+            owed.push(String::from(
+                "a `channel-…-shipped=` record past the one that reported both recordings \
+                 caught up, which is this appliance shipping records made after it had drained \
+                 the rings",
+            ));
         }
         let log = &String::from_utf8_lossy(serial);
         format!(
@@ -171,6 +178,23 @@ impl ChannelContract {
             or_nothing(dial_records(log)),
             or_nothing(channel_records(log)),
         )
+    }
+
+    /// Whether this boot owes the appliance a further burst of traffic now: it
+    /// holds the appliance to shipping records made after it drained the rings,
+    /// and it has said it drained them.
+    ///
+    /// Asked of the console rather than of a clock, because the ordering is the
+    /// assertion: traffic injected before the appliance has caught up is traffic
+    /// the first shipments would have carried anyway.
+    pub(crate) fn owes_shipping_after_catching_up(self, serial: &[u8]) -> bool {
+        if !self.owes_frames_beyond_the_greeting() {
+            return false;
+        }
+        let log = &String::from_utf8_lossy(serial);
+        shipping_places(log)
+            .iter()
+            .any(|[_, log_pending, _, capture_pending]| *log_pending == 0 && *capture_pending == 0)
     }
 
     /// Whether this boot also holds the appliance to having shipped a frame
@@ -600,6 +624,7 @@ pub(crate) fn judge(
     server: Option<Server>,
     serial: &[u8],
     device: &str,
+    resumed: bool,
 ) -> Result<String, String> {
     let log = &String::from_utf8_lossy(serial);
     match contract {
@@ -629,17 +654,21 @@ pub(crate) fn judge(
             expect_channel(log, &established_session())?;
             expect_certificate(&verification, device)?;
             expect_greeting(&transcript)?;
-            let records = expect_records(&transcript)?;
+            let (records, from) = expect_records(&transcript, resumed)?;
+            let shipped = expect_shipments_at_advancing_positions(&transcript)?;
             // The frame tally is read after the frames themselves, so a boot
             // that shipped nothing fails on the missing frame rather than on a
             // number.
             expect_frames_beyond_the_greeting(log)?;
+            expect_shipping_after_catching_up(log)?;
             Ok(format!(
                 "  answered   channel               appliance->server  {}:{DIAL_PORT}  \
                  TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768; the server validated \
                  CN={device} against the authority this run issued, both greetings crossed at \
                  version 1, and the appliance shipped {records} bytes of its log ring from \
-                 position 0 as UP_RECORDS",
+                 position {from} as UP_RECORDS — where that recording begins on the medium this \
+                 boot attached — then went on shipping across {shipped} frames at advancing \
+                 positions with traffic injected between them",
                 ipv4(DIAL_DESTINATION)
             ))
         }
@@ -824,6 +853,72 @@ fn expect_frames_beyond_the_greeting(log: &str) -> Result<(), String> {
     ))
 }
 
+/// Where the appliance said its channel had got to, one entry per record it
+/// wrote, in emission order.
+///
+/// Each is the two ring positions and the two backlogs behind them. A record
+/// missing any of the four is skipped rather than guessed at: what this contract
+/// is about is the numbers moving, and a record it could not read is a record it
+/// cannot say that of.
+fn shipping_places(log: &str) -> Vec<[u64; 4]> {
+    management(log)
+        .into_iter()
+        .filter_map(|record| {
+            let mut place = [0_u64; 4];
+            for (slot, key) in place.iter_mut().zip([
+                "channel-log-shipped",
+                "channel-log-pending",
+                "channel-capture-shipped",
+                "channel-capture-pending",
+            ]) {
+                *slot = value(record, key)?.parse().ok()?;
+            }
+            Some(place)
+        })
+        .collect()
+}
+
+/// The appliance shipped a recording it made **after** it had drained both
+/// rings, on the session it was already holding.
+///
+/// The order is the whole assertion and it is why the caught-up record has to
+/// come first: a channel that merely walks a backlog it had at the start reports
+/// advancing positions too, and would satisfy a check that only compared two
+/// numbers. A record stating both backlogs at zero is this appliance saying it
+/// has shipped everything the medium had taken; a higher position after it is a
+/// record that did not exist when it said so.
+fn expect_shipping_after_catching_up(log: &str) -> Result<(), String> {
+    let places = shipping_places(log);
+    let caught_up = places
+        .iter()
+        .position(|[_, log_pending, _, capture_pending]| {
+            *log_pending == 0 && *capture_pending == 0
+        });
+    let Some(caught_up) = caught_up else {
+        return Err(format!(
+            "the appliance never reported both recordings caught up, so nothing it shipped \
+             afterwards can be a record made after it had drained them. Where it said its channel \
+             had got to:\n  {}",
+            or_nothing(shipping_records(log))
+        ));
+    };
+    let [drained_log, _, drained_capture, _] = places[caught_up];
+    let advanced = places.get(caught_up + 1..).unwrap_or_default().iter().any(
+        |[log_position, _, capture_position, _]| {
+            *log_position > drained_log || *capture_position > drained_capture
+        },
+    );
+    if advanced {
+        return Ok(());
+    }
+    Err(format!(
+        "the appliance drained both recordings at log {drained_log} / capture {drained_capture} \
+         and never shipped past either of them again, so nothing recorded after that reached the \
+         server on the session it was holding. Where it said its channel had got to:\n  {}",
+        or_nothing(shipping_records(log))
+    ))
+}
+
 /// The first upstream log-ring frame the appliance sent, as the server received
 /// it, answering how many ring bytes it carried.
 ///
@@ -833,13 +928,16 @@ fn expect_frames_beyond_the_greeting(log: &str) -> Result<(), String> {
 /// zeroes; the payload is a big-endian ring position and then the ring's own
 /// bytes, verbatim.
 ///
-/// Two things are held, and both matter. The position is **zero**, which is the
-/// beginning of the ring's own append space rather than of whatever the
-/// appliance happened to have on hand — a frame that started anywhere else would
-/// be one a server could not place. And the ring bytes begin with a pcapng
-/// Section Header Block, which is what makes them a recording an ingest can open
-/// rather than a run of bytes the appliance called one.
-fn expect_records(transcript: &[u8]) -> Result<usize, String> {
+/// Two things are held, and both matter. The position is **where that recording
+/// begins**, rather than wherever the appliance happened to have bytes on hand —
+/// a frame that started anywhere else would be one a server could not place.
+/// That is zero on a fresh medium and the segment this boot opened on one a
+/// previous boot wrote, which is a segment boundary either way: the previous
+/// boot left its last segment unsealed, so it is not this one's to hand over.
+/// And the ring bytes begin with a pcapng Section Header Block, which is what
+/// makes them a recording an ingest can open rather than a run of bytes the
+/// appliance called one.
+fn expect_records(transcript: &[u8], resumed: bool) -> Result<(usize, u64), String> {
     let mut at = 0;
     while let Some(found) = transcript
         .get(at..)
@@ -854,23 +952,125 @@ fn expect_records(transcript: &[u8]) -> Result<usize, String> {
         if let Some(body) = body
             && let Some(position) = body.get(..RING_POSITION_LEN)
             && let Some(ring) = body.get(RING_POSITION_LEN..)
-            && position == [0; RING_POSITION_LEN]
+            && let Ok(octets) = <[u8; RING_POSITION_LEN]>::try_from(position)
+            && begins_a_recording(u64::from_be_bytes(octets), resumed)
             && ring.len() >= SECTION_HEADER_PREFIX_LEN
             && ring.get(..4) == Some(&SECTION_HEADER_BLOCK)
             && ring.get(8..12) == Some(&BYTE_ORDER_MAGIC)
         {
-            return Ok(ring.len());
+            return Ok((ring.len(), u64::from_be_bytes(octets)));
         }
         at = start + 1;
     }
     Err(format!(
-        "the appliance never shipped a well-formed UP_RECORDS frame from ring position 0 whose \
-         bytes open on a pcapng Section Header Block. The framing puts one on the wire as four \
-         bytes of payload length, the type byte {:#04x}, three reserved zeroes, a big-endian ring \
+        "the appliance never shipped a well-formed UP_RECORDS frame from {} whose bytes open on a \
+         pcapng Section Header Block. The framing puts one on the wire as four bytes of payload \
+         length, the type byte {UP_RECORDS_TYPE:#04x}, three reserved zeroes, a big-endian ring \
          position and then the ring's own bytes. The server's transcript was:\n{}",
-        UP_RECORDS_TYPE,
+        if resumed {
+            "the segment this boot opened, which is where a recording a previous boot wrote begins"
+        } else {
+            "ring position 0"
+        },
         String::from_utf8_lossy(transcript)
     ))
+}
+
+/// Whether `position` is where a recording begins on the medium this boot
+/// attached.
+///
+/// Zero on a fresh one. On a medium a previous boot wrote it is the segment this
+/// boot opened — which this harness does not know the number of, and does not
+/// have to: what it holds is that the appliance did not resume at zero and did
+/// not resume mid-segment, and a segment is the unit a boot opens.
+fn begins_a_recording(position: u64, resumed: bool) -> bool {
+    if !resumed {
+        return position == 0;
+    }
+    position > 0 && position.is_multiple_of(SEGMENT_BYTES as u64)
+}
+
+/// Every upstream frame the server received, as `(type, position, ring bytes)`,
+/// in the order they arrived.
+///
+/// Read off the transcript the way [`expect_records`] reads the first one, and
+/// for the same reason: the frames are looked for inside a stream `openssl`
+/// interleaves with its own diagnostics, so each is found by its header rather
+/// than at an offset.
+fn upstream_frames(transcript: &[u8]) -> Vec<(u8, u64, usize)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(next) = transcript
+        .get(at..)
+        .and_then(|tail| tail.windows(HEADER_LEN).position(is_upstream))
+    {
+        let start = at + next;
+        at = start + 1;
+        let Some(header) = transcript.get(start..start + HEADER_LEN) else {
+            break;
+        };
+        let stated = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let Some(body) = transcript.get(start + HEADER_LEN..start + HEADER_LEN + stated) else {
+            continue;
+        };
+        let (Some(position), Some(ring)) =
+            (body.get(..RING_POSITION_LEN), body.get(RING_POSITION_LEN..))
+        else {
+            continue;
+        };
+        let mut octets = [0_u8; RING_POSITION_LEN];
+        octets.copy_from_slice(position);
+        found.push((header[4], u64::from_be_bytes(octets), ring.len()));
+        at = start + HEADER_LEN + stated;
+    }
+    found
+}
+
+/// The appliance kept shipping: more than one upstream frame reached the server,
+/// and each ring's frames name strictly advancing positions.
+///
+/// **This is the server's own statement**, beside the appliance's on its console,
+/// and it is the half no reading of that console could establish: a node that
+/// reported shipping and put nothing on the wire looks identical there. The
+/// positions must advance because a position is what places a frame's bytes in
+/// the ring — two frames at one position are one shipment sent twice, which is
+/// exactly what a cursor that never moves produces.
+///
+/// # Errors
+/// A boot that shipped once and stopped, and one whose positions stood still.
+fn expect_shipments_at_advancing_positions(transcript: &[u8]) -> Result<usize, String> {
+    let frames = upstream_frames(transcript);
+    if frames.len() < 2 {
+        return Err(format!(
+            "the appliance put {} upstream frame(s) on the session it was holding, and this boot \
+             injects traffic after the first one arrives: a node that ships once and then goes \
+             quiet leaves its recordings on the appliance until the server's read timeout closes \
+             the connection. The frames that did arrive were {frames:?}",
+            frames.len()
+        ));
+    }
+    for ring in [UP_RECORDS_TYPE, UP_CAPTURE_TYPE] {
+        let positions: Vec<u64> = frames
+            .iter()
+            .filter(|(kind, ..)| *kind == ring)
+            .map(|(_, position, _)| *position)
+            .collect();
+        if positions.windows(2).any(|pair| pair[1] <= pair[0]) {
+            return Err(format!(
+                "the appliance shipped ring {ring:#04x} at positions {positions:?}, which do not \
+                 advance. A position places a frame's bytes in the ring, so a repeat is one \
+                 shipment sent twice rather than the next one"
+            ));
+        }
+    }
+    Ok(frames.len())
+}
+
+/// Whether these eight bytes are an upstream frame's header: either ring's type
+/// byte, and the three reserved bytes this protocol holds at zero.
+fn is_upstream(window: &[u8]) -> bool {
+    matches!(window.get(4), Some(&UP_RECORDS_TYPE | &UP_CAPTURE_TYPE))
+        && window.get(5..8) == Some(&[0, 0, 0][..])
 }
 
 /// Whether these eight bytes are an `UP_RECORDS` header: the type byte, and the
@@ -906,6 +1106,14 @@ fn channel_records(log: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Every record the reader that ships the recordings left.
+fn shipping_records(log: &str) -> Vec<&str> {
+    management(log)
+        .into_iter()
+        .filter(|record| record.contains("channel-log-shipped="))
+        .collect()
+}
+
 /// Every record the attempt left, likewise.
 fn dial_records(log: &str) -> Vec<&str> {
     management(log)
@@ -920,8 +1128,9 @@ fn dial_records(log: &str) -> Vec<&str> {
 /// idea of it.
 const HEADER_LEN: usize = 8;
 
-/// The type byte of a frame carrying log-ring bytes.
+/// The type bytes of a frame carrying log-ring and capture-ring bytes.
 const UP_RECORDS_TYPE: u8 = 0x02;
+const UP_CAPTURE_TYPE: u8 = 0x03;
 
 /// The ring position an upstream frame carries in front of its ring bytes.
 const RING_POSITION_LEN: usize = 8;
@@ -1026,6 +1235,17 @@ mod tests {
         assert!(!ChannelContract::RejectsTheAppliance.satisfied(misfiled.as_bytes()));
     }
 
+    /// A line saying where the channel has got to, as the appliance writes one.
+    fn shipping(log_position: u64, log_pending: u64, capture: u64, capture_pending: u64) -> String {
+        record(
+            Domain::Management,
+            &format!(
+                " channel-log-shipped={log_position} channel-log-pending={log_pending} \
+                 channel-capture-shipped={capture} channel-capture-pending={capture_pending}"
+            ),
+        )
+    }
+
     #[test]
     fn an_established_channel_waits_for_the_frame_past_its_own_greeting() {
         let contract = ChannelContract::Established;
@@ -1049,7 +1269,84 @@ mod tests {
             Domain::Crypto,
             " channel-agreed=true channel-version=1 channel-frames-sent=2 channel-frames-received=1",
         ));
+        // And still not: a frame past the greeting is one shipment, and this
+        // boot is about an appliance that goes on shipping.
+        assert!(!contract.satisfied(capture.as_bytes()));
+        capture.push_str(&shipping(512, 1_024, 0, 4_096));
+        capture.push_str(&shipping(1_536, 0, 4_096, 0));
+        assert!(
+            !contract.satisfied(capture.as_bytes()),
+            "catching up is not the same as shipping what came afterwards"
+        );
+        assert!(contract.owes_shipping_after_catching_up(capture.as_bytes()));
+        capture.push_str(&shipping(1_536, 0, 8_192, 512));
         assert!(contract.satisfied(capture.as_bytes()));
+    }
+
+    #[test]
+    fn a_channel_that_only_walks_the_backlog_it_started_with_is_not_shipping() {
+        // Positions advancing is not the property: a reader draining a ring it
+        // was already behind on reports exactly that, and would satisfy a check
+        // that compared two numbers. What is asserted is a position past the one
+        // the appliance itself said it had drained to.
+        let contract = ChannelContract::Established;
+        let mut capture = record(
+            Domain::Management,
+            " dial-attempts=1 dial-outcome=established",
+        );
+        capture.push_str(&record(
+            Domain::Crypto,
+            &format!(" {}", established_session()),
+        ));
+        capture.push_str(&record(
+            Domain::Crypto,
+            " channel-agreed=true channel-version=1 channel-frames-sent=2 channel-frames-received=1",
+        ));
+        for step in 1..=4 {
+            capture.push_str(&shipping(512 * step, 4_096, 0, 0));
+        }
+        assert!(!contract.satisfied(capture.as_bytes()));
+        assert!(!contract.owes_shipping_after_catching_up(capture.as_bytes()));
+        assert!(
+            contract
+                .outstanding(capture.as_bytes())
+                .contains("caught up"),
+            "the verdict must name what the boot was still owed"
+        );
+    }
+
+    #[test]
+    fn the_servers_own_frames_must_be_more_than_one_and_advance() {
+        // The appliance's console and the server's transcript are two halves of
+        // one claim, and this is the half no reading of the console could make.
+        let framed = |kind: u8, position: u64, bytes: usize| {
+            let mut frame = Vec::new();
+            let len = (RING_POSITION_LEN + bytes) as u32;
+            frame.extend_from_slice(&len.to_be_bytes());
+            frame.push(kind);
+            frame.extend_from_slice(&[0, 0, 0]);
+            frame.extend_from_slice(&position.to_be_bytes());
+            frame.extend(core::iter::repeat_n(0xA5, bytes));
+            frame
+        };
+        let one = framed(UP_RECORDS_TYPE, 0, 512);
+        assert!(expect_shipments_at_advancing_positions(&one).is_err());
+
+        let mut stalled = one.clone();
+        stalled.extend(framed(UP_RECORDS_TYPE, 0, 512));
+        assert!(
+            expect_shipments_at_advancing_positions(&stalled).is_err(),
+            "one shipment sent twice is not two shipments"
+        );
+
+        let mut shipping = one;
+        shipping.extend(framed(UP_CAPTURE_TYPE, 0, 4_058));
+        shipping.extend(framed(UP_RECORDS_TYPE, 512, 512));
+        assert_eq!(
+            expect_shipments_at_advancing_positions(&shipping),
+            Ok(3),
+            "each ring's own positions advance"
+        );
     }
 
     #[test]

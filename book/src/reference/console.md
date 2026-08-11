@@ -30,7 +30,7 @@ wire* for the two ways a line can nevertheless fail to be one record.
 ## `LFW-PD` — protection-domain lifecycle
 
 ```
-LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ recording-start=<n> recording=resumed recording-generation=<n> recording-sequence=<n> recording-opened=<n>][ recording-start=<n> recording=fresh recording-rebound=<true|false>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ ownership=<owned|unowned>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ delegated-anchor-delivered=<true|false> delegated-anchor=<n>][ published-endpoint=<address> published-port=<n> published=<true|false>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-retry-in=<n> dial-retry-bound=<n>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
+LFW-PD time=<rfc3339|unsynchronized> domain=<domain> state=<state>[ features=0x<hex>][ rx-posted=<n>][ tsc-hz=<n> utc=<rfc3339>][ frames=<n> bytes=<n>][ sectors=<n> leading=0x<hex>][ start=<n> sectors=<n>][ recording-start=<n> recording=resumed recording-generation=<n> recording-sequence=<n> recording-opened=<n>][ recording-start=<n> recording=fresh recording-rebound=<true|false>][ aes=proven pclmul=proven preemptions=<n> iterations=<n>][ primitive=<primitive> vectors=<n>][ primitive=<primitive> milli-cycles-per-byte=<n>][ ownership=<owned|unowned>][ device=<32 hex> generation=<n> onboarded=<true|false>][ fingerprint=<64 hex>][ anchor-fingerprint=<64 hex>][ adopted-endpoint=<address> adopted-port=<n> adopted-generation=<n>][ cleared-generation=<n> cleared-documents=<n> was-owned=<true|false>][ delegated-device=<32 hex> delegated-signatures=<n> delegated-certificate=<n>][ delegated-anchor-delivered=<true|false> delegated-anchor=<n>][ published-endpoint=<address> published-port=<n> published=<true|false>][ dial-destination=<address> dial-port=<n> dial-attempts=<n> dial-outcome=<outcome>][ dial-next-hop=<address> dial-next-hop-via=<prefix|gateway|none> dial-requests=<n> dial-learned=<n>][ dial-reply-unsolicited=<n> dial-reply-rebinding=<n> dial-reply-not-unicast=<n> dial-reply-contradicted=<n>][ dial-syns=<n> dial-resets-received=<n> dial-resets-sent=<n> dial-answered=<true|false>][ dial-retry-in=<n> dial-retry-bound=<n>][ dial-acknowledged=<n> dial-expected=<n>][ onboard-relayed=<n> onboard-received=<n> onboard-sent=<n> onboard-ended=<peer|consumer|forgotten|refused>][ onboard-accepted=<n> onboard-forgotten=<n> onboard-overflowed=<n> onboard-refused=<n>][ onboard-tls=<outcome>[ onboard-tls-version=0x<hex> onboard-tls-suite=0x<hex> onboard-tls-group=0x<hex>][ onboard-tls-incompatible=<incompatibility>][ onboard-tls-error=<refusal>][ onboard-tls-alert=0x<hex>][ onboard-tls-held=<n>]][ onboard-tls-suites=<0x<hex>[,…]|none> onboard-tls-suites-offered=<n>][ onboard-tls-groups=<0x<hex>[,…]|none> onboard-tls-groups-offered=<n>][ onboard-http=<resource> onboard-http-bytes=<n>][ onboard-http-installed=<n>][ onboard-http-refused=<refusal> onboard-http-status=<n> onboard-http-held=<n>][ onboard-http-strikes=<n> onboard-http-wait=<n>][ channel-tls=<outcome>[ channel-tls-version=0x<hex> channel-tls-suite=0x<hex> channel-tls-group=0x<hex>][ channel-tls-incompatible=<incompatibility>][ channel-tls-error=<refusal>][ channel-tls-certificate=<refusal>][ channel-tls-alert=0x<hex>][ channel-tls-held=<n>]][ channel-agreed=<true|false> channel-version=<n> channel-frames-sent=<n> channel-frames-received=<n>][ channel-log-shipped=<n> channel-log-pending=<n> channel-capture-shipped=<n> channel-capture-pending=<n>][[ cause=<token>] signalled=<true|false>[ detail=0x<hex>[,0x<hex>]]]
 ```
 
 At most one optional group appears, decided by the state. `domain=` is one of **`forwarder`**,
@@ -54,7 +54,7 @@ written waits forever:
 | `nic-driver` (once per port, **three** instances — two dataplane ports and the management one) | `starting`, `negotiated`, `ready` — or `starting` then `refused` | `negotiated` carries `features=`, `ready` carries `rx-posted=`, `refused` carries the refusal group |
 | `console` | `starting`, then `ready` — and **never** `refused` | none |
 | `clock` | `starting`, then `ready` **or** `refused` | `ready` carries `tsc-hz=` and `utc=`, `refused` carries the refusal group |
-| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, one `ready` per **attempt** on the channel it dials, and **two** `ready` records per **onboarding session** that ends on its second listening port — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; an attempt's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `established` four further `ready` records follow it carrying the counts that place the failure and the wait before the next attempt — a fifth where the station acknowledged a number that was never sent. An appliance with nowhere to dial emits no such record at all and says so once with `cause=dial-endpoint-unpublished` instead. A session's carries `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`, always followed by a second `ready` carrying the port's own totals as `onboard-accepted=`, `onboard-forgotten=`, `onboard-overflowed=` and `onboard-refused=`, and then by a `ready` carrying the refusal group where this appliance was the one that ended it. A `ready` carrying the refusal group on its own is one of the four narrow refusals this domain reports without declining to start |
+| `management` | `starting`, then `ready`, then a further `ready` on **every drain that took at least one frame**, one `ready` per **attempt** on the channel it dials, and **two** `ready` records per **onboarding session** that ends on its second listening port — and **never** `refused`. It additionally emits `LFW-CFG rejected=` for a committed configuration it will not read | the repeated `ready` carries `frames=` and `bytes=`; the first carries no tail; an attempt's carries `dial-destination=`, `dial-port=`, `dial-attempts=` and `dial-outcome=`, and where that outcome is not `established` four further `ready` records follow it carrying the counts that place the failure and the wait before the next attempt — a fifth where the station acknowledged a number that was never sent. An appliance with nowhere to dial emits no such record at all and says so once with `cause=dial-endpoint-unpublished` instead. A session's carries `onboard-relayed=`, `onboard-received=`, `onboard-sent=` and `onboard-ended=`, always followed by a second `ready` carrying the port's own totals as `onboard-accepted=`, `onboard-forgotten=`, `onboard-overflowed=` and `onboard-refused=`, and then by a `ready` carrying the refusal group where this appliance was the one that ended it. It also emits a `ready` carrying `channel-log-shipped=` — where the reader that ships the recordings up the channel it dials stands in each of them, at most once a second and only while a position is moving. A `ready` carrying the refusal group on its own is one of the narrow refusals this domain reports without declining to start |
 | `recorder` | `starting`, `negotiated`, then **five** `ready` records — or `starting` then `refused`. A recording whose extent held **another ring** adds a sixth carrying the refusal group, and a second such recording a seventh | `negotiated` carries `features=`; the first `ready` carries `sectors=` and `leading=`. The four after it are two per recording: `start=` with `sectors=`, which is the only place an operator learns where a recording is, and then `recording-start=` with either `recording=resumed` or `recording=fresh`, which is the only place they learn whether this boot continued what was already on the medium or wrote over it. A `ready` carrying the refusal group is an extent this boot recorded **over** and **not** a domain that failed to start |
 | `hardware-probe` | `starting`, then `ready` **or** `refused` | `ready` carries `aes=proven pclmul=proven preemptions=` and `iterations=` — the first domain compiled with the SIMD target reporting that AES-NI and PCLMULQDQ answered their known answers on every pass and that a live XMM value survived that many preemptions; `refused` carries the refusal group |
 | `store` | `starting`, `negotiated`, then **three** `ready` records — or `starting` then `refused`. A boot that honoured a **factory-reset request** emits a second `negotiated` between them. Afterwards, **two more `ready` records per onboarding package it installs**, and one carrying the refusal group per package it will not | the first `negotiated` carries `features=`; a second, where there is one, carries `cleared-generation=`, `cleared-documents=` and `was-owned=`, which is what a reset destroyed. Then the first `ready` carries `device=`, `generation=` and `onboarded=`, the second carries `fingerprint=` and the third carries `published-endpoint=`, `published-port=` and `published=` — where this domain has told the domain that opens the management channel to dial, which is nowhere on an appliance nobody has taken. The first two are the only place an operator learns which appliance this is and which key it authenticates with, there being no shell and no CLI. An installed package adds a `ready` carrying `anchor-fingerprint=` and then one carrying `adopted-endpoint=`, `adopted-port=` and `adopted-generation=` — the authority the appliance has just accepted and where it will now answer. A refused one adds a single `ready` carrying the refusal group, which is a package this domain would not take and **not** a domain that failed to start. `refused` carries the refusal group |
@@ -731,6 +731,28 @@ node: an operator holding a silent appliance still has only the external act.
   **No frame's payload has a representation here.** What was in them is a customer's recording, a
   configuration document, or a management server's instruction, and none of it reaches a console
   line.
+- `channel-log-shipped=<n> channel-log-pending=<n> channel-capture-shipped=<n>
+  channel-capture-pending=<n>` — **where the channel's own reader stands in each recording, and how
+  much of each it still owes the server.** The two `-shipped=` numbers are byte positions in each
+  ring's own append space — the same coordinate the ring superblocks keep and the same one the
+  management server's resume cursors are in — and the two `-pending=` numbers are the durable bytes
+  behind them.
+
+  It is written while a channel is up and a position is moving, at most once a second, so a healthy
+  appliance leaves one line a second and two consecutive lines name two different places. That
+  movement is the whole point of the record: the framing record above says how many frames a session
+  carried, but it is written at most twice per session, so an appliance that greeted its server and
+  then stopped shipping reads exactly like one that is still shipping. **This is the record that
+  tells them apart.** Two consecutive lines at the same position, with a `-pending=` above zero, is
+  an appliance that has records to send and is not sending them — and that state also raises its own
+  refusal token, below.
+
+  A `-pending=` of zero is a recording that has caught up, which is the healthy reading; a small one
+  that keeps changing is the ordinary lag of a batching channel. One that grows without bound is a
+  channel slower than the traffic, and the recordings will eventually be overwritten ahead of it.
+
+  **No byte of a recording has a representation here.** Four positions are system state; what stands
+  at them is a customer's traffic and reaches no console line.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -759,7 +781,7 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 23 the `management` domain raises, 46
+`nic-driver` domain raises, 30 the `clock` domain raises, 25 the `management` domain raises, 46
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 160 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
@@ -892,16 +914,30 @@ anything.
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
 | an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown` |
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
-| a recording the traffic outran while the channel was shipping it (a `ready` record, no `detail=`) | `upstream-log-ring-overrun`, `upstream-capture-ring-overrun` |
+| a recording that outran the channel's cursor, which carried on from where the recording now begins (`detail=` is the position that was lost and the position it resumed at) | `upstream-log-ring-resynchronised`, `upstream-capture-ring-resynchronised` |
+| a recording with durable bytes behind a cursor that is not moving, on a session that could carry them (`detail=` is the position and the bytes behind it) | `upstream-log-ring-stalled`, `upstream-capture-ring-stalled` |
 
-**The two `upstream-*` tokens say this node has stopped shipping a recording**, and nothing in this
-build starts it again — a cursor the ring wrapped past has no place to continue from, and carrying
-on from anywhere else would put one part of the recording on the wire under another part's position.
-Each is said once per boot. They are two tokens rather than one carrying which ring because the two
-are different losses: the log ring is this appliance's connection and policy history, and the capture
-ring is the traffic itself. Either means the appliance recorded faster than its channel shipped, so
-the thing to look at is the link to the management plane and the rate the recordings are being
-written at — not the recordings, which are intact on the medium and still downloadable.
+**The `-resynchronised` tokens say history has gone past this appliance.** The recording had
+overwritten the position the channel's cursor stood at, so the reader carried on from the oldest byte
+still on the medium and the two positions in `detail=` say how much went with it. The channel keeps
+shipping; what the management server will hold has a gap. There are two causes and both are worth
+distinguishing from a fault: the appliance recorded faster than its channel shipped, or this is a
+boot that resumed a medium a previous boot wrote — the segment the previous boot left open is not
+this one's to hand over, so the first cursor of every reboot is refused exactly once and moved
+forward. A resynchronisation that keeps recurring is the first cause and the thing to look at is the
+link to the management plane and the rate the recordings are being written at.
+
+**The `-stalled` tokens are the opposite fact and the more serious one**: bytes the medium has taken
+are standing behind a cursor that has not moved for ten seconds, with a session up that could carry
+them. The appliance is recording and not shipping, and the recordings will be overwritten ahead of
+the server. Said once per stall and again only after the cursor has moved, so a console does not fill
+with it. `detail=` carries the position and the backlog, and the shipping record above is where to
+watch whether the backlog is growing.
+
+Each pair is two tokens rather than one carrying which ring because the two recordings are different
+losses: the log ring is this appliance's connection and policy history, and the capture ring is the
+traffic itself. In every case the recordings themselves are intact on the medium and still
+downloadable.
 
 **`recorder`.** Its first token is the domain's own, raised before the device is touched at all. The
 four groups after it are `lfw_blk`'s bring-up tree, which is `nic-driver`'s with the differences a

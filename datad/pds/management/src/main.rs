@@ -191,7 +191,7 @@ use pd_runtime::{
     ConfigRequest, Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage,
     ForwardRings, Half, Hop, Ipv4Address, IsnSecret, OnboardCounters, OpenError, PdClock, Pool,
     RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
-    StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
+    Shipped, StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -766,17 +766,60 @@ const fn chosen_via(via: Via) -> NextHopVia {
 ///
 /// A token per recording rather than one carrying which: the log ring is this
 /// appliance's connection history and the capture ring is the traffic itself, so
-/// losing one is not losing the other and an operator acts on the two
-/// differently. Neither is a peer's doing — it is this node producing recorded
-/// bytes faster than its channel shipped them.
-const fn refusal_for_lost_ring(recording: DownloadSink) -> Refusal {
+/// what goes missing from one is not what goes missing from the other, and an
+/// operator acts on the two differently.
+///
+/// A **resynchronisation** is history this appliance can no longer ship: the ring
+/// wrapped past the cursor, and the reader carried on from the oldest byte still
+/// on the medium rather than stopping. The two positions say how much went with
+/// it. Not a peer's doing — it is this node producing recorded bytes faster than
+/// its channel shipped them, or a boot resuming a medium a previous one wrote.
+///
+/// A **stall** is the opposite fact and the more serious one: durable bytes are
+/// standing behind a cursor that is not moving, with a session up that could
+/// carry them. The position and the backlog are what an operator needs to see
+/// whether it is growing.
+const fn refusal_for(
+    recording: DownloadSink,
+    causes: (&'static str, &'static str),
+    detail: RefusalDetail,
+) -> Refusal {
     Refusal {
         cause: match recording {
-            DownloadSink::Log => "upstream-log-ring-overrun",
-            DownloadSink::Capture => "upstream-capture-ring-overrun",
+            DownloadSink::Log => causes.0,
+            DownloadSink::Capture => causes.1,
         },
-        detail: RefusalDetail::None,
+        detail,
         signalled: false,
+    }
+}
+
+/// What the channel's reader has to say, as a console record.
+fn shipping_record(shipped: Shipped) -> DomainDetail {
+    match shipped {
+        Shipped::Shipping { log, capture } => DomainDetail::ChannelShipping {
+            log_position: log.position,
+            log_pending: log.pending,
+            capture_position: capture.position,
+            capture_pending: capture.pending,
+        },
+        Shipped::Resynchronised {
+            recording,
+            lost_from,
+            resumed_at,
+        } => DomainDetail::Refusal(refusal_for(
+            recording,
+            (
+                "upstream-log-ring-resynchronised",
+                "upstream-capture-ring-resynchronised",
+            ),
+            RefusalDetail::Two(lost_from, resumed_at),
+        )),
+        Shipped::Stalled { recording, place } => DomainDetail::Refusal(refusal_for(
+            recording,
+            ("upstream-log-ring-stalled", "upstream-capture-ring-stalled"),
+            RefusalDetail::Two(place.position, place.pending),
+        )),
     }
 }
 
@@ -1095,17 +1138,12 @@ impl Handler for Management {
             if let Some(report) = pass.report {
                 announce_session(&running.sink, &report, running.stage.onboard_counters());
             }
-            // A ring the traffic outran while the channel's cursor stood in it.
-            // Said once per recording and never again: nothing in this build
-            // resynchronises a lost cursor, so what an operator is being told is
-            // that this appliance has stopped shipping that recording for the
-            // rest of this boot.
-            while let Some(lost) = running.downloads.take_lost() {
-                announce(
-                    &running.sink,
-                    DomainState::Ready,
-                    DomainDetail::Refusal(refusal_for_lost_ring(lost)),
-                );
+            // Where the channel's reader stands, what it had to skip, and
+            // whether it has stopped. Drained whole on every pass, so nothing
+            // accumulates in the reader's queue and every line reaches the
+            // console on the pass that raised it.
+            while let Some(shipped) = running.downloads.take_shipped() {
+                announce(&running.sink, DomainState::Ready, shipping_record(shipped));
             }
             // Both halves, because the relay just pushed onto one of them and a
             // pass that drove only the other would leave the answer waiting for

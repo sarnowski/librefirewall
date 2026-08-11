@@ -584,6 +584,17 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             " channel-agreed={agreed} channel-version={version} channel-frames-sent={sent} \
              channel-frames-received={received}"
         ),
+        DomainDetail::ChannelShipping {
+            log_position,
+            log_pending,
+            capture_position,
+            capture_pending,
+        } => write!(
+            cursor,
+            " channel-log-shipped={log_position} channel-log-pending={log_pending} \
+             channel-capture-shipped={capture_position} \
+             channel-capture-pending={capture_pending}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -1809,6 +1820,12 @@ mod tests {
                 sent: u64::MAX,
                 received: u64::MAX,
             },
+            DomainDetail::ChannelShipping {
+                log_position: u64::MAX,
+                log_pending: u64::MAX,
+                capture_position: u64::MAX,
+                capture_pending: u64::MAX,
+            },
             DomainDetail::Onboarded {
                 relayed: u64::MAX,
                 received: u64::MAX,
@@ -2067,6 +2084,16 @@ mod tests {
                     received,
                 }
             }),
+            any::<(u64, u64, u64, u64)>().prop_map(
+                |(log_position, log_pending, capture_position, capture_pending)| {
+                    DomainDetail::ChannelShipping {
+                        log_position,
+                        log_pending,
+                        capture_position,
+                        capture_pending,
+                    }
+                },
+            ),
             (any::<(u64, u64, u64)>(), (0..OnboardEnd::ALL.len())).prop_map(
                 |((relayed, received, sent), ended)| DomainDetail::Onboarded {
                     relayed,

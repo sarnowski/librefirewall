@@ -375,6 +375,15 @@ pub struct DownloadReply {
     /// Alignment only, on [`DownloadRequest::_pad`]'s terms.
     _pad: AtomicU32,
     total_len: AtomicU64,
+    /// The oldest position of the named recording the recorder can still serve,
+    /// in the ring's own append space.
+    ///
+    /// Published on **every** reply and not only on the refusal that needs it,
+    /// because the pair with [`Self::total_len`] is what a reply says about the
+    /// recording rather than about the request: between them they are the window
+    /// a cursor must lie in, and a field that appeared only sometimes would be
+    /// one both sides had to remember when it means anything.
+    first: AtomicU64,
     /// One atomic per byte rather than packed into words, for
     /// the tap ring's reason: these are bytes off a medium, so packing them
     /// would make the byte order of the region a thing this crate chooses
@@ -393,6 +402,7 @@ impl DownloadReply {
             len: AtomicU32::new(0),
             _pad: AtomicU32::new(0),
             total_len: AtomicU64::new(0),
+            first: AtomicU64::new(0),
             bytes: [const { AtomicU8::new(0) }; DOWNLOAD_WINDOW_LEN],
         }
     }
@@ -452,6 +462,10 @@ mod peer {
 
         pub(super) fn total_len(&self) -> u64 {
             self.0.total_len.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn first(&self) -> u64 {
+            self.0.first.load(Ordering::Relaxed)
         }
 
         /// Bounded by `into`, which the caller obtained from the window's own
@@ -561,6 +575,12 @@ pub enum DownloadPoll<'buf> {
         bytes: &'buf [u8],
         /// The snapshot's length, so a caller knows when it has read it all.
         total_len: u64,
+        /// The oldest position of the named recording still on the medium, in the
+        /// ring's own append space. Nothing here bounds it against `total_len`:
+        /// the two are the same coordinate only for [`DownloadReader::Ring`], and
+        /// the reader that uses it acts on it only where it moves a cursor
+        /// **forward**, which is a rule that holds whatever the recorder says.
+        first: u64,
     },
     /// The recorder answered and served nothing, saying why.
     Refused {
@@ -569,6 +589,10 @@ pub enum DownloadPoll<'buf> {
         /// [`DownloadRefusal::OutOfRange`] actionable rather than merely a
         /// refusal.
         total_len: u64,
+        /// The oldest position still on the medium, which is what makes
+        /// [`DownloadRefusal::Overrun`] actionable: a reader the ring outran
+        /// carries on from here rather than stopping.
+        first: u64,
     },
     /// The reply carried this request's sequence and could not be believed.
     Faulted(DownloadFault),
@@ -664,6 +688,7 @@ impl DownloadRequester<'_> {
 
         let len = self.reply.len();
         let total_len = self.reply.total_len();
+        let first = self.reply.first();
         let raw_status = self.reply.status();
 
         let Some(status) = DownloadStatus::from_bits(raw_status) else {
@@ -685,13 +710,18 @@ impl DownloadRequester<'_> {
             if len != 0 {
                 return self.fault(DownloadFault::BytesOnRefusal { status, len });
             }
-            return DownloadPoll::Refused { reason, total_len };
+            return DownloadPoll::Refused {
+                reason,
+                total_len,
+                first,
+            };
         }
 
         self.reply.copy_into(target);
         DownloadPoll::Delivered {
             bytes: target,
             total_len,
+            first,
         }
     }
 
@@ -822,18 +852,30 @@ impl DownloadResponder<'_> {
     /// `bytes` is truncated to what the demand asked for, which
     /// [`DownloadDemand::len`] has already bounded by the window — so a
     /// recorder handing over more than was asked publishes only what was.
-    pub fn deliver(&mut self, demand: DownloadDemand, bytes: &[u8], total_len: u64) -> usize {
+    pub fn deliver(
+        &mut self,
+        demand: DownloadDemand,
+        bytes: &[u8],
+        total_len: u64,
+        first: u64,
+    ) -> usize {
         let published = self.publish_bytes(demand.len(), bytes);
-        self.publish(demand, DownloadStatus::Ok, published, total_len);
+        self.publish(demand, DownloadStatus::Ok, published, total_len, first);
         published as usize
     }
 
     /// Answer `demand` with nothing, saying why. Publishes a zero length, which
     /// is what makes [`DownloadFault::BytesOnRefusal`] a fault the requester can
     /// raise against a peer that does otherwise.
-    pub fn refuse(&mut self, demand: DownloadDemand, reason: DownloadRefusal, total_len: u64) {
+    pub fn refuse(
+        &mut self,
+        demand: DownloadDemand,
+        reason: DownloadRefusal,
+        total_len: u64,
+        first: u64,
+    ) {
         self.publish_bytes(demand.len(), &[]);
-        self.publish(demand, reason.to_status(), 0, total_len);
+        self.publish(demand, reason.to_status(), 0, total_len, first);
     }
 
     /// Requests this responder has answered, by the number of the last one.
@@ -861,12 +903,14 @@ impl DownloadResponder<'_> {
         status: DownloadStatus,
         len: u32,
         total_len: u64,
+        first: u64,
     ) {
         self.reply.status.store(status.to_bits(), Ordering::Relaxed);
         self.reply.len.store(len, Ordering::Relaxed);
         self.reply.total_len.store(total_len, Ordering::Relaxed);
+        self.reply.first.store(first, Ordering::Relaxed);
         self.served = demand.sequence;
-        // Release, and last: the window and the three words above it must be
+        // Release, and last: the window and the four words above it must be
         // visible to management before the sequence that claims them as this
         // request's answer is. Reversing the two is what would let a requester
         // copy out a half-written window and believe it.
@@ -916,10 +960,12 @@ const _: () = {
     assert!(offset_of!(DownloadReply, len) == 8);
     assert!(offset_of!(DownloadReply, _pad) == 12);
     assert!(offset_of!(DownloadReply, total_len) == 16);
-    assert!(offset_of!(DownloadReply, bytes) == 24);
+    assert!(offset_of!(DownloadReply, first) == 24);
+    assert!(offset_of!(DownloadReply, bytes) == 32);
     assert!(align_of::<DownloadReply>() == 8);
     assert!(offset_of!(DownloadReply, total_len).is_multiple_of(align_of::<u64>()));
-    assert!(size_of::<DownloadReply>() == 24 + DOWNLOAD_WINDOW_LEN);
+    assert!(offset_of!(DownloadReply, first).is_multiple_of(align_of::<u64>()));
+    assert!(size_of::<DownloadReply>() == 32 + DOWNLOAD_WINDOW_LEN);
 
     // Each region must hold its type and be mappable.
     assert!(DOWNLOAD_REQUEST_REGION_SIZE >= size_of::<DownloadRequest>());

@@ -304,12 +304,12 @@ pub enum LogDetailKind {
     /// How long the dialling domain will wait before its next attempt, and the
     /// bound that wait was drawn below. Appended, never inserted.
     DialRetry,
-    /// The eight the **management channel this appliance dialled** produces:
-    /// six for how one handshake on it ended, and two for the framing above
-    /// that handshake. Appended, never inserted, and eight discriminants rather
-    /// than one for [`Self::OnboardingHandshake`]'s reason exactly — a completed
-    /// handshake carries three code points, and the four ways it does not each
-    /// carry a token out of a different vocabulary.
+    /// The nine the **management channel this appliance dialled** produces: six
+    /// for how one handshake on it ended, two for the framing above it, and one
+    /// for where its reader stands in the two recordings. Appended, never
+    /// inserted, and nine discriminants for [`Self::OnboardingHandshake`]'s
+    /// reason exactly — a completed handshake carries three code points, and the
+    /// four ways it does not each carry a token out of a different vocabulary.
     ChannelHandshake,
     ChannelEnded,
     ChannelIncompatible,
@@ -323,6 +323,10 @@ pub enum LogDetailKind {
     /// never inserted, and two discriminants for [`Self::DialRoute`]'s reason.
     RecordingResumed,
     RecordingFresh,
+    /// Where the **management channel's own reader** stands in each recording,
+    /// and how much of each it still owes the server. Appended, never inserted,
+    /// and one discriminant and not two: the question is about the channel.
+    ChannelShipping,
 }
 
 impl LogDetailKind {
@@ -384,6 +388,7 @@ impl LogDetailKind {
             Self::ChannelFrames => 52,
             Self::RecordingResumed => 53,
             Self::RecordingFresh => 54,
+            Self::ChannelShipping => 55,
         }
     }
 
@@ -445,6 +450,7 @@ impl LogDetailKind {
             52 => Some(Self::ChannelFrames),
             53 => Some(Self::RecordingResumed),
             54 => Some(Self::RecordingFresh),
+            55 => Some(Self::ChannelShipping),
             _ => None,
         }
     }
@@ -1008,7 +1014,7 @@ impl LogRecord {
                 delay_millis: self.operands[0],
                 bound_millis: self.operands[1],
             },
-            // The management channel's eight, ranged exactly as the onboarding
+            // The management channel's nine, ranged exactly as the onboarding
             // port's seven are: the leading word is the outcome's own
             // vocabulary, a code point beside it is sixteen bits wherever a TLS
             // registry numbers one, and a second token is held to its own set.
@@ -1059,6 +1065,13 @@ impl LogRecord {
                 generation: self.operands[1],
                 sequence: self.operands[2],
                 opened: self.operands[3],
+            },
+            // Four positions, none ranged, on `RecordingResumed`'s terms.
+            Some(LogDetailKind::ChannelShipping) => CheckedDetail::ChannelShipping {
+                log_position: self.operands[0],
+                log_pending: self.operands[1],
+                capture_position: self.operands[2],
+                capture_pending: self.operands[3],
             },
             // A sector and a flag, the flag in the fourth word where this ABI puts
             // every one, so a word that is neither 0 nor 1 makes it unreadable.
@@ -1883,6 +1896,13 @@ pub enum CheckedDetail {
     RecordingFresh {
         start_sector: u64,
         rebound: bool,
+    },
+    /// Where the channel's reader stands in each recording, and what is behind it.
+    ChannelShipping {
+        log_position: u64,
+        log_pending: u64,
+        capture_position: u64,
+        capture_pending: u64,
     },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.

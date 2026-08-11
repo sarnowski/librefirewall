@@ -694,6 +694,20 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::ChannelFrames.to_bits();
                     record.operands = [u64::from(*agreed), u64::from(*version), *sent, *received];
                 }
+                DomainDetail::ChannelShipping {
+                    log_position,
+                    log_pending,
+                    capture_position,
+                    capture_pending,
+                } => {
+                    record.detail = LogDetailKind::ChannelShipping.to_bits();
+                    record.operands = [
+                        *log_position,
+                        *log_pending,
+                        *capture_position,
+                        *capture_pending,
+                    ];
+                }
                 DomainDetail::Onboarded {
                     relayed,
                     received,
@@ -1188,6 +1202,19 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             sent: *sent,
             received: *received,
         },
+        // Four positions, none ranged: `wire` accepted every bit pattern of each
+        // because each is a byte position or a count the reading domain held.
+        CheckedDetail::ChannelShipping {
+            log_position,
+            log_pending,
+            capture_position,
+            capture_pending,
+        } => DomainDetail::ChannelShipping {
+            log_position: *log_position,
+            log_pending: *log_pending,
+            capture_position: *capture_position,
+            capture_pending: *capture_pending,
+        },
         // The token was ranged to the vocabulary by `wire`; the three counts are
         // tallies the emitting domain kept about its own session, so every bit
         // pattern of each is one it could have written.
@@ -1595,6 +1622,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         version,
                         sent,
                         received,
+                    },
+                    DomainDetail::ChannelShipping {
+                        log_position,
+                        log_pending,
+                        capture_position,
+                        capture_pending,
+                    } => DomainDetail::ChannelShipping {
+                        log_position,
+                        log_pending,
+                        capture_position,
+                        capture_pending,
                     },
                     DomainDetail::Onboarded {
                         relayed,

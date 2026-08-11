@@ -1391,3 +1391,60 @@ fn a_resumed_ring_refuses_the_positions_the_previous_boot_left() {
     assert!(!body.is_empty());
     assert_eq!(parse(&body).sections, 1, "the segment this boot opened");
 }
+
+#[test]
+fn the_first_position_is_where_a_refused_reader_must_carry_on_from() {
+    // Everything a cursor the recording has outrun needs, and the only thing
+    // this side can tell it: *not* that its position is gone — which leaves a
+    // reader with nowhere to go and, on every appliance that has rebooted once,
+    // stops the channel for the rest of the boot — but where the recording now
+    // begins.
+    let mut harness = Harness::new(2048, 6);
+    let bytes = frame(400, 3);
+    for _ in 0..12 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+    let state = harness.checkpoint();
+    // A fresh ring nothing has wrapped begins where every ring begins.
+    assert_eq!(harness.sink.first_position(), 0);
+    assert!(matches!(harness.sink.find(0), Locate::Live(_)));
+
+    let device = harness.device.clone();
+    let mut resumed = Harness::resumed(2048, 6, &state, device);
+    for _ in 0..6 {
+        resumed.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    resumed.seal();
+    let first = resumed.sink.first_position();
+    assert!(first > 0, "a resumed ring does not begin at zero");
+    assert_eq!(resumed.sink.find(0), Locate::Overrun);
+    assert!(
+        matches!(resumed.sink.find(first), Locate::Live(_)),
+        "the position a refused reader is sent to must itself be readable"
+    );
+    assert!(
+        first <= resumed.sink.durable_position(),
+        "a reader sent past the durable end would be told to skip bytes that exist"
+    );
+    // And it is the *first* such position: one byte earlier is still gone.
+    assert_eq!(resumed.sink.find(first - 1), Locate::Overrun);
+}
+
+#[test]
+fn the_first_position_follows_a_wrap_so_a_lagging_reader_is_sent_forward() {
+    let mut harness = Harness::new(2048, 3);
+    let bytes = frame(400, 9);
+    while harness.sink.counters().wraps < 2 {
+        harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.drain();
+    let first = harness.sink.first_position();
+    assert!(
+        first > 0,
+        "a ring that has wrapped no longer begins at zero"
+    );
+    assert_eq!(harness.sink.find(0), Locate::Overrun);
+    assert!(matches!(harness.sink.find(first), Locate::Live(_)));
+    assert_eq!(harness.sink.find(first - 1), Locate::Overrun);
+}

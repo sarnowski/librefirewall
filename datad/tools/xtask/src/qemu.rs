@@ -2206,7 +2206,15 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         channel: ChannelContract::Established,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
-        data: DataMedium::Fresh,
+        // The recorder medium earlier boots wrote, and **not** a fresh one: an
+        // appliance that has been running for a while has rebooted, so its
+        // recordings begin at the segment this boot opened rather than at
+        // position zero — and a channel cursor starts at zero whatever the
+        // medium says. That disagreement is the state a deployed appliance is
+        // actually in and the one a fresh medium never reaches, so a boot on a
+        // fresh one proves the channel ships for exactly the appliance that has
+        // never been restarted.
+        data: DataMedium::CarriedFrom("recording-download"),
     },
     // The delivered anchor refusing the server, which is the channel's most
     // likely failure and the one whose token sends an operator to the package
@@ -2867,8 +2875,13 @@ fn run_scenario(
         let device = store_contract::judge(&booted.serial, &log)
             .map(|reported| reported.device)
             .map_err(|error| format!("scenario {name}: {error}"))?;
-        let channel = channel_contract::judge(scenario.channel, server, &booted.serial, &device)
-            .map_err(|error| format!("scenario {name}: {error}"))?;
+        // Whether a previous boot wrote this boot's recorder medium, which is
+        // where its recordings begin: the harness's own fact about the image it
+        // attached, not one read back off the appliance.
+        let resumed = matches!(scenario.data, DataMedium::CarriedFrom(_));
+        let channel =
+            channel_contract::judge(scenario.channel, server, &booted.serial, &device, resumed)
+                .map_err(|error| format!("scenario {name}: {error}"))?;
         println!("{channel}");
         append_evidence(
             &log,
@@ -3818,8 +3831,13 @@ fn boot(
         // harness attached rather than from the recording, which would be the
         // recording judging itself.
         let conversations = matches!(owner, Ownership::Owned);
+        // Whether a previous boot wrote this medium, which decides where the
+        // extent's written bytes begin. The harness's own fact — which image it
+        // attached — rather than the recorder's, so a fresh extent is still
+        // walked whole.
+        let resumed = matches!(bench.data, DataMedium::CarriedFrom(_));
         let on_disk = data
-            .judge_recordings(conversations)
+            .judge_recordings(conversations, resumed)
             .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
         println!("  data disk {run_label}: {on_disk}");
         append_evidence(

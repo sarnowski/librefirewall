@@ -712,6 +712,16 @@ impl Sink {
             .saturating_add(self.durable.offset as u64)
     }
 
+    /// The oldest position still on the medium, in [`Self::durable_position`]'s
+    /// append space. Not always zero and not always where a wrap left it — a
+    /// **resumed** sink begins at the segment it opened — so a reader is told it.
+    #[must_use]
+    pub fn first_position(&self) -> u64 {
+        let (oldest, _) = self.ring.readable();
+        let segment = self.ring.geometry().segment_bytes() as u64;
+        oldest.max(self.first_claimable).saturating_mul(segment)
+    }
+
     /// Where absolute ring position `position` lives on the device. The
     /// coordinate is `sequence * segment_bytes + offset`, which a restart
     /// preserves — unlike [`Self::locate`]'s recomputed origin.
@@ -726,14 +736,11 @@ impl Sink {
         if segment == 0 {
             return Locate::PastEnd;
         }
-        let sequence = position / segment;
-        let within = (position % segment) as usize;
-        let (oldest, _) = self.ring.readable();
-        // The floor a snapshot is pinned under: a resumed sink left its
-        // predecessor's last segment unsealed.
-        if sequence < oldest.max(self.first_claimable) {
+        if position < self.first_position() {
             return Locate::Overrun;
         }
+        let sequence = position / segment;
+        let within = (position % segment) as usize;
         match self.ring.locate(sequence, within) {
             Located::Live(placement) => Locate::Live(Span {
                 sector: placement

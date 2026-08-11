@@ -228,7 +228,7 @@ fn a_recording_walked_to_the_superblocks_durable_end_passes() {
         &payload,
     );
     let verdict = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect("both extents are recordings");
     assert!(verdict.contains("durable end at payload byte"), "{verdict}");
     assert!(verdict.contains("generation 7"), "{verdict}");
@@ -258,7 +258,7 @@ fn a_recording_the_walk_stops_short_of_the_durable_end_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect_err("the walk stopped before the superblock's end");
     assert!(error.contains("durable end at payload byte"), "{error}");
     assert!(
@@ -287,7 +287,7 @@ fn a_superblock_one_flush_behind_the_written_prefix_is_reported_and_not_refused(
         &payload,
     );
     let verdict = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect("a checkpoint behind the payload is the ordinary state");
     assert!(
         verdict.contains(&format!("durable end at payload byte {behind}")),
@@ -319,7 +319,7 @@ fn bytes_past_the_written_prefix_are_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect_err("bytes past the walkable prefix are not the recording");
     assert!(
         error.contains("holds a non-zero byte at payload offset"),
@@ -341,7 +341,7 @@ fn a_superblock_claiming_nothing_durable_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect_err("a cursor at zero says nothing reached the medium");
     assert!(
         error.contains("no byte of the recording is durable"),
@@ -383,12 +383,12 @@ fn an_empty_history_is_allowed_only_where_no_conversation_was_carried() {
     );
 
     let error = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect_err("a boot that carried traffic owes a history");
     assert!(error.contains("holds no packet block"), "{error}");
 
     let verdict = disk
-        .judge_recordings(false)
+        .judge_recordings(false, false)
         .expect("a boot that carried nothing owes no history");
     assert!(verdict.contains("packet block(s)"), "{verdict}");
 }
@@ -398,7 +398,7 @@ fn an_extent_with_no_superblock_at_all_is_a_finding() {
     let scratch = Scratch::new("no-superblock");
     let disk = DataDisk::create(&scratch.root, "no-superblock").expect("created");
     let error = disk
-        .judge_recordings(true)
+        .judge_recordings(true, false)
         .expect_err("a zeroed extent carries no superblock");
     assert!(error.contains("no decodable superblock"), "{error}");
 }

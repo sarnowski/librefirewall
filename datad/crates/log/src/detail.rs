@@ -842,6 +842,21 @@ pub enum DomainDetail<C = &'static str> {
         /// Frames the server put on it, likewise.
         received: u64,
     },
+    /// Where the **management channel's own reader** stands in each recording,
+    /// and how much of each it still owes the server. Positions are in each
+    /// ring's own append space, the coordinate the server's resume cursors are
+    /// in; a pending of zero is a recording that has caught up.
+    ///
+    /// Its own record rather than a field beside the framing's: the framing is
+    /// written at most twice in a session, so a console carrying only it cannot
+    /// tell a shipping appliance from one that greeted its server and stopped.
+    /// This is the record that moves, and **no byte of a recording reaches it.**
+    ChannelShipping {
+        log_position: u64,
+        log_pending: u64,
+        capture_position: u64,
+        capture_pending: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

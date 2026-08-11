@@ -498,6 +498,12 @@ fn every_domain_detail_shape_survives_the_crossing() {
             sent: 7,
             received: 11,
         },
+        DomainDetail::ChannelShipping {
+            log_position: 65_536,
+            log_pending: 512,
+            capture_position: 1_048_576,
+            capture_pending: 4_096,
+        },
         // And the request surface's three, on the same terms: no two fields of
         // one shape are equal, so a field read out of the wrong operand word
         // fails here.
@@ -770,7 +776,7 @@ fn a_minted_event_becomes_its_bounded_form_field_for_field() {
 /// refusal waiting to happen for the records that make up most of a transcript.
 #[test]
 fn a_shape_with_no_cause_crosses_the_seam_unconditionally() {
-    let events: [Event; 14] = [
+    let events: [Event; 15] = [
         Event::Domain {
             domain: Domain::Console,
             state: DomainState::Ready,
@@ -845,6 +851,16 @@ fn a_shape_with_no_cause_crosses_the_seam_unconditionally() {
                 version: 1,
                 sent: 1,
                 received: 1,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Management,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelShipping {
+                log_position: 1_024,
+                log_pending: 0,
+                capture_position: 9_216,
+                capture_pending: 512,
             },
         },
         Event::Domain {
@@ -1179,6 +1195,16 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
                 received,
             }
         }),
+        any::<(u64, u64, u64, u64)>().prop_map(
+            |(log_position, log_pending, capture_position, capture_pending)| {
+                DomainDetail::ChannelShipping {
+                    log_position,
+                    log_pending,
+                    capture_position,
+                    capture_pending,
+                }
+            },
+        ),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()
             .prop_map(|(points, offered)| DomainDetail::OnboardingSuites { points, offered }),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()

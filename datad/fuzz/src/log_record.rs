@@ -167,7 +167,8 @@ const DETAIL_CHANNEL_BACKLOGGED: u8 = 51;
 const DETAIL_CHANNEL_FRAMES: u8 = 52;
 const DETAIL_RECORDING_RESUMED: u8 = 53;
 const DETAIL_RECORDING_FRESH: u8 = 54;
-const DETAIL_COUNT: u8 = 55;
+const DETAIL_CHANNEL_SHIPPING: u8 = 55;
+const DETAIL_COUNT: u8 = 56;
 
 /// How many ways a handshake on the management channel may end, and how many
 /// ways a delivered anchor may refuse the certificate a server presented.
@@ -646,7 +647,7 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_DELEGATED_ANCHOR
                 | DETAIL_PUBLISHED
                 | DETAIL_DIAL_RETRY
-                // The management channel's eight join them: each reads its
+                // The management channel's nine join them: each reads its
                 // operands from the same place and is refused separately below,
                 // and none of them reads a word outside the array.
                 | DETAIL_CHANNEL_HANDSHAKE
@@ -657,6 +658,9 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_CHANNEL_ALERT
                 | DETAIL_CHANNEL_BACKLOGGED
                 | DETAIL_CHANNEL_FRAMES
+                // And where its reader stands in the two recordings, which is
+                // four positions out of the same array.
+                | DETAIL_CHANNEL_SHIPPING
                 // And the recording superblock's two, on the same terms: each
                 // reads its words out of that array and none of them reaches a
                 // word outside it.
@@ -830,7 +834,11 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // *stored* ring is believable is asked of the geometry this side built,
         // which is a different question from the shape of this record — so a
         // range here would refuse a recording the appliance really resumed.
-        | DETAIL_RECORDING_RESUMED => None,
+        | DETAIL_RECORDING_RESUMED
+        // And where the channel's reader stands in the two recordings: four
+        // byte positions in a ring's own append space, every bit pattern of
+        // each a number the reading domain could really have held.
+        | DETAIL_CHANNEL_SHIPPING => None,
         // The details whose fourth operand word is a flag rather than a number
         // and which range nothing ahead of it: every other word each carries is
         // unranged, so that flag is the whole of what any of them can be refused
@@ -2026,8 +2034,21 @@ mod tests {
                     ..domain_record()
                 }),
             ),
+            (
+                "valid_domain_channel_shipping",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_SHIPPING,
+                    // Where the channel's reader stands in each recording and
+                    // what is still behind it: four unranged positions, no two
+                    // alike so one read out of the wrong word is visible, and
+                    // the widest a `u64` goes in the last so a rule that crept
+                    // a range onto it is refused here.
+                    operands: [65_536, 512, 1_048_576, u64::MAX],
+                    ..domain_record()
+                }),
+            ),
             // The two a boot's reading of the **recording superblock**
-            // produces, committed for the reason the channel's eight are and
+            // produces, committed for the reason the channel's nine are and
             // one sharper: between them these two can be refused for a single
             // word, so a cold run reaches their accepted shape — the one the
             // render path walks — only by drawing the discriminant.

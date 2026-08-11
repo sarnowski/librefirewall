@@ -537,6 +537,7 @@ enum Download {
     Fetching {
         demand: DownloadDemand,
         total_len: u64,
+        first: u64,
         /// Bytes of the first sector that are in front of the answer.
         skip: usize,
         len: usize,
@@ -550,6 +551,7 @@ enum Download {
     Fetched {
         demand: DownloadDemand,
         total_len: u64,
+        first: u64,
         skip: usize,
         len: usize,
     },
@@ -558,6 +560,7 @@ enum Download {
         demand: DownloadDemand,
         reason: Option<DownloadRefusal>,
         total_len: u64,
+        first: u64,
     },
 }
 
@@ -573,12 +576,17 @@ pub enum Served<'window> {
         demand: DownloadDemand,
         bytes: &'window [u8],
         total_len: u64,
+        /// The oldest position of the named recording still on the medium, so a
+        /// reader whose cursor the ring outran is told where to carry on from
+        /// rather than merely that it cannot.
+        first: u64,
     },
     /// Answer with a refusal, and why.
     Refuse {
         demand: DownloadDemand,
         reason: DownloadRefusal,
         total_len: u64,
+        first: u64,
     },
 }
 
@@ -823,6 +831,7 @@ impl Deck {
                 Download::Fetching {
                     demand,
                     total_len,
+                    first,
                     skip,
                     len,
                     submitted: true,
@@ -837,11 +846,13 @@ impl Deck {
                             demand,
                             reason: Some(DownloadRefusal::DeviceError),
                             total_len,
+                            first,
                         }
                     } else {
                         Download::Fetched {
                             demand,
                             total_len,
+                            first,
                             skip,
                             len,
                         }
@@ -1127,6 +1138,7 @@ impl Deck {
                 demand,
                 reason: Some(DownloadRefusal::NoSuchSink),
                 total_len: 0,
+                first: 0,
             };
             return;
         };
@@ -1135,6 +1147,7 @@ impl Deck {
                 demand,
                 reason: Some(DownloadRefusal::NoSuchReader),
                 total_len: 0,
+                first: 0,
             };
             return;
         };
@@ -1164,6 +1177,7 @@ impl Deck {
                     demand,
                     reason: Some(DownloadRefusal::NotReady),
                     total_len: 0,
+                    first: 0,
                 };
             }
         }
@@ -1186,6 +1200,7 @@ impl Deck {
                 demand,
                 reason,
                 total_len,
+                first,
             } => Some(match reason {
                 Some(reason) => {
                     self.counters.downloads_refused =
@@ -1194,6 +1209,7 @@ impl Deck {
                         demand,
                         reason,
                         total_len,
+                        first,
                     }
                 }
                 None => {
@@ -1203,12 +1219,14 @@ impl Deck {
                         demand,
                         bytes: &[],
                         total_len,
+                        first,
                     }
                 }
             }),
             Download::Fetched {
                 demand,
                 total_len,
+                first,
                 skip,
                 len,
             } => {
@@ -1225,6 +1243,7 @@ impl Deck {
                     demand,
                     bytes,
                     total_len,
+                    first,
                 })
             }
             other => {
@@ -1256,6 +1275,7 @@ impl Deck {
                     demand,
                     reason: Some(DownloadRefusal::NotReady),
                     total_len: 0,
+                    first: 0,
                 };
                 return;
             };
@@ -1319,16 +1339,22 @@ impl Deck {
                 demand,
                 reason: Some(DownloadRefusal::NotReady),
                 total_len: 0,
+                first: 0,
             };
             return;
         };
         let total_len = recording.sink.durable_position();
+        // Answered on every outcome, the refusal included, and that is what makes
+        // an overrun something a reader carries on from: the position it asked
+        // for is gone and this is the oldest one that is not.
+        let first = recording.sink.first_position();
         match recording.sink.find(demand.offset()) {
             Locate::PastEnd => {
                 self.download = Download::Answered {
                     demand,
                     reason: None,
                     total_len,
+                    first,
                 };
             }
             // Counted by the reader that lost its place rather than here: this
@@ -1339,6 +1365,7 @@ impl Deck {
                     demand,
                     reason: Some(DownloadRefusal::Overrun),
                     total_len,
+                    first,
                 };
             }
             Locate::Live(span) => {
@@ -1348,12 +1375,14 @@ impl Deck {
                         demand,
                         reason: None,
                         total_len,
+                        first,
                     };
                     return;
                 }
                 self.download = Download::Fetching {
                     demand,
                     total_len,
+                    first,
                     skip: span.skip(),
                     len,
                     sector: span.sector(),
@@ -1375,15 +1404,22 @@ impl Deck {
                 demand,
                 reason: Some(DownloadRefusal::NotReady),
                 total_len,
+                first: 0,
             };
             return;
         };
+        // The recording's own oldest position, which is what the word means
+        // whichever reader asked. A snapshot reader counts its offsets from a
+        // pinned origin instead and does not read it; publishing it anyway is
+        // what keeps one reply shape rather than two.
+        let first = recording.sink.first_position();
         match recording.sink.locate(&snapshot, demand.offset()) {
             Locate::PastEnd => {
                 self.download = Download::Answered {
                     demand,
                     reason: None,
                     total_len,
+                    first,
                 };
             }
             Locate::Overrun => {
@@ -1391,6 +1427,7 @@ impl Deck {
                     demand,
                     reason: Some(DownloadRefusal::Overrun),
                     total_len,
+                    first,
                 };
             }
             Locate::Live(span) => {
@@ -1400,12 +1437,14 @@ impl Deck {
                         demand,
                         reason: None,
                         total_len,
+                        first,
                     };
                     return;
                 }
                 self.download = Download::Fetching {
                     demand,
                     total_len,
+                    first,
                     skip: span.skip(),
                     len,
                     sector: span.sector(),
