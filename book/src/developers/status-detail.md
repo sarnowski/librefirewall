@@ -3452,7 +3452,51 @@ delivered anchor and matches the profile in every field.
   does report it, and against this listener it reports `Negotiated TLS1.3 group: X25519MLKEM768` with
   `TLS_CHACHA20_POLY1305_SHA256`.
 
-**Missing.** Everything the channel carries, and everything that comes after it.
+- **The recordings an appliance ships can be read.** A streaming pcapng decoder takes ring bytes in
+  whatever pieces a transport hands over, holds a block that has not all arrived rather than guessing
+  at it, and answers whole blocks and the remainder — so where a delivery ended is not visible in
+  what comes out. It takes each section's byte order from that section's own header rather than
+  assuming the one architecture the appliance happens to run on, and it reads the five blocks that
+  encoder emits: the section header, an interface description per port, the enhanced packet block
+  every observation is, the interface statistics block the encoder can write and the recorder does
+  not, and the custom block that fills the slack behind a sector and seals a segment. Options are
+  decoded per block type, because the code space is per block and reading the section's hardware
+  where a record's flags belong is exactly the silent misread two implementations of one format
+  produce; a code the appliance does not write is carried as the number it arrived as rather than
+  dropped. Each record's **PEN-tagged custom option** is decoded into its annotation — the verdict
+  and its drop reason, the direction, the flow's slot, occupant, classification and state, the
+  configuration generation, the event, and the rule that decided it — and a layout version this
+  build does not read leaves the record whole with its raw option intact, so an appliance one version
+  ahead still ingests as packets. `epb_dropcount` and `epb_packetid` are read, so what the tap could
+  not publish and what relates two observations of one frame both survive the crossing. There is **no
+  Decryption Secrets Block**, because the encoder writes none.
+- **It is bounded against the peer, and refuses by name.** A block's declared length is judged
+  against a first-party mebibyte bound — the segment size the channel's frame bound is already
+  sized for — *before* any byte is buffered for it, so a peer declaring a gigabyte costs twelve
+  bytes rather than a gigabyte, and what is held is one partial block and never more. The interface
+  table a section may build is bounded too. Every way the bytes can be wrong is one of **twenty-one
+  named refusals**: a length that disagrees with its trailer, one below a block type's own minimum or
+  past the bound or not four-aligned, an unknown block type, a captured length past the room its
+  block has or past the frame it came from, padding that is not zero, five distinct malformations of
+  an option list, a fixed-width field carrying the wrong number of bytes, a resolution in the
+  power-of-two form, a record naming an interface its section never described, and a tick count that
+  is not an instant. Nothing raises, and every refusal has words an operator can read. A refusal ends
+  the stream rather than resynchronising, because a block this reader will not agree with is a block
+  whose successor's offset is no longer known — and at-least-once delivery from a cursor is what
+  makes ending one affordable.
+- **It is tested against bytes the appliance wrote.** Three recordings a QEMU boot left on the medium
+  are committed as fixtures — a log ring and a capture ring from one channel scenario, and a policy
+  revocation carrying all three verdicts the appliance can reach, including the record about no frame
+  at all, which states a zero wire length and which `tcpdump` itself refuses to render. The suite
+  asserts their real contents: the block sequence, each ring's snap length, the named ports, a known
+  frame's length, the instants `tcpdump -r` renders, and the flow, rule and event on known records.
+  Every fixture is then cut at **every offset there is** and must yield the identical blocks, and one
+  is fed a byte at a time. Every refusal is driven by a real recording with one field broken rather
+  than by a blob assembled to fail, and a seeded generator puts noise, every truncation and six
+  hundred single-byte mutations through the decoder, requiring an answer under a named reason with
+  readable words every time. Two shapes have no fixture to be held to — an interface statistics
+  block and a big-endian section, neither of which an appliance produces — and both are built from
+  the encoder's own layout, each saying so where it stands.
 
 - **The two implementations have never met.** Each end is held to a peer the other did not write —
   this listener to an `:ssl` client offering the appliance's own group and suite, the appliance to the
@@ -3468,6 +3512,11 @@ delivered anchor and matches the profile in every field.
   is a different job with its own bounds and its own refusals, and the alternative to counting is
   storing bytes nothing can read back. The ClickHouse telemetry schema and its writer therefore still
   have **no producer** — they are exercised only by the suite.
+- **Nothing folds a decoded record into the telemetry schema.** The decoder produces the values a
+  `flow_events` row is made of and inserts none of them — and the five-tuple columns that row also
+  carries are not among them, those living in the recorded frame's own headers, which is a packet
+  dissection and not a pcapng one. The schema and its writer therefore still have **no producer**:
+  they are exercised only by the suite.
 - **No configuration operations.** Generation 1 is the document the package carried, and there is
   no staging, commit-confirm, rollback, or version beyond it — those are channel operations.
 - **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an
