@@ -2,12 +2,12 @@ defmodule Ctrld.Channel.Ingest.Counting do
   @moduledoc """
   The ingest that counts what arrived and keeps none of it.
 
-  It is the deployed default, and it is a complete implementation of what this
-  server can honestly do with ring bytes today: there is no pcapng decoder on
-  this side of the wire, so the alternative to counting is storing bytes nothing
-  can read back. A tally is the honest answer — how much arrived, for which
-  appliance, on which ring — and it is the measurement that says the channel is
-  carrying traffic before anything can say what the traffic was.
+  It is the measurement that says the channel is carrying traffic without
+  saying anything about what the traffic was: how much arrived, for which
+  appliance, on which ring. A deployment reads the recordings instead, so this
+  is what the suite runs behind the seam — a test that has not asked for an
+  ingest gets one that holds no state, starts no process and writes to no
+  store, which is what keeps the channel's own tests about the channel.
 
   The count goes out as a telemetry event and is held nowhere here: this module
   owns no process and no state, so ingest costs the connection an event

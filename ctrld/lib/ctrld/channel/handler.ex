@@ -191,12 +191,15 @@ defmodule Ctrld.Channel.Handler do
   end
 
   # The positions up to which this server has durably ingested each ring, which
-  # are the appliance's resume points. There is no durable ingest on this side of
-  # the wire yet — the bytes reach `Ctrld.Channel.Ingest` and are counted — so the
-  # honest cursor is the beginning of each ring: an appliance resuming from zero
-  # re-ships history this server did not keep, and delivery being at-least-once
-  # that is a duplicate rather than a loss. A cursor naming a position nothing
-  # here has stored would be the other way round, and that one loses recordings.
+  # are the appliance's resume points. Both are the beginning, and that is a
+  # statement about the appliance rather than about this server's ingest: an
+  # appliance keeps no reader cursor across a reboot and re-ships each ring from
+  # zero whatever it is told, so a cursor naming anywhere else would be a promise
+  # about a resume point neither end acts on. What it costs is bytes and not
+  # rows — `Ctrld.Telemetry.Cursor` is what an ingest holds its real position in,
+  # and a re-shipped run below it produces no row a second time. Naming a
+  # position nothing here has stored would be the other way round, and that one
+  # loses recordings.
   defp log_cursor(%Appliance{}), do: 0
   defp capture_cursor(%Appliance{}), do: 0
 

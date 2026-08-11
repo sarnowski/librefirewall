@@ -68,13 +68,20 @@ defmodule Ctrld.Channel.Ingest do
   @doc """
   The implementation this deployment ingests through.
 
-  Configured rather than named at the call site so the pcapng decode and the
-  telemetry write can be put behind this seam without the channel changing.
+  Configured rather than named at the call site, which is what lets the pcapng
+  decode and the telemetry write sit behind this seam without the channel
+  knowing they are there — and what lets a suite about the channel run against
+  an ingest that holds nothing.
+
+  The default is the one a deployment wants rather than the one that costs
+  least: a configuration that lost this line would otherwise throw a fleet's
+  recordings away and say nothing, and an ingest is not a thing to degrade
+  quietly into.
   """
   @spec configured() :: module()
   def configured do
     Application.get_env(:ctrld, __MODULE__, [])
-    |> Keyword.get(:handler, Ctrld.Channel.Ingest.Counting)
+    |> Keyword.get(:handler, Ctrld.Channel.Ingest.Telemetry)
   end
 
   @doc "Hand `bytes` to the configured implementation."

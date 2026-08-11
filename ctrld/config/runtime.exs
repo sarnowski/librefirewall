@@ -47,6 +47,18 @@ config :ctrld, Ctrld.Channel.Listener,
   # nothing in a gate container answers on the address literal a fleet dials.
   listen: config_env() != :test
 
+config :ctrld, Ctrld.Channel.Ingest,
+  # Where the recording bytes an appliance ships go. A deployment decodes them
+  # and writes what they say into the telemetry store; the suite counts them
+  # instead, so a test that has not asked for an ingest gets none — the
+  # telemetry one keeps state per appliance and ring and writes to a shared
+  # store, and every test in this suite that wants it drives it by name.
+  handler:
+    if(config_env() == :test,
+      do: Ctrld.Channel.Ingest.Counting,
+      else: Ctrld.Channel.Ingest.Telemetry
+    )
+
 config :ctrld, Ctrld.Bootstrap,
   # Off in test: the suite drives the bootstrap directly against the sandbox,
   # and a boot-time write would race every test that counts users.

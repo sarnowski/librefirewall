@@ -18,6 +18,7 @@ defmodule Ctrld.Application do
         {DNSCluster, query: Application.get_env(:ctrld, :dns_cluster_query) || :ignore},
         {Phoenix.PubSub, name: Ctrld.PubSub}
       ] ++
+        Ctrld.Channel.Ingest.Telemetry.children() ++
         bootstrap_child() ++
         channel_listener_child() ++
         [CtrldWeb.Endpoint]
@@ -25,6 +26,12 @@ defmodule Ctrld.Application do
     opts = [strategy: :one_for_one, name: Ctrld.Supervisor]
     Supervisor.start_link(children, opts)
   end
+
+  # The registry and dynamic supervisor an ingest holds its per-ring decoders
+  # under go up before the listener, and unconditionally: which implementation
+  # sits behind the ingest seam is configuration, and a supervisor started only
+  # for one of them would make the seam's own choice a boot-order question.
+  # They are two idle processes where the configured ingest keeps no state.
 
   # The first start's setup sits between the repository and the listener, and
   # is allowed to take the whole boot down with it: a server with no

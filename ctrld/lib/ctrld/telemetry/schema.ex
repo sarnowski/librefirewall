@@ -11,41 +11,46 @@ defmodule Ctrld.Telemetry.Schema do
   Every column here is a field the appliance already produces — the annotation
   a recording carries on each observation, the log record a domain publishes,
   the metric sample a shard holds — so the schema is the real one and not a
-  sketch to be replaced when the channel arrives. What the channel adds is a
-  producer; nothing here changes to accept it.
+  sketch to be replaced when the channel arrives.
 
   Partitioning is by month and the sort key leads with the appliance, because
   every question an operator asks starts by naming one appliance and a window.
+
+  ## An enumeration is declared once
+
+  The four enumerated columns of `flow_events` are built from the tables below
+  rather than written out in the statement, and those same tables are what a
+  producer holds an annotation's code against before it batches a row. That is
+  not tidiness either: ClickHouse refuses a whole `JSONEachRow` batch over one
+  value outside a declared enumeration, so a producer that guessed which codes
+  are declared would lose the rows around the one it guessed wrong about. One
+  declaration read by both makes the guess unrepresentable.
   """
 
-  @flow_events """
-  CREATE TABLE IF NOT EXISTS flow_events (
-    device_id           FixedString(32),
-    observed_at         DateTime64(6, 'UTC'),
-    generation          UInt32,
-    interface_id        UInt8,
-    direction           Enum8('inbound' = 0, 'outbound' = 1),
-    verdict             Enum8('forwarded' = 0, 'dropped' = 1, 'revoked' = 2),
-    drop_reason         UInt8,
-    flow_class          Enum8('none' = 0, 'new' = 1, 'established' = 2, 'related' = 3),
-    event               Enum8('none' = 0, 'flow-opened' = 1, 'flow-advanced' = 2,
-                              'flow-closed' = 3, 'policy-denied' = 4, 'policy-no-match' = 5,
-                              'flow-refused' = 6, 'flow-revoked' = 7),
-    flow_state          UInt8,
-    flow_slot           UInt32,
-    flow_occupant       UInt32,
-    matched_rule        UInt16,
-    protocol            UInt8,
-    source_address      IPv4,
-    destination_address IPv4,
-    source_port         UInt16,
-    destination_port    UInt16,
-    ingested_at         DateTime64(6, 'UTC') DEFAULT now64(6)
-  )
-  ENGINE = MergeTree
-  PARTITION BY toYYYYMM(observed_at)
-  ORDER BY (device_id, observed_at, flow_slot, flow_occupant)
-  """
+  # The appliance's own vocabularies, by the code each member arrives as. A code
+  # is the wire value the annotation carries and the value stored, so the name
+  # beside it is a label for a reader and never something a producer resolves
+  # through.
+  @direction %{0 => "inbound", 1 => "outbound"}
+  @verdict %{0 => "forwarded", 1 => "dropped", 2 => "revoked"}
+  @flow_class %{0 => "none", 1 => "new", 2 => "established", 3 => "related"}
+  @event %{
+    0 => "none",
+    1 => "flow-opened",
+    2 => "flow-advanced",
+    3 => "flow-closed",
+    4 => "policy-denied",
+    5 => "policy-no-match",
+    6 => "flow-refused",
+    7 => "flow-revoked"
+  }
+
+  @flow_event_enums %{
+    direction: @direction,
+    verdict: @verdict,
+    flow_class: @flow_class,
+    event: @event
+  }
 
   @log_events """
   CREATE TABLE IF NOT EXISTS log_events (
@@ -81,6 +86,29 @@ defmodule Ctrld.Telemetry.Schema do
   def tables, do: ~w(flow_events log_events metric_samples)
 
   @doc """
+  The enumerated columns of `flow_events`, each as its codes and their names.
+
+  This is the declaration a producer checks a code against, and the one the
+  statement below is built from.
+  """
+  @spec flow_event_enums() :: %{atom() => %{non_neg_integer() => String.t()}}
+  def flow_event_enums, do: @flow_event_enums
+
+  @doc """
+  Whether `column` declares `code`.
+
+  Answers false for a column that is not enumerated at all, so a caller cannot
+  get a pass out of a misspelt name.
+  """
+  @spec declares?(atom(), term()) :: boolean()
+  def declares?(column, code) do
+    case Map.fetch(@flow_event_enums, column) do
+      {:ok, members} -> Map.has_key?(members, code)
+      :error -> false
+    end
+  end
+
+  @doc """
   The statements that bring the schema up, in order.
 
   They are all `IF NOT EXISTS`, so running them is how the schema is applied
@@ -88,5 +116,45 @@ defmodule Ctrld.Telemetry.Schema do
   lets the gate and a development start both call it unconditionally.
   """
   @spec statements() :: [String.t()]
-  def statements, do: [@flow_events, @log_events, @metric_samples]
+  def statements, do: [flow_events(), @log_events, @metric_samples]
+
+  @spec flow_events() :: String.t()
+  defp flow_events do
+    """
+    CREATE TABLE IF NOT EXISTS flow_events (
+      device_id           FixedString(32),
+      observed_at         DateTime64(6, 'UTC'),
+      generation          UInt32,
+      interface_id        UInt8,
+      direction           #{enum8(@direction)},
+      verdict             #{enum8(@verdict)},
+      drop_reason         UInt8,
+      flow_class          #{enum8(@flow_class)},
+      event               #{enum8(@event)},
+      flow_state          UInt8,
+      flow_slot           UInt32,
+      flow_occupant       UInt32,
+      matched_rule        UInt16,
+      protocol            UInt8,
+      source_address      IPv4,
+      destination_address IPv4,
+      source_port         UInt16,
+      destination_port    UInt16,
+      ingested_at         DateTime64(6, 'UTC') DEFAULT now64(6)
+    )
+    ENGINE = MergeTree
+    PARTITION BY toYYYYMM(observed_at)
+    ORDER BY (device_id, observed_at, flow_slot, flow_occupant)
+    """
+  end
+
+  @spec enum8(%{non_neg_integer() => String.t()}) :: String.t()
+  defp enum8(members) do
+    body =
+      members
+      |> Enum.sort()
+      |> Enum.map_join(", ", fn {code, name} -> "'#{name}' = #{code}" end)
+
+    "Enum8(#{body})"
+  end
 end

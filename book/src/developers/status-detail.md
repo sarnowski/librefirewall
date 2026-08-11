@@ -3408,6 +3408,11 @@ delivered anchor and matches the profile in every field.
 - **ClickHouse holds the telemetry schema** — flow events, log events and metric samples, with the
   fields the appliance's recording annotations, log records and metric samples actually carry — and
   a writer over ClickHouse's HTTP interface. The suite round-trips rows through a real ClickHouse.
+  The four enumerated columns of `flow_events` are declared once and read twice: the statement that
+  creates the table is built from those declarations, and a producer holds an annotation's code
+  against the same ones before it batches a row. That is not tidiness — ClickHouse refuses a whole
+  batch over a single value outside a declared enumeration, so a producer guessing at which codes
+  are declared would lose the rows beside the one it guessed wrong about.
 - **The gate runs against real databases and stays offline.** Both are pinned by digest and run on
   a Podman network with no gateway; the gate container refuses to run if it holds a default route,
   and a database that does not answer fails the run rather than shrinking it. The
@@ -3497,6 +3502,59 @@ delivered anchor and matches the profile in every field.
   readable words every time. Two shapes have no fixture to be held to — an interface statistics
   block and a big-endian section, neither of which an appliance produces — and both are built from
   the encoder's own layout, each saying so where it stands.
+- **A decoded record becomes a row in ClickHouse.** The ingest seam's deployed implementation holds
+  one decoder per appliance and ring in a process of its own, because a decoder is stateful and the
+  seam is not, and the connection's own process hands over and returns rather than paying for a
+  decode. A process lives as long as the session feeding it: it watches the connection that
+  delivered the first shipment, writes out what it holds when that goes away, and ends — so nothing
+  is left behind by an appliance that disconnected, and nothing outlives the validity of the
+  half-arrived block it is holding. Rows go in batched on a size and an age bound, both first-party
+  constants, and an insert the store refuses keeps its rows for the next attempt rather than
+  throwing them away, which is what makes a store that restarted cost nothing; a hold that grows
+  past its own bound drops the oldest and names what it dropped. What lands is one row per record,
+  and what an operator reads it back with is a query naming one appliance and a window:
+
+  ```sql
+  SELECT observed_at, verdict, event, flow_class, drop_reason, matched_rule,
+         protocol, source_address, source_port, destination_address, destination_port
+  FROM flow_events
+  WHERE device_id = '<the appliance>'
+  ORDER BY observed_at
+  ```
+- **It is the connection history that becomes rows.** `flow_events` has no column naming a ring, so
+  a table fed from both would mix one record per lifecycle or policy event with one record per frame
+  the dataplane decided on — orders of magnitude more of them, almost all carrying no event at all —
+  and nothing could tell the two apart afterwards. The sort key says the same thing from the other
+  side: it leads with the instant and the flow slot, which separates the history's records and
+  collides for the capture's. The capture ring is still decoded and its records counted, which is
+  what makes the choice a measurement rather than a silence and what notices a capture ring that has
+  stopped parsing.
+- **The five-tuple is read out of the recorded frame itself.** The annotation says what the
+  appliance decided; it does not say whom about, so the protocol, the two addresses and the two
+  ports are read from the frame's own Ethernet II, IPv4 and TCP/UDP headers. Those bytes are the
+  most hostile this server handles — not the appliance's, but whatever some host on a customer's
+  network put on a wire — so the reader is a fixed number of matches with no loop in it, answers
+  every byte string with a five-tuple or one of **nine named refusals**, and is held to that over
+  noise, every truncation of a real recorded frame, and two thousand single-byte mutations of one.
+  A frame it cannot read still has a row, the annotation being the evidence and intact; the five
+  columns then carry zeroes, and the protocol is what makes that unmistakable — no IPv4 datagram
+  carries protocol 0, so those rows are exactly the ones with nothing to say about whom, and the
+  refusal that produced each is counted where it happened.
+- **A record with no row is counted rather than dropped quietly.** Two shapes have none: an
+  annotation under a layout version this build does not read, which would otherwise become five real
+  columns and eleven zeroes that look like decisions; and a code outside what the schema declares,
+  which ClickHouse would refuse the whole batch over. Both are counted, and the second names which
+  column has grown so the schema can be extended rather than guessed at.
+- **Delivery is at-least-once, and the same recording twice is not the same rows twice.** An
+  appliance re-ships each ring from its beginning on every reconnect and every reboot, so a durable
+  per-ring cursor in Postgres holds the position everything below which is already stored. It gates
+  rows rather than bytes, deliberately: a pcapng stream is readable only from a section header and a
+  record's instant is resolved against an interface table built near one, so bytes below the cursor
+  are still fed to the decoder and simply produce nothing. The split is exact because the cursor is
+  only ever set to the end of a whole block, and a run is cut at it and fed as two. The suite proves
+  it against a real ClickHouse: the same fixture shipped twice from position zero leaves the rows it
+  left the first time, and the same fixture delivered in ninety-seven-byte and seven-byte pieces at
+  their own positions produces exactly the rows one delivery does.
 
 - **The two implementations have never met.** Each end is held to a peer the other did not write —
   this listener to an `:ssl` client offering the appliance's own group and suite, the appliance to the
@@ -3506,17 +3564,17 @@ delivered anchor and matches the profile in every field.
   framing agree on bytes neither of them composed. The group that blocked such a scenario outright is
   no longer what stands in the way; what it needs is a boot that dials this server rather than a
   stand-in.
-- **No pcapng decoder.** Ring bytes arrive and cross a documented seam — a device, a recording, a
-  position and the bytes — whose deployed implementation counts them, emits a telemetry event and
-  keeps nothing: decoding an appliance's pcapng is parsing an untrusted self-describing format, which
-  is a different job with its own bounds and its own refusals, and the alternative to counting is
-  storing bytes nothing can read back. The ClickHouse telemetry schema and its writer therefore still
-  have **no producer** — they are exercised only by the suite.
-- **Nothing folds a decoded record into the telemetry schema.** The decoder produces the values a
-  `flow_events` row is made of and inserts none of them — and the five-tuple columns that row also
-  carries are not among them, those living in the recorded frame's own headers, which is a packet
-  dissection and not a pcapng one. The schema and its writer therefore still have **no producer**:
-  they are exercised only by the suite.
+- **The ingest still resumes from the beginning of a ring.** The acknowledgement this server greets
+  an appliance with names position zero for both rings, which is honest about the appliance rather
+  than about the ingest: an appliance keeps no reader cursor across a reboot and re-ships each ring
+  from its beginning whatever it is told. What that costs is bytes on the wire and re-decoding, and
+  no duplicate row — the durable cursor is what settles that — but an acknowledgement that named the
+  stored position would cost neither, and it is the next thing to wire.
+- **A ring that is lost is lost.** A shipment that jumped, a stream a refusal ended, and rows a
+  store would not take for longer than the hold allows are each counted, logged and emitted, and
+  none of them is re-fetched: the channel has a range read for exactly that and nothing here calls
+  it. Recovery is the appliance's next re-ship of the whole ring, which arrives on its own schedule
+  rather than on this server's noticing.
 - **No configuration operations.** Generation 1 is the document the package carried, and there is
   no staging, commit-confirm, rollback, or version beyond it — those are channel operations.
 - **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an
