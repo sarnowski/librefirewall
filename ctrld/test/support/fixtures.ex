@@ -8,7 +8,7 @@ defmodule Ctrld.Fixtures do
   quietly become one.
   """
 
-  alias Ctrld.PKI.{KeyPair, Profile}
+  alias Ctrld.PKI.{Certificate, KeyPair, Profile}
   alias Ctrld.{Accounts, ChannelEndpoint, PKI}
 
   @doc "An administrator account."
@@ -37,10 +37,70 @@ defmodule Ctrld.Fixtures do
   def endpoint_fixture, do: ChannelEndpoint.configured!()
 
   @doc "The channel endpoint's server certificate, and the authority under it."
-  def endpoint_certificate_fixture do
+  def endpoint_certificate_fixture(endpoint \\ nil) do
     _authority = PKI.active_authority() || authority_fixture()
-    {:ok, certificate} = PKI.issue_endpoint_certificate(endpoint_fixture())
+    {:ok, certificate} = PKI.issue_endpoint_certificate(endpoint || endpoint_fixture())
     certificate
+  end
+
+  @doc """
+  A loopback endpoint, for a listener a test can actually reach.
+
+  The configured endpoint is an address literal a fleet dials and nothing in a
+  gate container answers on it, so a test that wants a real connection issues
+  the endpoint certificate for this one instead. The port is not in the
+  certificate — the profile binds the address and only the address, an appliance
+  validating what it dialled rather than where — so a certificate issued here is
+  valid for whichever port the operating system then hands the listener.
+  """
+  def loopback_endpoint, do: %ChannelEndpoint{address: {127, 0, 0, 1}, port: 1}
+
+  @doc """
+  A device certificate under this server's own authority, with its private key.
+
+  The client half of a channel handshake. `device_id` decides whether it names
+  an onboarded appliance: pass an onboarded one's to be admitted, and a fresh
+  one to be a certificate this server issued that names nothing it holds.
+  """
+  def device_certificate_fixture(device_id) when is_binary(device_id) do
+    authority = PKI.active_authority() || authority_fixture()
+    key = KeyPair.generate()
+
+    {:ok, issued} =
+      PKI.issue_device_certificate(
+        authority,
+        KeyPair.public_point(key),
+        device_id,
+        DateTime.utc_now()
+      )
+
+    %{device_id: device_id, der: issued.der, key: key}
+  end
+
+  @doc """
+  A device certificate under an authority this server has never heard of.
+
+  Generated in memory and inserted nowhere, which is the point twice over: it is
+  a credential no row of this server's backs, and creating a second authority row
+  would leave the server with two it considers active.
+  """
+  def foreign_device_certificate_fixture(device_id \\ nil) do
+    device_id = device_id || device_id()
+    now = DateTime.utc_now()
+    {:ok, {authority, authority_key}} = Certificate.create_authority("foreign authority", now)
+    key = KeyPair.generate()
+
+    {:ok, issued} =
+      Certificate.issue_under(
+        :device,
+        device_id,
+        KeyPair.public_point(key),
+        authority.subject_common_name,
+        authority_key,
+        now
+      )
+
+    %{device_id: device_id, der: issued.der, key: key, authority_der: authority.der}
   end
 
   @doc "A random device identifier, rendered the way the profile renders one."
@@ -177,7 +237,14 @@ defmodule Ctrld.Fixtures do
     :public_key.pem_encode([{:CertificationRequest, der, :not_encrypted}])
   end
 
-  @doc "An onboarded appliance, with the package it was issued."
+  @doc """
+  An onboarded appliance, with the package it was issued.
+
+  The private key behind its certificate comes back too, under `:key`: a test
+  that dials the channel as this appliance needs the key its certificate binds,
+  and generating a second one would be presenting a certificate for a key the
+  client cannot prove it holds.
+  """
   def onboarded_fixture(options \\ []) do
     actor = Keyword.get_lazy(options, :actor, &administrator_fixture/0)
     _authority = PKI.active_authority() || authority_fixture()
@@ -193,6 +260,6 @@ defmodule Ctrld.Fixtures do
         received_at: DateTime.truncate(DateTime.utc_now(), :second)
       })
 
-    Map.put(result, :actor, actor)
+    result |> Map.put(:actor, actor) |> Map.put(:key, request.key)
   end
 end

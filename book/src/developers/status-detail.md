@@ -3398,9 +3398,13 @@ delivered anchor and matches the profile in every field.
   the work factor stored on each hash. Sessions are server-side tokens: the cookie carries the
   token, the database its digest, and signing out deletes the row. Every state-changing action
   writes an audit record, and issuance writes its record in the same transaction as the issuance.
-- **The inventory is honest.** Status is derived from what the server can evidence, not stored:
-  today "onboarded" and when the request arrived. Nothing renders reachability, and the page says
-  why.
+- **The inventory is honest.** Status is derived from what the server can evidence, never stored:
+  a session open on this server right now is online, a session that has ended is offline with the
+  instant it was last seen, and a certificate issued with no session ever is onboarded. The live
+  column is cleared for every row as the listener starts, because a session cannot outlive the
+  process that held it — so online is never a value that survived a restart — and a session
+  transition writes its two columns by force rather than by difference, so clearing a live session
+  cannot be turned into a no-op by a caller holding a stale copy of the row.
 - **ClickHouse holds the telemetry schema** — flow events, log events and metric samples, with the
   fields the appliance's recording annotations, log records and metric samples actually carry — and
   a writer over ClickHouse's HTTP interface. The suite round-trips rows through a real ClickHouse.
@@ -3411,15 +3415,33 @@ delivered anchor and matches the profile in every field.
 
 **Missing.** Everything the channel carries, and everything that comes after it.
 
-- **No channel listener and no pcapng decoder.** Nothing has ever connected to this server: there
-  is no ThousandIsland listener, no [framing](../contracts/channel-framing.md) on this side of the
-  wire — the appliance now dials out, establishes a mutually-authenticated session and puts its
-  greeting on the wire, against an `openssl s_server` the gate stands up because this server cannot
-  take the connection — and no
-  decoder tested against bytes the appliance's encoder produced. The telemetry schema and its writer
-  therefore have **no producer** — they are exercised only by the suite.
-- **Online, offline and last seen do not exist**, and neither do the columns behind them; they
-  arrive with the connection that establishes them.
+- **The channel listener exists, and no appliance can reach it yet.** The listener is real and the
+  whole of [the framing](../contracts/channel-framing.md) is implemented on this side of the wire,
+  against the appliance's own codec field by field: the eight-byte header, the ten frames, the
+  direction each may travel, both greeting shapes, the payload floors, the two closed byte
+  vocabularies, and twelve refusals — one per rule broken, read in the order the appliance reads
+  them, so both ends name the same cause for the same bytes. A `ThousandIsland` listener on the
+  endpoint's port serves the endpoint certificate, requires and verifies a client certificate against
+  this server's authority alone, and hands the connection a session that greets first with its two
+  resume cursors. It is proved end to end in the suite over a real TLS 1.3 session: an ephemeral port,
+  an `:ssl` client presenting a device certificate this server's authority issued, greetings both
+  ways, frames reassembled from a stream cut a byte at a time, and three connections refused — a
+  certificate from another authority, one naming no appliance this server holds, and none at all.
+  What is **not** proved is interoperability with the appliance, and it cannot be: the appliance's
+  provider offers the hybrid `X25519MLKEM768` key exchange and no other, `:ssl` on the pinned OTP
+  offers no ML-KEM group at all, so the two ends share no group and the handshake fails before either
+  certificate is examined. This listener offers `x25519`, the classical half of that hybrid, and
+  `openssl s_client` negotiates `TLS_CHACHA20_POLY1305_SHA256` over it. Closing the pair is one of two
+  decisions nobody has taken: a runtime here that can offer the hybrid group, or an appliance that
+  offers the classical one beside it — which gives up the harvest-now-decrypt-later property the
+  hybrid exists for. Until then the appliance's channel is still proved against the `openssl s_server`
+  the gate stands up.
+- **No pcapng decoder.** Ring bytes arrive and cross a documented seam — a device, a recording, a
+  position and the bytes — whose deployed implementation counts them, emits a telemetry event and
+  keeps nothing: decoding an appliance's pcapng is parsing an untrusted self-describing format, which
+  is a different job with its own bounds and its own refusals, and the alternative to counting is
+  storing bytes nothing can read back. The ClickHouse telemetry schema and its writer therefore still
+  have **no producer** — they are exercised only by the suite.
 - **No configuration operations.** Generation 1 is the document the package carried, and there is
   no staging, commit-confirm, rollback, or version beyond it — those are channel operations.
 - **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an
@@ -3428,9 +3450,12 @@ delivered anchor and matches the profile in every field.
 - **No revocation, no CA rollover, no identity federation.** Device certificates are long-lived and
   nothing withdraws one yet; the authority cannot be replaced without visiting every appliance; and
   authentication is local accounts only, with one role.
-- **No live view of anything.** The inventory, the appliance page, the authority page and the audit
-  trail are LiveViews that mount and render; nothing ever pushes an update to one, and PubSub fans
-  out to nothing, because nothing produces events.
+- **Nothing yet subscribes to the events that now exist.** A channel session announces itself on
+  PubSub — a connection and a disconnection on both a fleet topic and the appliance's own, and each
+  arrival of ring bytes on the appliance's own topic alone, carrying a count and never a byte of what
+  arrived. So there is a producer now; what is missing is the consumer. The inventory, the appliance
+  page, the authority page and the audit trail are still LiveViews that mount and render, and a status
+  on one is current as of the last load.
 
 ## Engineering foundations
 

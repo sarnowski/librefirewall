@@ -71,6 +71,12 @@ defmodule CtrldWeb.ApplianceLive.Show do
           <dd>{@appliance.certificate_authority.signature_algorithm}</dd>
           <dt class="opacity-70">Endpoint it dials</dt>
           <dd class="font-mono">{@appliance.endpoint}</dd>
+          <dt class="opacity-70">Channel</dt>
+          <dd id="appliance-channel-status">{Appliances.status(@appliance)}</dd>
+          <dt class="opacity-70">Session open since</dt>
+          <dd id="appliance-connected-since">{@appliance.connected_since || "no session is open"}</dd>
+          <dt class="opacity-70">Last seen</dt>
+          <dd id="appliance-last-seen">{@appliance.last_seen_at || "never"}</dd>
           <dt class="opacity-70">Onboarded by</dt>
           <dd>{@appliance.onboarded_by && @appliance.onboarded_by.email}</dd>
         </dl>
@@ -90,7 +96,9 @@ defmodule CtrldWeb.ApplianceLive.Show do
         </div>
         <p class="text-xs opacity-60 mt-2">
           Generation 1 is the document the onboarding package carried. Further generations arrive
-          over the management channel, which does not exist yet.
+          over the management channel, whose configuration operations this server does not yet
+          carry out — the channel comes up and carries the recordings upstream, and nothing on it
+          stages or commits a document.
         </p>
       </section>
 

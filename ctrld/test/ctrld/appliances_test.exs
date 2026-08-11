@@ -138,8 +138,130 @@ defmodule Ctrld.AppliancesTest do
     test "shows only what the server can evidence" do
       {{:ok, %{appliance: appliance}}, _request, _actor} = onboard()
       assert Appliances.status(appliance) == :onboarded
+      refute appliance.connected_since
+      refute appliance.last_seen_at
+    end
+  end
+
+  describe "what a channel session establishes" do
+    setup do
+      _authority = authority_fixture()
+      %{appliance: appliance} = onboarded_fixture()
+      %{appliance: appliance}
     end
 
+    test "an open session reads as online, with the instant it opened", %{appliance: appliance} do
+      at = DateTime.utc_now()
+
+      assert {:ok, updated} = Appliances.session_opened(appliance, at)
+      assert Appliances.status(updated) == :online
+      assert DateTime.truncate(at, :second) == updated.connected_since
+      assert DateTime.truncate(at, :second) == updated.last_seen_at
+    end
+
+    test "an ended session reads as offline, keeping when it was last seen", %{
+      appliance: appliance
+    } do
+      opened = DateTime.utc_now()
+      closed = DateTime.add(opened, 60, :second)
+
+      {:ok, appliance} = Appliances.session_opened(appliance, opened)
+      assert {:ok, updated} = Appliances.session_closed(appliance, closed)
+
+      assert Appliances.status(updated) == :offline
+      refute updated.connected_since
+      assert DateTime.truncate(closed, :second) == updated.last_seen_at
+    end
+
+    test "closing from a stale copy of the row still clears the live session", %{
+      appliance: appliance
+    } do
+      at = DateTime.utc_now()
+      {:ok, _fresh} = Appliances.session_opened(appliance, at)
+
+      # Closed from the struct as it was *before* the session opened, which is the
+      # copy a caller most easily holds. A changeset built by difference would
+      # find nothing to clear here and leave the row claiming a session no process
+      # holds — an inventory saying online on the strength of somebody's stale
+      # memory, which is the one thing a derived status must not do.
+      assert {:ok, updated} = Appliances.session_closed(appliance, at)
+      refute updated.connected_since
+
+      reloaded = Appliances.get_appliance_by_device_id(appliance.device_id)
+      refute reloaded.connected_since
+      assert reloaded.last_seen_at
+      assert Appliances.status(reloaded) == :offline
+    end
+
+    test "a live session outranks the memory of an ended one", %{appliance: appliance} do
+      at = DateTime.utc_now()
+      {:ok, appliance} = Appliances.session_opened(appliance, at)
+      {:ok, appliance} = Appliances.session_closed(appliance, at)
+      {:ok, appliance} = Appliances.session_opened(appliance, at)
+
+      # Both columns are filled now, and the live one is the answer.
+      assert appliance.connected_since
+      assert appliance.last_seen_at
+      assert Appliances.status(appliance) == :online
+    end
+
+    test "clearing sessions forgets the live one and keeps the remembered one", %{
+      appliance: appliance
+    } do
+      {:ok, appliance} = Appliances.session_opened(appliance, DateTime.utc_now())
+
+      assert Appliances.clear_sessions() == 1
+
+      cleared = Appliances.get_appliance_by_device_id(appliance.device_id)
+      refute cleared.connected_since
+      assert cleared.last_seen_at
+      assert Appliances.status(cleared) == :offline
+    end
+
+    test "clearing sessions when there are none changes nothing", %{appliance: _appliance} do
+      assert Appliances.clear_sessions() == 0
+    end
+
+    test "a session may not write an identity" do
+      # The changeset a connection reaches this row through casts two fields, so
+      # a connection that tried to move a certificate would move nothing.
+      %{appliance: appliance} = onboarded_fixture()
+
+      changeset =
+        Ctrld.Appliances.Appliance.session_changeset(appliance, %{
+          connected_since: DateTime.truncate(DateTime.utc_now(), :second),
+          device_id: "0000000000000000000000000000dead",
+          certificate_der: <<0>>,
+          endpoint: "10.0.0.1:1"
+        })
+
+      assert Map.keys(changeset.changes) == [:connected_since]
+    end
+
+    test "both topics carry the same two messages", %{appliance: appliance} do
+      device_id = appliance.device_id
+      :ok = Appliances.subscribe()
+      :ok = Appliances.subscribe(device_id)
+
+      at = DateTime.utc_now()
+      {:ok, appliance} = Appliances.session_opened(appliance, at)
+
+      assert_receive {:appliance_connected, ^device_id, %DateTime{}}
+      assert_receive {:appliance_connected, ^device_id, %DateTime{}}
+
+      {:ok, _appliance} = Appliances.session_closed(appliance, at)
+
+      assert_receive {:appliance_disconnected, ^device_id, %DateTime{}}
+      assert_receive {:appliance_disconnected, ^device_id, %DateTime{}}
+    end
+
+    test "the topics are named where a subscriber can find them", %{appliance: appliance} do
+      assert Appliances.fleet_topic() == "appliances"
+      assert Appliances.topic(appliance.device_id) == "appliance:" <> appliance.device_id
+    end
+  end
+
+  describe "listing the inventory" do
     test "lists appliances newest first" do
       _authority = authority_fixture()
       {{:ok, %{appliance: first}}, _, _} = onboard(%{name: "first"})

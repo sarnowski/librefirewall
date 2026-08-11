@@ -77,8 +77,10 @@ defmodule CtrldWeb.AuthorityLive do
           <dd>{@endpoint_certificate.not_before} to {@endpoint_certificate.not_after}</dd>
         </dl>
         <p class="text-xs opacity-60 mt-3">
-          Nothing listens on that endpoint yet. The certificate exists because an appliance is
-          told the address at onboarding and can never be told a different one afterwards.
+          The channel listener serves this certificate on that endpoint's port, and an appliance
+          validates it against the trust anchor its package delivered and against the address
+          literal it dialled — never a name. An appliance is told that address at onboarding and
+          can never be told a different one afterwards.
         </p>
       </section>
     </Layouts.app>

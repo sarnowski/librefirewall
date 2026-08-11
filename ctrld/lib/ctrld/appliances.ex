@@ -7,6 +7,13 @@ defmodule Ctrld.Appliances do
   certificate issued without a record of who issued it is exactly the fact an
   audit trail exists to hold, so it is not allowed to exist even for the width
   of a failed insert.
+
+  It also holds what a channel session establishes about an appliance — that one
+  is open, and when one was last seen — and announces every transition on
+  `Ctrld.PubSub`, so a view of the inventory can be a subscription rather than a
+  poll. Those two facts are the only ones a connection may write: an identity is
+  the onboarding's to establish and never a session's, which is what
+  `Ctrld.Appliances.Appliance.session_changeset/2` exists to enforce.
   """
 
   import Ecto.Query
@@ -45,13 +52,157 @@ defmodule Ctrld.Appliances do
   @doc """
   What the server can evidence about an appliance.
 
-  A status derived from a fact the server holds, never an optimistic default:
-  the request arrived and the certificate was issued, so the appliance was
-  onboarded. Whether it is *reachable* is a different question, and this
-  server cannot answer it until an appliance dials it.
+  A status derived from the facts on the row, never stored and never an
+  optimistic default. There are three, and each is a different thing the server
+  has actually observed: a session is open on this server right now, so the
+  appliance is `:online`; no session is open but one was, so it is `:offline`
+  with the instant beside it; or a certificate was issued and no session has
+  ever opened, so it is `:onboarded` and nothing more is known.
+
+  The order matters, and only in one direction: a live session outranks the
+  memory of an ended one, because `last_seen_at` is set on both transitions and
+  an online appliance therefore has both columns filled.
   """
-  @spec status(Appliance.t()) :: :onboarded
+  @spec status(Appliance.t()) :: :online | :offline | :onboarded
+  def status(%Appliance{connected_since: %DateTime{}}), do: :online
+  def status(%Appliance{last_seen_at: %DateTime{}}), do: :offline
   def status(%Appliance{certificate_issued_at: %DateTime{}}), do: :onboarded
+
+  @doc """
+  The topic every appliance's connection state is announced on.
+
+  What a subscriber of this one receives, and the whole of it:
+
+      {:appliance_connected, device_id :: String.t(), connected_since :: DateTime.t()}
+      {:appliance_disconnected, device_id :: String.t(), last_seen_at :: DateTime.t()}
+
+  Neither message carries anything an appliance sent. A subscriber that needs
+  more than the transition reads the row, which is where the facts are.
+  """
+  @spec fleet_topic() :: String.t()
+  def fleet_topic, do: "appliances"
+
+  @doc """
+  The topic one appliance's channel is announced on.
+
+  It carries the two connection messages `fleet_topic/0` carries, so a view of
+  one appliance and a view of the fleet handle the same shapes, and one more that
+  the fleet topic deliberately does not:
+
+      {:appliance_telemetry, device_id :: String.t(), ring :: :log | :capture,
+       position :: non_neg_integer(), byte_count :: non_neg_integer()}
+
+  That one arrives per upstream frame — at least once a second per appliance
+  whenever it has unsent bytes — which is why it is here and not on the fleet
+  topic: a view of the whole inventory would be woken by every appliance's every
+  flush to render a column it does not have. `position` is the byte position in
+  the recording ring's own append space that the frame's bytes began at, and
+  `byte_count` is how many arrived. **The bytes themselves are not in it and
+  never will be**: they are a customer's captured traffic, a recording is where
+  that belongs, and a subscriber wanting content reads it from whatever ingests
+  it.
+  """
+  @spec topic(String.t()) :: String.t()
+  def topic(device_id) when is_binary(device_id), do: "appliance:" <> device_id
+
+  @doc "Subscribe to every appliance's connection state."
+  @spec subscribe() :: :ok | {:error, term()}
+  def subscribe, do: Phoenix.PubSub.subscribe(Ctrld.PubSub, fleet_topic())
+
+  @doc "Subscribe to one appliance's channel: its connection state and its traffic."
+  @spec subscribe(String.t()) :: :ok | {:error, term()}
+  def subscribe(device_id) when is_binary(device_id) do
+    Phoenix.PubSub.subscribe(Ctrld.PubSub, topic(device_id))
+  end
+
+  @doc """
+  Announce that recording bytes arrived from an appliance.
+
+  Nothing is written: an upstream frame is not a fact about the inventory — what
+  the row keeps is that a session is open, which is already true — so this is an
+  announcement and only that. It is what makes a live view of one appliance's
+  traffic a subscription rather than a poll, and it takes a count rather than the
+  bytes because the count is all a topic may carry.
+  """
+  @spec telemetry_received(String.t(), :log | :capture, non_neg_integer(), non_neg_integer()) ::
+          :ok
+  def telemetry_received(device_id, ring, position, byte_count)
+      when is_binary(device_id) and ring in [:log, :capture] and is_integer(position) and
+             is_integer(byte_count) do
+    Phoenix.PubSub.broadcast(
+      Ctrld.PubSub,
+      topic(device_id),
+      {:appliance_telemetry, device_id, ring, position, byte_count}
+    )
+
+    :ok
+  end
+
+  @doc """
+  Record that a channel session opened for an appliance.
+
+  Both columns move: the session is live from `at`, and `at` is also the last
+  instant the appliance was seen — so an appliance that connects and is never
+  heard from again still has a last-seen instant when the session ends.
+  """
+  @spec session_opened(Appliance.t(), DateTime.t()) :: {:ok, Appliance.t()} | {:error, term()}
+  def session_opened(%Appliance{} = appliance, %DateTime{} = at) do
+    at = DateTime.truncate(at, :second)
+
+    with {:ok, updated} <- update_session(appliance, %{connected_since: at, last_seen_at: at}) do
+      announce(updated, {:appliance_connected, updated.device_id, at})
+      {:ok, updated}
+    end
+  end
+
+  @doc """
+  Record that a channel session closed for an appliance.
+
+  The live-session column is cleared and the last-seen instant advances, which
+  together are the whole of "it was here until now and is not here".
+  """
+  @spec session_closed(Appliance.t(), DateTime.t()) :: {:ok, Appliance.t()} | {:error, term()}
+  def session_closed(%Appliance{} = appliance, %DateTime{} = at) do
+    at = DateTime.truncate(at, :second)
+
+    with {:ok, updated} <- update_session(appliance, %{connected_since: nil, last_seen_at: at}) do
+      announce(updated, {:appliance_disconnected, updated.device_id, at})
+      {:ok, updated}
+    end
+  end
+
+  @doc """
+  Forget every live session, and answer how many were forgotten.
+
+  Called by the channel listener as it starts. A live session is held by a
+  process, so no session survives the listener that held it, and a row still
+  claiming one describes a connection that cannot exist — the one way a derived
+  status could lie. Nothing is announced: there is nothing subscribed at the
+  instant a listener starts, and a fleet's worth of transitions nobody asked for
+  is not an announcement.
+  """
+  @spec clear_sessions() :: non_neg_integer()
+  def clear_sessions do
+    {cleared, _returned} =
+      Repo.update_all(
+        from(appliance in Appliance, where: not is_nil(appliance.connected_since)),
+        set: [connected_since: nil]
+      )
+
+    cleared
+  end
+
+  defp update_session(appliance, attributes) do
+    appliance
+    |> Appliance.session_changeset(attributes)
+    |> Repo.update()
+  end
+
+  defp announce(appliance, message) do
+    Phoenix.PubSub.broadcast(Ctrld.PubSub, fleet_topic(), message)
+    Phoenix.PubSub.broadcast(Ctrld.PubSub, topic(appliance.device_id), message)
+    :ok
+  end
 
   @doc """
   Onboard an appliance: issue against a validated request and compose its

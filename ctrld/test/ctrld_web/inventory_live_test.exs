@@ -26,15 +26,42 @@ defmodule CtrldWeb.InventoryLiveTest do
       assert html =~ "onboarded"
     end
 
-    test "shows no reachability, because nothing establishes it yet", %{conn: conn} do
-      _onboarded = onboarded_fixture()
+    # The status is asserted on the badge of the appliance's own row rather than
+    # on the page's text: the summary above the table counts what is onboarded, so
+    # a page-wide match on a status word finds that count as readily as the row.
+    test "shows an appliance that has never dialled as onboarded, never seen", %{conn: conn} do
+      %{appliance: appliance} = onboarded_fixture()
       {:ok, view, _html} = live(conn, ~p"/appliances")
-      html = render(view)
 
-      refute html =~ "Last seen"
-      refute html =~ ">online<"
-      refute html =~ ">offline<"
-      assert html =~ "not shown"
+      assert has_element?(view, status_badge(appliance), "onboarded")
+      assert render(view) =~ "Last seen"
+      assert render(view) =~ "never"
+    end
+
+    test "shows an appliance with an open session as online", %{conn: conn} do
+      %{appliance: appliance} = onboarded_fixture()
+      {:ok, _appliance} = Ctrld.Appliances.session_opened(appliance, DateTime.utc_now())
+
+      {:ok, view, _html} = live(conn, ~p"/appliances")
+
+      assert has_element?(view, status_badge(appliance), "online")
+      refute has_element?(view, status_badge(appliance), "onboarded")
+    end
+
+    # Closed from the struct the onboarding left behind rather than from the one
+    # `session_opened/2` answered, which is the stale copy a caller most easily
+    # holds: the row must read offline either way, or the derived status is
+    # deciding on somebody's memory of it.
+    test "shows an appliance whose session has ended as offline, with when", %{conn: conn} do
+      %{appliance: appliance} = onboarded_fixture()
+      seen = DateTime.utc_now()
+      {:ok, _appliance} = Ctrld.Appliances.session_opened(appliance, seen)
+      {:ok, _appliance} = Ctrld.Appliances.session_closed(appliance, seen)
+
+      {:ok, view, _html} = live(conn, ~p"/appliances")
+
+      assert has_element?(view, status_badge(appliance), "offline")
+      refute render(view) =~ "never"
     end
 
     test "the root path is the inventory", %{conn: conn} do
@@ -82,6 +109,29 @@ defmodule CtrldWeb.InventoryLiveTest do
     test "offers the package again", %{conn: conn, appliance: appliance} do
       {:ok, view, _html} = live(conn, ~p"/appliances/#{appliance.device_id}")
       assert has_element?(view, "#download-package")
+    end
+
+    test "shows the channel as onboarded with no session before one is ever opened", %{
+      conn: conn,
+      appliance: appliance
+    } do
+      {:ok, view, _html} = live(conn, ~p"/appliances/#{appliance.device_id}")
+
+      assert view |> element("#appliance-channel-status") |> render() =~ "onboarded"
+      assert view |> element("#appliance-connected-since") |> render() =~ "no session is open"
+      assert view |> element("#appliance-last-seen") |> render() =~ "never"
+    end
+
+    test "shows the channel as online while a session is open", %{
+      conn: conn,
+      appliance: appliance
+    } do
+      {:ok, _appliance} = Ctrld.Appliances.session_opened(appliance, DateTime.utc_now())
+      {:ok, view, _html} = live(conn, ~p"/appliances/#{appliance.device_id}")
+
+      assert view |> element("#appliance-channel-status") |> render() =~ "online"
+      refute view |> element("#appliance-connected-since") |> render() =~ "no session is open"
+      refute view |> element("#appliance-last-seen") |> render() =~ "never"
     end
 
     test "an unknown device identifier goes back to the inventory", %{conn: conn} do
@@ -142,4 +192,7 @@ defmodule CtrldWeb.InventoryLiveTest do
       assert render(view) =~ "package.downloaded"
     end
   end
+
+  # The status badge in one appliance's own row.
+  defp status_badge(appliance), do: "#appliance-status-#{appliance.device_id}"
 end

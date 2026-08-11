@@ -4,9 +4,9 @@ defmodule Ctrld.Appliances.ConfigurationVersion do
 
   Generations are the appliance's own numbering and start at one, which is the
   document the onboarding package carried. There are no staging, commit or
-  confirmation timestamps here: those are facts a channel establishes, this
-  server has no channel yet, and a column nothing ever writes reads as a fact
-  nobody has.
+  confirmation timestamps here: those are facts a channel's configuration
+  operations establish, this server carries out none of them yet, and a column
+  nothing ever writes reads as a fact nobody has.
   """
 
   use Ecto.Schema

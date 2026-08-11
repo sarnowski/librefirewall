@@ -19,6 +19,7 @@ defmodule Ctrld.Application do
         {Phoenix.PubSub, name: Ctrld.PubSub}
       ] ++
         bootstrap_child() ++
+        channel_listener_child() ++
         [CtrldWeb.Endpoint]
 
     opts = [strategy: :one_for_one, name: Ctrld.Supervisor]
@@ -31,6 +32,22 @@ defmodule Ctrld.Application do
   # should say so at start rather than at first use — before it is listening.
   defp bootstrap_child do
     if Ctrld.Bootstrap.run_on_start?(), do: [Ctrld.Bootstrap], else: []
+  end
+
+  # After the bootstrap, because the certificate the listener serves is one of
+  # the things the bootstrap puts in place, and before the web endpoint, because
+  # an appliance's channel is the product and an administrator's browser is how
+  # it is watched. A deployment that cannot listen does not start: an appliance
+  # has nowhere else to report, and a server answering the web port while no
+  # appliance can reach it is a server that looks healthy.
+  #
+  # Off in test, where the suite starts a listener of its own on a port the
+  # operating system picks — the configured endpoint is an address literal a
+  # fleet dials, and nothing in a gate container answers on it.
+  defp channel_listener_child do
+    if Application.get_env(:ctrld, Ctrld.Channel.Listener, [])[:listen] == true,
+      do: [Ctrld.Channel.Listener],
+      else: []
   end
 
   @impl true

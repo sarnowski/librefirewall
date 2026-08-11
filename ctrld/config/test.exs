@@ -20,6 +20,14 @@ config :ctrld, CtrldWeb.Endpoint,
   secret_key_base: "xwrXhcJTzSu+Nsn9mwZWJSek60LFK1dRGZ0bXqiOFGTg3p0ioSeG/BTzL7RDp8j+",
   server: false
 
+# The channel listener's two deadlines, shortened so the suite can prove that a
+# peer which never completes a handshake and one which never greets are both
+# dropped, without paying the deployment's fifteen and thirty seconds for them on
+# every run. The greeting deadline stays well clear of what a test needs to read
+# one frame and write another on a loaded machine.
+config :ctrld, Ctrld.Channel.Transport, handshake_timeout: 250
+config :ctrld, Ctrld.Channel.Handler, greeting_timeout: 1_000
+
 # In test we don't send emails
 config :ctrld, Ctrld.Mailer, adapter: Swoosh.Adapters.Test
 

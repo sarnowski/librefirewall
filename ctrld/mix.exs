@@ -75,7 +75,11 @@ defmodule Ctrld.MixProject do
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
-      {:bandit, "~> 1.5"}
+      {:bandit, "~> 1.5"},
+      # The channel listener's socket acceptor. Declared because this
+      # application starts a listener of its own on it, rather than reaching
+      # into what the web server happens to depend on.
+      {:thousand_island, "~> 1.5"}
     ]
   end
 

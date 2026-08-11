@@ -52,6 +52,14 @@ defmodule CtrldWeb.Telemetry do
         unit: {:native, :millisecond}
       ),
 
+      # Management channel metrics. What arrived from an appliance and how much
+      # of it, by recording — never a byte of what was in it, a recording being
+      # traffic and a metric label not being a place for it. The ring is a label
+      # of two values and the device identifier deliberately is not one: a label
+      # per appliance is a cardinality that grows with the fleet.
+      counter("ctrld.channel.ingest.bytes", tags: [:ring]),
+      sum("ctrld.channel.ingest.bytes", tags: [:ring], unit: :byte),
+
       # VM Metrics
       summary("vm.memory.total", unit: {:byte, :kilobyte}),
       summary("vm.total_run_queue_lengths.total"),

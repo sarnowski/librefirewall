@@ -2,11 +2,17 @@ defmodule CtrldWeb.ApplianceLive.Index do
   @moduledoc """
   The appliance inventory.
 
-  The status column shows what this server can evidence and nothing else.
-  Today that is "onboarded" and when the request arrived — the facts issuance
-  left behind. There is no online, offline, or last-seen column, because
-  nothing has yet established any of those and a column showing an unknown as
-  a value is the one thing an inventory must never do.
+  The status column shows what this server can evidence and nothing else: a
+  session open on this server right now, a session that has ended with the
+  instant it was last seen, or a certificate issued and no session ever — one
+  of three facts, derived from the row and never stored. A column showing an
+  unknown as a value is the one thing an inventory must never do, which is why
+  an appliance that has never dialled reads as onboarded rather than as
+  offline.
+
+  The page is rendered from the rows as they are at mount. A session opening or
+  closing is announced on `Ctrld.Appliances.fleet_topic/0`, and this view does
+  not yet subscribe to it — so a status here is current as of the last load.
   """
 
   use CtrldWeb, :live_view
@@ -44,13 +50,14 @@ defmodule CtrldWeb.ApplianceLive.Index do
             <th>Name</th>
             <th>Device identifier</th>
             <th>Status</th>
+            <th>Last seen</th>
             <th>Request received</th>
             <th>Endpoint</th>
           </tr>
         </thead>
         <tbody id="appliances" phx-update="stream">
           <tr id="appliances-empty" class="hidden only:table-row">
-            <td colspan="5" class="text-sm opacity-60">
+            <td colspan="6" class="text-sm opacity-60">
               No appliance has been onboarded yet.
             </td>
           </tr>
@@ -62,10 +69,14 @@ defmodule CtrldWeb.ApplianceLive.Index do
             </td>
             <td class="font-mono text-xs">{appliance.device_id}</td>
             <td>
-              <span class="badge badge-success badge-sm">
+              <span
+                id={"appliance-status-#{appliance.device_id}"}
+                class={["badge badge-sm", status_badge(Appliances.status(appliance))]}
+              >
                 {Appliances.status(appliance)}
               </span>
             </td>
+            <td class="text-xs">{appliance.last_seen_at || "never"}</td>
             <td class="text-xs">{appliance.csr_received_at}</td>
             <td class="font-mono text-xs">{appliance.endpoint}</td>
           </tr>
@@ -73,10 +84,17 @@ defmodule CtrldWeb.ApplianceLive.Index do
       </table>
 
       <p class="text-xs opacity-60">
-        Whether an appliance is reachable is not shown, because nothing here knows: an appliance
-        dials this server over the management channel, and that channel does not exist yet.
+        An appliance dials this server over the management channel and holds the connection open, so
+        online means a session is open on this server at this moment. Offline means one has been and
+        has ended; onboarded means a certificate was issued and no session has ever opened.
       </p>
     </Layouts.app>
     """
   end
+
+  # Three statuses, three colours, and no fourth: a colour for a status the
+  # derivation cannot produce would be a branch nothing can reach.
+  defp status_badge(:online), do: "badge-success"
+  defp status_badge(:offline), do: "badge-warning"
+  defp status_badge(:onboarded), do: "badge-neutral"
 end

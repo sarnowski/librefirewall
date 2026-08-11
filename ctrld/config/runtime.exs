@@ -40,6 +40,13 @@ config :ctrld, Ctrld.Vault, key_base64: System.get_env("CTRLD_KEY_ENCRYPTION_KEY
 
 config :ctrld, Ctrld.ChannelEndpoint, endpoint: System.get_env("CTRLD_CHANNEL_ENDPOINT")
 
+config :ctrld, Ctrld.Channel.Listener,
+  # Off in test: the suite starts a listener per test on a port the operating
+  # system picks, against a certificate it issues for that port, so a listener
+  # bound at boot would be a second one competing for the configured port — and
+  # nothing in a gate container answers on the address literal a fleet dials.
+  listen: config_env() != :test
+
 config :ctrld, Ctrld.Bootstrap,
   # Off in test: the suite drives the bootstrap directly against the sandbox,
   # and a boot-time write would race every test that counts users.
