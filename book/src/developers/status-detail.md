@@ -537,9 +537,9 @@ record and its ring (see *[Engineering foundations](#engineering-foundations)*).
 
 ## virtio-blk driver
 
-**What exists.** A ninth protection domain, `recorder` — the seventh binary, the driver's three
-instances being one binary — owns a virtio-blk device at the pinned PCI function 00:05.0. It is no
-longer the only domain that can put a byte on persistent storage: the store domain owns a **second**
+**What exists.** The `recorder` protection domain — one of the twelve this system runs from ten
+binaries, the driver's three instances being one binary — owns a virtio-blk device at the pinned
+PCI function 00:05.0. It is no longer the only domain that can put a byte on persistent storage: the store domain owns a **second**
 such device at 00:06.0 (below), and the two are separate authorities — neither maps any part of the
 other's ECAM page, BAR window, DMA region or staging window. The device class is
 `datad/crates/blk`: PCI identification and the virtio 1.0 handshake (`bringup`), the request
@@ -718,8 +718,11 @@ timestamps, `if_snaplen` the sink's own. Every observation is an Enhanced Packet
 `epb_flags` (direction), `epb_dropcount` (the tap-ring observations lost ahead of this record),
 `epb_packetid`, `epb_verdict`, and a PEN-tagged custom option holding a layout version, the
 verdict, the drop reason, the interface, the direction and the **configuration generation the
-decision was made under**. A sealed segment is padded to a sector boundary with a Custom Block that
-any reader skips. **The connection history additionally carries the whole metric surface** about
+decision was made under**. Padding is a Custom Block any reader skips, and it appears wherever the
+encoder must leave a sector whole: the tail of a closed segment, the open sector before a download
+is served, and — since a durable cursor must not be allowed to fall inside a block a reader will
+follow — the open sector behind every metric reading and every console-transcript block.
+**The connection history additionally carries the whole metric surface** about
 once a second, and the console transcript as it is printed, each as a Custom Block of the same type
 and enterprise number told apart by the first byte of its data — zero, or no data at all, is padding,
 `1` a reading and `2` a batch of console lines — which is what gives the management server's
@@ -855,6 +858,26 @@ and wall-clock times. An independent parse of the two files established:
   record and continues the ring it finds, and two boots of one medium in the system gate hold it to
   the console record, to a superblock that advanced, and to the previous boot's durable bytes being
   byte for byte where it left them.
+- **A console line costs a sector of medium, and a metric reading costs one too.** A superblock's
+  durable cursor advances by whole sectors, because that is the unit the device takes, while a
+  pcapng block ends wherever its length ends — so a reader holding only the medium can be pointed
+  at a position inside a block. Both blocks written when nothing else is happening are therefore
+  followed by a seal that pads the open sector: a reading and a batch of console lines each end on
+  a sector boundary, and the cursor that names them names whole blocks. The price is the padding.
+  The console publishes a line at a time and the recorder frames whatever it holds each pass, so in
+  practice a batch is one line, and a line costs a whole 512-byte sector however short it is — a
+  boot that printed 178 of them left a 100 864-byte recording, against the log recording's fifteen
+  1 MiB payload segments. Bounded and affordable, and unmeasured against a node that runs for
+  months rather than for a boot: nothing bounds how much of that extent a chatty domain can spend,
+  and the ring's own wrap is what stops it.
+- **The seal restores that property where it is written and does not establish it generally.** A
+  packet block draws no seal — one per frame would cost a sector per frame — so between the seal
+  points the durable cursor still lands wherever the last whole sector fell, which can be inside an
+  ordinary packet block. A download is unaffected, because serving one seals the recording first;
+  what meets it is a reader that has only the medium and the superblock, and what such a reader
+  meets is a final block whose stated length runs past the bytes that are there. That is a
+  pre-existing property of the layout rather than something the seal introduced, and closing it
+  needs the cursor to name a block boundary rather than a sector boundary.
 - **Two readers, and neither holds a durable cursor.** The superblock carries four reader-cursor
   slots and nothing registers one. The [management](../design/management.md) and
   [recording](../design/recording.md) designs make the channel the ring's cursor-holding reader,
@@ -954,7 +977,7 @@ regions are separate and mirrored (`cfg` read-write here and read-only there, `c
 so neither domain can forge the other's half. Its layout — the `#[repr(C)]` value a reader copies
 out, the atomic mirror a writer stores through, and the offset assertions that hold the two
 byte-identical — comes from one declaration per object, so a mirror cannot drift from the image it
-mirrors. `cfg` is reserved at eight pages rather than the four its 14,156 bytes need, because its
+mirrors. `cfg` is reserved at eight pages rather than the four its 14,664 bytes need, because its
 size is the one thing in the system description that cannot be changed locally: it is mapped at a
 fixed virtual address in three domains, and everything behind it in that window moves when it grows.
 The 256 rule slots are what took it from one page to four; the reservation was doubled at the same
@@ -1236,19 +1259,20 @@ same reason. `Com1::claim` then reads every register the driver can address befo
 on the capability, so a grant that no longer covers what the driver reaches is a named refusal
 rather than a fault in the middle of a console line.
 
-`datad/crates/wire` carries the transport: a 248-byte fixed-layout `LogRecord` whose every offset is a
+`datad/crates/wire` carries the transport: a 264-byte fixed-layout `LogRecord` whose every offset is a
 static assertion, and a 64-slot ring laid across **two** regions with opposite permissions. The
-record grew by the eight bytes of its instant and one discriminant byte taken out of existing
-padding, and the slot count did not move: the ring is sized for a boot transcript whose first
-generation alone is 20 change records, and 64 records of 248 bytes still fit the 16 KiB the region
-already rounded to. The records region (slots, producer cursor, the writer's drop count) is
+slot count is sized for a boot transcript, which is the case where nothing is draining yet: the
+shipped document's first generation alone is 43 change records, and 64 records of 264 bytes plus
+the cursor and the drop count come to 16 904 bytes, so the records region rounds to five pages
+rather than four — the count is what the record's width is spent against and the page is what that
+width costs. The records region (slots, producer cursor, the writer's drop count) is
 read-write to the writing domain and read-only to the console, so the console cannot forge a line
 attributed to a domain that never emitted one — it is the domain whose output is read as testimony
 about the others. The consume region (the console's cursor, one word) is read-write to the console
 and read-only to the writer, so a writer cannot forge how much of its own ring has been read and
-quietly reuse slots the console never rendered. Sixteen regions, 160 KiB, one pair for each of the
-eight writing domains; no writer maps another writer's, and the console — which writes no ring of
-its own — maps every records half read-only and every consume half read-write.
+quietly reuse slots the console never rendered. Twenty-two regions, 264 KiB, one pair for each of
+the eleven writing domains; no writer maps another writer's, and the console — which writes no ring
+of its own — maps every records half read-only and every consume half read-write.
 
 The console busy-polls and never leaves `init`, exactly as the NIC drivers do: a `notified`-driven
 console would stall a boot transcript longer than the 16-byte FIFO until something woke it again,
@@ -1311,6 +1335,27 @@ indifferent to whether anything is printed.
   and a console that blocked on a peer's readiness would stop reporting exactly when the node is in
   trouble. Nor does the ring throttle a writer: a full ring refuses the *newest* record and counts
   it, so a domain that outruns the line loses records with nothing slowing it down.
+- **And a busy node does outrun it, so the printed transcript is incomplete.** This is the cost of
+  the bullet above rather than a second gap, and it is stated separately because it is what an
+  operator actually meets. One domain drains eleven rings round-robin, at most eight records from
+  any one of them per pass, and puts each line on a 115200-baud port — on the order of a hundred
+  lines a second, against domains that emit records at memory speed. The management domain is the
+  one that reaches that rate in ordinary use: it announces the frames it moved once per wakeup that
+  moved any, so a TLS handshake on the management port draws tens of records in tens of
+  milliseconds and fills a 64-slot ring long before the line has taken them. What is lost is not
+  only bulk. On a release boot the end-to-end gate passed, the management domain's account of the
+  first of four onboarding sessions — the one that completed a handshake — is absent from the
+  console while the accounts of the three sessions after it are present; a ring is ordered, so a
+  record printed after an absent one was written after it, and the absent one was refused rather
+  than merely queued. An operator reading the console of a loaded appliance is therefore reading a
+  transcript with holes in it, and a session's outcome can be one of them.
+- **The console cannot say any of that, and the metrics surface can.** Every refusal is counted
+  where it happens and published as `librefirewall_log_records_dropped_total` per domain, so a
+  scrape says how much of the transcript is missing even though the transcript cannot. That is the
+  whole of the mitigation: nothing recovers a refused record, nothing marks the gap in the line
+  itself, and the ordering that makes the loss detectable at all — the newest record refused rather
+  than the oldest overwritten — is what keeps a boot transcript readable at the cost of losing the
+  present. Reading a console beside a scrape is the discipline this leaves an operator with.
 - **One port, one baud, both compiled in.** `0x3F8` and a divisor of 1 (115200) are build-time
   constants matched to the `<ioport>` grant, because a runtime base is a value the capability could
   not follow. There is no second console, no second UART, and no way to move either without a
@@ -1361,8 +1406,9 @@ indifferent to whether anything is printed.
 
 ## Console system-state events
 
-**What exists.** The five ad-hoc bring-up markers are gone. Call sites in all seven
-protection-domain binaries emit **typed events** — a closed set of named fields — and rendering
+**What exists.** The five ad-hoc bring-up markers are gone. Call sites in all nine
+protection-domain binaries that write a log ring — every one of the ten but the console, which
+renders rather than publishes — emit **typed events** — a closed set of named fields — and rendering
 happens once, in the console domain, so the attribute structure an OpenTelemetry record needs is
 produced at the call site rather than thrown away in a format string, and the structure is what
 crosses between domains rather than the text. Two channels of closed vocabulary reach the line,
@@ -1861,11 +1907,11 @@ established one.
 
 ## Prometheus metrics
 
-**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 117
-metric families and 420 counter and gauge series, plus one info series per configured interface and
-one hit counter per rule the running policy declares — covering every one of the ten protection
+**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 128
+metric families and 471 counter and gauge series, plus one info series per configured interface and
+one hit counter per rule the running policy declares — covering every one of the twelve protection
 domains. Its worst case is computed from the catalogue at build time (`MAX_EXPOSITION_LEN`,
-93 546 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
+102 941 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
 scrape can never be short. That bound is dominated by the rules: it covers a policy naming all 256
 the configuration accepts, so it is sized by what an operator is entitled to write rather than by
 what a node happens to be running. The end-to-end gate scrapes it with `curl` off a booted release
@@ -1900,7 +1946,7 @@ generation declared reaches no series at all: a counter under nobody's name is n
 expose.
 
 The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
-shared table. A shard is a 3,136-byte, cache-line aligned array of 392 `AtomicU64` slots, mapped
+shared table. A shard is a 3,200-byte, cache-line aligned array of 400 `AtomicU64` slots, mapped
 read-write into the one domain that owns it and read-only into the management domain; slot order is
 the catalogue's series order, asserted statically. Every shard is that wide because the widest set a
 domain publishes — the forwarder's, whose per-rule block reserves one slot per rule the ABI admits —
@@ -1908,17 +1954,17 @@ is what the width is derived from, and it costs nothing: a shard is its own regi
 page, so the reservation was already a page before the block existed. A second region carrying the
 rule counters alone would have bought back no memory and added a mapping to the domain that faces the
 management-plane attacker. So a domain publishes by relaxed store into memory
-nobody else may write, and the management domain renders by reading nine regions — no lock, no
-barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are individually
-meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
+nobody else may write, and the management domain renders by reading the twelve shard regions — no
+lock, no barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are
+individually meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
 last wrote; that is stated as a freshness boundary in the
 [metrics reference](../reference/metrics.md) rather than papered over.
 
 The exposition is rendered by `datad/crates/metrics` (`no_std`, panic-free, with a computed
 `MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `datad/crates/http`
-(`no_std`, a bounded server-side HTTP/1.1 head parser that returns a typed error mapping onto one of
-eight statuses). Both are fuzzed. The management domain's own shard is stored before the exposition
-is composed rather than after, which is why a scrape is never one request behind its own surface —
+(`no_std`, a bounded server-side HTTP/1.1 head parser whose typed error maps onto one of five of the
+twelve statuses that crate names). Both are fuzzed. The management domain's own shard is stored
+before the exposition is composed rather than after, which is why a scrape is never one request behind its own surface —
 stated as a freshness property in the [metrics reference](../reference/metrics.md).
 
 **Missing.**
@@ -1970,7 +2016,7 @@ published clock does not run ahead by the cost of reading the part.
 
 **Every domain consumes it, and every structured record carries an instant.** The calibration goes
 into a shared region (`wire::ClockCalibration`, a seqlock: even settled, odd being written) that the
-clock domain maps read-write and the other nine read-only. Each reads `RDTSC` itself — one
+clock domain maps read-write and the other eleven read-only. Each reads `RDTSC` itself — one
 unprivileged instruction, behind the single `unsafe` seam in `pd_runtime::read_timestamp_counter` —
 converts it with the published triple, and stamps the record it is about to emit, so an instant is
 this node's own arithmetic over one counter rather than a value passed between domains. The console
@@ -2035,7 +2081,7 @@ what catches an interrupt input shared with another device, the fault that chose
   against an external log to about a second, and is evidence of nothing.
 - **No metric says which domain has taken the calibration up.** It is readable per record on the log
   stream (`time=unsynchronized` against an instant) and `/metrics` carries the gauge for the
-  management domain alone; the other eight writing domains publish no such series (see the
+  management domain alone; the other ten writing domains publish no such series (see the
   [metrics reference](../reference/metrics.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
   never corrected, and the periodic wakeup does not change that: it announces that an interval has
@@ -2982,7 +3028,7 @@ unknown type byte, a nonzero reserved byte, a frame from the wrong end, a first 
 greeting, and a staged document past its own 64 KiB all cost **eight bytes**. A peer cannot pace this
 end into holding a mebibyte on the strength of a number it has already lost the connection over.
 
-**Thirteen refusals, one per rule broken.** A nonzero reserved byte (with which of the three), an
+**Twelve refusals, one per rule broken.** A nonzero reserved byte (with which of the three), an
 unknown type byte, a length past the frame bound, a frame from the wrong end, a first frame that is
 not the greeting, a greeting naming another protocol version, a payload that is not the frame's shape
 — short of its fields, or with bytes trailing a frame that has nothing variable in it — a ring

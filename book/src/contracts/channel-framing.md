@@ -184,10 +184,12 @@ Each entry:
 and may put any token it likes in a record it publishes; which ring a record came out of is decided
 by the appliance's capability topology and no writing domain can forge it. So a consumer that wants
 to know which domain spoke reads the origin, and the token in the line stays visible as that domain's
-own claim — which is what an operator reading the console sees too. The origins index the protection
-domains in the order the [architecture](../design/architecture.md) names them; unlike a snapshot,
-there is no fingerprint in front of them, so a consumer holding a stale table names the wrong domain
-rather than refusing the block.
+own claim — which is what an operator reading the console sees too. The origins index the
+appliance's own list of protection domains, in the order that list declares them, and the appliance
+publishes it for a consumer as a generated table rather than leaving it to be retyped — ten entries
+today, the three instances of the network driver sharing one. Unlike a snapshot there is no
+fingerprint in front of them, so a consumer holding a stale table names the wrong domain rather than
+refusing the block.
 
 **A line is printable ASCII and nothing else** — space through tilde, no control byte, no byte above
 127 — because that is the whole alphabet the console grammar renders. A consumer refuses a line

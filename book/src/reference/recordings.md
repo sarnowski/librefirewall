@@ -225,9 +225,24 @@ causing packet that *is* written, and the paragraph above says how it is written
 has no such record.
 
 - **A Custom Block of padding** fills whatever the encoder must leave empty to keep every write to
-  the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
-  sector before every download. A downloaded file therefore carries padding in its interior and not
-  only at a segment's end. It is skipped by any reader that does not know the PEN, and by `tcpdump`.
+  the device a whole sector: the rest of a segment when one is sealed, the rest of the open sector
+  before every download, and the rest of the open sector behind every counter block and every
+  console-transcript block below. A downloaded file therefore carries padding in its interior and
+  not only at a segment's end — in `/logs.pcapng`, one block of it after each of those two, which is
+  why that file holds roughly a sector per console line. It is skipped by any reader that does not
+  know the PEN, and by `tcpdump`.
+- **Why those two are padded and a packet is not.** The header each extent carries states how far
+  the recording is durably written, and it can only state a whole sector, because a sector is what
+  the device takes. A block ends where its length ends. So a reader working from a recovered disk —
+  which has nothing but the extent and that header — can be pointed at a byte inside a block, and
+  meet a final block claiming more bytes than are there. Padding the two blocks that are written
+  when nothing else is happening keeps the header pointing at a block boundary in the case that
+  would otherwise be the common one. It does **not** hold generally: a packet block is not padded,
+  one sector per frame being a cost a capture cannot carry, so between those points the position
+  the header states can still fall inside a packet block. A download is not exposed to this — the
+  appliance seals the recording before it serves one — and neither is a reader following the
+  recording upstream, which is handed the bytes as a stream. It is the direct reader of the medium
+  who must be prepared for a short final block.
 - **A Custom Block of counters** appears in `/logs.pcapng` about once a second, carrying the whole
   metric surface as it stood at one instant. It shares the block type and the enterprise number with
   the padding above and is told apart by the first byte of its data: **empty data, or a leading zero

@@ -1379,9 +1379,9 @@ generation was committed and never reached the dataplane, which is a fault; seei
 healthy boot. The forwarding domain additionally reports `generation=0 outcome=applied changes=0`
 from its own start-up, and that is not a third copy of anything — it is the node stating that it is
 running the fail-closed empty table and forwarding nothing until a generation arrives. On the
-shipped document the whole sequence is 20 change records — two interfaces of five fields, two
-neighbours of three, and the management object's four —
-`generation=1 outcome=applied changes=20`, the fail-closed `generation=0 outcome=applied changes=0`,
+shipped document the whole sequence is 43 change records — two interfaces of five fields, two
+neighbours of three, two rules of eleven, and the management object's five —
+`generation=1 outcome=applied changes=43`, the fail-closed `generation=0 outcome=applied changes=0`,
 and `generation=1 outcome=applied changes=0`.
 
 **`offset=` is not always a byte offset.** It is the one number the reason names, and which number
