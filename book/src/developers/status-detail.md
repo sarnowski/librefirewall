@@ -1478,7 +1478,13 @@ a TCP connection with a minimal deterministic client of its own, and then requir
   reassembled in order, its `Content-Length` held to the bytes that arrived → the appliance's `FIN`,
   `Connection: close` obliging it to close first → the client's `FIN` → the final `ACK`. Every
   segment's pseudo-header checksum is verified by the harness's own summation, and a segment arriving
-  at a step it does not belong to is refused;
+  at a step it does not belong to is refused. One that repeats sequence space the client has already
+  taken is the exception, because it is the appliance re-sending a segment whose acknowledgement has
+  not reached it and that is a peer working: the client compares it against what was sent at those
+  numbers before, answers as a peer answers one — the request again where the passive open is what
+  was repeated — and leaves its own model where it was. Those are counted, so an appliance that only
+  ever repeats itself still fails the boot; a `SYN` on a connection that has gone past its handshake
+  is refused as it always was;
 - **distinct initial sequence numbers across the boots**, compared between scenarios — two boots of
   one disk are separated only by the per-boot `RDRAND` secret and the time component, so an equal
   pair would mean one of the two is not reaching the generator (RFC 6528);

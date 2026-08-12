@@ -434,6 +434,27 @@ const ONBOARD_PAYLOAD: &[u8] = &[
 const ONBOARD_REPORT_POLLS: usize = 256;
 const ONBOARD_REPORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How many segments repeating sequence space it has already taken the client
+/// will accept on its connection before it calls the appliance broken.
+///
+/// A retransmission is a peer working, not a peer misbehaving, so each one is
+/// taken and answered rather than refused — but a peer that only ever repeats
+/// itself never finishes the exchange, and a station that waited for it could
+/// not tell that from a slow machine. The appliance's own transport abandons a
+/// range after five re-sends, and an exchange has a handful of ranges in it: a
+/// ceiling with room above that rather than a count, on
+/// [`ONBOARD_SEGMENT_LIMIT`]'s terms and for its reason.
+const CLIENT_REPEAT_LIMIT: usize = 16;
+
+/// The same bound for the station on the far end of the appliance's dial, across
+/// a whole boot.
+///
+/// [`CLIENT_REPEAT_LIMIT`]'s ceiling and its reason, spread over the sessions one
+/// boot may open: the dial's numbers begin again with every `SYN` this station
+/// answers, and this counts across all of them, so what a session is allowed is
+/// the client's own ceiling and the product is what a boot is.
+const DIAL_REPEAT_LIMIT: usize = CLIENT_REPEAT_LIMIT * DIAL_RESTART_LIMIT;
+
 /// How many segments the onboarding station will accept on one connection before
 /// it calls the appliance broken.
 ///
@@ -3955,6 +3976,11 @@ struct DialStation {
     /// session of the boot. Counted rather than kept: what a station that
     /// answers nothing can state about them is how many there were.
     offered: usize,
+    /// Segments that repeated sequence space this station had already taken,
+    /// across every session of the boot. Bounded by [`DIAL_REPEAT_LIMIT`]: a
+    /// peer whose every segment is one it already sent is not carrying a
+    /// channel, and the bytes of a re-send are not new bytes offered.
+    repeats: usize,
 }
 
 impl DialStation {
@@ -3972,6 +3998,7 @@ impl DialStation {
             resolutions: 0,
             dials: 0,
             offered: 0,
+            repeats: 0,
         }
     }
 
@@ -3999,8 +4026,9 @@ impl DialStation {
         format!(
             "the station is {:?}; the appliance's own dial is at {:?} and still owes {}; it \
              dialled from port {} with initial sequence {}, opened {} connection(s) after {} \
-             resolution(s) and reset {} of them, and {} probe bytes have arrived — with this \
-             station having put nothing on the wire to carry any of it",
+             resolution(s) and reset {} of them, {} segments repeated space already taken, and {} \
+             probe bytes have arrived — with this station having put nothing on the wire to carry \
+             any of it",
             self.misbehaviour,
             self.step,
             self.step.outstanding(),
@@ -4011,6 +4039,7 @@ impl DialStation {
             self.dials,
             self.resolutions,
             self.resets,
+            self.repeats,
             self.probe.len()
         )
     }
@@ -4360,6 +4389,10 @@ struct TcpClient {
     /// that never opened, and "it stopped after 47 segments holding 25048 bytes"
     /// is the difference between a close defect and a stream defect.
     segments: usize,
+    /// Of those, the ones that repeated sequence space this client had already
+    /// taken. Bounded by [`CLIENT_REPEAT_LIMIT`]: a peer whose every segment is
+    /// one it already sent is not making the exchange happen.
+    repeats: usize,
     last_segment: Option<(u8, u32, u32, usize)>,
 }
 
@@ -4373,6 +4406,7 @@ impl TcpClient {
             response: Vec::new(),
             peer_closed: false,
             segments: 0,
+            repeats: 0,
             last_segment: None,
         }
     }
@@ -4382,11 +4416,13 @@ impl TcpClient {
         match self.last_segment {
             None => String::from("no segment has come back at all"),
             Some((flags, sequence, acknowledgement, payload)) => format!(
-                "{} segments came back holding {} response bytes, the last with flags {flags:#04x} \
-                 sequence {sequence} acknowledgement {acknowledgement} and {payload} payload \
-                 bytes; this client's next sequence is {} and it expects {}",
+                "{} segments came back holding {} response bytes, {} of them repeating sequence \
+                 space already taken, the last with flags {flags:#04x} sequence {sequence} \
+                 acknowledgement {acknowledgement} and {payload} payload bytes; this client's next \
+                 sequence is {} and it expects {}",
                 self.segments,
                 self.response.len(),
+                self.repeats,
                 self.sequence,
                 self.expect
             ),
@@ -4583,10 +4619,17 @@ impl ManagementProbe {
     /// actually sent, the payload against the bytes it actually sent. Nothing here
     /// matches a substring or a rendered line.
     ///
+    /// A segment carrying sequence space this client has already taken is the
+    /// appliance re-sending one it has not seen acknowledged, which is a peer
+    /// working: it is judged against what was sent there before
+    /// ([`judge_repeat`]), leaves the client where it was, and counts against
+    /// [`CLIENT_REPEAT_LIMIT`]. Everything else belongs to a step.
+    ///
     /// # Errors
-    /// The verdict, naming the field and the two values. A segment that arrives at
-    /// a step it does not belong to is refused rather than tolerated: the whole
-    /// value of asserting a sequence is that its order is part of the contract.
+    /// The verdict, naming the field and the two values. A segment carrying
+    /// sequence space this connection has not reached and arriving at a step it
+    /// does not belong to is refused rather than tolerated: the whole value of
+    /// asserting a sequence is that its order is part of the contract.
     fn judge_tcp(&self, frame: &[u8], client: &mut TcpClient) -> Result<TcpStep, String> {
         let segment = decode_tcp(frame, &self.port)?;
         if segment.source_port != MANAGEMENT_TCP_PORT || segment.destination_port != CLIENT_PORT {
@@ -4610,6 +4653,38 @@ impl ManagementProbe {
             segment.acknowledgement,
             segment.payload.len(),
         ));
+        // A retransmission is not misbehaviour, and it reaches this client at
+        // every step past the handshake. This end answers on its own schedule —
+        // one queued frame a pass, released against what the console says
+        // arrived — so the appliance's timer fires on a range this client has
+        // already taken while its answer is still in the queue, and what comes
+        // back is a segment it has seen before. The wire can lose a frame
+        // outright as well, which is the same thing arriving for a different
+        // reason.
+        //
+        // Such a segment is identified by its numbers rather than by its shape:
+        // it occupies sequence space this client has already taken, ending no
+        // later than the number it next expects, compared as offsets from the
+        // appliance's own initial number so the arithmetic wraps with the
+        // sequence space rather than breaking across it. It carries nothing
+        // new, so nothing in this client's model moves for it — and what is
+        // refused inside that branch is every shape a repeat cannot have.
+        //
+        // Zero-length segments are deliberately not repeats: they occupy no
+        // sequence space at all, so *every* one of them would qualify, and the
+        // per-step assertions on the acknowledgement they carry are exactly
+        // what this connection is judged by. They go on to the step, as they
+        // always did.
+        if let Some(peer_isn) = client.peer_isn {
+            let occupied = (segment.payload.len() as u32)
+                .saturating_add(u32::from(segment.carries(TCP_SYN, 0)))
+                .saturating_add(u32::from(segment.carries(TCP_FIN, 0)));
+            let start = segment.sequence.wrapping_sub(peer_isn);
+            let taken = client.expect.wrapping_sub(peer_isn);
+            if occupied > 0 && start.saturating_add(occupied) <= taken {
+                return judge_repeat(&segment, client, peer_isn, start);
+            }
+        }
         match client.step {
             TcpStep::Unopened => Err(format!(
                 "a segment came back on the management port before the client opened a \
@@ -4639,11 +4714,22 @@ impl ManagementProbe {
                 Ok(TcpStep::AwaitSynAck)
             }
             TcpStep::AwaitResponse => {
+                // A `SYN` reaching here is one the repeat branch above did not
+                // account for: it sits on sequence space this connection has
+                // not reached, so it is not the passive open being re-sent but
+                // a second one at a number of its own — a transport offering to
+                // establish a connection it is already carrying.
                 if !segment.carries(TCP_ACK, TCP_SYN) {
                     return Err(format!(
-                        "the appliance answered with flags {:#04x}, and an established connection \
-                         owes an ACK with no SYN",
-                        segment.flags
+                        "the appliance answered with flags {:#04x} at sequence {}, and an \
+                         established connection owes an ACK with no SYN. Its passive open sat on \
+                         {}, and re-sending that one is taken; this is another",
+                        segment.flags,
+                        segment.sequence,
+                        client.peer_isn.map_or_else(
+                            || String::from("(no number at all)"),
+                            |isn| isn.to_string()
+                        )
                     ));
                 }
                 // The client has sent its `SYN` and its request and nothing
@@ -4693,11 +4779,17 @@ impl ManagementProbe {
                 Ok(TcpStep::AwaitResponse)
             }
             TcpStep::AwaitLastAck => {
+                // The appliance's own `FIN` re-sent is not refused here — the
+                // repeat branch above took it, this end's `FIN` having already
+                // acknowledged it. What this refuses is a `FIN` on sequence
+                // space the appliance had not reached, which is a second close
+                // of a connection it had already closed once.
                 if !segment.carries(TCP_ACK, TCP_SYN | TCP_FIN) {
                     return Err(format!(
-                        "the appliance answered the client's FIN with flags {:#04x}, and a peer \
-                         that has already closed owes a bare ACK",
-                        segment.flags
+                        "the appliance answered the client's FIN with flags {:#04x} at sequence \
+                         {}, and a peer that has already closed owes a bare ACK; this client had \
+                         taken up to {}",
+                        segment.flags, segment.sequence, client.expect
                     ));
                 }
                 // The client's `FIN` occupied one number past its request.
@@ -4711,9 +4803,17 @@ impl ManagementProbe {
                 client.sequence = owed;
                 Ok(TcpStep::Closed)
             }
+            // A close agrees what both ends have exchanged and nothing about
+            // what is still travelling, so a segment repeating that agreed
+            // space crosses it and was taken by the branch above. This refuses
+            // what genuinely contradicts the close: sequence space the
+            // appliance had not reached when it acknowledged this end's `FIN`,
+            // which is a connection it is still writing to.
             TcpStep::Closed => Err(format!(
-                "a segment came back after the connection closed: flags {:#04x}, sequence {}",
-                segment.flags, segment.sequence
+                "a segment came back after the connection closed carrying sequence space the \
+                 appliance had not reached: flags {:#04x}, sequence {}, and this client had taken \
+                 up to {}",
+                segment.flags, segment.sequence, client.expect
             )),
         }
     }
@@ -4752,12 +4852,38 @@ impl ManagementProbe {
                     &[],
                 ),
             ),
+            // The appliance has re-sent its passive open, so this end's own
+            // acknowledgement has not reached it — and that acknowledgement is
+            // the segment carrying the request. A bare one here would complete
+            // the handshake and then wait out the whole budget for a response to
+            // a request the appliance never took, so what goes back is the
+            // segment again: `client.sequence` is what the appliance last
+            // acknowledged, and it standing short of everything this client has
+            // sent is the definition of an outstanding range.
+            TcpStep::AwaitResponse if client.sequence != TcpClient::sent_through_request() => (
+                TcpStep::AwaitResponse,
+                tcp_frame(
+                    &self.port,
+                    client.sequence,
+                    client.expect,
+                    TCP_ACK | TCP_PSH,
+                    TCP_REQUEST,
+                ),
+            ),
             TcpStep::AwaitResponse => (
                 TcpStep::AwaitResponse,
                 tcp_frame(&self.port, client.sequence, client.expect, TCP_ACK, &[]),
             ),
             // The client's `FIN` is already out; what remains is the appliance's
             // acknowledgement of it, which `judge_tcp` closes the exchange on.
+            //
+            // Nothing is composed for a segment repeating what this end has
+            // already taken here either, and that is deliberate rather than an
+            // omission. The `FIN` this client sent acknowledges the appliance's
+            // own and is on the wire; a re-send of it would agree nothing more,
+            // and the appliance answers every acceptable segment in TIME-WAIT
+            // with an acknowledgement — so it would draw one more segment out of
+            // a connection this end had finished with.
             TcpStep::AwaitLastAck | TcpStep::Closed => return None,
         };
         client.step = next;
@@ -5326,20 +5452,73 @@ impl ManagementProbe {
                         segment.acknowledgement, station.sequence
                     ));
                 }
-                // In order and with no gap, on the client's own terms: what runs
-                // over this connection is a stream, so a segment out of place is
-                // refused rather than reassembled.
-                if segment.sequence != station.expect {
-                    return Err(format!(
-                        "a segment of the dial begins at sequence {} and the station expected {}",
-                        segment.sequence, station.expect
-                    ));
-                }
+                // Ahead of everything a segment's numbers say, because it holds
+                // whatever they are: this channel is a connection the appliance
+                // holds, so a close is the defect whether it arrives in order or
+                // behind one.
                 if segment.carries(TCP_FIN, 0) {
                     return Err(String::from(
                         "the appliance closed the channel it dialled, and a management channel is \
                          a connection it holds: a close here is a node that will re-dial a server \
                          that did nothing wrong",
+                    ));
+                }
+                // A segment repeating space this station has already taken is the
+                // appliance re-sending one it has not seen acknowledged, and this
+                // station is exactly the peer that provokes that: it answers on
+                // the run loop's schedule, one queued frame a pass. Acknowledged
+                // again and nothing else — the bytes are not new bytes offered,
+                // the stream does not move, and a station that answered nothing
+                // would let the appliance spend its retransmission budget and
+                // abandon a connection this boot judges as held open.
+                //
+                // Compared as offsets from the appliance's own initial number so
+                // the arithmetic wraps with the sequence space, and bounded on a
+                // count: a peer that only ever repeats itself is not carrying a
+                // channel, and a station that simply went on acknowledging could
+                // not tell that from a slow machine.
+                if let Some(peer_isn) = station.peer_isn {
+                    let occupied = segment.payload.len() as u32;
+                    let start = segment.sequence.wrapping_sub(peer_isn);
+                    let taken = station.expect.wrapping_sub(peer_isn);
+                    if occupied > 0 && start.saturating_add(occupied) <= taken {
+                        station.repeats = station.repeats.saturating_add(1);
+                        if station.repeats > DIAL_REPEAT_LIMIT {
+                            return Err(format!(
+                                "the appliance has re-sent {} segments this station had already \
+                                 taken and acknowledged, over the {} session(s) a boot may open. A \
+                                 peer that only repeats itself is one that never gets its flight \
+                                 across",
+                                station.repeats, DIAL_RESTART_LIMIT
+                            ));
+                        }
+                        station.owed.push_back(station_segment(
+                            &self.port,
+                            DIAL_DESTINATION,
+                            Ports {
+                                source: DIAL_PORT,
+                                destination: segment.source_port,
+                            },
+                            Numbers {
+                                sequence: station.sequence,
+                                acknowledgement: station.expect,
+                            },
+                            TCP_ACK,
+                            STATION_WINDOW,
+                            &[],
+                        ));
+                        return Ok(DialStep::Handshaken);
+                    }
+                }
+                // In order and with no gap, on the client's own terms: what runs
+                // over this connection is a stream, so a segment out of place is
+                // refused rather than reassembled.
+                if segment.sequence != station.expect {
+                    return Err(format!(
+                        "a segment of the dial begins at sequence {} and the station expected {}; \
+                         it had taken up to there and this is neither the next of the stream nor a \
+                         re-send of what it holds",
+                        segment.sequence, station.expect
                     ));
                 }
                 if !segment.payload.is_empty() {
@@ -5481,6 +5660,165 @@ impl ManagementProbe {
             echo_differences(&expected, &reply).join("; ")
         ))
     }
+}
+
+/// Judge a segment that repeats sequence space this client has already taken,
+/// and leave the client exactly where it was.
+///
+/// The step does not move and nothing is composed here: a repeat carries no
+/// information this client does not already hold, and a model that moved for one
+/// would be counting the same bytes twice. What it must still be is *the same
+/// segment again*, and four things say it is not:
+///
+/// An acknowledgement outside what this client has sent. It is the one field a
+/// re-send composes afresh rather than repeats, so it is held to the same span
+/// every step here holds it to: an appliance claiming bytes nobody sent is a
+/// defect whatever else the segment is.
+///
+/// A `SYN` anywhere but on the appliance's own initial number, which is the one
+/// place the connection's only `SYN` ever sat. One inside the stream is a
+/// transport re-offering a connection it is already carrying.
+///
+/// A `SYN` at all once this connection has gone past the handshake. The
+/// appliance sets that flag in one segment — the passive open — and re-sends it
+/// only while this client's acknowledgement has not reached it. The moment a
+/// byte of the response or the `FIN` arrives, that acknowledgement demonstrably
+/// did reach it, so a `SYN` after that is the appliance answering an established
+/// connection with an offer to establish it. That is the defect this whole check
+/// exists to catch, and it is caught here rather than made tolerable.
+///
+/// Payload bytes that differ from the ones already taken at the same numbers. A
+/// stream is what is under test, and a peer that answers one sequence number
+/// with two different bytes has not sent the same segment again — it has sent a
+/// second stream.
+///
+/// # Errors
+/// The verdict, naming the field and the two values, or the count where the
+/// appliance has done nothing but repeat itself.
+fn judge_repeat(
+    segment: &TcpFrame,
+    client: &mut TcpClient,
+    peer_isn: u32,
+    start: u32,
+) -> Result<TcpStep, String> {
+    client.repeats = client.repeats.saturating_add(1);
+    if client.repeats > CLIENT_REPEAT_LIMIT {
+        return Err(format!(
+            "the appliance has re-sent {} segments this client had already taken, and an exchange \
+             of this shape has a handful of ranges in it. A peer that only repeats itself is one \
+             that never finishes",
+            client.repeats
+        ));
+    }
+    // The one field of a re-send that is not a repeat of anything: the
+    // acknowledgement is composed afresh from what the appliance has taken by
+    // now. This client sends its `SYN`, its request and its `FIN` and nothing
+    // else, so that is the whole of what may be acknowledged — as offsets from
+    // this client's own initial number, the arithmetic wrapping with the
+    // sequence space rather than breaking across it.
+    let acknowledged = segment.acknowledgement.wrapping_sub(CLIENT_ISN);
+    let sent = TcpClient::sent_through_request()
+        .wrapping_add(1)
+        .wrapping_sub(CLIENT_ISN);
+    if acknowledged == 0 || acknowledged > sent {
+        return Err(format!(
+            "the appliance re-sent sequence {} acknowledging {}, and this client has sent its SYN, \
+             its request and its FIN — {} numbers from {CLIENT_ISN}. An acknowledgement outside \
+             that is one for bytes nobody sent",
+            segment.sequence, segment.acknowledgement, sent
+        ));
+    }
+    if segment.carries(TCP_SYN, 0) {
+        if start != 0 {
+            return Err(format!(
+                "the appliance set SYN on sequence {} and its own initial sequence number was \
+                 {peer_isn}: flags {:#04x}. The connection's only SYN sat on that number, so one \
+                 inside the stream is a transport re-offering a connection it is already carrying",
+                segment.sequence, segment.flags
+            ));
+        }
+        // One past the `SYN` is the whole of what this client has taken while
+        // the handshake is still outstanding, so anything more is the response.
+        if client.expect != peer_isn.wrapping_add(1) {
+            return Err(format!(
+                "the appliance answered with flags {:#04x} after it had already answered up to \
+                 sequence {}. Re-sending the passive open is what a peer does while this end's \
+                 acknowledgement has not reached it, and a response byte proves that it did",
+                segment.flags, client.expect
+            ));
+        }
+        if !segment.carries(TCP_SYN | TCP_ACK, TCP_FIN) {
+            return Err(format!(
+                "the appliance re-sent its passive open with flags {:#04x}, and a passive open \
+                 owes SYN and ACK together and no FIN",
+                segment.flags
+            ));
+        }
+        // The client's `SYN` is the whole of what an appliance still offering
+        // the handshake can have taken: the segment that acknowledges the offer
+        // carries the request with it, so one that took the request would have
+        // taken the acknowledgement too and would owe no passive open at all.
+        let owed = CLIENT_ISN.wrapping_add(1);
+        if segment.acknowledgement != owed {
+            return Err(format!(
+                "the re-sent SYN-ACK acknowledges {} and an appliance still offering the handshake \
+                 has taken the client's SYN alone, which occupied {owed}",
+                segment.acknowledgement
+            ));
+        }
+        if !segment.payload.is_empty() {
+            return Err(format!(
+                "the appliance's re-sent SYN carried {} payload bytes, and it answers the request \
+                 after the handshake rather than on it",
+                segment.payload.len()
+            ));
+        }
+        return Ok(client.step);
+    }
+    if !segment.carries(TCP_ACK, 0) {
+        return Err(format!(
+            "the appliance re-sent sequence {} with flags {:#04x}, and every segment of an \
+             established connection carries an ACK",
+            segment.sequence, segment.flags
+        ));
+    }
+    if !segment.payload.is_empty() {
+        if start == 0 {
+            return Err(format!(
+                "the appliance re-sent {} bytes on sequence {peer_isn}, which is the number its \
+                 own SYN occupied alone. The response begins one past it, so bytes there are a \
+                 stream this connection never carried",
+                segment.payload.len()
+            ));
+        }
+        // The response begins one past the `SYN`, so this is where in it the
+        // re-sent bytes belong.
+        let at = start.wrapping_sub(1) as usize;
+        let already = client
+            .response
+            .get(at..at.saturating_add(segment.payload.len()))
+            .ok_or_else(|| {
+                format!(
+                    "the appliance re-sent {} bytes at sequence {} and this client holds {} \
+                     response bytes: the range ends past every byte it has taken, and the only \
+                     sequence space there is the number the appliance's own FIN occupied. Data on \
+                     it is not the segment it sent there before",
+                    segment.payload.len(),
+                    segment.sequence,
+                    client.response.len()
+                )
+            })?;
+        if already != segment.payload {
+            return Err(format!(
+                "the appliance re-sent {} bytes at sequence {} and they are not the bytes it sent \
+                 there before. A stream answers one sequence number with one byte, so a second \
+                 answer is a second stream",
+                segment.payload.len(),
+                segment.sequence
+            ));
+        }
+    }
+    Ok(client.step)
 }
 
 /// Judge the whole response the appliance sent before closing.
@@ -9787,6 +10125,79 @@ mod tests {
         );
     }
 
+    /// This station is exactly the peer that provokes a re-send: it answers on
+    /// the run loop's schedule, one queued frame a pass, so the appliance's
+    /// timer fires on a flight whose acknowledgement is still in this end's
+    /// queue. It used to call the segment that comes back a stream out of place
+    /// and fail the boot on it.
+    #[test]
+    fn a_re_sent_segment_of_the_dial_is_acknowledged_again_and_taken_once() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut station = DialStation::new(DialMisbehaviour::Answers);
+        let peer_port = 0xabcd;
+        // Close enough to the wrap that every offset the re-send rule takes
+        // crosses it: raw comparison passes none of what follows.
+        let peer_isn = 0xffff_ff00;
+        let hello: &[u8] = b"a client hello";
+
+        station.step = DialStep::Resolved;
+        station.step = probe
+            .judge_dial_tcp(
+                &dial_segment(&management, peer_port, peer_isn, 0, TCP_SYN, &[]),
+                &mut station,
+            )
+            .expect("a SYN opens it");
+        let flight = dial_segment(
+            &management,
+            peer_port,
+            peer_isn.wrapping_add(1),
+            STATION_ISN.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            hello,
+        );
+        station.step = probe
+            .judge_dial_tcp(&flight, &mut station)
+            .expect("the session's first flight");
+        let taken = station.expect;
+        station.owed.clear();
+
+        assert_eq!(
+            probe.judge_dial_tcp(&flight, &mut station),
+            Ok(DialStep::Handshaken)
+        );
+        assert_eq!(station.expect, taken, "a re-send moved the stream");
+        assert_eq!(
+            station.offered,
+            hello.len(),
+            "a re-send was counted as bytes offered"
+        );
+        assert_eq!(station.repeats, 1);
+        let answer = decode_tcp_to(
+            &station.owed.pop_front().expect("acknowledged again"),
+            &management,
+            DIAL_DESTINATION,
+        )
+        .expect("a well-formed segment");
+        assert!(answer.carries(TCP_ACK, TCP_SYN | TCP_FIN));
+        assert_eq!(answer.acknowledgement, taken);
+
+        // And the tolerance is bounded on a count, which is what a peer that
+        // never gets its flight across is.
+        for _ in 1..DIAL_REPEAT_LIMIT {
+            probe
+                .judge_dial_tcp(&flight, &mut station)
+                .expect("a re-send inside the bound");
+        }
+        let verdict = probe
+            .judge_dial_tcp(&flight, &mut station)
+            .expect_err("a peer that only repeats itself");
+        assert!(
+            verdict.contains("never gets its flight across"),
+            "{verdict}"
+        );
+    }
+
     /// What the station refuses: a dial that never asked, a probe that is not
     /// the one the appliance is contracted to carry, and a resolution asked
     /// twice.
@@ -10842,6 +11253,310 @@ mod tcp_client_tests {
         );
         assert!(client.response.is_empty());
         assert_eq!(client.expect, 0x1000, "an empty segment moved the stream");
+    }
+
+    /// The appliance's own initial sequence number for the scrape connection,
+    /// chosen so close to the wrap that every offset the repeat rule takes
+    /// crosses it: an implementation comparing raw sequence numbers with `<`
+    /// passes none of the tests below.
+    const SCRAPE_PEER_ISN: u32 = 0xffff_ff00;
+
+    /// A client driven to the step where its request is out and the appliance
+    /// owes the response: the open, the passive open answering it, and the
+    /// acknowledgement that carries the request.
+    fn handshaken(probe: &ManagementProbe, management: &ManagementPort) -> TcpClient {
+        let mut client = TcpClient::new();
+        probe.advance(&mut client).expect("the client's own SYN");
+        let syn_ack = appliance_segment(
+            management,
+            SCRAPE_PEER_ISN,
+            CLIENT_ISN.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            &[],
+        );
+        client.step = probe
+            .judge_tcp(&syn_ack, &mut client)
+            .expect("the passive open");
+        probe.advance(&mut client).expect("the request");
+        assert_eq!(client.step, TcpStep::AwaitResponse);
+        client
+    }
+
+    /// The passive open this appliance re-sends because this end's
+    /// acknowledgement has not reached it yet.
+    fn passive_open_again(management: &ManagementPort) -> Vec<u8> {
+        appliance_segment(
+            management,
+            SCRAPE_PEER_ISN,
+            CLIENT_ISN.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            &[],
+        )
+    }
+
+    /// An appliance whose retransmission timer fires before this end's
+    /// acknowledgement reaches it re-sends its passive open, and that is a peer
+    /// working — this step used to call it a peer answering an established
+    /// connection with an offer to establish it, and fail the boot on it.
+    #[test]
+    fn a_re_sent_passive_open_is_answered_with_the_request_again() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = handshaken(&probe, &management);
+
+        let again = passive_open_again(&management);
+        assert_eq!(
+            probe.judge_tcp(&again, &mut client),
+            Ok(TcpStep::AwaitResponse)
+        );
+        assert_eq!(
+            client.expect,
+            SCRAPE_PEER_ISN.wrapping_add(1),
+            "a segment carrying nothing new moved the stream"
+        );
+        assert!(client.response.is_empty());
+        assert_eq!(client.repeats, 1);
+
+        // And what goes back is the request again rather than a bare
+        // acknowledgement: the appliance never took it, so a client that only
+        // completed the handshake would wait out its whole budget for a
+        // response to a request nobody has.
+        let answer = probe.advance(&mut client).expect("the request again");
+        let sent = decode_tcp(&answer, &management).expect("it re-parses");
+        assert_eq!(sent.payload, TCP_REQUEST);
+        assert_eq!(sent.acknowledgement, SCRAPE_PEER_ISN.wrapping_add(1));
+        assert_eq!(client.step, TcpStep::AwaitResponse);
+    }
+
+    /// And the four shapes that are not the passive open re-sent, each of which
+    /// is an appliance offering to establish a connection it is already
+    /// carrying. This is what the check at this step exists for, and it still
+    /// catches every one of them.
+    #[test]
+    fn a_passive_open_that_is_not_the_one_already_seen_still_fails_the_boot() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let head = response_of(64);
+
+        // A second passive open at a number of its own, before anything of the
+        // response has arrived: it is not a re-send of the one already seen.
+        let mut client = handshaken(&probe, &management);
+        let verdict = probe
+            .judge_tcp(
+                &appliance_segment(
+                    &management,
+                    SCRAPE_PEER_ISN.wrapping_add(3),
+                    CLIENT_ISN.wrapping_add(1),
+                    TCP_SYN | TCP_ACK,
+                    &[],
+                ),
+                &mut client,
+            )
+            .expect_err("a passive open at a new number");
+        assert!(verdict.contains("owes an ACK with no SYN"), "{verdict}");
+
+        // A re-send claiming to have taken more than the client's own `SYN`,
+        // which an appliance still owed a passive open cannot have.
+        let mut client = handshaken(&probe, &management);
+        let verdict = probe
+            .judge_tcp(
+                &appliance_segment(
+                    &management,
+                    SCRAPE_PEER_ISN,
+                    TcpClient::sent_through_request(),
+                    TCP_SYN | TCP_ACK,
+                    &[],
+                ),
+                &mut client,
+            )
+            .expect_err("a re-send acknowledging the request");
+        assert!(
+            verdict.contains("still offering the handshake"),
+            "{verdict}"
+        );
+
+        // The two that need the connection to have gone past the handshake: a
+        // byte of the response proves this end's acknowledgement arrived.
+        for (sequence, expected) in [
+            (SCRAPE_PEER_ISN, "already answered up to"),
+            (
+                SCRAPE_PEER_ISN.wrapping_add(5),
+                "initial sequence number was",
+            ),
+        ] {
+            let mut client = handshaken(&probe, &management);
+            client.step = probe
+                .judge_tcp(
+                    &appliance_segment(
+                        &management,
+                        SCRAPE_PEER_ISN.wrapping_add(1),
+                        TcpClient::sent_through_request(),
+                        TCP_ACK | TCP_PSH,
+                        &head,
+                    ),
+                    &mut client,
+                )
+                .expect("the response opening");
+            let verdict = probe
+                .judge_tcp(
+                    &appliance_segment(
+                        &management,
+                        sequence,
+                        CLIENT_ISN.wrapping_add(1),
+                        TCP_SYN | TCP_ACK,
+                        &[],
+                    ),
+                    &mut client,
+                )
+                .expect_err("a SYN on a connection that completed its handshake");
+            assert!(verdict.contains(expected), "{verdict}");
+        }
+    }
+
+    /// A response segment and a close re-sent because their acknowledgement had
+    /// not reached the appliance are taken once, not twice: the stream is what
+    /// it was, and neither step moves.
+    #[test]
+    fn a_re_sent_response_segment_and_close_are_taken_once() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = handshaken(&probe, &management);
+        let response = response_of(200);
+        let owed = TcpClient::sent_through_request();
+        let (head, tail) = response.split_at(80);
+        let tail_at = SCRAPE_PEER_ISN.wrapping_add(1 + head.len() as u32);
+
+        let opening = appliance_segment(
+            &management,
+            SCRAPE_PEER_ISN.wrapping_add(1),
+            owed,
+            TCP_ACK | TCP_PSH,
+            head,
+        );
+        client.step = probe
+            .judge_tcp(&opening, &mut client)
+            .expect("the response opening");
+
+        // The same segment again, its acknowledgement still in the queue.
+        assert_eq!(
+            probe.judge_tcp(&opening, &mut client),
+            Ok(TcpStep::AwaitResponse)
+        );
+        assert_eq!(client.response, head, "a re-send was taken twice");
+        assert_eq!(client.expect, tail_at, "a re-send moved the stream");
+
+        // The rest of it and the close, then the whole of that segment again.
+        let closing = appliance_segment(
+            &management,
+            tail_at,
+            owed,
+            TCP_ACK | TCP_PSH | TCP_FIN,
+            tail,
+        );
+        client.step = probe.judge_tcp(&closing, &mut client).expect("the close");
+        probe.advance(&mut client).expect("the client's own FIN");
+        assert_eq!(client.step, TcpStep::AwaitLastAck);
+        assert_eq!(
+            probe.judge_tcp(&closing, &mut client),
+            Ok(TcpStep::AwaitLastAck),
+            "a close re-sent after this end answered it is not a second close"
+        );
+        assert_eq!(client.response, response, "a re-send was taken twice");
+        assert_eq!(client.repeats, 2);
+        assert_eq!(
+            probe.advance(&mut client),
+            None,
+            "a station that has answered a close owes nothing more"
+        );
+
+        // The final acknowledgement still closes the exchange over it.
+        let last_ack = appliance_segment(
+            &management,
+            client.expect,
+            owed.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        assert_eq!(probe.judge_tcp(&last_ack, &mut client), Ok(TcpStep::Closed));
+    }
+
+    /// A peer answering one sequence number with two different bytes has not
+    /// re-sent a segment, it has sent a second stream — and a stream is what
+    /// this connection is judged as.
+    #[test]
+    fn a_re_send_whose_bytes_differ_still_fails_the_boot() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = handshaken(&probe, &management);
+        let head = response_of(64);
+        let owed = TcpClient::sent_through_request();
+
+        client.step = probe
+            .judge_tcp(
+                &appliance_segment(
+                    &management,
+                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    owed,
+                    TCP_ACK | TCP_PSH,
+                    &head,
+                ),
+                &mut client,
+            )
+            .expect("the response opening");
+
+        let mut altered = head.clone();
+        altered.splice(9..12, b"503".iter().copied());
+        let verdict = probe
+            .judge_tcp(
+                &appliance_segment(
+                    &management,
+                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    owed,
+                    TCP_ACK | TCP_PSH,
+                    &altered,
+                ),
+                &mut client,
+            )
+            .expect_err("a second stream at the same numbers");
+        assert!(verdict.contains("not the bytes it sent there"), "{verdict}");
+
+        // The acknowledgement is the one field a re-send composes afresh, and
+        // it is held to what this client has actually sent here as it is at
+        // every step.
+        let verdict = probe
+            .judge_tcp(
+                &appliance_segment(
+                    &management,
+                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    owed.wrapping_add(9),
+                    TCP_ACK | TCP_PSH,
+                    &head,
+                ),
+                &mut client,
+            )
+            .expect_err("a re-send acknowledging bytes nobody sent");
+        assert!(verdict.contains("bytes nobody sent"), "{verdict}");
+    }
+
+    /// The tolerance is bounded on a count, which is what a peer that only ever
+    /// repeats itself is: it never finishes the exchange, and a client that
+    /// simply went on answering could not tell that from a slow machine.
+    #[test]
+    fn an_appliance_that_only_re_sends_fails_on_the_count() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut client = handshaken(&probe, &management);
+        let again = passive_open_again(&management);
+
+        for _ in 0..CLIENT_REPEAT_LIMIT {
+            probe
+                .judge_tcp(&again, &mut client)
+                .expect("a re-send inside the bound");
+        }
+        let verdict = probe
+            .judge_tcp(&again, &mut client)
+            .expect_err("a peer that only repeats itself");
+        assert!(verdict.contains("never finishes"), "{verdict}");
     }
 
     /// The checksum is verified rather than trusted: it is the one field of the
