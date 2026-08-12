@@ -44,14 +44,15 @@ use crate::catalog::{
     RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
     RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
-    RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES, RECORDING_STREAM_WINDOWS,
-    RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER, RECORDING_TAP_RECORDS,
-    RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, STORE_GENERATION,
-    STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET, STORE_SIGN_REFUSALS,
-    STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST, TCP_BYTES,
-    TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED, TCP_RESETS,
-    TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES,
-    TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
+    RECORDING_SNAPSHOTS, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
+    RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
+    RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS,
+    STORE_GENERATION, STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET,
+    STORE_SIGN_REFUSALS, STORE_SIGNATURES, Series, TAP_OBSERVATIONS, TAP_OBSERVATIONS_LOST,
+    TCP_BYTES, TCP_CHALLENGE_ACKS, TCP_CHALLENGES_SUPPRESSED, TCP_CONNECTIONS, TCP_REFUSED,
+    TCP_RESETS, TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED,
+    TRANSMIT_BYTES, TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES,
+    UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
 use crate::rules::MAX_RULE_SERIES;
 
@@ -2300,7 +2301,7 @@ pub const SINKS: usize = 2;
 const SINK_SLOTS: usize = 10;
 
 /// Slots [`RecorderSample`] occupies.
-pub const RECORDER_SLOTS: usize = 12 + SINKS * SINK_SLOTS + 6;
+pub const RECORDER_SLOTS: usize = 12 + SINKS * SINK_SLOTS + 9;
 
 /// What the domain owning the block device has to say about itself. Its faults
 /// carry `queue="request"` on the family a driver's carry `queue="receive"`.
@@ -2320,6 +2321,8 @@ pub struct RecorderSample {
     pub tap: [u64; 3],
     /// Downloads served then refused.
     pub downloads: [u64; 2],
+    /// Metric readings written, missed and dropped, as the series name them.
+    pub snapshots: [u64; 3],
     pub records_unclocked: u64,
     pub log: LogSample,
 }
@@ -2406,6 +2409,9 @@ impl RecorderSample {
         plain(&RECORDING_TAP_DROPPED_BY_WRITER),
         s(&RECORDING_DOWNLOADS, &[Label::new("outcome", "served")]),
         s(&RECORDING_DOWNLOADS, &[Label::new("outcome", "refused")]),
+        s(&RECORDING_SNAPSHOTS, &[Label::new("outcome", "written")]),
+        s(&RECORDING_SNAPSHOTS, &[Label::new("outcome", "missed")]),
+        s(&RECORDING_SNAPSHOTS, &[Label::new("outcome", "dropped")]),
         plain(&RECORDING_RECORDS_UNCLOCKED),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
@@ -2434,6 +2440,7 @@ impl RecorderSample {
         }
         put_all(&mut values, &mut at, &self.tap);
         put_all(&mut values, &mut at, &self.downloads);
+        put_all(&mut values, &mut at, &self.snapshots);
         put(&mut values, &mut at, self.records_unclocked);
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);

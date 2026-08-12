@@ -147,6 +147,27 @@ impl Snapshot {
         }
     }
 
+    /// The catalogue's slots laid end to end, in shard order, for the reading
+    /// this node hands to the domain that writes the medium — the same walk the
+    /// exposition makes, without the names, so a slot's position here **is** its
+    /// position in [`SHARDS`]. The two dynamic families are absent: which
+    /// interfaces and which rules exist comes from the committed configuration,
+    /// so neither has a fixed slot to occupy.
+    #[must_use]
+    pub fn relay_values(&self) -> [u64; crate::SNAPSHOT_SLOTS] {
+        let mut out = [0u64; crate::SNAPSHOT_SLOTS];
+        let mut at = 0;
+        for (spec, values) in SHARDS.iter().zip(&self.values) {
+            for slot in 0..spec.series.len() {
+                if let Some(target) = out.get_mut(at) {
+                    *target = values.get(slot).copied().unwrap_or(0);
+                }
+                at = at.saturating_add(1);
+            }
+        }
+        out
+    }
+
     /// Write the whole exposition into `out`, answering its length.
     ///
     /// # Errors

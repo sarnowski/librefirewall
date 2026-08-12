@@ -1181,7 +1181,7 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 101_114);
+    assert_eq!(MAX_EXPOSITION_LEN, 101_703);
 }
 
 /// A sample's fields land on the series that declare them, positionally.

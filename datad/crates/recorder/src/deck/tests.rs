@@ -378,7 +378,7 @@ fn run(
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..passes {
-        deck.poll(medium, reader, &mut scratch, clock());
+        deck.poll(medium, reader, &mut scratch, clock(), None);
     }
 }
 
@@ -747,7 +747,7 @@ fn a_completion_for_a_boot_time_read_reaching_the_pass_is_counted_and_never_sett
     medium.forge(Job::Preload(Which::Log));
     medium.forge(Job::Preload(Which::Capture));
     let mut scratch = [0u8; TAP_SNAP_LEN];
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     assert_eq!(deck.counters().completions_unexpected, 2);
 }
 
@@ -835,7 +835,7 @@ fn a_medium_that_refuses_every_submit_loses_no_record() {
     medium.refuse = 0;
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..64 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
 
     let counters = deck.counters();
@@ -897,7 +897,7 @@ fn a_revoked_flow_reaches_the_connection_history_and_not_the_capture() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..12 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
 
     let counters = deck.counters();
@@ -952,7 +952,7 @@ fn a_tap_annotation_the_reader_refuses_is_counted_and_recorded_nowhere() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..4 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
 
     let counters = deck.counters();
@@ -985,7 +985,7 @@ fn pump(
     passes: usize,
 ) -> Option<Answer> {
     for _ in 0..passes {
-        deck.poll(medium, reader, scratch, clock());
+        deck.poll(medium, reader, scratch, clock(), None);
         if let Some(served) = deck.answer(medium) {
             return Some(match served {
                 Served::Deliver {
@@ -1130,7 +1130,7 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
     let mut scratch = [0u8; TAP_SNAP_LEN];
     deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
     // The seal reaches the medium first; the read after it is the one broken.
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     medium.fail = 1;
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {
@@ -1201,7 +1201,7 @@ fn a_completion_answering_no_job_is_counted_without_ending_the_drain() {
     // the flushes.
     let mut scratch = [0u8; TAP_SNAP_LEN];
     medium.unattributed = 3;
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     let after = deck.counters();
     assert_eq!(
         after.completions_unexpected,
@@ -1223,7 +1223,7 @@ fn a_completion_answering_no_job_is_counted_without_ending_the_drain() {
     // The recording is unharmed: everything published still reaches a segment.
     medium.unattributed = 0;
     for _ in 0..64 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
     for sink in deck.counters().sinks {
         assert_eq!(sink.records, 8);
@@ -1339,7 +1339,7 @@ fn the_log_recording_holds_only_the_observations_that_carry_an_event() {
             .write(&annotation, frame.len() as u32, &frame)
             .expect("the ring is empty");
     }
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
 
     let counters = deck.counters();
     assert_eq!(counters.tap_records, 5, "every observation was drained");
@@ -1375,7 +1375,7 @@ fn a_recording_under_sustained_traffic_rolls_segments_and_stays_consistent() {
                 published += 1;
             }
         }
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
     let counters = deck.counters();
     assert_eq!(counters.tap_records, published);
@@ -1427,7 +1427,7 @@ fn an_unclocked_recorder_states_no_instant_rather_than_a_counter_reading() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..4 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, None, None);
     }
     assert_eq!(deck.counters().records_unclocked, 1);
     assert_eq!(deck.counters().sinks[0].records, 1);
@@ -1459,7 +1459,7 @@ fn a_segment_reopens_only_once_its_predecessor_is_durable() {
     medium.refuse = 0;
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..512 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
     for sink in deck.counters().sinks {
         assert_eq!(sink.records, 40, "and every record still reached a segment");
@@ -1490,7 +1490,7 @@ fn a_records_drop_count_states_what_the_tap_ring_lost_before_it() {
 
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..256 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
     }
 
     let counters = deck.counters();
@@ -1672,7 +1672,7 @@ fn a_forged_barrier_completion_releases_no_superblock() {
     medium.forge(Job::Barrier(Which::Log));
     medium.forge(Job::Barrier(Which::Capture));
     let mut scratch = [0u8; TAP_SNAP_LEN];
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock());
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
 
     assert_eq!(
         deck.counters().completions_unexpected,
@@ -1811,4 +1811,260 @@ fn a_ring_read_neither_seals_nor_pins_and_leaves_a_download_alone() {
         Some(Answer::Bytes(_, total_len)) => assert_eq!(total_len, opened.1),
         other => panic!("the download continues against its own snapshot: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The metric reading a recording carries
+// ---------------------------------------------------------------------------
+
+/// A Custom Block's enterprise number and the byte behind it, read out of a
+/// recording exactly as a management server does: by block type, then by the
+/// leading byte that tells a reading from the padding.
+const CUSTOM_BLOCK: u32 = 0x0000_0BAD;
+
+/// Every Custom Block in a stream, as `(pen, data)`, walked by length.
+fn customs(bytes: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(header) = bytes.get(at..at + 8) {
+        let kind = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        if len < BLOCK_FRAMING_LEN || !len.is_multiple_of(4) || at + len > bytes.len() {
+            break;
+        }
+        if kind == CUSTOM_BLOCK
+            && let Some(body) = bytes.get(at + 8..at + len - 4)
+            && let Some(pen) = body.get(..4)
+        {
+            found.push((
+                u32::from_le_bytes([pen[0], pen[1], pen[2], pen[3]]),
+                body[4..].to_vec(),
+            ));
+        }
+        at += len;
+    }
+    found
+}
+
+/// Every kind-1 Custom Block in a stream, decoded.
+fn readings(bytes: &[u8]) -> Vec<lfw_metrics::MetricSnapshot> {
+    customs(bytes)
+        .into_iter()
+        .filter_map(|(_pen, data)| lfw_metrics::decode_snapshot(&data).ok())
+        .collect()
+}
+
+/// A relay holding one reading, at generation 2.
+fn published(unix_nanos: u64, first: u64) -> Box<StatsRelay> {
+    let relay = Box::new(StatsRelay::zero());
+    let mut values = [0u64; lfw_metrics::SNAPSHOT_SLOTS];
+    for (slot, value) in values.iter_mut().enumerate() {
+        *value = first.wrapping_add(slot as u64);
+    }
+    relay.publish(unix_nanos, &values);
+    relay
+}
+
+/// The payload of one recording: its extent past segment 0, which carries the
+/// superblock and no block a pcapng reader walks.
+fn payload(medium: &Fake, which: Which) -> &[u8] {
+    let (start, sectors) = which.extent();
+    medium.extent(start + SEGMENT_SECTORS, sectors - SEGMENT_SECTORS)
+}
+
+/// Publish, poll until the reading is framed, then seal the log recording so the
+/// part-sector holding it reaches the device. Bounded by passes throughout —
+/// never by elapsed time — because a device that never completes must end the
+/// test rather than hang it.
+fn settle(
+    deck: &mut Deck,
+    medium: &mut Fake,
+    reader: &mut wire::TapReader<'_>,
+    relay: &StatsRelay,
+    passes: usize,
+) {
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    for _ in 0..passes {
+        deck.poll(medium, reader, &mut scratch, clock(), Some(relay));
+    }
+    // A download seals the recording, which is what puts the last part-sector on
+    // the medium; without it the block is staged and the disk is simply shorter.
+    let _ = download(deck, medium, reader, DownloadSink::Log);
+}
+
+#[test]
+fn a_published_reading_reaches_the_log_recording_and_decodes() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = published(1_785_443_220_000_000_000, 7);
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+    assert_eq!(deck.counters().snapshots_written, 1);
+    assert_eq!(deck.counters().snapshots_dropped, 0);
+
+    let held = readings(payload(&medium, Which::Log));
+    assert_eq!(held.len(), 1, "the log recording holds one reading");
+    assert_eq!(held[0].unix_nanos, 1_785_443_220_000_000_000);
+    assert_eq!(held[0].values[0], 7);
+    assert_eq!(held[0].values[1], 8);
+}
+
+/// The capture recording is deliberately not offered one: its rate is three to
+/// four orders of magnitude higher, so a reading placed there would be swept
+/// past by traffic before anybody read it.
+#[test]
+fn the_capture_recording_carries_no_reading() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = published(1, 1);
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+    let _ = download(&mut deck, &mut medium, &mut reader, DownloadSink::Capture);
+    assert!(readings(payload(&medium, Which::Capture)).is_empty());
+}
+
+/// The generation is the pace. A relay that has not moved is read on every pass
+/// and framed on none of them, which is what keeps the recording's snapshot rate
+/// the publisher's rather than the poll loop's.
+#[test]
+fn a_reading_is_framed_once_per_publish_however_often_it_is_polled() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = published(1, 1);
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+    assert_eq!(deck.counters().snapshots_written, 1);
+
+    relay.publish(2, &[9u64; 4]);
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+    assert_eq!(deck.counters().snapshots_written, 2);
+
+    let held = readings(payload(&medium, Which::Log));
+    assert_eq!(held.len(), 2);
+    assert_eq!(held[1].unix_nanos, 2);
+    // The second publish is shorter than the catalogue, and the slots it did not
+    // reach read zero rather than the first reading's tail.
+    assert_eq!(held[1].values[0], 9);
+    assert_eq!(held[1].values[5], 0);
+}
+
+/// A publisher caught mid-write costs a counted miss and nothing else: the next
+/// pass asks again, and no half-written reading reaches the medium.
+#[test]
+fn a_publisher_caught_mid_write_costs_a_counted_miss() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = Box::new(StatsRelay::zero());
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+
+    // A zeroed region is a publisher that has published nothing, which reads the
+    // same way a torn one does and is counted the same way.
+    for _ in 0..4 {
+        deck.poll(
+            &mut medium,
+            &mut reader,
+            &mut scratch,
+            clock(),
+            Some(&relay),
+        );
+    }
+    assert_eq!(deck.counters().snapshots_missed, 4);
+    assert_eq!(deck.counters().snapshots_written, 0);
+    assert!(readings(payload(&medium, Which::Log)).is_empty());
+}
+
+/// No relay at all — the shape a host test or an unmapped region has — writes
+/// nothing and counts nothing.
+#[test]
+fn a_deck_offered_no_relay_frames_nothing() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    for _ in 0..8 {
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    }
+    let counters = deck.counters();
+    assert_eq!(counters.snapshots_written, 0);
+    assert_eq!(counters.snapshots_missed, 0);
+    assert_eq!(counters.snapshots_dropped, 0);
+}
+
+/// A reading placed among observations leaves both readable: the packet blocks
+/// are still there and still in order, which is the property a reader that does
+/// not know this enterprise number depends on.
+#[test]
+fn a_reading_between_observations_leaves_the_recording_parseable() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = published(5, 5);
+
+    // Observations, a reading, then more observations, so the reading sits
+    // between packet blocks rather than behind all of them. One writer for the
+    // whole test, as the forwarding domain has one for its life: a second would
+    // restart at slot zero.
+    let mut writer = ring.writer();
+    let frame = [0xABu8; 64];
+    for packet_id in 0..4u64 {
+        writer
+            .write(&annotation(packet_id, 0), frame.len() as u32, &frame)
+            .expect("the ring holds four");
+    }
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+    relay.publish(6, &[6u64; 8]);
+    for packet_id in 4..8u64 {
+        writer
+            .write(&annotation(packet_id, 0), frame.len() as u32, &frame)
+            .expect("the ring holds four more");
+    }
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+
+    let bytes = payload(&medium, Which::Log);
+    let (sections, packets) = walk(bytes);
+    assert_eq!(sections, 1);
+    assert_eq!(
+        packets, 8,
+        "the observations survived the readings among them"
+    );
+    assert_eq!(readings(bytes).len(), 2);
+}
+
+/// The padding that fills the slack behind a sector shares this block type and
+/// this enterprise number, and is told apart by its leading zero. Every padding
+/// block a recording holds must therefore decode as padding and never as a
+/// reading — the property every recording ever written rests on.
+#[test]
+fn the_padding_a_recording_holds_is_never_read_as_a_reading() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let relay = published(9, 9);
+    run(&mut deck, &mut medium, &ring, &mut reader, 16, 128, 32);
+    settle(&mut deck, &mut medium, &mut reader, &relay, 8);
+
+    let bytes = payload(&medium, Which::Log);
+    let blocks = customs(bytes);
+    assert!(blocks.len() > 1, "the recording holds padding as well");
+    let mut padding = 0;
+    for (pen, data) in &blocks {
+        assert_eq!(*pen, lfw_pcapng::UNREGISTERED_PEN);
+        match lfw_metrics::decode_snapshot(data) {
+            Ok(_reading) => assert_eq!(data.first(), Some(&1)),
+            Err(lfw_metrics::SnapshotDecodeError::Padding) => {
+                padding += 1;
+                assert!(data.iter().all(|byte| *byte == 0));
+            }
+            Err(other) => panic!("a block a recording holds decoded as {other:?}"),
+        }
+    }
+    assert!(padding > 0, "no padding block was written at all");
 }

@@ -99,7 +99,7 @@ use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
 use wire::{
     ClockCalibration, DownloadReply, DownloadRequest, DownloadResponder, LogConsume, LogRecords,
-    TAP_SNAP_LEN, TapConsume, TapRecords,
+    StatsRelay, TAP_SNAP_LEN, TapConsume, TapRecords,
 };
 
 /// The management domain, which is told whenever a reply lands.
@@ -374,6 +374,7 @@ fn init() -> Recorder {
     let tap_consume: &'static TapConsume = attach_region!(tap_consume_vaddr: TapConsume);
     let request: &'static DownloadRequest = attach_region!(dl_request_vaddr: DownloadRequest);
     let reply: &'static DownloadReply = attach_region!(dl_reply_vaddr: DownloadReply);
+    let relay: &'static StatsRelay = attach_region!(stats_relay_vaddr: StatsRelay);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
@@ -410,6 +411,7 @@ fn init() -> Recorder {
                             tap: tap_consume.reader(tap),
                             responder: reply.responder(request),
                             stats,
+                            relay,
                             clock: PdClock::new(clock),
                             blocks,
                         },
@@ -505,6 +507,9 @@ struct Loop<'region> {
     tap: wire::TapReader<'region>,
     responder: DownloadResponder<'region>,
     stats: &'region StatsShard,
+    /// The whole metric reading the management domain publishes, read-only here
+    /// and the only way this domain learns any counter but its own.
+    relay: &'region StatsRelay,
     clock: PdClock<'region>,
     blocks: BlockCounters,
 }
@@ -517,6 +522,7 @@ fn run(mut held: Loop<'_>, sink: &RingSink<'_, PdClock<'_>>) -> ! {
         tap,
         responder,
         stats,
+        relay,
         clock,
         blocks,
     } = &mut held;
@@ -524,7 +530,7 @@ fn run(mut held: Loop<'_>, sink: &RingSink<'_, PdClock<'_>>) -> ! {
     loop {
         // Read afresh each pass: a cached triple would be a stopped clock that
         // no longer says so.
-        deck.poll(device, tap, &mut scratch, clock.calibration());
+        deck.poll(device, tap, &mut scratch, clock.calibration(), Some(relay));
         // One demand at a time, which is all the channel admits: taking a
         // second while the first is unanswered would leave the requester
         // waiting on a sequence nothing will publish.

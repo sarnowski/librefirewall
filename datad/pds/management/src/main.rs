@@ -191,12 +191,13 @@ use pd_runtime::{
     ConfigRequest, Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage,
     ForwardRings, Half, Hop, Ipv4Address, IsnSecret, OnboardCounters, OpenError, PdClock, Pool,
     RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
-    Shipped, StatsRegions, Via, Wait, attach_region, log_sample, read_timestamp_counter,
+    Shipped, SnapshotSchedule, StatsRegions, Via, Wait, attach_region, log_sample,
+    read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
     DownloadReply, DownloadRequest, DownloadSink, LogConsume, LogRecords, ManagementDestination,
-    ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest,
+    ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest, StatsRelay,
 };
 
 /// How many dataplane ports the build has, and so the bound a committed image's
@@ -920,6 +921,10 @@ fn init() -> Management {
     // handle `wire::relay` hands back reaches the reply through a view with no
     // store on it, so this domain cannot write the records it then puts on the
     // wire as though the other end had produced them.
+    // The one page this domain writes for the recorder: read-write here and
+    // read-only there, which is what lets a whole metric reading cross without
+    // the recorder mapping a single statistics shard.
+    let stats_relay: &'static StatsRelay = attach_region!(stats_relay_vaddr: StatsRelay);
     let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
     let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
     let relay = Relay::attach(relay_request, relay_reply);
@@ -959,6 +964,9 @@ fn init() -> Management {
         // redial instant is observable from the wire, and a schedule seeded
         // from that secret would leak it through its own timing.
         channel: OutboundChannel::new(drawn.jitter),
+        stats,
+        stats_relay,
+        snapshots: SnapshotSchedule::new(),
         sink,
     })
 }
@@ -1005,6 +1013,13 @@ struct Running {
     /// because an attempt crosses wakeups and the schedule between attempts
     /// outlives every one of them.
     channel: OutboundChannel,
+    /// Every shard, kept beside the stage that also holds them: the reading
+    /// published for the recorder is taken from here.
+    stats: StatsRegions<'static>,
+    /// Where that reading goes — read by the recorder, which maps no shard but
+    /// its own.
+    stats_relay: &'static StatsRelay,
+    snapshots: SnapshotSchedule,
     sink: RingSink<'static, PdClock<'static>>,
 }
 
@@ -1152,6 +1167,15 @@ impl Handler for Management {
             running.stage.drive_onboarding(now);
             running.stage.publish(log);
         }
+        // Last in the pass and outside the clocked block, so the reading carries
+        // what every shard holds *after* this pass published its own — and so an
+        // unclocked node publishes its one reading rather than none.
+        running.snapshots.publish_due(
+            now,
+            running.stage.utc(ticks),
+            &running.stats,
+            running.stats_relay,
+        );
         if moved > 0 {
             let counters = running.stage.counters();
             announce(

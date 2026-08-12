@@ -443,6 +443,12 @@ impl Sink {
         self.ring.cursor()
     }
 
+    /// The most one segment can ever hold, a block too large reported against it.
+    #[must_use]
+    pub const fn segment_payload(&self) -> usize {
+        self.ring.segment_payload()
+    }
+
     /// Where this recording's superblock goes: the first sector of its extent,
     /// which no record ever reaches.
     #[must_use]
@@ -546,6 +552,56 @@ impl Sink {
         self.pending_drops = 0;
         self.counters.records = self.counters.records.saturating_add(1);
         self.counters.record_bytes = self.counters.record_bytes.saturating_add(written as u64);
+        Recorded::Placed { bytes: written }
+    }
+
+    /// Encode one PEN-tagged Custom Block carrying `data` into the staging
+    /// buffer.
+    ///
+    /// The same eight steps [`Sink::record`] takes and in the same order —
+    /// measure, claim the tail reserve, refuse what no segment could hold, refuse
+    /// what this one cannot, write into staging, re-offer rather than drop when
+    /// staging is full, place, commit — because a block that skipped any of them
+    /// could leave a segment without room for its seal. `data` is opaque, save
+    /// that one leading with a zero byte, or with none, reads as the padding
+    /// below. **It touches none of this sink's counters**:
+    /// `records` and `record_bytes` are the account of *observations*, held by
+    /// the gate to the packet blocks in the file and the frames put on the wire.
+    pub fn block(&mut self, data: &[u8], staging: &mut [u8]) -> Recorded {
+        let body = CustomBinary {
+            pen: lfw_pcapng::UNREGISTERED_PEN,
+            data,
+        };
+        let needed = match lfw_pcapng::custom_block_len(&body) {
+            Ok(needed) => needed,
+            Err(error) => return Recorded::Refused(error),
+        };
+        let claim = needed.saturating_add(TAIL_RESERVE);
+        if claim > self.ring.segment_payload() {
+            return Recorded::Oversized { needed };
+        }
+        if claim > self.ring.slack() {
+            return Recorded::SegmentFull;
+        }
+        let out: &mut [u8] = staging.get_mut(self.staged_len..).unwrap_or_default();
+        let written = match lfw_pcapng::write_custom_block(out, &body) {
+            Ok(written) => written,
+            Err(EncodeError::OutOfSpace { needed, capacity }) => {
+                return Recorded::StagingFull {
+                    needed,
+                    free: capacity,
+                };
+            }
+            Err(error) => return Recorded::Refused(error),
+        };
+        match self.ring.append(written) {
+            Append::Placed(reservation) => {
+                reservation.commit();
+            }
+            Append::SegmentFull => return Recorded::SegmentFull,
+            Append::Oversized { .. } => return Recorded::Oversized { needed: written },
+        }
+        self.staged_len = self.staged_len.saturating_add(written);
         Recorded::Placed { bytes: written }
     }
 

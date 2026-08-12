@@ -228,6 +228,17 @@ has no such record.
   the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
   sector before every download. A downloaded file therefore carries padding in its interior and not
   only at a segment's end. It is skipped by any reader that does not know the PEN, and by `tcpdump`.
+- **A Custom Block of counters** appears in `/logs.pcapng` about once a second, carrying the whole
+  metric surface as it stood at one instant. It shares the block type and the enterprise number with
+  the padding above and is told apart by the first byte of its data: **empty data, or a leading zero
+  byte, is padding**, and `1` is a metric reading. Its layout is in
+  [the channel framing contract](../contracts/channel-framing.md#metric-snapshots), which is where
+  the management server reads it from. What it holds is exactly the closed catalogue —
+  [every counter and gauge series of the twelve shards](metrics.md), in the order that page lists
+  them — and not the two families whose members depend on the running configuration: there is no
+  per-interface information and no per-rule hit count in a recording, because neither has a fixed
+  place in the catalogue to occupy. A reader that does not recognise the PEN skips these exactly as
+  it skips the padding, so a recording carrying them opens in `tcpdump` unchanged.
 - **The PEN is `0xFFFFFFFF`, and it is nobody's.** No registered Private Enterprise Number stands
   behind these annotations. The value is IANA-reserved so it can never collide with a real
   assignment, but it identifies no one, and a reader must not treat a PEN-tagged option in these

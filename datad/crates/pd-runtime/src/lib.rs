@@ -530,6 +530,7 @@ pub mod handover;
 pub mod owner;
 pub mod reconnect;
 pub mod relay;
+pub mod snapshot;
 pub mod stats;
 pub mod tap;
 
@@ -574,6 +575,7 @@ pub use relay::{
     RelayReport, RelaySession, Relayed, SHIPPED_RING_BYTES, TerminatedSession, Terminating,
     TerminatingPass, Terminator, Upstream,
 };
+pub use snapshot::{SNAPSHOT_PERIOD, SnapshotSchedule};
 pub use stats::{
     BlockCounters, ForwarderCounters, StatsRegions, StoreIdentity, StoreSigning,
     SubmissionCounters, config_sample, flow_sample, forwarder_sample, log_sample,

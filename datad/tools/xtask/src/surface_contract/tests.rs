@@ -104,6 +104,8 @@ fn recording(snap_len: u32, ids: &[(u64, usize)]) -> Parsed {
             })
             .collect(),
         consumed: 0,
+        snapshots: Vec::new(),
+        padding_blocks: 0,
     }
 }
 
@@ -736,6 +738,8 @@ fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way()
             annotation: Some(opening(0, 0)),
         }],
         consumed: 0,
+        snapshots: Vec::new(),
+        padding_blocks: 0,
     };
     let log = block(LOG_SNAP as usize);
     let capture = block(CAPTURE_SNAP as usize);

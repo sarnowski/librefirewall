@@ -933,6 +933,7 @@ version = "0.1.0"
 dependencies = [
  "lfw-capture-ring",
  "lfw-clock",
+ "lfw-metrics",
  "lfw-pcapng",
  "proptest",
  "wire",

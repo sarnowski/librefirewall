@@ -64,7 +64,9 @@
 
 use core::num::NonZeroU64;
 
-use lfw_clock::{Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks};
+use lfw_clock::{
+    Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks, UtcNanos,
+};
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
     http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
@@ -710,6 +712,15 @@ impl<'ring> EndpointStage<'ring> {
         self.calibration
             .as_ref()
             .map(|calibration| calibration.monotonic(now))
+    }
+
+    /// The wall-clock instant `now` names, or `None` while no calibration has
+    /// been taken — which is the instant a published reading is stamped with.
+    #[must_use]
+    pub fn utc(&self, now: Ticks) -> Option<UtcNanos> {
+        self.calibration
+            .as_ref()
+            .map(|calibration| calibration.utc(now))
     }
 
     /// Take frames off the pipeline until it is observed empty, the return ring

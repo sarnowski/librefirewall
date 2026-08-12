@@ -21,7 +21,7 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
   alias Ctrld.Channel.Ingest.Telemetry
   alias Ctrld.Channel.Ingest.Telemetry.Ring
   alias Ctrld.RecordingFixtures
-  alias Ctrld.Telemetry.{Cursor, Store}
+  alias Ctrld.Telemetry.{Cursor, MetricCatalogue, Store}
 
   # How many records each committed recording holds, counted here so a fixture
   # that changed shows up as a disagreement rather than as a silently smaller
@@ -260,6 +260,73 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
     end
   end
 
+  describe "the metric readings a connection history carries" do
+    test "become metric_samples rows a query reads back", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      rows = metric_samples(device)
+      assert rows != []
+
+      # One row per catalogue slot per reading, which is what makes the count a
+      # statement about the mapping rather than about how many blocks arrived.
+      assert rem(length(rows), MetricCatalogue.slots()) == 0
+      readings = div(length(rows), MetricCatalogue.slots())
+      assert readings >= 2, "the fixture carries #{readings} reading(s)"
+
+      # The recorder's own account of the medium under it, which a boot on the
+      # harness's 64 MiB data disk reports as 131072 sectors — a number this
+      # server never composed and can only have read out of the recording.
+      capacity =
+        Enum.filter(rows, fn row ->
+          row["family"] == "librefirewall_block_capacity_sectors" and
+            row["labels"]["domain"] == "recorder"
+        end)
+
+      assert length(capacity) == readings
+      assert Enum.any?(capacity, &(&1["value"] == 131_072.0))
+
+      # Every row names a series the catalogue declares, and carries the domain
+      # label the shard supplies.
+      declared = MapSet.new(MetricCatalogue.series())
+
+      for row <- rows do
+        labels = Map.new(row["labels"])
+        assert MapSet.member?(declared, {row["family"], labels})
+      end
+    end
+
+    test "carry the appliance's own instant, not this server's", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      instants =
+        device |> metric_samples() |> Enum.map(& &1["observed_at"]) |> Enum.uniq() |> Enum.sort()
+
+      assert length(instants) >= 2, "every reading was stamped with one instant"
+      # The readings are a second apart on the appliance, and this server took
+      # them all in one call — so distinct instants can only be the appliance's.
+      assert List.first(instants) != List.last(instants)
+    end
+
+    test "leave the padding that shares their block type alone", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      # The fixture carries padding blocks between the readings, and a padding
+      # block read as a reading would put four hundred fabricated numbers in the
+      # store. Nothing is counted as a skipped record for them: padding is not a
+      # fault and is stepped over in silence.
+      refute_received {:telemetry, :records_skipped, _measurements, %{cause: :padding}}
+      refute_received {:telemetry, :samples_skipped, _measurements, _metadata}
+    end
+
+    test "and the connection history's own records land beside them", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      # Two tables from one ring, and the cursor moved once both were in.
+      assert metric_samples(device) != []
+      assert Cursor.position(device, :log) > 0
+    end
+  end
+
   describe "a ring's process" do
     test "lives as long as the session feeding it, and leaves nothing behind", %{device: device} do
       test = self()
@@ -349,6 +416,16 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
       binary_part(bytes, 0, size)
       | chunks(binary_part(bytes, size, byte_size(bytes) - size), size)
     ]
+  end
+
+  defp metric_samples(device) do
+    {:ok, rows} =
+      Store.query(
+        "SELECT * FROM metric_samples WHERE device_id = '#{device}' " <>
+          "ORDER BY observed_at, family"
+      )
+
+    rows
   end
 
   defp flow_events(device) do

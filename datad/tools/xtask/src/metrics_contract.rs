@@ -1484,6 +1484,32 @@ pub fn forwarded_frames_total(body: &str) -> Result<u64, String> {
     Ok(series.iter().map(|sample| sample.value).sum())
 }
 
+/// What one shard reports for the medium under it, in sectors.
+///
+/// # Errors
+/// An exposition carrying no such series, or more than one.
+pub fn capacity_sectors(body: &str, domain: &str) -> Result<u64, String> {
+    one_value(
+        body,
+        "librefirewall_block_capacity_sectors",
+        &[("domain", domain)],
+    )
+}
+
+/// The one sample of `name` carrying `labels`, as a number.
+///
+/// The general form the two helpers above are special cases of, for a caller
+/// naming a series this module has no reason to know about — the snapshot
+/// contract names several, and a function per series would be a second copy of
+/// the catalogue.
+///
+/// # Errors
+/// An exposition where the labels match no series, or more than one.
+pub fn one_value(body: &str, name: &str, labels: &[(&str, &str)]) -> Result<u64, String> {
+    let exposition = parse(body)?;
+    one(&exposition, name, labels).map(|sample| sample.value)
+}
+
 /// The one sample of `name` matching `labels`, or a verdict naming what was
 /// found instead.
 fn one<'a>(

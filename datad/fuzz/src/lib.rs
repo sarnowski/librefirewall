@@ -17,6 +17,7 @@
 //! | [`flow`] | `lfw_flow`'s connection table: the TCP state machine and window checks over it, the UDP and ICMP pseudo-flows, and the quoted datagram inside an ICMP error | untrusted network traffic **and** a connection-flood attacker |
 //! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
 //! | [`metrics_render`] | `lfw_metrics`' exposition renderer, over arbitrary counters and arbitrary storage | a byzantine neighbour PD **and** a management-plane attacker |
+//! | [`metric_snapshot`] | `lfw_metrics`' metric-reading codec: arbitrary bytes out of a recording, and arbitrary counters into one | whoever holds a recording **and** a byzantine neighbour PD |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
@@ -153,6 +154,7 @@ pub mod ip_endpoint;
 pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
+pub mod metric_snapshot;
 pub mod metrics_render;
 pub mod neighbour;
 pub mod onboarding_install;
@@ -279,6 +281,10 @@ mod tests {
         (
             "metrics_render",
             crate::metrics_render::metrics_render_harness,
+        ),
+        (
+            "metric_snapshot",
+            crate::metric_snapshot::metric_snapshot_harness,
         ),
         (
             "onboarding_surface",

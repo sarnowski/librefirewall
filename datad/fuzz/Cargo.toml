@@ -54,7 +54,9 @@ cargo-fuzz = true
 #                   so that crate is on this surface through this one and
 #                   needs no target of its own
 #   lfw-metrics     the exposition rendered out of counters a peer PD wrote, into
-#                   storage of whatever size the endpoint has
+#                   storage of whatever size the endpoint has — and the metric
+#                   reading a recording carries, whose decode side reads bytes
+#                   out of a file that left a customer's premises
 #   routing         the forwarding table those headers are resolved against
 #   pipeline        the chain of stages that turns them into a verdict
 #   queue           the shared ring whose cursors and slots a peer PD owns
@@ -283,6 +285,13 @@ bench = false
 [[bin]]
 name = "metrics_render"
 path = "fuzz_targets/metrics_render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metric_snapshot"
+path = "fuzz_targets/metric_snapshot.rs"
 test = false
 doc = false
 bench = false

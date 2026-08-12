@@ -1126,6 +1126,57 @@
     <memory_region name="stats_crypto" size="0x1000" />
     <memory_region name="stats_store" size="0x1000" />
 
+    <!-- THE STATISTICS RELAY, and it exists because the two halves of one job
+         are in two domains that may not be merged.
+
+         The recorder is the only domain that can write the medium, and it maps
+         no statistics shard but its own. The management domain maps every
+         shard and can therefore compose one whole reading, and it can write no
+         recording. So a metric snapshot destined for a recording has to cross,
+         and this page is the crossing: the MANAGEMENT domain maps it READ-WRITE
+         and the RECORDER maps it READ-ONLY, which is `dl_request`'s direction
+         with a different pair of domains.
+
+         WHY THIS AND NOT ELEVEN MORE READ GRANTS ON THE RECORDER. Widening
+         `stats_*` to the recorder would delete the property those grants exist
+         for — one writer and one reader per shard — on the domain that holds a
+         block device and a DMA-capable controller. This page is the narrower
+         grant by every measure: one region instead of eleven, one direction
+         instead of eleven, and the recorder learns numbers rather than gaining
+         the ability to read whatever a peer is currently counting.
+
+         WHAT THE RECORDER CANNOT DO WITH IT. It is READ-ONLY there, so a
+         compromised recorder cannot forge a number into the `/metrics` surface
+         or into another domain's shard: it can only decline to write what it
+         was handed, which is a recording that says less and never one that lies.
+         And the management domain, which writes this page, gains nothing on the
+         medium — it cannot place a block, only offer numbers the recorder
+         chooses to frame.
+
+         WHY A SEQLOCK WHERE A SHARD NEEDS NONE. A shard's slots are
+         independently meaningful; a *reading* is meaningful only whole, its
+         whole claim being that every number in it was taken at one instant. So
+         this region carries `clock`'s generation counter and its protocol — even
+         settled, odd being written — and the reader takes a bounded number of
+         attempts and then reports having missed one (`wire::StatsRelay`). The
+         counter doubles as the pace: it rises once per publish, so the recorder
+         writes a block when it has moved and never on a timer of its own.
+
+         NO OTHER DOMAIN MAPS IT, in either direction. The forwarder in
+         particular does not: the dataplane neither publishes nor observes this
+         page, exactly as it maps no shard but its own.
+
+         Size is `wire::STATS_RELAY_REGION_SIZE`, on the same footing as every
+         constant above. The type is one page by construction — a header and as
+         many slots as fit behind it — and `lfw_metrics` asserts at build time
+         that the catalogue fits, so a reading that outgrew the page is a
+         compile error rather than one silently cut short.
+
+         No phys_addr, for the reason the shards above carry none: no device
+         DMAs into it, and a zeroed region is generation zero, which every
+         reader reads as "nothing published yet". -->
+    <memory_region name="stats_relay" size="0x1000" />
+
     <!-- The forwarder maps four dataplane regions and two configuration ones,
          and holds no device capability at all. IT IS GRANTED NO MANAGEMENT
          REGION, in either direction and of either pipeline, and the management
@@ -1596,6 +1647,7 @@
         <map mr="stats_hardware_probe" vaddr="0x5_009_000" perms="r" cached="true" setvar_vaddr="stats_hardware_probe_vaddr" />
         <map mr="stats_crypto" vaddr="0x5_00a_000" perms="r" cached="true" setvar_vaddr="stats_crypto_vaddr" />
         <map mr="stats_store" vaddr="0x5_00b_000" perms="r" cached="true" setvar_vaddr="stats_store_vaddr" />
+        <map mr="stats_relay" vaddr="0x5_00c_000" perms="rw" cached="true" setvar_vaddr="stats_relay_vaddr" />
     </protection_domain>
 
     <!-- Each driver maps five of its six pipeline regions. The exception is the
@@ -1818,6 +1870,7 @@
         <map mr="log_recorder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_recorder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_recorder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
+        <map mr="stats_relay" vaddr="0x5_00c_000" perms="r" cached="true" setvar_vaddr="stats_relay_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar3" />
         <setvar symbol="dma_paddr" region_paddr="blk_dma" />
         <setvar symbol="io_paddr" region_paddr="blk_io" />

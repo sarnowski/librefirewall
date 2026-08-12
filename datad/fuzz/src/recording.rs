@@ -58,7 +58,7 @@
 //!   was configured with, and never promises a download more bytes than the
 //!   device has taken.
 
-use std::{collections::VecDeque, string::String, vec, vec::Vec};
+use std::{boxed::Box, collections::VecDeque, string::String, vec, vec::Vec};
 
 use arbitrary::{Arbitrary, Unstructured};
 use lfw_capture_ring::{
@@ -66,6 +66,7 @@ use lfw_capture_ring::{
     RingState, SECTOR_SIZE, SUPERBLOCK_BYTES, SUPERBLOCK_COPY_BYTES, SUPERBLOCK_MAGIC,
     SUPERBLOCK_VERSION, decode_superblock, encode_superblock,
 };
+use lfw_metrics::SNAPSHOT_SLOTS;
 use lfw_recorder::deck::{
     Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Polled, Refused, SEGMENT_BYTES,
     STAGING_END, Served, TAP_BUDGET, Transfer,
@@ -76,8 +77,8 @@ use lfw_recorder::{
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReader, DownloadReply, DownloadRequest, DownloadSink,
-    TAP_SNAP_LEN, TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection,
-    TapDropReason, TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
+    StatsRelay, TAP_SNAP_LEN, TapAnnotation, TapClassification, TapConsume, TapDecision,
+    TapDirection, TapDropReason, TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
 };
 
 use crate::guard::Guarded;
@@ -132,11 +133,21 @@ enum Step {
     /// they asked for, leaving the rest of the staging area holding whatever
     /// the previous transfer left in it.
     UnderDeliver { count: usize },
+    /// The management domain publishes a metric reading — of any length,
+    /// including one longer than the page it goes in.
+    ///
+    /// The *other* thing that peer can do to this side — hold the region
+    /// mid-write so no settled reading can be taken — is not a step here and is
+    /// not excluded either: it reaches this side as a `None` load, which every
+    /// pass before the first publish already is. What that region does under a
+    /// wholly arbitrary generation, odd values included, is `wire::StatsRelay`'s
+    /// own property to hold, and it does.
+    Publish { unix_nanos: u64, values: Vec<u64> },
 }
 
 fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
     let tag = u8::arbitrary(unstructured).ok()?;
-    Some(match tag % 6 {
+    Some(match tag % 7 {
         0 => Step::Observe {
             packet_id: u64::arbitrary(unstructured).ok()?,
             timestamp: u64::arbitrary(unstructured).ok()?,
@@ -163,6 +174,14 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             len: u32::arbitrary(unstructured).ok()?,
         },
         2 | 3 => Step::Pass,
+        5 => Step::Publish {
+            unix_nanos: u64::arbitrary(unstructured).ok()?,
+            values: {
+                let len = u16::arbitrary(unstructured).ok()? as usize % (SNAPSHOT_SLOTS + 8);
+                let value = u64::arbitrary(unstructured).ok()?;
+                vec![value; len]
+            },
+        },
         4 => match u8::arbitrary(unstructured).ok()? % 5 {
             0 => Step::Refuse {
                 count: u8::arbitrary(unstructured).ok()? as usize,
@@ -604,6 +623,8 @@ pub fn recording_pass(data: &[u8]) {
     let mut scratch = [0u8; TAP_SNAP_LEN];
     let mut answers = 0usize;
     let mut demands = 0usize;
+    // The relay page, written by a peer this side may assume nothing about.
+    let relay = Box::new(StatsRelay::zero());
 
     for _ in 0..MAX_STEPS {
         let Some(step) = take_step(&mut unstructured) else {
@@ -636,9 +657,10 @@ pub fn recording_pass(data: &[u8]) {
                     deck.demand(demand);
                 }
             }
+            Step::Publish { unix_nanos, values } => relay.publish(unix_nanos, &values),
             Step::Pass => {
                 let before = deck.counters();
-                deck.poll(&mut medium, &mut reader, &mut scratch, None);
+                deck.poll(&mut medium, &mut reader, &mut scratch, None, Some(&relay));
                 let after = deck.counters();
                 // Boundedness: the pass's own constants, never the peers'.
                 assert!(

@@ -46,14 +46,17 @@ use lfw_capture_ring::{
     Geometry, GeometryError, RingState, RingStateError, SECTOR_SIZE, SUPERBLOCK_BYTES,
     SUPERBLOCK_COPY_BYTES,
 };
+use lfw_metrics::{SNAPSHOT_BYTES, SNAPSHOT_SLOTS, encode_snapshot};
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader, DownloadRefusal, DownloadSink,
-    TAP_SNAP_LEN, TapReader,
+    StatsRelay, TAP_SNAP_LEN, TapReader,
 };
+
+use lfw_pcapng::MIN_CUSTOM_BLOCK_LEN;
 
 use crate::{
     Flush, InterfaceName, Locate, MAX_INTERFACES, Recorded, Sink, SinkConfig, SinkCounters,
-    SinkError, Snapshot,
+    SinkError, Snapshot, TAIL_RESERVE,
 };
 
 /// Sectors at the front of the device neither recording may touch.
@@ -400,6 +403,13 @@ pub struct RecorderCounters {
     /// Completions answering a job nothing was waiting on: a device replaying
     /// its used ring, or a wiring defect. Expected to stay zero.
     pub completions_unexpected: u64,
+    /// Metric readings framed into the log recording.
+    pub snapshots_written: u64,
+    /// Readings the publisher had moved on from before a settled one could be
+    /// taken — a torn read, bounded and reported rather than retried.
+    pub snapshots_missed: u64,
+    /// Readings no recording could hold, which the assertion below proves none.
+    pub snapshots_dropped: u64,
 }
 
 /// How one recording's extent was opened at boot — a fresh ring looking exactly
@@ -604,6 +614,11 @@ pub struct Deck {
     /// How far the one checkpoint in progress has got. One at a time, because
     /// both recordings share one staging area.
     checkpointing: Checkpointing,
+    /// The relay generation the last framed reading came from. A reading is
+    /// written when this has moved, so the recording's snapshot rate is the
+    /// publisher's; and it advances only once one is *placed*, so a deferred
+    /// reading is retried against whatever the publisher holds by then.
+    framed_generation: u32,
     counters: RecorderCounters,
 }
 
@@ -668,6 +683,7 @@ impl Deck {
                 download: Download::Idle,
                 clock: None,
                 checkpointing: Checkpointing::Idle,
+                framed_generation: 0,
                 counters: RecorderCounters::default(),
             },
             [log_opened, capture_opened],
@@ -702,6 +718,7 @@ impl Deck {
         tap: &mut TapReader<'_>,
         scratch: &mut [u8; TAP_SNAP_LEN],
         clock: Option<Calibration>,
+        relay: Option<&StatsRelay>,
     ) {
         self.clock = clock;
         for _ in 0..COMPLETION_BUDGET {
@@ -710,11 +727,71 @@ impl Deck {
             }
         }
         self.drain_tap(medium, tap, scratch);
+        self.frame_snapshot(medium, relay);
         self.advance_download(medium);
         for index in 0..self.recordings.len() {
             self.advance(index, medium);
         }
         self.checkpoint(medium);
+    }
+
+    /// Take whatever reading the publisher has settled and frame it into the log
+    /// recording, if it is newer than the last that went in; at most one per
+    /// pass. **The log and not the capture**, the two rings differing by three
+    /// to four orders of magnitude in rate.
+    fn frame_snapshot(&mut self, medium: &mut impl Medium, relay: Option<&StatsRelay>) {
+        let Some(relay) = relay else {
+            return;
+        };
+        let Some((generation, image)) = relay.load(SNAPSHOT_SLOTS) else {
+            // Nothing published yet, or every attempt lost to a publisher
+            // mid-write; the next pass asks again.
+            self.counters.snapshots_missed = self.counters.snapshots_missed.saturating_add(1);
+            return;
+        };
+        if generation == self.framed_generation {
+            return;
+        }
+        let mut body = [0u8; SNAPSHOT_BYTES];
+        // Unreachable at the encoder's own length; a value, not an assertion.
+        if encode_snapshot(&mut body, image.unix_nanos, image.values()).is_err() {
+            self.counters.snapshots_dropped = self.counters.snapshots_dropped.saturating_add(1);
+            self.framed_generation = generation;
+            return;
+        }
+        let which = Which::Log;
+        let staging = medium.staging(which.area());
+        let Some(recording) = self.recordings.get_mut(which.index()) else {
+            return;
+        };
+        match recording.sink.block(&body, staging) {
+            Recorded::Placed { .. } => {
+                // And complete the sector behind it: a reading is the largest
+                // block written here and the only one written when nothing else
+                // is happening, so without this the durable prefix a superblock
+                // names would routinely end inside one — and a reader following
+                // that cursor meets a block whose closing length never reached
+                // the medium, a truncated file rather than a shorter one.
+                let _ = recording.sink.seal(staging);
+                self.counters.snapshots_written = self.counters.snapshots_written.saturating_add(1);
+                self.framed_generation = generation;
+            }
+            // "Not now": the segment rolls or the staging drains, and the next
+            // pass offers a fresher reading, the generation not being consumed.
+            Recorded::SegmentFull => {
+                if !recording.rolling && recording.sink.close_segment(staging).is_ok() {
+                    recording.rolling = true;
+                }
+            }
+            Recorded::StagingFull { .. } => {}
+            // Neither is reachable for a reading: the assertion at the foot of
+            // this module holds its length under a segment's. Counted rather
+            // than asserted, nothing about a metric may fault this domain.
+            Recorded::Oversized { .. } | Recorded::Refused(_) => {
+                self.counters.snapshots_dropped = self.counters.snapshots_dropped.saturating_add(1);
+                self.framed_generation = generation;
+            }
+        }
     }
 
     /// Bytes the transfer answering `job` asked for, or `None` holding none.
@@ -1484,6 +1561,14 @@ fn place(
         Recorded::StagingFull { .. } => false,
     }
 }
+
+// A metric reading always fits the recording it is framed into, both lengths
+// being build constants — the catalogue decides one and `SEGMENT_BYTES` the
+// other — which is what makes `Sink::block`'s two terminal answers unreachable
+// above. The framing sits in front of the reading and the reserve behind it.
+const _: () = {
+    assert!(SNAPSHOT_BYTES + MIN_CUSTOM_BLOCK_LEN + TAIL_RESERVE < SEGMENT_BYTES);
+};
 
 #[cfg(test)]
 mod tests;

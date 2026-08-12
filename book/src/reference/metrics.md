@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-124 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 463 counter and gauge series from the 12 shards,
+125 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 466 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 100 136 bytes — a worst case computed from
+declares, and the document they render into is bounded at 101 703 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -346,6 +346,7 @@ misreporting rather than a lost record.
 | `librefirewall_recording_records_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Observations encoded into a recording, by sink. |
 | `librefirewall_recording_staging_deferrals_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Records a recording could not stage yet and re-offered. **Not a loss**: a deferred record is held and placed on a later pass, so this rising says the medium is behind the encoder and never that a recording has a gap. |
 | `librefirewall_recording_records_unclocked_total` | counter | `recorder` | — | Records placed before any calibration was published, so the recording states no instant for them rather than a counter reading. |
+| `librefirewall_recording_snapshots_total` | counter | `recorder` | `outcome`&nbsp;(`dropped`, `missed`, `written`) | Metric readings the recorder framed into the connection history, and those it could not: one the publisher had moved on from before a settled copy could be taken, and one no segment could hold. |
 | `librefirewall_recording_sectors_written_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Sectors of a recording the device acknowledged. |
 | `librefirewall_recording_segments_closed_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Segments sealed and rolled past, by sink. |
 | `librefirewall_recording_tap_dropped_by_writer_total` | counter | `recorder` | — | Observations the forwarder says the ring had no slot for; its claim about itself. |

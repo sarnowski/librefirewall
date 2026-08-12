@@ -109,7 +109,8 @@ use wire::{
     DOWNLOAD_REQUEST_REGION_SIZE, ENDPOINT_REGION_SIZE, INSTALL_STAGING_REGION_SIZE,
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, OWNERSHIP_REGION_SIZE,
     RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
-    SIGN_REQUEST_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
+    SIGN_REQUEST_REGION_SIZE, STATS_RELAY_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
+    TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -1503,6 +1504,23 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_write("store"), read_only("management")],
         withheld: Some(STATS_WITHHELD),
     },
+    // The relay that carries a whole reading the other way: from the one domain
+    // that may read every shard to the one domain that may write the medium.
+    // The perms carry the whole argument. Read-write on the domain that composes
+    // the reading and READ-ONLY on the domain that frames it, so a compromised
+    // recorder can decline to write what it was handed and cannot forge a
+    // number into it; and the writer gains nothing on the medium in exchange,
+    // this page being the only thing it can put there.
+    RegionRule {
+        name: "stats_relay",
+        size: ExpectedSize {
+            rust_name: "wire::STATS_RELAY_REGION_SIZE",
+            bytes: STATS_RELAY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("management"), read_only("recorder")],
+        withheld: Some(STATS_RELAY_WITHHELD),
+    },
     // The appliance's one allocator, and the one region with no structure.
     RegionRule {
         name: "arena_crypto",
@@ -1545,6 +1563,18 @@ const STATS_WITHHELD: &str = "one writer and one reader per shard, and every oth
      console in particular maps no shard but its own, which is the same exclusion the log rings \
      already make one step further: there it cannot forge a record, here it cannot forge a \
      number";
+
+/// As [`STATS_WITHHELD`], for the page that carries a whole reading across to
+/// the recorder — and the rule that keeps this page from becoming a way around
+/// the shard grants it exists to preserve.
+const STATS_RELAY_WITHHELD: &str = "the recorder still maps no statistics shard but its own, and \
+     no third domain maps this page in either direction. That is the whole reason it exists: the \
+     alternative was eleven read grants on the domain holding a block device and a DMA-capable \
+     controller, which would have deleted the one-writer-one-reader property those shards are \
+     granted for. The recorder's grant is READ-ONLY, so a compromise of it declines to write a \
+     reading and cannot forge one; the management domain writes numbers and still cannot place a \
+     block on the medium; and the forwarder maps neither side, so the dataplane neither publishes \
+     nor observes what this page carries";
 
 /// What an I/O-port grant withholds, quoted into the finding that reports one
 /// being widened, moved, or handed to a second domain.

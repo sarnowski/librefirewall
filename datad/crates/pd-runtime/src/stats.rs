@@ -18,6 +18,7 @@
 //! the whole of the argument (see the system description).
 
 use lfw_blk::request::{Operation, RequestFaults};
+use lfw_clock::UtcNanos;
 use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, TcpCounters, Unhandled};
 use lfw_metrics::{
@@ -27,6 +28,7 @@ use lfw_metrics::{
     SinkSample, Snapshot, StatsShard, StoreSample, TapSample, TcpSample,
 };
 use lfw_recorder::RecorderCounters;
+use wire::StatsRelay;
 
 use net_headers::ParseFailure;
 use pipeline::{DropReason, PolicyCounters, PolicySweep, PolicySweepCounters};
@@ -50,6 +52,14 @@ impl StatsRegions<'_> {
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::read(self.shards)
+    }
+
+    /// Publish one whole reading, stamped with the instant it was taken at.
+    pub fn publish_relay(&self, relay: &StatsRelay, utc: Option<UtcNanos>) {
+        relay.publish(
+            utc.map_or(0, UtcNanos::as_nanos),
+            &self.snapshot().relay_values(),
+        );
     }
 
     /// The shard this domain writes its own counters into.
@@ -513,6 +523,14 @@ pub fn recorder_sample(
             recording.tap_dropped_by_writer,
         ],
         downloads: [recording.downloads_served, recording.downloads_refused],
+        // In `lfw_metrics::RECORDING_SNAPSHOTS`' label order, which is the ABI: a
+        // pair swapped here reports every reading that never reached the medium
+        // as one that did.
+        snapshots: [
+            recording.snapshots_written,
+            recording.snapshots_missed,
+            recording.snapshots_dropped,
+        ],
         records_unclocked: recording.records_unclocked,
         log,
     }

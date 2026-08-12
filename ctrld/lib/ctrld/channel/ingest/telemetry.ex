@@ -80,8 +80,8 @@ defmodule Ctrld.Channel.Ingest.Telemetry do
   @spec events() :: [[atom()]]
   def events do
     Enum.map(
-      ~w(rows_built rows_inserted insert_failed rows_dropped records_skipped frame_unread
-         decoder_refused resynchronised bytes_lost)a,
+      ~w(rows_built rows_inserted insert_failed rows_dropped records_skipped samples_skipped
+         frame_unread decoder_refused resynchronised bytes_lost)a,
       &(prefix() ++ [&1])
     )
   end

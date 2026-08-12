@@ -1448,3 +1448,143 @@ fn the_first_position_follows_a_wrap_so_a_lagging_reader_is_sent_forward() {
     assert!(matches!(harness.sink.find(first), Locate::Live(_)));
     assert_eq!(harness.sink.find(first - 1), Locate::Overrun);
 }
+
+// ---------------------------------------------------------------------------
+// `Sink::block`: the general PEN-tagged block, on `Sink::record`'s terms
+// ---------------------------------------------------------------------------
+
+/// A block's own framing plus its enterprise number, ahead of whatever data it
+/// carries. Restated rather than imported: a caller sizes a body against a
+/// number a reader would compute from the file, and a shared constant could be
+/// renamed without either side noticing.
+const CUSTOM_OVERHEAD: usize = 16;
+
+#[test]
+fn a_block_is_placed_and_reads_back_as_a_custom_block_with_its_data() {
+    let mut staging = vec![0u8; STAGING];
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
+    let prologue = sink.staged_len;
+
+    let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let placed = sink.block(&data, &mut staging);
+    let Recorded::Placed { bytes } = placed else {
+        panic!("a small block is placed: {placed:?}");
+    };
+    assert_eq!(bytes, CUSTOM_OVERHEAD + data.len());
+
+    // Read the block back out of staging by the framing a reader walks, so the
+    // assertion is about the file rather than about this encoder's opinion.
+    let block = &staging[prologue..prologue + bytes];
+    assert_eq!(
+        u32::from_le_bytes(block[..4].try_into().unwrap()),
+        0x0000_0BAD
+    );
+    assert_eq!(
+        u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize,
+        bytes
+    );
+    assert_eq!(
+        u32::from_le_bytes(block[8..12].try_into().unwrap()),
+        lfw_pcapng::UNREGISTERED_PEN
+    );
+    assert_eq!(&block[12..12 + data.len()], &data);
+}
+
+/// Data whose length is not a multiple of four is padded to the boundary by the
+/// encoder, which is the format's rule and the reason a Custom Block states no
+/// length for its own data.
+#[test]
+fn a_block_whose_data_is_unaligned_is_padded_to_the_boundary() {
+    let mut staging = vec![0u8; STAGING];
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
+    for len in 0..8usize {
+        let placed = sink.block(&vec![0xAB; len], &mut staging);
+        let Recorded::Placed { bytes } = placed else {
+            panic!("a {len}-byte body is placed: {placed:?}");
+        };
+        assert!(bytes.is_multiple_of(4), "a {len}-byte body gave {bytes}");
+        assert_eq!(bytes, CUSTOM_OVERHEAD + len.next_multiple_of(4));
+    }
+}
+
+/// The counters are the account of *observations*, and the gate holds them to
+/// the packet blocks in a downloaded recording. A block is not an observation,
+/// so it must move none of them.
+#[test]
+fn a_block_moves_none_of_the_sinks_record_counters() {
+    let mut staging = vec![0u8; STAGING];
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
+    let before = sink.counters();
+    assert!(matches!(
+        sink.block(&[1, 2, 3, 4], &mut staging),
+        Recorded::Placed { .. }
+    ));
+    assert_eq!(sink.counters(), before);
+}
+
+/// No segment could ever hold it, so no roll and no flush makes it placeable.
+/// Terminal, and named as such rather than retried forever.
+#[test]
+fn a_block_no_segment_could_hold_is_answered_oversized() {
+    let mut staging = vec![0u8; 1024 * 1024];
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
+    let data = vec![0u8; SEGMENT];
+    let outcome = sink.block(&data, &mut staging);
+    let Recorded::Oversized { needed } = outcome else {
+        panic!("a body of a whole segment is oversized: {outcome:?}");
+    };
+    assert!(needed > sink.segment_payload());
+    // And nothing was placed: the ring is where it was.
+    assert!(matches!(
+        sink.block(&[1, 2, 3, 4], &mut staging),
+        Recorded::Placed { .. }
+    ));
+}
+
+/// The open segment has no room but a later one would: closed and retried, never
+/// dropped, exactly as a record is.
+#[test]
+fn a_block_the_open_segment_cannot_hold_is_answered_segment_full() {
+    let mut staging = vec![0u8; STAGING];
+    let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
+    let data = vec![0xCD; 512];
+    let mut placed = 0;
+    let outcome = loop {
+        match sink.block(&data, &mut staging) {
+            Recorded::Placed { .. } => {
+                placed += 1;
+                // Staging is smaller than a segment, so it is drained as it
+                // fills; the segment is what this test wants to run out.
+                if let Some(flush) = sink.take_flush() {
+                    sink.acknowledge(flush, &mut staging);
+                }
+            }
+            other => break other,
+        }
+        assert!(placed < 1024, "the segment never filled");
+    };
+    assert!(matches!(outcome, Recorded::SegmentFull), "{outcome:?}");
+    assert!(placed > 0);
+}
+
+/// Staging is full and a flush would clear it, so the answer is a re-offer and
+/// never a drop — the one distinction that decides whether a recording has a gap.
+#[test]
+fn a_block_staging_cannot_hold_is_re_offered_rather_than_dropped() {
+    let mut staging = vec![0u8; 4096];
+    let mut sink = Sink::new(config(2048, 8), &mut staging).expect("a legal sink");
+    let data = vec![0xEF; 1024];
+    let outcome = loop {
+        match sink.block(&data, &mut staging) {
+            Recorded::Placed { .. } => {}
+            other => break other,
+        }
+    };
+    let Recorded::StagingFull { needed, free } = outcome else {
+        panic!("a full staging buffer re-offers: {outcome:?}");
+    };
+    assert!(needed > free);
+    // Nothing was counted as dropped: the caller offers it again.
+    assert_eq!(sink.counters().dropped_oversized, 0);
+    assert_eq!(sink.counters().dropped_refused, 0);
+}

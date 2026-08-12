@@ -88,6 +88,7 @@
 "crates/metrics/src/render.rs" = 0.2878
 "crates/metrics/src/rules.rs" = 0.4632
 "crates/metrics/src/sample.rs" = 0.0894
+"crates/metrics/src/snapshot.rs" = 0.3123
 "crates/net-headers/src/lib.rs" = 0.2154
 "crates/nic-driver-core/src/bringup.rs" = 0.3517
 "crates/nic-driver-core/src/lib.rs" = 0.4663
@@ -113,6 +114,7 @@
 "crates/pd-runtime/src/owner.rs" = 0.5122
 "crates/pd-runtime/src/reconnect.rs" = 0.5493
 "crates/pd-runtime/src/relay.rs" = 0.4306
+"crates/pd-runtime/src/snapshot.rs" = 0.4935
 "crates/pd-runtime/src/stats.rs" = 0.2272
 "crates/pd-runtime/src/tap.rs" = 0.3717
 "crates/pipeline/src/lib.rs" = 0.4227
@@ -166,6 +168,7 @@
 "crates/wire/src/owner.rs" = 0.5897
 "crates/wire/src/relay.rs" = 0.4064
 "crates/wire/src/signing.rs" = 0.4141
+"crates/wire/src/stats_relay.rs" = 0.5574
 "crates/wire/src/submission.rs" = 0.3286
 "crates/wire/src/tap.rs" = 0.3146
 "crates/x509/src/der.rs" = 0.2609

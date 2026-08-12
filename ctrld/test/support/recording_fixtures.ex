@@ -3,7 +3,11 @@ defmodule Ctrld.RecordingFixtures do
   The committed recordings, and the two ways a test needs to look at them.
 
   The fixtures are recordings the appliance's own encoder wrote, taken off the
-  medium a QEMU boot left behind and committed unchanged. They are the reason
+  medium a QEMU boot left behind and committed unchanged. `metric-readings-logs`
+  is the one that carries the appliance's metric readings: a connection history
+  from a boot long enough to have published several, so the whole path from a
+  Custom Block to a `metric_samples` row is driven by bytes this server did not
+  compose. They are the reason
   this decoder is tested at all rather than merely exercised: bytes a helper here
   produced would only ever prove that this reader agrees with this reader.
 
@@ -24,7 +28,9 @@ defmodule Ctrld.RecordingFixtures do
 
   @doc "The fixtures, by the names the tests know them under."
   @spec names() :: [String.t()]
-  def names, do: ~w(channel-established-logs channel-established-capture policy-revocation-logs)
+  def names,
+    do: ~w(channel-established-logs channel-established-capture policy-revocation-logs
+         metric-readings-logs)
 
   @doc "One fixture's bytes."
   @spec read!(String.t()) :: binary()

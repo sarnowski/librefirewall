@@ -100,6 +100,7 @@ mod log_slot;
 mod owner;
 mod relay;
 mod signing;
+mod stats_relay;
 mod submission;
 mod tap;
 
@@ -148,6 +149,7 @@ pub use signing::{
     SignAnswerBuffer, SignDemand, SignFault, SignOperation, SignPoll, SignRefusal, SignReply,
     SignRequest, SignRequester, SignResponder, SignStatus,
 };
+pub use stats_relay::{RELAY_SLOTS, RelayImage, STATS_RELAY_REGION_SIZE, StatsRelay};
 pub use submission::{
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, ConfigAnswer, ConfigDemand, ConfigFault,
     ConfigOperation, ConfigPoll, ConfigReply, ConfigRequest, ConfigRequester, ConfigResponder,

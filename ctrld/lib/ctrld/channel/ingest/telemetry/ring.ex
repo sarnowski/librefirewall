@@ -67,8 +67,8 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   alias Ctrld.Channel.Frame
   alias Ctrld.Channel.Ingest.Telemetry, as: Ingest
   alias Ctrld.Pcapng
-  alias Ctrld.Pcapng.Packet
-  alias Ctrld.Telemetry.{Cursor, FlowEvent, Store}
+  alias Ctrld.Pcapng.{Custom, Packet}
+  alias Ctrld.Telemetry.{Cursor, FlowEvent, MetricSnapshot, Store}
 
   # The pcapng section header, as it lies on the wire in either byte order —
   # the writer's magic is a palindrome, which is what lets a section be found
@@ -94,6 +94,11 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   # the oldest are dropped, counted, and named in the log.
   @max_pending 5_000
 
+  # The two tables a recording's blocks become. One list per table rather than
+  # one list of tagged rows, because a batch is inserted per table and the
+  # cursor may only move once every table's batch is in.
+  @tables ["flow_events", "metric_samples"]
+
   @typep state :: %{
            device_id: String.t(),
            ring: Frame.ring(),
@@ -101,7 +106,7 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
            decoder: nil | Pcapng.t(),
            fed_through: nil | non_neg_integer(),
            resync: nil | {non_neg_integer(), binary()},
-           pending: [map()],
+           pending: %{String.t() => [map()]},
            pending_through: nil | non_neg_integer(),
            session: nil | pid(),
            monitor: nil | reference(),
@@ -137,7 +142,7 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
        decoder: nil,
        fed_through: nil,
        resync: nil,
-       pending: [],
+       pending: empty(),
        pending_through: nil,
        session: nil,
        monitor: nil,
@@ -316,16 +321,24 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
     %{state | decoder: nil, fed_through: nil, resync: nil}
   end
 
+  # Two kinds of block become rows, and they go to different tables: an
+  # Enhanced Packet Block is what the appliance decided about a packet, and a
+  # Custom Block carrying a metric reading is what its counters read at an
+  # instant. Every other block — the section, the interfaces, and the padding
+  # that shares a type and an enterprise number with a reading — contributes
+  # none, which is why the padding needs no filter of its own here: it arrives
+  # as a `%Custom{}` and the decoder below answers `:padding` for it.
   @spec collect(state(), [Pcapng.block()], boolean(), non_neg_integer()) :: state()
   defp collect(state, blocks, store?, complete_through) do
     records = Enum.filter(blocks, &match?(%Packet{}, &1))
+    customs = Enum.filter(blocks, &match?(%Custom{}, &1))
 
     cond do
-      records == [] ->
+      records == [] and customs == [] ->
         state
 
       not store? ->
-        Ingest.emit(:records_skipped, %{records: length(records)}, %{
+        Ingest.emit(:records_skipped, %{records: length(records) + length(customs)}, %{
           device_id: state.device_id,
           ring: state.ring,
           cause: :already_stored
@@ -334,7 +347,7 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
         state
 
       not stores?(state.ring) ->
-        Ingest.emit(:records_skipped, %{records: length(records)}, %{
+        Ingest.emit(:records_skipped, %{records: length(records) + length(customs)}, %{
           device_id: state.device_id,
           ring: state.ring,
           cause: :ring_not_stored
@@ -343,14 +356,60 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
         state
 
       true ->
-        rows = Enum.reduce(records, [], &build(&1, &2, state))
+        flow_rows = Enum.reduce(records, [], &build(&1, &2, state))
+        sample_rows = Enum.reduce(customs, [], &sample(&1, &2, state))
 
-        Ingest.emit(:rows_built, %{rows: length(rows)}, %{
+        Ingest.emit(:rows_built, %{rows: length(flow_rows) + length(sample_rows)}, %{
           device_id: state.device_id,
           ring: state.ring
         })
 
-        %{state | pending: rows ++ state.pending, pending_through: complete_through}
+        state
+        |> hold("flow_events", flow_rows)
+        |> hold("metric_samples", sample_rows)
+        |> Map.put(:pending_through, complete_through)
+    end
+  end
+
+  @spec hold(state(), String.t(), [map()]) :: state()
+  defp hold(state, _table, []), do: state
+
+  defp hold(state, table, rows),
+    do: %{state | pending: Map.update!(state.pending, table, &(rows ++ &1))}
+
+  # A Custom Block is a metric reading or it is the padding that fills a sector,
+  # and the leading byte of its data is what tells them apart. Padding is the
+  # commoner of the two by far and is not a fault, so it is stepped over in
+  # silence; everything else is counted under the cause that named it.
+  @spec sample(Custom.t(), [map()], state()) :: [map()]
+  defp sample(%Custom{data: data}, rows, state) do
+    case MetricSnapshot.rows(state.device_id, data) do
+      {:ok, %{rows: built, unrepresentable: 0}} ->
+        Enum.reverse(built) ++ rows
+
+      {:ok, %{rows: built, unrepresentable: refused}} ->
+        # A counter no `Float64` holds exactly. Refused by name rather than
+        # stored rounded: a rounded counter reads as a measurement and nothing
+        # downstream can tell it from one.
+        Ingest.emit(:samples_skipped, %{samples: refused}, %{
+          device_id: state.device_id,
+          ring: state.ring,
+          cause: :value_unrepresentable
+        })
+
+        Enum.reverse(built) ++ rows
+
+      {:error, :padding} ->
+        rows
+
+      {:error, refusal} ->
+        Ingest.emit(:records_skipped, %{records: 1}, %{
+          device_id: state.device_id,
+          ring: state.ring,
+          cause: MetricSnapshot.tag(refusal)
+        })
+
+        rows
     end
   end
 
@@ -390,11 +449,11 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   @spec maybe_flush(state()) :: state()
   defp maybe_flush(state) do
     cond do
-      length(state.pending) >= @batch_rows ->
+      held(state) >= @batch_rows ->
         {_result, state} = flush(state)
         state
 
-      state.pending == [] ->
+      held(state) == 0 ->
         state
 
       true ->
@@ -402,45 +461,80 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
     end
   end
 
+  # A batch is bounded across both tables together, because what the bound
+  # protects is this process's memory and one recording feeds both.
+  @spec held(state()) :: non_neg_integer()
+  defp held(state), do: state.pending |> Map.values() |> Enum.map(&length/1) |> Enum.sum()
+
+  @spec empty() :: %{String.t() => [map()]}
+  defp empty, do: Map.new(@tables, &{&1, []})
+
   @spec schedule(state()) :: state()
   defp schedule(%{timer: nil} = state),
     do: %{state | timer: Process.send_after(self(), :flush, @batch_age)}
 
   defp schedule(state), do: state
 
+  # Every table's batch, and the cursor moves only once all of them are in.
+  # Advancing it on a partial success would mark bytes as stored whose other
+  # table never took them, and the next delivery would skip exactly those.
   @spec flush(state()) :: {:ok | {:error, term()}, state()}
-  defp flush(%{pending: []} = state), do: {:ok, cancel(state)}
-
   defp flush(state) do
-    rows = Enum.reverse(state.pending)
-
-    case Store.insert("flow_events", rows) do
-      :ok ->
-        Ingest.emit(:rows_inserted, %{rows: length(rows)}, %{
-          device_id: state.device_id,
-          ring: state.ring
-        })
-
-        {:ok, stored(state)}
-
-      {:error, reason} ->
-        {{:error, reason}, retain(state, rows, reason)}
+    if held(state) == 0 do
+      {:ok, cancel(state)}
+    else
+      Enum.reduce(@tables, {:ok, state}, fn table, {result, state} ->
+        case insert(state, table) do
+          {:ok, state} -> {result, state}
+          {{:error, reason}, state} -> {{:error, reason}, state}
+        end
+      end)
+      |> settle()
     end
   end
+
+  @spec insert(state(), String.t()) :: {:ok | {:error, term()}, state()}
+  defp insert(state, table) do
+    case Map.fetch!(state.pending, table) do
+      [] ->
+        {:ok, state}
+
+      held ->
+        rows = Enum.reverse(held)
+
+        case Store.insert(table, rows) do
+          :ok ->
+            Ingest.emit(:rows_inserted, %{rows: length(rows)}, %{
+              device_id: state.device_id,
+              ring: state.ring,
+              table: table
+            })
+
+            {:ok, %{state | pending: Map.put(state.pending, table, [])}}
+
+          {:error, reason} ->
+            {{:error, reason}, retain(state, table, rows, reason)}
+        end
+    end
+  end
+
+  @spec settle({:ok | {:error, term()}, state()}) :: {:ok | {:error, term()}, state()}
+  defp settle({:ok, state}), do: {:ok, stored(state)}
+  defp settle({{:error, reason}, state}), do: {{:error, reason}, state}
 
   # The rows are in, so the cursor may name the last block they cover — and
   # only that block, never the bytes that arrived, the run having likely ended
   # inside a block whose rows are not built yet.
   @spec stored(state()) :: state()
   defp stored(%{pending_through: nil} = state),
-    do: %{recovered(state) | pending: []}
+    do: %{recovered(state) | pending: empty()}
 
   defp stored(state) do
     :ok = Cursor.advance(state.device_id, state.ring, state.pending_through)
 
     %{
       recovered(state)
-      | pending: [],
+      | pending: empty(),
         pending_through: nil,
         cursor: max(state.cursor, state.pending_through)
     }
@@ -467,44 +561,56 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   # would otherwise write the same sentence eighteen hundred times per ring —
   # which is a record count driven by how long a fault lasted rather than by
   # what happened. Every attempt is still counted.
-  @spec retain(state(), [map()], term()) :: state()
-  defp retain(state, rows, reason) do
+  @spec retain(state(), String.t(), [map()], term()) :: state()
+  defp retain(state, table, rows, reason) do
     unless state.failing? do
       Logger.warning(
         "ctrld: appliance #{state.device_id} #{state.ring} ring could not store " <>
-          "#{length(rows)} flow events, and is holding them: #{Store.describe(reason)}"
+          "#{length(rows)} #{table} rows, and is holding them: #{Store.describe(reason)}"
       )
     end
 
     Ingest.emit(:insert_failed, %{rows: length(rows)}, %{
       device_id: state.device_id,
       ring: state.ring,
+      table: table,
       reason: refusal_tag(reason)
     })
 
-    held = length(state.pending)
+    over = held(state) - @max_pending
 
     pending =
-      if held > @max_pending do
-        dropped = held - @max_pending
-
+      if over > 0 do
         Logger.warning(
-          "ctrld: appliance #{state.device_id} #{state.ring} ring dropped #{dropped} flow " <>
-            "events the store would not take"
+          "ctrld: appliance #{state.device_id} #{state.ring} ring dropped #{over} telemetry " <>
+            "rows the store would not take"
         )
 
-        Ingest.emit(:rows_dropped, %{rows: dropped}, %{
+        Ingest.emit(:rows_dropped, %{rows: over}, %{
           device_id: state.device_id,
           ring: state.ring
         })
 
-        Enum.take(state.pending, @max_pending)
+        trim(state.pending, over)
       else
         state.pending
       end
 
     retrying = state |> cancel() |> schedule()
     %{retrying | pending: pending, failing?: true}
+  end
+
+  # Drop the oldest rows first, and take them from the table that holds the most
+  # so one busy table cannot squeeze another out of the hold entirely. The lists
+  # are newest-first, so the oldest are at the tail.
+  @spec trim(%{String.t() => [map()]}, non_neg_integer()) :: %{String.t() => [map()]}
+  defp trim(pending, 0), do: pending
+
+  defp trim(pending, over) do
+    {table, rows} = Enum.max_by(pending, fn {_table, rows} -> length(rows) end)
+    take = min(over, length(rows))
+    pending = Map.put(pending, table, Enum.take(rows, length(rows) - take))
+    trim(pending, over - take)
   end
 
   @spec cancel(state()) :: state()

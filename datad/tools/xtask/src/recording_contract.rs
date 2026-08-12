@@ -31,6 +31,17 @@ const BLOCK_FRAMING_LEN: usize = 12;
 const SECTION_HEADER_BLOCK: u32 = 0x0A0D_0D0A;
 const INTERFACE_DESCRIPTION_BLOCK: u32 = 0x0000_0001;
 const ENHANCED_PACKET_BLOCK: u32 = 0x0000_0006;
+const CUSTOM_BLOCK: u32 = 0x0000_0BAD;
+
+/// The first byte of a Custom Block's data: `0`, or no data at all, is the
+/// padding that fills a sector, and `1` is a metric reading. Restated here as a
+/// number for the reason every constant above is — a reader tells the two apart
+/// by this byte, and a harness sharing the writer's constant could not tell a
+/// renamed one from a correct file.
+const SNAPSHOT_KIND: u8 = 1;
+
+/// Bytes of a metric reading ahead of its first slot.
+const SNAPSHOT_HEADER_LEN: usize = 20;
 
 /// pcapng's byte-order magic, little-endian as this appliance writes it.
 const BYTE_ORDER_MAGIC: u32 = 0x1A2B_3C4D;
@@ -338,6 +349,59 @@ pub struct Parsed {
     /// Bytes the walk consumed. Below the body's length exactly when a block's
     /// own length stopped it, which is the failure a reader would hit.
     pub consumed: usize,
+    /// Every metric reading the file carries, in order. The padding blocks that
+    /// share this block type are not here: they are told apart by the first byte
+    /// of their data, exactly as a management server tells them apart.
+    pub snapshots: Vec<Snapshot>,
+    /// Custom Blocks the walk read as padding, which is what a file with none at
+    /// all would be a finding about.
+    pub padding_blocks: usize,
+}
+
+/// One metric reading out of a recording, read by the offsets the framing
+/// contract states rather than through the encoder that wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub fingerprint: u32,
+    /// Nanoseconds since the Unix epoch as the appliance stamped it, or zero
+    /// where it had no clock.
+    pub unix_nanos: u64,
+    pub values: Vec<u64>,
+}
+
+impl Snapshot {
+    /// One slot's value, or `None` past the reading — which is a finding for
+    /// whoever asked rather than a panic in a harness.
+    #[must_use]
+    pub fn slot(&self, at: usize) -> Option<u64> {
+        self.values.get(at).copied()
+    }
+}
+
+/// Take a Custom Block's data apart as a metric reading, or answer `None` for
+/// the padding this block type also carries.
+///
+/// Deliberately no use of `lfw_metrics`' own decoder: this is the reader a
+/// management server writes from the contract page, and a harness that used the
+/// appliance's decoder would prove the two agree with themselves.
+fn snapshot(data: &[u8]) -> Option<Snapshot> {
+    if data.first().copied().unwrap_or(0) != SNAPSHOT_KIND {
+        return None;
+    }
+    let header = data.get(..SNAPSHOT_HEADER_LEN)?;
+    let slots = word(header, 16)? as usize;
+    let body = data.get(SNAPSHOT_HEADER_LEN..)?;
+    let mut values = Vec::with_capacity(slots);
+    for slot in 0..slots {
+        let at = slot * 8;
+        let bytes = body.get(at..at + 8)?;
+        values.push(u64::from_le_bytes(bytes.try_into().ok()?));
+    }
+    Some(Snapshot {
+        fingerprint: word(header, 4)?,
+        unix_nanos: u64::from_le_bytes(header.get(8..16)?.try_into().ok()?),
+        values,
+    })
 }
 
 impl Parsed {
@@ -470,6 +534,17 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
             }
             INTERFACE_DESCRIPTION_BLOCK => found.interfaces.push(interface(block)),
             ENHANCED_PACKET_BLOCK => found.packets.push(packet(block)),
+            // The enterprise number sits at offset 8 and the data behind it; a
+            // block too short for one is neither a reading nor padding and is
+            // stepped over exactly as an unknown block is.
+            CUSTOM_BLOCK => {
+                if let Some(data) = block.get(12..block.len().saturating_sub(4)) {
+                    match snapshot(data) {
+                        Some(reading) => found.snapshots.push(reading),
+                        None => found.padding_blocks += 1,
+                    }
+                }
+            }
             // Every other block is one a reader skips by its length, which is
             // exactly what this walk does — the padding the recorder writes to
             // keep each device write a whole sector lands here.
@@ -680,12 +755,15 @@ pub fn evidence(download: &Download, parsed: &Parsed, snap_len: usize) -> String
     let _ = write!(
         line,
         "  {}: {} bytes, {} section header(s), {} interface block(s), {} packet block(s), \
+         {} metric reading(s), {} padding block(s), \
          longest capture {} of a snap length of {snap_len}",
         download.target,
         download.body.len(),
         parsed.sections,
         parsed.interfaces.len(),
         parsed.packets.len(),
+        parsed.snapshots.len(),
+        parsed.padding_blocks,
         parsed.longest_capture(),
     );
     line

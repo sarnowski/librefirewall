@@ -63,6 +63,7 @@ mod interfaces;
 mod render;
 mod rules;
 mod sample;
+mod snapshot;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -89,6 +90,11 @@ pub use sample::{
     PipelineSample, PolicySample, PolicySweepSample, PoolSample, RECORDER_SLOTS,
     ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS,
     STORE_SLOTS, SinkSample, StoreSample, TapSample, TcpSample, UartSample,
+};
+pub use snapshot::{
+    CATALOGUE_FINGERPRINT, DecodeError as SnapshotDecodeError, EncodeError as SnapshotEncodeError,
+    MetricSnapshot, SNAPSHOT_BYTES, SNAPSHOT_HEADER_BYTES, SNAPSHOT_KIND, SNAPSHOT_SLOTS,
+    SNAPSHOT_VERSION, decode as decode_snapshot, encode as encode_snapshot,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table

@@ -31,7 +31,7 @@ use std::{
 };
 
 use crate::{
-    budgets, crypto_profile, image, reference_contract, sysdesc, target_spec,
+    budgets, crypto_profile, image, metric_catalogue, reference_contract, sysdesc, target_spec,
     util::{repository_root, run_command},
 };
 
@@ -198,6 +198,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "channel_tls",
     "channel_frames",
     "metrics_render",
+    "metric_snapshot",
     "config_document",
     "config_submission",
     "spsc_ring_peer",
@@ -267,6 +268,12 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // binary was not built with is worse than no page, because a deployment
     // buys hardware against it.
     crypto_profile::check(root, &repository_root()?)?;
+    // And the fifth, on the same terms and against the one document that leaves
+    // this workspace: the management server maps every slot of a metric snapshot
+    // through a catalogue generated from `lfw_metrics`, and a copy of a
+    // four-hundred-entry table kept by hand in another language is a divergence
+    // with nothing failing behind it.
+    metric_catalogue::check(&repository_root()?)?;
     // And for the third time the same argument: a configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost

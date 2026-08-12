@@ -100,6 +100,49 @@ story, and it is the [recording design's](../design/recording.md#one-writer-many
 one: the appliance never blocks on a slow server, a lagging server catches up from the ring, and
 true overrun is reported rather than hidden.
 
+## Metric snapshots
+
+The appliance's whole metric surface travels upstream as a **pcapng Custom Block written into the
+log ring**, once a second, in the same verbatim ring bytes as everything else. It is a snapshot and
+not a stream of deltas: what the block holds is what every counter read at one instant, and a server
+differences successive blocks exactly as a scraper differences successive scrapes.
+
+**Block type `0x00000BAD`, PEN `0xFFFFFFFF`** — the same pair the padding block carries, and the
+first byte of the data is what tells them apart. Every multi-byte field of the block's data is
+**little-endian**, unlike the frame headers above: these are pcapng bytes and pcapng is
+self-describing byte-for-byte, so the block follows the file it is in rather than the protocol
+carrying it.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | kind — `0` padding, `1` metric snapshot; **empty data is padding too** |
+| 1 | 1 | body version; this page defines `1` |
+| 2 | 2 | reserved, zero — a nonzero byte is a block this reader does not share a layout with |
+| 4 | 4 | catalogue fingerprint |
+| 8 | 8 | the instant the reading was taken, nanoseconds since the Unix epoch, or `0` where the appliance had no clock |
+| 16 | 4 | slot count |
+| 20 | 8 × slots | the slots, each an unsigned 64-bit counter |
+
+**Padding stays readable under this rule, and every recording ever written already satisfies it**:
+a padding block's data is all zeroes, and the smallest one has no data at all. So a reader takes an
+empty body or a leading zero as padding and never looks further.
+
+**The slots are the catalogue laid end to end**, in the order the
+[metrics reference](../reference/metrics.md) lists the shards and the series within them, and the
+**catalogue fingerprint** is derived from every family name, label and shard in that order. A server
+whose own fingerprint differs **refuses the whole snapshot** rather than mapping any of it: a slot
+means whatever the table at that position means, and a number reported under the wrong name is worse
+than a number not reported at all, because nothing downstream can tell.
+
+The two families whose members depend on the running configuration — the per-interface information
+and the per-rule hit counts — are **not** in a snapshot. Which of those exist comes from the
+committed configuration rather than from the catalogue, so neither has a fixed slot, and a fingerprint
+over a table that changed with a configuration commit would mean nothing.
+
+**A counter is a full 64-bit unsigned value.** A consumer storing one in a format that cannot
+represent it exactly — a 64-bit float, whose integers are exact only to 2^53 — refuses the sample and
+says which, rather than storing a rounded number that reads as a measurement.
+
 ## Downstream: configuration operations
 
 DOWN_CONFIG_STAGE carries a whole configuration document. The appliance stages it as the candidate

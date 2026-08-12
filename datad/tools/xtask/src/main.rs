@@ -87,6 +87,7 @@ mod grub;
 mod host;
 mod image;
 mod management_contract;
+mod metric_catalogue;
 mod metrics_contract;
 mod onboard_contract;
 mod onboard_install_contract;
@@ -100,6 +101,7 @@ mod recording_contract;
 mod reference_contract;
 mod reproducible;
 mod signing;
+mod snapshot_contract;
 mod stamp_contract;
 mod store_contract;
 mod surface_contract;
@@ -163,6 +165,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("ci passed: {}", ci(&root)?);
         }
         "release" => release(&root)?,
+        "metric-catalogue" => metric_catalogue::write(&util::repository_root()?)?,
         "clean" => host::clean(&root)?,
         _ => return Err(usage().into()),
     }
@@ -298,7 +301,7 @@ fn discard_dist(dist: &Path, failure: &dyn fmt::Display) -> String {
 
 fn usage() -> String {
     "usage: cargo xtask <image|image-debug|run|test|coverage|bench|fuzz|verify-reproducible\
-     |test-system|test-ab|ci|release|clean>"
+     |test-system|test-ab|ci|release|metric-catalogue|clean>"
         .to_owned()
 }
 

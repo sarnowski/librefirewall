@@ -14,6 +14,10 @@ wire = { path = "../wire" }
 # states. The conversion is here rather than on the dataplane because the
 # forwarder would have to re-read another domain's region per frame to do it.
 lfw-clock = { path = "../clock" }
+# The metric reading this crate frames into the log recording: the catalogue
+# decides how long one is and what every slot means, so the encoder is there and
+# the placement is here.
+lfw-metrics = { path = "../metrics" }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -974,6 +974,14 @@ design, and this is where it is said.
 | reading a recording's superblock back before a record is placed (`signalled=true` throughout, and see above for what that does not mean; **the first `detail=` number is always the extent's first sector**, which is what says which of the two recordings the read was for) | `recording-superblock-refused` (the extent), `recording-superblock-silent` (the extent, the poll budget spent), `recording-superblock-misattributed` (the extent), `recording-superblock-failed` (the extent), `recording-superblock-short` (the extent, bytes moved), `recording-superblock-unstaged` (the extent, the staging length offered) |
 | the recordings on it (`signalled=true` throughout, and see above for what that does not mean) | `recording-extent-unusable` (the numbers the geometry rule that refused names: the extent's first sector and the device's capacity, or one count of sectors, bytes or segments), `recording-sink-unusable` (no `detail=`), `recording-extent-rebound` (the extent's first sector and the one the superblock on it claimed, or that sector alone where the disagreement was neither extent's start) |
 
+**The metric readings this domain frames into the connection history raise no token at all**, and
+that is a property of the build rather than an omission. A reading's length and a segment's are both
+compile-time constants, and the appliance does not assemble unless one fits inside the other — so a
+reading the recorder cannot write is a build that does not exist, not a node that reports one. What
+a running node can say about them is on [`/metrics`](metrics.md):
+`librefirewall_recording_snapshots_total` counts the readings framed and the readings the publisher
+had moved on from before a settled copy could be taken.
+
 **`hardware-probe`.** The first three groups are the CPUID feature gate, run before the first probe
 instruction: a part below the product's compile-time CPU baseline refuses with the feature word an
 operator compares against the part's documentation, rather than taking an invalid-opcode fault on

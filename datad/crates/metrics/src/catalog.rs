@@ -963,6 +963,14 @@ pub const RECORDING_RECORDS_UNCLOCKED: Metric = metric(
      for them rather than a counter reading.",
 );
 
+pub const RECORDING_SNAPSHOTS: Metric = metric(
+    "librefirewall_recording_snapshots_total",
+    Kind::Counter,
+    "Metric readings the recorder framed into the connection history, and those it could not: \
+     one the publisher had moved on from before a settled copy could be taken, and one no \
+     segment could hold.",
+);
+
 pub const RECORDING_DOWNLOAD_OVERRUNS: Metric = metric(
     "librefirewall_recording_download_overruns_total",
     Kind::Counter,
@@ -1119,6 +1127,7 @@ pub const ALL_METRICS: &[&Metric] = &[
     &RECORDING_TAP_REFUSED,
     &RECORDING_TAP_DROPPED_BY_WRITER,
     &RECORDING_DOWNLOADS,
+    &RECORDING_SNAPSHOTS,
     &RECORDING_DOWNLOAD_OVERRUNS,
     &RECORDING_RECORDS_UNCLOCKED,
     &RECORDING_STREAMS,
