@@ -199,6 +199,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "channel_frames",
     "metrics_render",
     "metric_snapshot",
+    "transcript_block",
     "config_document",
     "config_submission",
     "spsc_ring_peer",
@@ -274,6 +275,7 @@ pub(crate) fn test_host(root: &Path) -> Result<(), String> {
     // four-hundred-entry table kept by hand in another language is a divergence
     // with nothing failing behind it.
     metric_catalogue::check(&repository_root()?)?;
+    metric_catalogue::check_domains(&repository_root()?)?;
     // And for the third time the same argument: a configuration document is
     // a source-controlled input the protection domains are built from, so a
     // document the appliance would refuse is a finding available for the cost

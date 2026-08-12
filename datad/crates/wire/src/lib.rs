@@ -95,6 +95,7 @@ mod endpoint;
 mod image;
 mod install;
 mod log_record;
+mod log_relay;
 mod log_ring;
 mod log_slot;
 mod owner;
@@ -103,6 +104,7 @@ mod signing;
 mod stats_relay;
 mod submission;
 mod tap;
+mod transcript_block;
 
 use core::{
     fmt,
@@ -133,6 +135,10 @@ pub use log_record::{
     LOG_TLS_REFUSAL_COUNT, LogDetailKind, LogKind, LogRecord, LogRecordError, LogStampKind,
     LogText, LogValueKind, TextFault, TextImage, ValueImage,
 };
+pub use log_relay::{
+    FLAG_STAMPED, LOG_RELAY_CONSUME_REGION_SIZE, LOG_RELAY_REGION_SIZE, LOG_RELAY_SLOTS, LogRelay,
+    LogRelayConsume, LogRelayReader, LogRelayWriter, RELAY_FLAG_BITS, RELAY_LINE_BYTES, RelayLine,
+};
 pub use log_ring::{
     LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RING_SLOTS, LogConsume, LogDrain,
     LogReader, LogRecords, LogRingFull, LogWriter,
@@ -162,6 +168,12 @@ pub use tap::{
     TapAnnotation, TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason,
     TapEvent, TapFault, TapFlow, TapFlowState, TapOutcome, TapReader, TapRecords, TapRingFull,
     TapRule, TapVerdict, TapWriteError, TapWriter,
+};
+pub use transcript_block::{
+    BATCH_BYTES, Batch as TranscriptBatch, DecodeError as TranscriptDecodeError,
+    EncodeError as TranscriptEncodeError, Entry as TranscriptEntry, TRANSCRIPT_ENTRY_HEADER_BYTES,
+    TRANSCRIPT_HEADER_BYTES, TRANSCRIPT_KIND, TRANSCRIPT_LINE_BYTES, TRANSCRIPT_MAX_ENTRIES,
+    TRANSCRIPT_VERSION, TranscriptLine, decode as decode_transcript, encode as encode_transcript,
 };
 
 use image::{checked_value, shared_image};

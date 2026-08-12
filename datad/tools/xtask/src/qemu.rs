@@ -68,6 +68,7 @@ use crate::{
     recording_contract::{self, Download},
     snapshot_contract, stamp_contract, store_contract, surface_contract,
     topology::{PORTS, Topology},
+    transcript_contract,
     util::{copy_file, locate, require_file, run_command},
 };
 
@@ -3568,6 +3569,32 @@ fn judge_recordings(
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
 
+    // And the fifth: the console transcript the same connection history carries.
+    // The console rendered each record once and put the bytes on two surfaces —
+    // the serial port this run captured, and a relay the recorder framed into
+    // this recording — so a line in only one of them is a line the appliance
+    // invented. Neither surface can agree with the other by construction, which
+    // is the whole reason this comparison is worth its cost.
+    let transcript = transcript_contract::judge(
+        pd_runtime::LOG_TARGET,
+        &log_parsed.transcript,
+        log_parsed.transcript_batches,
+        &booted.serial,
+        &transcript_contract::Demanded {
+            // A floor rather than a count, and a low one: how much of a boot
+            // transcript reaches the medium before the download depends on how
+            // fast the emulated block device came up. What it refuses is the
+            // vacuous pass.
+            at_least: 4,
+            // The anchor is a record the recorder itself emits once its device is
+            // live, so it is printed after the domain that drains the relay has
+            // started draining it. A relay that filled during bring-up and never
+            // recovered would hold only earlier lines and fail here.
+            anchored_on: "domain=recorder state=ready",
+        },
+    )
+    .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
+
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
             target: pd_runtime::LOG_TARGET,
@@ -3596,6 +3623,8 @@ fn judge_recordings(
     evidence.push_str(&agreement.evidence());
     evidence.push('\n');
     evidence.push_str(&snapshots.evidence());
+    evidence.push('\n');
+    evidence.push_str(&transcript.evidence());
     Ok(evidence)
 }
 

@@ -18,6 +18,7 @@
 //! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
 //! | [`metrics_render`] | `lfw_metrics`' exposition renderer, over arbitrary counters and arbitrary storage | a byzantine neighbour PD **and** a management-plane attacker |
 //! | [`metric_snapshot`] | `lfw_metrics`' metric-reading codec: arbitrary bytes out of a recording, and arbitrary counters into one | whoever holds a recording **and** a byzantine neighbour PD |
+//! | [`transcript_block`] | `wire`'s console-transcript block and the relay region a printed line crosses to the medium on | whoever holds a recording **and** a byzantine neighbour PD |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
 //! | [`handover`] | `wire`'s configuration handover image | a byzantine neighbour PD |
 //! | [`free_list`] | `packet_buffer` ownership ledger | a byzantine neighbour PD |
@@ -169,6 +170,7 @@ pub mod ring_abi;
 pub mod spsc_ring;
 pub mod store_state;
 pub mod tcp;
+pub mod transcript_block;
 pub mod virtio_pci;
 pub mod virtqueue;
 
@@ -285,6 +287,10 @@ mod tests {
         (
             "metric_snapshot",
             crate::metric_snapshot::metric_snapshot_harness,
+        ),
+        (
+            "transcript_block",
+            crate::transcript_block::transcript_block_harness,
         ),
         (
             "onboarding_surface",

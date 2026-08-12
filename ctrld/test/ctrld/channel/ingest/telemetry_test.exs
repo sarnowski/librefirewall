@@ -21,7 +21,7 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
   alias Ctrld.Channel.Ingest.Telemetry
   alias Ctrld.Channel.Ingest.Telemetry.Ring
   alias Ctrld.RecordingFixtures
-  alias Ctrld.Telemetry.{Cursor, MetricCatalogue, Store}
+  alias Ctrld.Telemetry.{Cursor, LogRecord, MetricCatalogue, Store}
 
   # How many records each committed recording holds, counted here so a fixture
   # that changed shows up as a disagreement rather than as a silently smaller
@@ -321,9 +321,87 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
     test "and the connection history's own records land beside them", %{device: device} do
       ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
 
-      # Two tables from one ring, and the cursor moved once both were in.
+      # Three tables from one ring, and the cursor moved once all of them were in.
       assert metric_samples(device) != []
+      assert log_events(device) != []
       assert Cursor.position(device, :log) > 0
+    end
+  end
+
+  describe "the console transcript a connection history carries" do
+    test "becomes log_events rows a query reads back", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      rows = log_events(device)
+      assert rows != []
+
+      # Every row's detail is a console line the appliance printed, which is what
+      # a reader of this table is looking at: the text, not a re-rendering of it.
+      for row <- rows do
+        assert String.starts_with?(row["detail"], "LFW-PD ") or
+                 String.starts_with?(row["detail"], "LFW-CFG "),
+               row["detail"]
+
+        assert row["domain"] in LogRecord.domains()
+      end
+
+      # The boot the fixture came from brought its own domains up, so the lines a
+      # reader would go looking for are there — and the domain column names the
+      # ring each came out of.
+      details = Enum.map(rows, & &1["detail"])
+      assert Enum.any?(details, &String.contains?(&1, "domain=recorder state=ready"))
+      assert Enum.any?(details, &String.contains?(&1, "state=starting"))
+
+      # More than one protection domain published into the transcript, so the
+      # origin byte is being read rather than a constant reaching every row.
+      assert rows |> Enum.map(& &1["domain"]) |> Enum.uniq() |> length() >= 3
+    end
+
+    test "carries the appliance's lifecycle point in severity, not a level", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      states = device |> log_events() |> Enum.map(& &1["severity"]) |> Enum.uniq()
+
+      # The column holds a protection domain's state and nothing else. `ready` is
+      # a domain announcing that it works, which no syslog level would say.
+      assert "ready" in states
+
+      assert Enum.all?(states, &(&1 in ["", "starting", "negotiated", "ready", "refused"])),
+             inspect(states)
+    end
+
+    test "carries the appliance's own instant where it had one", %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      instants = device |> log_events() |> Enum.map(& &1["observed_at"]) |> Enum.uniq()
+
+      # Most of a boot transcript is emitted before the node establishes a time,
+      # and those rows sit at the epoch rather than at this server's clock — a
+      # value legible as exactly what it is, with the line beside it saying so.
+      assert "1970-01-01 00:00:00.000000" in instants
+      assert Enum.any?(instants, &(&1 > "2020-01-01 00:00:00.000000"))
+
+      unsynchronized =
+        device
+        |> log_events()
+        |> Enum.filter(&(&1["observed_at"] == "1970-01-01 00:00:00.000000"))
+
+      assert Enum.all?(unsynchronized, &String.contains?(&1["detail"], "time=unsynchronized"))
+    end
+
+    test "leaves the readings and the padding that share its block type alone",
+         %{device: device} do
+      ship(device, :log, RecordingFixtures.read!("metric-readings-logs"))
+
+      # One ring, three kinds of Custom Block, and each reader steps over the
+      # other's in silence: a block one of them reads is not a block the other
+      # refused.
+      assert log_events(device) != []
+      assert metric_samples(device) != []
+      refute_received {:telemetry, :records_skipped, _measurements, %{cause: :padding}}
+      refute_received {:telemetry, :records_skipped, _measurements, %{cause: :metric_reading}}
+      refute_received {:telemetry, :records_skipped, _measurements, %{cause: :unknown_kind}}
+      refute_received {:telemetry, :records_skipped, _measurements, %{cause: :unprintable}}
     end
   end
 
@@ -423,6 +501,16 @@ defmodule Ctrld.Channel.Ingest.TelemetryTest do
       Store.query(
         "SELECT * FROM metric_samples WHERE device_id = '#{device}' " <>
           "ORDER BY observed_at, family"
+      )
+
+    rows
+  end
+
+  defp log_events(device) do
+    {:ok, rows} =
+      Store.query(
+        "SELECT * FROM log_events WHERE device_id = '#{device}' " <>
+          "ORDER BY observed_at, domain"
       )
 
     rows

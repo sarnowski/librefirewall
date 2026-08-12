@@ -297,6 +297,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "transcript_block"
+path = "fuzz_targets/transcript_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "config_image"
 path = "fuzz_targets/config_image.rs"
 test = false

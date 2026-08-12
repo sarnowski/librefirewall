@@ -231,7 +231,7 @@ has no such record.
 - **A Custom Block of counters** appears in `/logs.pcapng` about once a second, carrying the whole
   metric surface as it stood at one instant. It shares the block type and the enterprise number with
   the padding above and is told apart by the first byte of its data: **empty data, or a leading zero
-  byte, is padding**, and `1` is a metric reading. Its layout is in
+  byte, is padding**, `1` is a metric reading and `2` is a console transcript. Its layout is in
   [the channel framing contract](../contracts/channel-framing.md#metric-snapshots), which is where
   the management server reads it from. What it holds is exactly the closed catalogue —
   [every counter and gauge series of the twelve shards](metrics.md), in the order that page lists
@@ -239,6 +239,17 @@ has no such record.
   per-interface information and no per-rule hit count in a recording, because neither has a fixed
   place in the catalogue to occupy. A reader that does not recognise the PEN skips these exactly as
   it skips the padding, so a recording carrying them opens in `tcpdump` unchanged.
+- **A Custom Block of console lines** appears in `/logs.pcapng` carrying a batch of the lines the
+  appliance printed on its serial console, byte for byte as it printed them, each with the
+  protection-domain ring it was drained from and the instant it was emitted at. Its kind byte is `2`
+  and its layout is in
+  [the channel framing contract](../contracts/channel-framing.md#console-transcript). It is what a
+  management server stores as this appliance's log, and it is the same text an operator watching the
+  console reads — the appliance renders each record once and puts the bytes on both surfaces. A
+  recorded transcript is a **subset** of a printed one: the console never waits on the domain that
+  writes the medium, so lines it cannot take are dropped and counted on
+  `librefirewall_console_transcript_lines_total`, and the earliest lines of a boot are the ones most
+  likely to be missing.
 - **The PEN is `0xFFFFFFFF`, and it is nobody's.** No registered Private Enterprise Number stands
   behind these annotations. The value is IANA-reserved so it can never collide with a real
   assignment, but it identifies no one, and a reader must not treat a PEN-tagged option in these

@@ -68,7 +68,7 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   alias Ctrld.Channel.Ingest.Telemetry, as: Ingest
   alias Ctrld.Pcapng
   alias Ctrld.Pcapng.{Custom, Packet}
-  alias Ctrld.Telemetry.{Cursor, FlowEvent, MetricSnapshot, Store}
+  alias Ctrld.Telemetry.{Cursor, FlowEvent, LogRecord, MetricSnapshot, Store}
 
   # The pcapng section header, as it lies on the wire in either byte order —
   # the writer's magic is a palindrome, which is what lets a section be found
@@ -94,10 +94,15 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
   # the oldest are dropped, counted, and named in the log.
   @max_pending 5_000
 
-  # The two tables a recording's blocks become. One list per table rather than
+  # The three tables a recording's blocks become. One list per table rather than
   # one list of tagged rows, because a batch is inserted per table and the
   # cursor may only move once every table's batch is in.
-  @tables ["flow_events", "metric_samples"]
+  @tables ["flow_events", "log_events", "metric_samples"]
+
+  # The Custom Block kind a transcript batch carries, so the metric reader can
+  # step over one in a guard. Taken from the module that owns it at compile time
+  # rather than restated, the two readers being in one repository.
+  @transcript_kind LogRecord.kind()
 
   @typep state :: %{
            device_id: String.t(),
@@ -321,13 +326,14 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
     %{state | decoder: nil, fed_through: nil, resync: nil}
   end
 
-  # Two kinds of block become rows, and they go to different tables: an
-  # Enhanced Packet Block is what the appliance decided about a packet, and a
-  # Custom Block carrying a metric reading is what its counters read at an
-  # instant. Every other block — the section, the interfaces, and the padding
-  # that shares a type and an enterprise number with a reading — contributes
+  # Three kinds of block become rows, and they go to different tables: an
+  # Enhanced Packet Block is what the appliance decided about a packet, a Custom
+  # Block carrying a metric reading is what its counters read at an instant, and
+  # one carrying a transcript batch is what its protection domains said about
+  # themselves. Every other block — the section, the interfaces, and the padding
+  # that shares a type and an enterprise number with the last two — contributes
   # none, which is why the padding needs no filter of its own here: it arrives
-  # as a `%Custom{}` and the decoder below answers `:padding` for it.
+  # as a `%Custom{}` and both decoders below answer `:padding` for it.
   @spec collect(state(), [Pcapng.block()], boolean(), non_neg_integer()) :: state()
   defp collect(state, blocks, store?, complete_through) do
     records = Enum.filter(blocks, &match?(%Packet{}, &1))
@@ -358,14 +364,17 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
       true ->
         flow_rows = Enum.reduce(records, [], &build(&1, &2, state))
         sample_rows = Enum.reduce(customs, [], &sample(&1, &2, state))
+        log_rows = Enum.reduce(customs, [], &transcript(&1, &2, state))
 
-        Ingest.emit(:rows_built, %{rows: length(flow_rows) + length(sample_rows)}, %{
-          device_id: state.device_id,
-          ring: state.ring
-        })
+        Ingest.emit(
+          :rows_built,
+          %{rows: length(flow_rows) + length(sample_rows) + length(log_rows)},
+          %{device_id: state.device_id, ring: state.ring}
+        )
 
         state
         |> hold("flow_events", flow_rows)
+        |> hold("log_events", log_rows)
         |> hold("metric_samples", sample_rows)
         |> Map.put(:pending_through, complete_through)
     end
@@ -402,11 +411,53 @@ defmodule Ctrld.Channel.Ingest.Telemetry.Ring do
       {:error, :padding} ->
         rows
 
+      # A transcript batch, which the reader above takes. Stepped over here rather
+      # than counted: a block one decoder reads is not a block the other refused.
+      {:error, {:unknown_kind, @transcript_kind}} ->
+        rows
+
       {:error, refusal} ->
         Ingest.emit(:records_skipped, %{records: 1}, %{
           device_id: state.device_id,
           ring: state.ring,
           cause: MetricSnapshot.tag(refusal)
+        })
+
+        rows
+    end
+  end
+
+  # A Custom Block is a transcript batch, a metric reading, or the padding that
+  # fills a sector. The first byte of its data is what tells them apart, so the
+  # two decoders step over each other's blocks in silence and only a block neither
+  # can read is counted.
+  @spec transcript(Custom.t(), [map()], state()) :: [map()]
+  defp transcript(%Custom{data: data}, rows, state) do
+    case LogRecord.rows(state.device_id, data) do
+      {:ok, %{rows: built, refused: 0}} ->
+        Enum.reverse(built) ++ rows
+
+      {:ok, %{rows: built, refused: refused}} ->
+        # A line from a ring this server has no name for. Refused rather than
+        # stored under a guess: a log line attributed to the wrong protection
+        # domain is worse than a missing one, nothing downstream being able to
+        # tell.
+        Ingest.emit(:records_skipped, %{records: refused}, %{
+          device_id: state.device_id,
+          ring: state.ring,
+          cause: :unknown_origin
+        })
+
+        Enum.reverse(built) ++ rows
+
+      {:error, refusal} when refusal in [:padding, :metric_reading] ->
+        rows
+
+      {:error, refusal} ->
+        Ingest.emit(:records_skipped, %{records: 1}, %{
+          device_id: state.device_id,
+          ring: state.ring,
+          cause: LogRecord.tag(refusal)
         })
 
         rows

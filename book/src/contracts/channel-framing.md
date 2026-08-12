@@ -115,7 +115,7 @@ carrying it.
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 1 | kind — `0` padding, `1` metric snapshot; **empty data is padding too** |
+| 0 | 1 | kind — `0` padding, `1` metric snapshot, `2` console transcript; **empty data is padding too** |
 | 1 | 1 | body version; this page defines `1` |
 | 2 | 2 | reserved, zero — a nonzero byte is a block this reader does not share a layout with |
 | 4 | 4 | catalogue fingerprint |
@@ -142,6 +142,69 @@ over a table that changed with a configuration commit would mean nothing.
 **A counter is a full 64-bit unsigned value.** A consumer storing one in a format that cannot
 represent it exactly — a 64-bit float, whose integers are exact only to 2^53 — refuses the sample and
 says which, rather than storing a rounded number that reads as a measurement.
+
+## Console transcript
+
+The lines the appliance prints on its serial console travel upstream the same way, as a **pcapng
+Custom Block written into the log ring**, carrying a batch of them. It is the same block type and the
+same enterprise number as a metric snapshot and the padding, told apart by the same first byte of the
+data, and every multi-byte field is little-endian for the same reason.
+
+**What travels is the rendered line, not the record it came from.** The appliance's console grammar
+is a large closed vocabulary — dozens of detail shapes over eighteen enumerations — and a server
+handed structured records would need a second copy of that grammar in another language, drifting from
+the first with nothing to notice. Handed lines it needs none, and the text a query returns is the text
+an operator read on the console, which is a property worth more than the few bytes a structured record
+would save. The appliance's own boot gate holds the two surfaces to each other: every line in a
+recording it downloads must be one the same boot printed.
+
+**Block type `0x00000BAD`, PEN `0xFFFFFFFF`.** The block's data is a header and then one entry per
+line:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | kind — `2` for a console transcript |
+| 1 | 1 | body version; this page defines `1` |
+| 2 | 2 | reserved, zero |
+| 4 | 2 | entry count — where the entries stop, so a reader does not take the block's own padding for one |
+| 6 | 2 | reserved, zero |
+| 8 | … | the entries, back to back, each as below |
+
+Each entry:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | origin — which protection domain's log ring the console drained the record from |
+| 1 | 1 | flags — bit 0 set means the instant below is a real one; every other bit reserved, zero |
+| 2 | 2 | line length in bytes, at most 256 |
+| 4 | 8 | the instant the record was emitted, nanoseconds since the Unix epoch; meaningful only where bit 0 of the flags is set |
+| 12 | length | the line, exactly as it was printed, **without its line ending** |
+
+**The origin is the ring and not the line's own `domain=` token.** A writing domain owns its log ring
+and may put any token it likes in a record it publishes; which ring a record came out of is decided
+by the appliance's capability topology and no writing domain can forge it. So a consumer that wants
+to know which domain spoke reads the origin, and the token in the line stays visible as that domain's
+own claim — which is what an operator reading the console sees too. The origins index the protection
+domains in the order the [architecture](../design/architecture.md) names them; unlike a snapshot,
+there is no fingerprint in front of them, so a consumer holding a stale table names the wrong domain
+rather than refusing the block.
+
+**A line is printable ASCII and nothing else** — space through tilde, no control byte, no byte above
+127 — because that is the whole alphabet the console grammar renders. A consumer refuses a line
+outside it rather than storing it: the bytes crossed a shared region a peer domain writes, so text
+outside the alphabet is text no domain printed.
+
+**The absence of an instant is a flag and not a zero.** Most of a boot transcript is emitted before
+the appliance has established a time, and dating those lines to 1970 would be a claim the appliance
+never made. The line itself says `time=unsynchronized` either way.
+
+**A batch is best-effort and a gap is counted.** The appliance's console must never wait on its
+recorder — it is the only diagnostic surface a deployed node has, and one that stalled on the domain
+writing the medium would go quiet exactly when that domain is what is wrong. So lines the recorder is
+not draining fast enough are dropped rather than queued, and the drop is reported on
+`librefirewall_console_transcript_lines_total{outcome="dropped"}`. A recorded transcript is therefore
+a subset of a printed one, and the earliest lines of a boot — printed while the recorder is still
+bringing its block device up — are the ones most likely to be missing.
 
 ## Downstream: configuration operations
 

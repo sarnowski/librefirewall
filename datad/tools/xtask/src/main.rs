@@ -108,6 +108,7 @@ mod surface_contract;
 mod sysdesc;
 mod target_spec;
 mod topology;
+mod transcript_contract;
 mod util;
 
 fn main() -> ExitCode {

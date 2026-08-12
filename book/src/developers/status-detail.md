@@ -720,9 +720,10 @@ timestamps, `if_snaplen` the sink's own. Every observation is an Enhanced Packet
 verdict, the drop reason, the interface, the direction and the **configuration generation the
 decision was made under**. A sealed segment is padded to a sector boundary with a Custom Block that
 any reader skips. **The connection history additionally carries the whole metric surface** about
-once a second, as a Custom Block of the same type and enterprise number told apart by the first byte
-of its data — zero, or no data at all, is padding — which is what gives the management server's
-`metric_samples` table a producer without a second transport. The [recording download endpoints reference](../reference/recordings.md) is the
+once a second, and the console transcript as it is printed, each as a Custom Block of the same type
+and enterprise number told apart by the first byte of its data — zero, or no data at all, is padding,
+`1` a reading and `2` a batch of console lines — which is what gives the management server's
+`metric_samples` and `log_events` tables their producers without a second transport. The [recording download endpoints reference](../reference/recordings.md) is the
 operator-facing statement of all of it.
 
 The console names both extents at bring-up. Nothing else states them: they are compiled in rather
@@ -1258,7 +1259,26 @@ shared round-robin with a rotating start and at most eight records taken from an
 both constants of this build: a domain that fills its ring faster than the line drains costs the
 others a delay and never their records.
 
-Two persistent fuzz targets drive it (`log_record`, `log_ring`), the second modelling both sides as
+**The transcript also leaves the node.** Every line the console prints it publishes into one further
+pair of regions — `log_relay`, read-write to the console and read-only to the recorder, and
+`log_relay_consume`, the other way round — and the domain that owns the block device frames batches
+of them into the log recording as PEN-tagged Custom Blocks, which the channel ships upstream with
+everything else. That is the whole of why the pair exists: the recorder is the only domain that can
+write the medium and it maps no log ring but its own, so widening those grants to reach the records
+would have handed eleven read grants to the domain holding a block device and a DMA-capable
+controller. What crosses instead is a line the console has already printed, in the direction the
+authority already runs.
+
+Two properties make it safe to have at all. **The console is never stalled by it**: publishing is
+total and non-blocking, and a relay the recorder is not draining fast enough costs a counted drop on
+`librefirewall_console_transcript_lines_total{outcome="dropped"}` rather than a line the serial port
+did not get. And **the origin is the ring rather than the record's own `domain=` token**, because a
+writing domain may claim to be any domain in a record it publishes and cannot claim to be another
+domain's ring. A recorded transcript is therefore a *subset* of a printed one, and every boot in the
+gate holds the containment: each line the recording it downloads carries must be one the same boot
+printed on the serial console, which is the only check that can catch either rendering being wrong.
+
+Three persistent fuzz targets drive it (`log_record`, `log_ring`, `transcript_block`), the second modelling both sides as
 independently hostile — a forged cursor arriving between two steps of one drain, a slot rewritten
 one atomic at a time, which is the only granularity at which a torn record is expressible. One
 asserts directly that no observability surface can be made to carry what it must not: no record the
@@ -1281,9 +1301,12 @@ indifferent to whether anything is printed.
   share of a core for as long as the node runs. An interrupt-driven transmitter would remove the
   polling entirely; it needs the system's first `<irq>` element — a second new capability class in
   one change — and was deliberately not bundled with the first `<ioport>`.
-- **No `GET /logs` retention ring.** The log rings are a transport to the line, not storage: a
-  record the console has rendered is gone. There is no second reader, no retention, and nothing to
-  query after the fact — the transcript exists only in whatever captured the serial port.
+- **No `GET /logs` retention ring.** The log rings are still a transport to the line, not storage: a
+  record the console has rendered is gone from the ring, and there is no second reader of one and
+  nothing on the node to query after the fact. What a transcript can be asked of now is the
+  *management server*, which stores every line the recording carried; the node itself answers no such
+  question, and the earliest lines of a boot — printed while the recorder is still bringing its device
+  up — reach neither.
 - **No flow control, in either sense.** The link has none — nothing on either end asserts DTR/RTS,
   and a console that blocked on a peer's readiness would stop reporting exactly when the node is in
   trouble. Nor does the ring throttle a writer: a full ring refuses the *newest* record and counts
@@ -3563,6 +3586,31 @@ delivered anchor and matches the profile in every field.
   counter reads as a measurement and is not one. Nothing this appliance counts reaches 2^53 in any
   plausible life, so that refusal answers a domain that is faulty or hostile, which is exactly when
   a silently rounded number would be worst.
+- **The console transcript becomes rows too, and `log_events` now has a producer.** The console
+  domain renders every record its eleven peers publish, puts the line on the serial port, and
+  publishes the same bytes to the recorder, which frames batches of them into the log recording as a
+  PEN-tagged Custom Block of kind `2`. What is stored is the **rendered line**, byte for byte, in
+  `log_events.detail`: the console grammar is dozens of detail shapes over eighteen enumerations, and
+  a server that re-rendered records would be a second copy of it in another language, drifting with
+  nothing to notice. Storing the line makes the text a query returns and the text an operator read the
+  same by construction — and every boot in the appliance's system gate holds the two to each other,
+  demanding that every line in the recording it downloads be one the same boot printed.
+
+  `log_events.domain` is the **ring** the record came out of and not the `domain=` token inside the
+  line, because a writing domain may claim to be any domain in its own record and cannot claim to be
+  another domain's ring; the claim stays visible in the line beside it. The ten-entry vocabulary those
+  origins index is generated alongside the metric catalogue into `ctrld/priv/log_domains.json`, and
+  unlike a snapshot there is no fingerprint in front of it — a stale table would name the wrong domain
+  rather than refuse the block — so the appliance's gate holds the committed file to
+  `lfw_log::Domain`. `log_events.severity` holds a **lifecycle point and not a level**: `starting`,
+  `negotiated`, `ready` or `refused` for a protection-domain record, and empty for a configuration
+  one. Nothing maps those onto `warn` or `error`, because no such judgement exists on the appliance.
+
+  A recorded transcript is a **subset** of a printed one. The console is the only diagnostic surface a
+  deployed node has, so it never waits on the recorder: a relay the recorder is not draining fast
+  enough costs a counted drop on `librefirewall_console_transcript_lines_total{outcome="dropped"}`,
+  and the earliest lines of a boot — printed while the recorder is still bringing its block device up
+  — are the ones most likely to be missing.
 - **The numbers cross a page rather than a widened grant.** The recorder is the only domain that
   can write the medium and it maps no statistics shard but its own; the management domain maps every
   shard and can write no recording. So one new region — `stats_relay`, one page, management
@@ -3571,6 +3619,13 @@ delivered anchor and matches the profile in every field.
   page carries the calibration region's seqlock, because a *reading* is meaningful only whole, and
   its generation is what paces the recorder: a block is written when the publisher has moved, never
   on a timer of the recorder's own.
+
+  The transcript crosses the same way and in the same direction, over `log_relay` and
+  `log_relay_consume`: the recorder still maps no log ring but its own, and what reaches it is a line
+  the console has already printed rather than a record a peer wrote. The relay is a **bounded ring
+  with a counted drop** rather than a seqlock, because a line is meaningful alone where a reading is
+  meaningful only whole — and because the console must not be stalled by it. Its lines are peeked and
+  released only once the block is placed, so a rolling segment costs latency and never transcript.
 - **It is the connection history that becomes rows.** `flow_events` has no column naming a ring, so
   a table fed from both would mix one record per lifecycle or policy event with one record per frame
   the dataplane decided on — orders of magnitude more of them, almost all carrying no event at all —
@@ -3657,7 +3712,7 @@ naming the generation and segment the medium held, a superblock that came out at
 and a later segment than it went in at, and the previous boot's durable bytes still byte for byte
 where it left them. Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes, **one session at a time**: the next client is not opened until the appliance has accounted for the session before it, because every frame that port takes draws a console record and a domain's log ring holds a bounded number of them, so four sessions opened back to back would crowd out the very accounts the boot is judged on. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **4 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued. That boot attaches a recorder medium **two earlier boots wrote**, because a fresh one never reaches the state a deployed appliance is in: a resumed recording begins at the segment its boot opened, a channel cursor begins at zero, and what the appliance does about that disagreement is the whole of whether it ships at all after a restart. It must resynchronise both recordings off position zero and say so, drain both, and then — on a burst injected on the strength of the console saying it had drained them, so that what follows did not exist when it said so — ship past that drain, with the server receiving more than one upstream frame at strictly advancing positions and the first from where that recording begins on the medium. The other three are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. Each of those four boots **ends on the record it owes** rather than beside it: the domain that terminates a session writes its outcome on the pass that decided the session, which is later than the traffic, the scrape and the recordings the same boot also waits for, so a run that stopped on those alone would kill the guest with the channel's own record still unwritten and read an appliance that was about to speak as one that never did. The wait asks only whether the record has appeared, never how often the appliance re-dialled — that is the appliance's own decision — and it is bounded by the same total budget every boot takes, so an appliance that genuinely never reports fails on that budget rather than hanging the gate. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 31 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 32 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |

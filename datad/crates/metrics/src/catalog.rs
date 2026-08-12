@@ -971,6 +971,20 @@ pub const RECORDING_SNAPSHOTS: Metric = metric(
      segment could hold.",
 );
 
+pub const RECORDING_TRANSCRIPTS: Metric = metric(
+    "librefirewall_recording_transcripts_total",
+    Kind::Counter,
+    "Batches of console transcript lines the recorder framed into the connection history, and \
+     those it could not: one no segment could hold.",
+);
+
+pub const RECORDING_TRANSCRIPT_LINES: Metric = metric(
+    "librefirewall_recording_transcript_lines_total",
+    Kind::Counter,
+    "Console lines those batches carried, which is what a management server stores as this \
+     appliance's log.",
+);
+
 pub const RECORDING_DOWNLOAD_OVERRUNS: Metric = metric(
     "librefirewall_recording_download_overruns_total",
     Kind::Counter,
@@ -1001,6 +1015,13 @@ pub const CONSOLE_RECORDS: Metric = metric(
     "librefirewall_console_records_total",
     Kind::Counter,
     "Records the console path resolved, by outcome; each outcome accuses a different party.",
+);
+
+pub const CONSOLE_TRANSCRIPT_LINES: Metric = metric(
+    "librefirewall_console_transcript_lines_total",
+    Kind::Counter,
+    "Printed lines the console offered the domain that writes the medium, by whether that \
+     domain had room: a drop is a gap in the recorded transcript and never a stalled console.",
 );
 
 pub const UART_BYTES_WRITTEN: Metric = metric(
@@ -1128,12 +1149,15 @@ pub const ALL_METRICS: &[&Metric] = &[
     &RECORDING_TAP_DROPPED_BY_WRITER,
     &RECORDING_DOWNLOADS,
     &RECORDING_SNAPSHOTS,
+    &RECORDING_TRANSCRIPTS,
+    &RECORDING_TRANSCRIPT_LINES,
     &RECORDING_DOWNLOAD_OVERRUNS,
     &RECORDING_RECORDS_UNCLOCKED,
     &RECORDING_STREAMS,
     &RECORDING_STREAM_WINDOWS,
     &RECORDING_STREAM_BYTES,
     &CONSOLE_RECORDS,
+    &CONSOLE_TRANSCRIPT_LINES,
     &UART_BYTES_WRITTEN,
     &UART_TRANSMITTER_TIMEOUTS,
     &UART_INIT_FAILURES,

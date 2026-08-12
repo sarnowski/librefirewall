@@ -1015,6 +1015,65 @@
     <memory_region name="log_store" size="0x5000" />
     <memory_region name="log_store_consume" size="0x1000" />
 
+    <!-- THE TRANSCRIPT RELAY: the one pair of log regions that runs the other
+         way, from the console domain to the domain that writes the medium.
+
+         WHY IT EXISTS. The management server stores this appliance's log, and
+         those lines have to reach the recording medium. The recorder is the only
+         domain that can write that medium and it maps NO log ring but its own —
+         widening that would delete the property the twenty-two rows above are
+         granted for, and it would hand eleven read grants to the domain holding a
+         block device and a DMA-capable controller. The console domain is the
+         opposite: it already maps all eleven read-only and already renders every
+         record. So the transcript travels the way the authority already runs. The
+         console publishes each line it has just printed and the recorder copies
+         it out. One pair of pages instead of eleven read grants, and the recorder
+         learns what other domains have said rather than gaining the ability to
+         read whatever a peer happens to be writing.
+
+         WHAT EACH SIDE MAY DO, and it is the log rings' split read in the mirror.
+         `log_relay` holds the line slots, the producer cursor and the console's
+         drop count: the console maps it READ-WRITE and the recorder READ-ONLY, so
+         a compromised recorder can decline to frame a line and cannot forge one
+         into the recording a management server believes. `log_relay_consume`
+         holds the consumer cursor alone: the recorder maps it read-write and the
+         console read-only, so the console cannot forge how far the recorder has
+         read and so cannot overwrite a line that has not been framed while
+         counting no drop for it. One region could not carry both authorities,
+         exactly as `cfg`/`cfgack` cannot.
+
+         A FULL RELAY COSTS A COUNTED DROP AND NEVER THE CONSOLE. The console is
+         this appliance's only diagnostic surface, and one that waited on the
+         recorder would go quiet exactly when the recorder is what is wrong. So
+         the console's publish is total and non-blocking: the serial line gets
+         every line whatever this region's state, and a relay the recorder is not
+         draining fast enough shows up as
+         `librefirewall_console_transcript_lines_total{outcome="dropped"}` — a gap
+         in the recorded transcript, never a stalled console.
+
+         WHAT IS NOT WIDENED. The recorder still maps no log ring but its own, in
+         either direction, and no third domain maps either of these regions. What
+         crosses is a line the console has already printed, not a record a peer
+         wrote, so a compromised console can put words in the recording that it
+         could equally have put on the serial port — which it can do anyway,
+         owning the port and being the sole renderer. The forwarder maps neither
+         side, exactly as it maps no log ring but its own.
+
+         Sizes are `wire::LOG_RELAY_REGION_SIZE` and
+         `wire::LOG_RELAY_CONSUME_REGION_SIZE`, each its type's `size_of` rounded
+         up to the mapping granularity and held to it by `xtask::sysdesc`.
+         `LogRelay` is deliberately ONE page — a second page of authority on the
+         domain holding the block device is what this whole region avoids — and it
+         carries every slot that fits behind its header, which is fifteen lines of
+         up to 256 bytes. `LogRelayConsume` is one word and costs the page a
+         region costs.
+
+         Neither carries phys_addr, for the log rings' reason: no device DMAs into
+         one, and a zeroed pair is a valid empty relay, so the console may publish
+         before the recorder has run. -->
+    <memory_region name="log_relay" size="0x1000" />
+    <memory_region name="log_relay_consume" size="0x1000" />
+
     <!-- THE ARENA: the appliance's only allocator, and the only region in this
          system with no structure.
 
@@ -1869,6 +1928,8 @@
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_recorder" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_recorder_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
+        <map mr="log_relay" vaddr="0x4_b00_000" perms="r" cached="true" setvar_vaddr="log_relay_vaddr" />
+        <map mr="log_relay_consume" vaddr="0x4_b10_000" perms="rw" cached="true" setvar_vaddr="log_relay_consume_vaddr" />
         <map mr="stats_recorder" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
         <map mr="stats_relay" vaddr="0x5_00c_000" perms="r" cached="true" setvar_vaddr="stats_relay_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar3" />
@@ -2309,6 +2370,8 @@
         <map mr="log_crypto_consume" vaddr="0x4_910_000" perms="rw" cached="true" setvar_vaddr="log_crypto_consume_vaddr" />
         <map mr="log_store" vaddr="0x4_a00_000" perms="r" cached="true" setvar_vaddr="log_store_vaddr" />
         <map mr="log_store_consume" vaddr="0x4_a10_000" perms="rw" cached="true" setvar_vaddr="log_store_consume_vaddr" />
+        <map mr="log_relay" vaddr="0x4_b00_000" perms="rw" cached="true" setvar_vaddr="log_relay_vaddr" />
+        <map mr="log_relay_consume" vaddr="0x4_b10_000" perms="r" cached="true" setvar_vaddr="log_relay_consume_vaddr" />
         <map mr="stats_console" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
     </protection_domain>
 

@@ -90,7 +90,7 @@ use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, 
 use lfw_metrics::StatsShard;
 use lfw_recorder::deck::{
     Area, Completion, Deck, DeckError, Ended, InterfaceNames, Job, Medium, Opened, Polled,
-    RESERVED_SECTORS, Refused, STAGING_END, Served, Transfer, Which,
+    RESERVED_SECTORS, Refused, STAGING_END, Served, Transcript, Transfer, Which,
 };
 use lfw_recorder::preload::{self, PreloadError};
 use lfw_recorder::{InterfaceName, MAX_INTERFACES};
@@ -99,7 +99,7 @@ use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 use virtio::pci::PciConfig;
 use wire::{
     ClockCalibration, DownloadReply, DownloadRequest, DownloadResponder, LogConsume, LogRecords,
-    StatsRelay, TAP_SNAP_LEN, TapConsume, TapRecords,
+    LogRelay, LogRelayConsume, StatsRelay, TAP_SNAP_LEN, TapConsume, TapRecords,
 };
 
 /// The management domain, which is told whenever a reply lands.
@@ -375,6 +375,9 @@ fn init() -> Recorder {
     let request: &'static DownloadRequest = attach_region!(dl_request_vaddr: DownloadRequest);
     let reply: &'static DownloadReply = attach_region!(dl_reply_vaddr: DownloadReply);
     let relay: &'static StatsRelay = attach_region!(stats_relay_vaddr: StatsRelay);
+    let transcript: &'static LogRelay = attach_region!(log_relay_vaddr: LogRelay);
+    let transcript_consume: &'static LogRelayConsume =
+        attach_region!(log_relay_consume_vaddr: LogRelayConsume);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
@@ -412,6 +415,10 @@ fn init() -> Recorder {
                             responder: reply.responder(request),
                             stats,
                             relay,
+                            // Taken once and kept, which is what the relay asks
+                            // of a reader: a second handle restarts at slot zero
+                            // and re-frames every line the first consumed.
+                            transcript: Transcript::new(transcript_consume.reader(transcript)),
                             clock: PdClock::new(clock),
                             blocks,
                         },
@@ -510,6 +517,11 @@ struct Loop<'region> {
     /// The whole metric reading the management domain publishes, read-only here
     /// and the only way this domain learns any counter but its own.
     relay: &'region StatsRelay,
+    /// The console lines the console domain publishes, read-only here, and the
+    /// only way this domain learns what any other domain has said about itself.
+    /// It maps no other domain's log ring and this is not one: it carries lines
+    /// the console has already printed rather than records a peer wrote.
+    transcript: Transcript<'region>,
     clock: PdClock<'region>,
     blocks: BlockCounters,
 }
@@ -523,6 +535,7 @@ fn run(mut held: Loop<'_>, sink: &RingSink<'_, PdClock<'_>>) -> ! {
         responder,
         stats,
         relay,
+        transcript,
         clock,
         blocks,
     } = &mut held;
@@ -530,7 +543,14 @@ fn run(mut held: Loop<'_>, sink: &RingSink<'_, PdClock<'_>>) -> ! {
     loop {
         // Read afresh each pass: a cached triple would be a stopped clock that
         // no longer says so.
-        deck.poll(device, tap, &mut scratch, clock.calibration(), Some(relay));
+        deck.poll(
+            device,
+            tap,
+            &mut scratch,
+            clock.calibration(),
+            Some(relay),
+            Some(transcript),
+        );
         // One demand at a time, which is all the channel admits: taking a
         // second while the first is unanswered would leave the requester
         // waiting on a sequence nothing will publish.

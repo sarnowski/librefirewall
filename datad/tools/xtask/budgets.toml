@@ -163,6 +163,7 @@
 "crates/wire/src/install.rs" = 0.5164
 "crates/wire/src/lib.rs" = 0.2689
 "crates/wire/src/log_record.rs" = 0.2647
+"crates/wire/src/log_relay.rs" = 0.4204
 "crates/wire/src/log_ring.rs" = 0.4271
 "crates/wire/src/log_slot.rs" = 0.1088
 "crates/wire/src/owner.rs" = 0.5897
@@ -171,6 +172,7 @@
 "crates/wire/src/stats_relay.rs" = 0.5574
 "crates/wire/src/submission.rs" = 0.3286
 "crates/wire/src/tap.rs" = 0.3146
+"crates/wire/src/transcript_block.rs" = 0.3382
 "crates/x509/src/der.rs" = 0.2609
 "crates/x509/src/lib.rs" = 0.6222
 "crates/x509/src/pem.rs" = 0.4051

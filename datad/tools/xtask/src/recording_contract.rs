@@ -34,14 +34,25 @@ const ENHANCED_PACKET_BLOCK: u32 = 0x0000_0006;
 const CUSTOM_BLOCK: u32 = 0x0000_0BAD;
 
 /// The first byte of a Custom Block's data: `0`, or no data at all, is the
-/// padding that fills a sector, and `1` is a metric reading. Restated here as a
-/// number for the reason every constant above is — a reader tells the two apart
-/// by this byte, and a harness sharing the writer's constant could not tell a
-/// renamed one from a correct file.
+/// padding that fills a sector, `1` is a metric reading and `2` is a batch of
+/// console transcript lines. Restated here as numbers for the reason every
+/// constant above is — a reader tells them apart by this byte, and a harness
+/// sharing the writer's constants could not tell a renamed one from a correct
+/// file.
 const SNAPSHOT_KIND: u8 = 1;
+const TRANSCRIPT_KIND: u8 = 2;
 
 /// Bytes of a metric reading ahead of its first slot.
 const SNAPSHOT_HEADER_LEN: usize = 20;
+
+/// Bytes of a transcript batch ahead of its first entry, and of one entry ahead
+/// of its line.
+const TRANSCRIPT_HEADER_LEN: usize = 8;
+const TRANSCRIPT_ENTRY_HEADER_LEN: usize = 12;
+
+/// The flag bit an entry sets when its instant is a real one rather than the
+/// absence of one.
+const TRANSCRIPT_FLAG_STAMPED: u8 = 1;
 
 /// pcapng's byte-order magic, little-endian as this appliance writes it.
 const BYTE_ORDER_MAGIC: u32 = 0x1A2B_3C4D;
@@ -356,6 +367,26 @@ pub struct Parsed {
     /// Custom Blocks the walk read as padding, which is what a file with none at
     /// all would be a finding about.
     pub padding_blocks: usize,
+    /// Every console transcript line the file carries, in the order the blocks
+    /// carrying them appear — which is the order they were printed.
+    pub transcript: Vec<TranscriptLine>,
+    /// Batches those lines arrived in, so a file carrying one line per block can
+    /// be told from one carrying them in batches.
+    pub transcript_batches: usize,
+}
+
+/// One console line out of a recording, read by the offsets the framing contract
+/// states rather than through the encoder that wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptLine {
+    /// Which protection domain's ring the console drained it from, as
+    /// `lfw_log::Domain`'s discriminant.
+    pub origin: u8,
+    /// Nanoseconds since the Unix epoch, or `None` where the emitting domain had
+    /// no clock — which most of a boot transcript does not.
+    pub unix_nanos: Option<u64>,
+    /// The line as the console printed it, without its ending.
+    pub line: String,
 }
 
 /// One metric reading out of a recording, read by the offsets the framing
@@ -402,6 +433,44 @@ fn snapshot(data: &[u8]) -> Option<Snapshot> {
         unix_nanos: u64::from_le_bytes(header.get(8..16)?.try_into().ok()?),
         values,
     })
+}
+
+/// Take a Custom Block's data apart as a batch of console transcript lines, or
+/// answer `None` for a block of some other kind.
+///
+/// Deliberately no use of `wire`'s own decoder, on [`snapshot`]'s terms: this is
+/// the reader a management server writes from the contract page, and a harness
+/// that used the appliance's decoder would prove the two agree with themselves.
+///
+/// A malformed entry ends the walk and the lines before it stand, exactly as a
+/// server's reader treats one: what was whole was printed.
+fn transcript(data: &[u8]) -> Option<Vec<TranscriptLine>> {
+    if data.first().copied().unwrap_or(0) != TRANSCRIPT_KIND {
+        return None;
+    }
+    let header = data.get(..TRANSCRIPT_HEADER_LEN)?;
+    let stated = u16::from_le_bytes([*header.get(4)?, *header.get(5)?]) as usize;
+    let mut lines = Vec::with_capacity(stated);
+    let mut at = TRANSCRIPT_HEADER_LEN;
+    for _ in 0..stated {
+        let Some(entry) = data.get(at..at + TRANSCRIPT_ENTRY_HEADER_LEN) else {
+            break;
+        };
+        let flags = entry[1];
+        let len = u16::from_le_bytes([entry[2], entry[3]]) as usize;
+        let nanos = u64::from_le_bytes(entry[4..12].try_into().ok()?);
+        let from = at + TRANSCRIPT_ENTRY_HEADER_LEN;
+        let Some(text) = data.get(from..from + len) else {
+            break;
+        };
+        lines.push(TranscriptLine {
+            origin: entry[0],
+            unix_nanos: (flags & TRANSCRIPT_FLAG_STAMPED != 0).then_some(nanos),
+            line: String::from_utf8_lossy(text).into_owned(),
+        });
+        at = from + len;
+    }
+    Some(lines)
 }
 
 impl Parsed {
@@ -539,9 +608,13 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
             // stepped over exactly as an unknown block is.
             CUSTOM_BLOCK => {
                 if let Some(data) = block.get(12..block.len().saturating_sub(4)) {
-                    match snapshot(data) {
-                        Some(reading) => found.snapshots.push(reading),
-                        None => found.padding_blocks += 1,
+                    match (snapshot(data), transcript(data)) {
+                        (Some(reading), _) => found.snapshots.push(reading),
+                        (_, Some(lines)) => {
+                            found.transcript_batches += 1;
+                            found.transcript.extend(lines);
+                        }
+                        _ => found.padding_blocks += 1,
                     }
                 }
             }
@@ -755,7 +828,7 @@ pub fn evidence(download: &Download, parsed: &Parsed, snap_len: usize) -> String
     let _ = write!(
         line,
         "  {}: {} bytes, {} section header(s), {} interface block(s), {} packet block(s), \
-         {} metric reading(s), {} padding block(s), \
+         {} metric reading(s), {} transcript batch(es) of {} line(s), {} padding block(s), \
          longest capture {} of a snap length of {snap_len}",
         download.target,
         download.body.len(),
@@ -763,6 +836,8 @@ pub fn evidence(download: &Download, parsed: &Parsed, snap_len: usize) -> String
         parsed.interfaces.len(),
         parsed.packets.len(),
         parsed.snapshots.len(),
+        parsed.transcript_batches,
+        parsed.transcript.len(),
         parsed.padding_blocks,
         parsed.longest_capture(),
     );

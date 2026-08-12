@@ -1,27 +1,37 @@
 #![no_main]
 #![no_std]
 
-//! Console protection domain: the one holder of the serial controller. It
-//! drains every other domain's log ring, renders each record, and puts the line
-//! on COM1.
+//! Console protection domain: the one holder of the serial controller. It drains
+//! every other domain's log ring, renders each record, puts the line on COM1, and
+//! publishes it to the domain that writes the recording medium.
 //!
 //! # Adversary
 //!
 //! Both of the adversaries this domain can meet. The **byzantine peer
-//! protection domain** owns the nine records regions mapped here read-only:
-//! every slot, the producer cursor and the drop count are peer-chosen, and
-//! nothing this domain does can correct one. The **hostile or malfunctioning
-//! device** is the controller, which may never report its transmitter empty.
-//! Neither is judged in this file: `wire` and `lfw_log` refuse a record and
-//! `uart_16550` bounds every wait.
+//! protection domain** owns the eleven records regions mapped here read-only —
+//! every slot, the producer cursor and the drop count are peer-chosen — and the
+//! far end of the transcript relay, where the recorder publishes how far it has
+//! read. The **hostile or malfunctioning device** is the controller, which may
+//! never report its transmitter empty. Neither is judged in this file: `wire`
+//! and `lfw_log` refuse a record and `uart_16550` bounds every wait.
 //!
-//! # Eighteen regions, not nine
+//! # Twenty-four regions, twenty-two in and two out
 //!
 //! Each writing domain's ring is two regions carrying opposite grants. This
 //! domain maps the records read-only, so it cannot forge a line attributed to a
 //! domain that never emitted one, and maps that domain's consume cursor
 //! read-write, because how far the console has read is this domain's own
 //! statement and the writer must not be able to forge it.
+//!
+//! `log_relay` and `log_relay_consume` are the one pair this domain writes *out*
+//! of: every line it prints it also publishes there, and the domain that owns the
+//! block device frames batches of them into the recording a management server
+//! reads. The direction is what the pair buys — the recorder maps no log ring but
+//! its own, so a transcript reaches the medium without eleven read grants going
+//! to the domain holding a DMA-capable controller. **Publishing never decides
+//! whether a line is printed**: it is offered after the device has had the bytes,
+//! and a full relay costs a counted drop, this domain being the only diagnostic
+//! surface a deployed node has.
 //!
 //! # Why it never leaves `init`
 //!
@@ -70,8 +80,9 @@
 //! Drain order, the per-ring burst, what becomes of an undecodable record and
 //! which counter accuses whom are all in [`ConsolePrinter`], where a host test
 //! drives them; the register protocol and every bounded wait are in
-//! `uart_16550`. This file maps eighteen log regions, claims one port window, and
-//! calls one function in a loop.
+//! `uart_16550`. This file maps twenty-four log regions, claims one port window,
+//! pairs each reader with the domain whose ring it drains, and calls one
+//! function in a loop.
 //!
 //! # Why the port access is here and not in `uart_16550`
 //!
@@ -97,13 +108,13 @@ mod com1;
 
 use com1::Com1;
 use lfw_log::{
-    Clock as _, ConsoleCounters, ConsolePrinter, Domain, DomainDetail, DomainState, Event,
+    Clock as _, ConsoleCounters, ConsolePrinter, Domain, DomainDetail, DomainState, Event, Ring,
 };
 use lfw_metrics::{ConsoleSample, StatsShard};
 use pd_runtime::{PdClock, attach_region};
 use sel4_microkit::{ChannelSet, Handler, Infallible, debug_println, protection_domain};
 use uart_16550::{Transmitter, Uart, WriteError};
-use wire::{ClockCalibration, LogConsume, LogReader, LogRecords};
+use wire::{ClockCalibration, LogConsume, LogRecords, LogRelay, LogRelayConsume};
 
 /// The log rings this domain drains, and so the length of the round-robin: one
 /// per writing domain, matching the eleven pairs of `<map>` rows on the console
@@ -164,6 +175,10 @@ fn init() -> Console {
     let crypto_consume: &'static LogConsume = attach_region!(log_crypto_consume_vaddr: LogConsume);
     let store_consume: &'static LogConsume = attach_region!(log_store_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
+    // The one pair this domain writes *out* of; see the crate header.
+    let relay: &'static LogRelay = attach_region!(log_relay_vaddr: LogRelay);
+    let relay_consume: &'static LogRelayConsume =
+        attach_region!(log_relay_consume_vaddr: LogRelayConsume);
     // For its own two records alone: a peer's instant is rendered, never minted.
     let stamps = PdClock::new(attach_region!(clock_vaddr: ClockCalibration));
 
@@ -203,37 +218,53 @@ fn init() -> Console {
     };
 
     let mut printer = ConsolePrinter::new(SerialLine(transmitter));
-    printer.print(stamps.now(), &announce(DomainState::Starting));
+    // Taken once and kept, on the log rings' terms below.
+    let mut relay = relay.writer(relay_consume);
+    printer.print(
+        Domain::Console,
+        stamps.now(),
+        &announce(DomainState::Starting),
+        &mut relay,
+    );
 
-    // Taken once and kept, which is what `LogConsume::reader` asks of a caller:
-    // a second handle restarts at slot zero and re-renders every record the
-    // first consumed. They live as long as the loop below, which never ends.
-    // Each pairs this domain's own consume region with the records region of
-    // the domain that fills it.
-    let mut readers: [LogReader<'static>; RINGS] = [
-        forwarder_consume.reader(forwarder),
-        nic_driver0_consume.reader(nic_driver0),
-        nic_driver1_consume.reader(nic_driver1),
-        config_consume.reader(config),
-        clock_consume.reader(clock),
-        nic_driver2_consume.reader(nic_driver2),
-        management_consume.reader(management),
-        recorder_consume.reader(recorder),
-        hardware_probe_consume.reader(hardware_probe),
-        crypto_consume.reader(crypto),
-        store_consume.reader(store),
+    // Taken once and kept, which is what `LogConsume::reader` asks of a caller: a
+    // second handle restarts at slot zero and re-renders every record the first
+    // consumed. Each pairs a reader with the domain that owns the ring it drains
+    // — this file's to make and nowhere else's, since which region a reader was
+    // built over is decided by the system description while a record's `domain=`
+    // token is a field of a region its own domain writes.
+    let mut rings: [Ring<'static>; RINGS] = [
+        Ring::new(Domain::Forwarder, forwarder_consume.reader(forwarder)),
+        Ring::new(Domain::NicDriver, nic_driver0_consume.reader(nic_driver0)),
+        Ring::new(Domain::NicDriver, nic_driver1_consume.reader(nic_driver1)),
+        Ring::new(Domain::Config, config_consume.reader(config)),
+        Ring::new(Domain::Clock, clock_consume.reader(clock)),
+        Ring::new(Domain::NicDriver, nic_driver2_consume.reader(nic_driver2)),
+        Ring::new(Domain::Management, management_consume.reader(management)),
+        Ring::new(Domain::Recorder, recorder_consume.reader(recorder)),
+        Ring::new(
+            Domain::HardwareProbe,
+            hardware_probe_consume.reader(hardware_probe),
+        ),
+        Ring::new(Domain::Crypto, crypto_consume.reader(crypto)),
+        Ring::new(Domain::Store, store_consume.reader(store)),
     ];
-    printer.print(stamps.now(), &announce(DomainState::Ready));
+    printer.print(
+        Domain::Console,
+        stamps.now(),
+        &announce(DomainState::Ready),
+        &mut relay,
+    );
 
-    // Written once so a scrape taken before the first record reads a console
-    // that is up, and thereafter only when something moved. Compared rather than
+    // Written once so a scrape taken before the first record reads a console that
+    // is up, and thereafter only when something moved. Compared rather than
     // stored unconditionally for `pds/nic-driver`'s reason: this is a busy loop,
-    // and an unconditional publish would dirty the shard's cache line millions
-    // of times a second for nothing.
+    // and an unconditional publish would dirty the shard's cache line millions of
+    // times a second for nothing.
     let mut published = sample(&printer);
     stats.publish(&published.values());
     loop {
-        printer.drain(&mut readers);
+        printer.drain(&mut rings, &mut relay);
         let current = sample(&printer);
         if current != published {
             stats.publish(&current.values());

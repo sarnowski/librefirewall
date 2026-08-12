@@ -64,7 +64,7 @@ mod stamp;
 
 use core::cell::Cell;
 
-pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter};
+pub use console::{BURST_PER_RING, ByteSink, ConsoleCounters, ConsolePrinter, Ring};
 pub use detail::{
     Cause, CauseError, DomainDetail, MAX_CAUSE_LEN, MAX_OFFERED_POINTS, Refusal, RefusalDetail,
 };

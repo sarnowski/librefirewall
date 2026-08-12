@@ -531,6 +531,8 @@ pub fn recorder_sample(
             recording.snapshots_missed,
             recording.snapshots_dropped,
         ],
+        transcripts: [recording.transcripts_written, recording.transcripts_dropped],
+        transcript_lines: recording.transcript_lines,
         records_unclocked: recording.records_unclocked,
         log,
     }

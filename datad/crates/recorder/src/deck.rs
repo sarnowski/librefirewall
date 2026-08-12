@@ -48,8 +48,9 @@ use lfw_capture_ring::{
 };
 use lfw_metrics::{SNAPSHOT_BYTES, SNAPSHOT_SLOTS, encode_snapshot};
 use wire::{
-    CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader, DownloadRefusal, DownloadSink,
-    StatsRelay, TAP_SNAP_LEN, TapReader,
+    BATCH_BYTES, CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader, DownloadRefusal,
+    DownloadSink, LogRelayReader, RELAY_LINE_BYTES, StatsRelay, TAP_SNAP_LEN,
+    TRANSCRIPT_MAX_ENTRIES, TapReader, TranscriptBatch, TranscriptEntry,
 };
 
 use lfw_pcapng::MIN_CUSTOM_BLOCK_LEN;
@@ -410,6 +411,11 @@ pub struct RecorderCounters {
     pub snapshots_missed: u64,
     /// Readings no recording could hold, which the assertion below proves none.
     pub snapshots_dropped: u64,
+    /// Batches of console transcript lines framed into the log recording, batches
+    /// no recording could hold — the assertion below proves none — and their lines.
+    pub transcripts_written: u64,
+    pub transcripts_dropped: u64,
+    pub transcript_lines: u64,
 }
 
 /// How one recording's extent was opened at boot — a fresh ring looking exactly
@@ -600,6 +606,78 @@ pub enum Served<'window> {
     },
 }
 
+/// The relay this domain drains console lines out of, and the storage one batch of
+/// them is composed in. The protection domain owns it rather than [`Deck`], for
+/// the reason the tap's scratch buffer is: a batch is a page that exists only
+/// during a pass, and a [`Deck`] carrying it would move that page every time one
+/// is returned.
+pub struct Transcript<'region> {
+    reader: LogRelayReader<'region>,
+    batch: [u8; BATCH_BYTES],
+    line: [u8; RELAY_LINE_BYTES],
+}
+
+/// What one composed batch was worth: bytes, and relay slots accounted for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Composed {
+    bytes: usize,
+    lines: u32,
+}
+
+impl<'region> Transcript<'region> {
+    /// Hold a relay reader and the storage a batch is composed in.
+    #[must_use]
+    pub const fn new(reader: LogRelayReader<'region>) -> Self {
+        Self {
+            reader,
+            batch: [0; BATCH_BYTES],
+            line: [0; RELAY_LINE_BYTES],
+        }
+    }
+
+    /// What the console says it dropped for want of a slot: its own claim, passed
+    /// on rather than decided under.
+    #[must_use]
+    pub fn dropped_by_console(&self) -> u32 {
+        self.reader.dropped_by_writer()
+    }
+
+    /// Compose one batch out of whatever the relay holds, without consuming it,
+    /// or `None` where it holds nothing. Bounded by the relay's slot count and by
+    /// the entries a batch may carry, both build constants and neither the
+    /// console's — so a console that keeps publishing cannot extend a pass. One
+    /// entry at a time because one line at a time is all this holds.
+    fn compose(&mut self) -> Option<Composed> {
+        let queued = self.reader.queued().min(TRANSCRIPT_MAX_ENTRIES as u32);
+        if queued == 0 {
+            return None;
+        }
+        let mut batch = TranscriptBatch::new(&mut self.batch);
+        for at in 0..queued {
+            let Some(read) = self.reader.peek(at, &mut self.line) else {
+                break;
+            };
+            let Some(text) = self.line.get(..read.len) else {
+                break;
+            };
+            let taken = batch.push(&TranscriptEntry {
+                origin: read.origin,
+                unix_nanos: read.stamp(),
+                line: text,
+            });
+            if !taken {
+                break;
+            }
+        }
+        let lines = u32::from(batch.entries());
+        let bytes = batch.finish();
+        if lines == 0 {
+            return None;
+        }
+        Some(Composed { bytes, lines })
+    }
+}
+
 /// Both recordings, and the pass that drives them.
 pub struct Deck {
     recordings: [Recording; 2],
@@ -719,6 +797,7 @@ impl Deck {
         scratch: &mut [u8; TAP_SNAP_LEN],
         clock: Option<Calibration>,
         relay: Option<&StatsRelay>,
+        transcript: Option<&mut Transcript<'_>>,
     ) {
         self.clock = clock;
         for _ in 0..COMPLETION_BUDGET {
@@ -728,6 +807,7 @@ impl Deck {
         }
         self.drain_tap(medium, tap, scratch);
         self.frame_snapshot(medium, relay);
+        self.frame_transcript(medium, transcript);
         self.advance_download(medium);
         for index in 0..self.recordings.len() {
             self.advance(index, medium);
@@ -790,6 +870,68 @@ impl Deck {
             Recorded::Oversized { .. } | Recorded::Refused(_) => {
                 self.counters.snapshots_dropped = self.counters.snapshots_dropped.saturating_add(1);
                 self.framed_generation = generation;
+            }
+        }
+    }
+
+    /// Take whatever console lines the relay holds and frame them into the log
+    /// recording as one batch; at most one per pass. **The log and not the
+    /// capture**, for the reason a reading goes there: the two rings differ by
+    /// three to four orders of magnitude in rate.
+    ///
+    /// They are **peeked and not consumed** until the block is placed, so a
+    /// rolling segment or a draining staging buffer is a "not now" and not a
+    /// loss. The only loss on this path is the console's, when the relay filled
+    /// because this domain was not draining it fast enough, and that is counted
+    /// where it happens.
+    fn frame_transcript(
+        &mut self,
+        medium: &mut impl Medium,
+        transcript: Option<&mut Transcript<'_>>,
+    ) {
+        let Some(transcript) = transcript else {
+            return;
+        };
+        let Some(taken) = transcript.compose() else {
+            return;
+        };
+        let which = Which::Log;
+        let staging = medium.staging(which.area());
+        let Some(recording) = self.recordings.get_mut(which.index()) else {
+            return;
+        };
+        let body = transcript.batch.get(..taken.bytes).unwrap_or_default();
+        match recording.sink.block(body, staging) {
+            Recorded::Placed { .. } => {
+                // And complete the sector behind it, for the reason
+                // `frame_snapshot` does: this too is a block written when
+                // nothing else may be happening.
+                let _ = recording.sink.seal(staging);
+                transcript.reader.consume(taken.lines);
+                self.counters.transcripts_written =
+                    self.counters.transcripts_written.saturating_add(1);
+                self.counters.transcript_lines = self
+                    .counters
+                    .transcript_lines
+                    .saturating_add(u64::from(taken.lines));
+            }
+            // "Not now", with nothing consumed.
+            Recorded::SegmentFull => {
+                if !recording.rolling && recording.sink.close_segment(staging).is_ok() {
+                    recording.rolling = true;
+                }
+            }
+            Recorded::StagingFull { .. } => {}
+            // Neither is reachable for a batch: the assertion at the foot of this
+            // module holds the largest one's length under a segment's. The lines
+            // are consumed rather than offered again — a batch refused on its
+            // shape is refused for ever, and a relay never drained would then
+            // stop carrying the transcript at all. Counted rather than asserted,
+            // nothing about a transcript line may fault this domain.
+            Recorded::Oversized { .. } | Recorded::Refused(_) => {
+                transcript.reader.consume(taken.lines);
+                self.counters.transcripts_dropped =
+                    self.counters.transcripts_dropped.saturating_add(1);
             }
         }
     }
@@ -1568,6 +1710,13 @@ fn place(
 // above. The framing sits in front of the reading and the reserve behind it.
 const _: () = {
     assert!(SNAPSHOT_BYTES + MIN_CUSTOM_BLOCK_LEN + TAIL_RESERVE < SEGMENT_BYTES);
+    // And a batch of console transcript lines, by the same arithmetic: the
+    // relay's slot count and slot width are build constants, so the largest batch
+    // is one too — which is what makes `Sink::block`'s two terminal answers
+    // unreachable for a batch as well. The staging buffer must hold one beside
+    // the reserve, a batch being composed elsewhere and copied in.
+    assert!(BATCH_BYTES + MIN_CUSTOM_BLOCK_LEN + TAIL_RESERVE < SEGMENT_BYTES);
+    assert!(LOG_STAGING_BYTES > BATCH_BYTES + MIN_CUSTOM_BLOCK_LEN + TAIL_RESERVE);
 };
 
 #[cfg(test)]

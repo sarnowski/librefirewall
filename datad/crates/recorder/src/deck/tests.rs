@@ -378,7 +378,7 @@ fn run(
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..passes {
-        deck.poll(medium, reader, &mut scratch, clock(), None);
+        deck.poll(medium, reader, &mut scratch, clock(), None, None);
     }
 }
 
@@ -747,7 +747,7 @@ fn a_completion_for_a_boot_time_read_reaching_the_pass_is_counted_and_never_sett
     medium.forge(Job::Preload(Which::Log));
     medium.forge(Job::Preload(Which::Capture));
     let mut scratch = [0u8; TAP_SNAP_LEN];
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     assert_eq!(deck.counters().completions_unexpected, 2);
 }
 
@@ -835,7 +835,7 @@ fn a_medium_that_refuses_every_submit_loses_no_record() {
     medium.refuse = 0;
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..64 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
 
     let counters = deck.counters();
@@ -897,7 +897,7 @@ fn a_revoked_flow_reaches_the_connection_history_and_not_the_capture() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..12 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
 
     let counters = deck.counters();
@@ -952,7 +952,7 @@ fn a_tap_annotation_the_reader_refuses_is_counted_and_recorded_nowhere() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..4 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
 
     let counters = deck.counters();
@@ -985,7 +985,7 @@ fn pump(
     passes: usize,
 ) -> Option<Answer> {
     for _ in 0..passes {
-        deck.poll(medium, reader, scratch, clock(), None);
+        deck.poll(medium, reader, scratch, clock(), None, None);
         if let Some(served) = deck.answer(medium) {
             return Some(match served {
                 Served::Deliver {
@@ -1130,7 +1130,7 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
     let mut scratch = [0u8; TAP_SNAP_LEN];
     deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
     // The seal reaches the medium first; the read after it is the one broken.
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     medium.fail = 1;
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {
@@ -1201,7 +1201,7 @@ fn a_completion_answering_no_job_is_counted_without_ending_the_drain() {
     // the flushes.
     let mut scratch = [0u8; TAP_SNAP_LEN];
     medium.unattributed = 3;
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     let after = deck.counters();
     assert_eq!(
         after.completions_unexpected,
@@ -1223,7 +1223,7 @@ fn a_completion_answering_no_job_is_counted_without_ending_the_drain() {
     // The recording is unharmed: everything published still reaches a segment.
     medium.unattributed = 0;
     for _ in 0..64 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
     for sink in deck.counters().sinks {
         assert_eq!(sink.records, 8);
@@ -1339,7 +1339,7 @@ fn the_log_recording_holds_only_the_observations_that_carry_an_event() {
             .write(&annotation, frame.len() as u32, &frame)
             .expect("the ring is empty");
     }
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
 
     let counters = deck.counters();
     assert_eq!(counters.tap_records, 5, "every observation was drained");
@@ -1375,7 +1375,7 @@ fn a_recording_under_sustained_traffic_rolls_segments_and_stays_consistent() {
                 published += 1;
             }
         }
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
     let counters = deck.counters();
     assert_eq!(counters.tap_records, published);
@@ -1427,7 +1427,7 @@ fn an_unclocked_recorder_states_no_instant_rather_than_a_counter_reading() {
     }
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..4 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, None, None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, None, None, None);
     }
     assert_eq!(deck.counters().records_unclocked, 1);
     assert_eq!(deck.counters().sinks[0].records, 1);
@@ -1459,7 +1459,7 @@ fn a_segment_reopens_only_once_its_predecessor_is_durable() {
     medium.refuse = 0;
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..512 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
     for sink in deck.counters().sinks {
         assert_eq!(sink.records, 40, "and every record still reached a segment");
@@ -1490,7 +1490,7 @@ fn a_records_drop_count_states_what_the_tap_ring_lost_before_it() {
 
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..256 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
 
     let counters = deck.counters();
@@ -1672,7 +1672,7 @@ fn a_forged_barrier_completion_releases_no_superblock() {
     medium.forge(Job::Barrier(Which::Log));
     medium.forge(Job::Barrier(Which::Capture));
     let mut scratch = [0u8; TAP_SNAP_LEN];
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
 
     assert_eq!(
         deck.counters().completions_unexpected,
@@ -1885,7 +1885,7 @@ fn settle(
 ) {
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..passes {
-        deck.poll(medium, reader, &mut scratch, clock(), Some(relay));
+        deck.poll(medium, reader, &mut scratch, clock(), Some(relay), None);
     }
     // A download seals the recording, which is what puts the last part-sector on
     // the medium; without it the block is staged and the disk is simply shorter.
@@ -1971,6 +1971,7 @@ fn a_publisher_caught_mid_write_costs_a_counted_miss() {
             &mut scratch,
             clock(),
             Some(&relay),
+            None,
         );
     }
     assert_eq!(deck.counters().snapshots_missed, 4);
@@ -1988,7 +1989,7 @@ fn a_deck_offered_no_relay_frames_nothing() {
     let mut reader = ring.reader();
     let mut scratch = [0u8; TAP_SNAP_LEN];
     for _ in 0..8 {
-        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None);
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
     let counters = deck.counters();
     assert_eq!(counters.snapshots_written, 0);
@@ -2067,4 +2068,283 @@ fn the_padding_a_recording_holds_is_never_read_as_a_reading() {
         }
     }
     assert!(padding > 0, "no padding block was written at all");
+}
+
+// ── The console transcript, out of the relay and into the log recording ──────
+
+/// Every kind-2 Custom Block in a stream, as the lines it carried.
+fn transcript(bytes: &[u8]) -> Vec<(u8, Option<u64>, String)> {
+    let mut lines = Vec::new();
+    for (_pen, data) in customs(bytes) {
+        let _ = wire::decode_transcript(&data, |line| {
+            lines.push((
+                line.origin,
+                line.unix_nanos,
+                String::from_utf8_lossy(line.line).into_owned(),
+            ))
+        });
+    }
+    lines
+}
+
+/// The two relay regions, on the heap because one is a page.
+struct Lines {
+    relay: Box<wire::LogRelay>,
+    consume: Box<wire::LogRelayConsume>,
+}
+
+fn lines() -> Lines {
+    Lines {
+        relay: Box::new(wire::LogRelay::zero()),
+        consume: Box::new(wire::LogRelayConsume::zero()),
+    }
+}
+
+impl Lines {
+    fn writer(&self) -> wire::LogRelayWriter<'_> {
+        self.relay.writer(&self.consume)
+    }
+
+    fn transcript(&self) -> Transcript<'_> {
+        Transcript::new(self.consume.reader(&self.relay))
+    }
+}
+
+/// As [`settle`], driving the transcript relay instead of the metric one.
+fn settle_transcript(
+    deck: &mut Deck,
+    medium: &mut Fake,
+    reader: &mut wire::TapReader<'_>,
+    transcript: &mut Transcript<'_>,
+    passes: usize,
+) {
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+    for _ in 0..passes {
+        deck.poll(
+            medium,
+            reader,
+            &mut scratch,
+            clock(),
+            None,
+            Some(transcript),
+        );
+    }
+    let _ = download(deck, medium, reader, DownloadSink::Log);
+}
+
+#[test]
+fn published_console_lines_reach_the_log_recording_and_decode() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    let mut writer = region.writer();
+    assert!(writer.publish(
+        0,
+        None,
+        b"LFW-PD time=unsynchronized domain=forwarder state=ready"
+    ));
+    assert!(writer.publish(
+        6,
+        Some(1_785_443_220_000_000_000),
+        b"LFW-PD domain=recorder state=ready"
+    ));
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 8);
+
+    assert_eq!(
+        deck.counters().transcripts_written,
+        1,
+        "one batch, two lines"
+    );
+    assert_eq!(deck.counters().transcript_lines, 2);
+    assert_eq!(deck.counters().transcripts_dropped, 0);
+
+    let carried = transcript(payload(&medium, Which::Log));
+    assert_eq!(carried.len(), 2);
+    assert_eq!(carried[0].0, 0);
+    assert_eq!(carried[0].1, None);
+    assert!(carried[0].2.contains("domain=forwarder"));
+    assert_eq!(carried[1].0, 6);
+    assert_eq!(carried[1].1, Some(1_785_443_220_000_000_000));
+}
+
+/// The capture recording is deliberately not offered the transcript either, for
+/// the reason it is offered no reading.
+#[test]
+fn the_capture_recording_carries_no_transcript() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    assert!(
+        region
+            .writer()
+            .publish(0, None, b"LFW-PD domain=console state=ready")
+    );
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 8);
+    let _ = download(&mut deck, &mut medium, &mut reader, DownloadSink::Capture);
+    assert!(transcript(payload(&medium, Which::Capture)).is_empty());
+}
+
+/// A relay that has not moved is read on every pass and framed on none of them,
+/// so the recording carries one batch per burst of lines rather than one per
+/// pass — which is what keeps a busy poll loop from filling the medium with
+/// empty batches.
+#[test]
+fn an_empty_relay_frames_nothing_however_often_it_is_polled() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 12);
+    assert_eq!(deck.counters().transcripts_written, 0);
+    assert_eq!(deck.counters().transcript_lines, 0);
+    assert!(transcript(payload(&medium, Which::Log)).is_empty());
+
+    assert!(
+        region
+            .writer()
+            .publish(0, None, b"LFW-PD domain=clock state=ready")
+    );
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 12);
+    assert_eq!(deck.counters().transcripts_written, 1);
+    assert_eq!(deck.counters().transcript_lines, 1);
+}
+
+/// Every line the relay holds goes into one batch, so a full relay costs one
+/// block and not fifteen.
+#[test]
+fn a_full_relay_becomes_one_batch() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    let mut writer = region.writer();
+    let capacity = writer.capacity();
+    for index in 0..capacity {
+        let line = std::format!("LFW-CFG time=unsynchronized generation={index} outcome=applied");
+        assert!(writer.publish(3, Some(u64::from(index)), line.as_bytes()));
+    }
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 8);
+    assert_eq!(deck.counters().transcripts_written, 1);
+    assert_eq!(deck.counters().transcript_lines, u64::from(capacity));
+    assert_eq!(
+        transcript(payload(&medium, Which::Log)).len(),
+        capacity as usize
+    );
+}
+
+/// The console's own drop count crosses to the domain that publishes it, which is
+/// how a gap in a recorded transcript becomes a number an operator can scrape.
+#[test]
+fn the_consoles_drop_count_is_visible_to_the_recorder() {
+    let region = lines();
+    let mut writer = region.writer();
+    for _ in 0..writer.capacity() {
+        assert!(writer.publish(0, None, b"line"));
+    }
+    assert!(!writer.publish(0, None, b"refused"));
+    let held = region.transcript();
+    assert_eq!(held.dropped_by_console(), 1);
+}
+
+/// The widest line the console grammar renders survives the whole path, which is
+/// what keeps a refusal — the widest shape there is — out of a truncation.
+#[test]
+fn the_widest_line_survives_the_relay_and_the_block() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    let widest: Vec<u8> = core::iter::repeat_n(b'~', wire::RELAY_LINE_BYTES).collect();
+    assert!(region.writer().publish(9, None, &widest));
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 8);
+    let carried = transcript(payload(&medium, Which::Log));
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].2.len(), wire::RELAY_LINE_BYTES);
+}
+
+/// A line is released from the relay exactly once. A batch framed twice would
+/// duplicate the transcript in the recording, and a reader has no way to tell a
+/// duplicated line from a repeated one.
+#[test]
+fn a_line_is_framed_once_however_many_passes_follow() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    assert!(
+        region
+            .writer()
+            .publish(0, None, b"LFW-PD domain=store state=ready")
+    );
+    let mut held = region.transcript();
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 24);
+    assert_eq!(deck.counters().transcripts_written, 1);
+    assert_eq!(deck.counters().transcript_lines, 1);
+    assert_eq!(transcript(payload(&medium, Which::Log)).len(), 1);
+}
+
+/// A batch the recording cannot take yet is offered again rather than lost: the
+/// lines are peeked and released only once the block is placed. Driven by a
+/// device that acknowledges nothing, so the staging buffer is what a batch meets
+/// — and bounded by passes throughout, never by elapsed time.
+#[test]
+fn a_batch_the_recording_defers_is_offered_again_and_loses_nothing() {
+    let mut medium = Fake::new();
+    let ring = Ring::new();
+    let mut deck = deck(&mut medium);
+    let mut reader = ring.reader();
+    let region = lines();
+    let mut writer = region.writer();
+    let mut held = region.transcript();
+    let mut scratch = [0u8; TAP_SNAP_LEN];
+
+    // Every submission refused, so nothing leaves the staging buffer and it
+    // fills; the batch then meets `StagingFull` rather than a placed block.
+    medium.refuse = usize::MAX;
+    let mut published = 0u32;
+    for _ in 0..400 {
+        if writer.publish(
+            0,
+            None,
+            b"LFW-PD time=unsynchronized domain=store state=ready",
+        ) {
+            published += 1;
+        }
+        deck.poll(
+            &mut medium,
+            &mut reader,
+            &mut scratch,
+            clock(),
+            None,
+            Some(&mut held),
+        );
+    }
+    let deferred = published - deck.counters().transcript_lines as u32;
+    assert!(
+        deferred > 0,
+        "the staging buffer never filled, so nothing was deferred"
+    );
+
+    // Released, and every line that was deferred is still in the relay and still
+    // reaches the recording: nothing was consumed on a block that was not placed.
+    medium.refuse = 0;
+    let before = deck.counters().transcript_lines;
+    settle_transcript(&mut deck, &mut medium, &mut reader, &mut held, 64);
+    assert!(
+        deck.counters().transcript_lines > before,
+        "the deferred lines were consumed rather than offered again"
+    );
 }

@@ -16,6 +16,21 @@ defmodule Ctrld.Telemetry.Schema do
   Partitioning is by month and the sort key leads with the appliance, because
   every question an operator asks starts by naming one appliance and a window.
 
+  ## `log_events.severity` holds a lifecycle point, not a level
+
+  Stated here because the column name invites the other reading. The appliance
+  makes no severity judgement anywhere: a protection-domain record carries the
+  domain's *state* — `starting`, `negotiated`, `ready` or `refused` — and that is
+  what this column stores, with `refused` being the one that reports a failure and
+  `ready` a domain announcing that it works. A configuration record carries no
+  state at all and the column is empty for one.
+
+  So the column is arguably misnamed for what this appliance produces. It is not
+  renamed here, and nothing maps a lifecycle point onto `warn` or `error` either:
+  a severity in the store that no domain ever claimed would be worse than a column
+  whose name is a little wide. `Ctrld.Telemetry.LogRecord` is the producer and
+  says the same thing.
+
   ## An enumeration is declared once
 
   The four enumerated columns of `flow_events` are built from the tables below

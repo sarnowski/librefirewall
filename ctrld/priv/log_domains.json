@@ -1,0 +1,14 @@
+{
+  "domains": [
+    "forwarder",
+    "nic-driver",
+    "config",
+    "console",
+    "clock",
+    "management",
+    "recorder",
+    "hardware-probe",
+    "crypto",
+    "store"
+  ]
+}

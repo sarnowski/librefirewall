@@ -1807,6 +1807,10 @@ fn digest_bytes(words: &[u64; LOG_OPERANDS]) -> [u8; DIGEST_BYTES] {
 // let a token be read as an array index and a bounded text be copied whole.
 const _: () = {
     assert!(Domain::ALL.len() == wire::LOG_DOMAIN_COUNT as usize);
+    // And the relay a printed line crosses to the recording on must carry the
+    // widest line this grammar renders. A relay one byte narrower would drop
+    // exactly the refusal lines a recording is read for.
+    assert!(crate::render::MAX_LINE_LEN == wire::RELAY_LINE_BYTES);
     assert!(DomainState::ALL.len() == wire::LOG_DOMAIN_STATE_COUNT as usize);
     assert!(ChangeKind::ALL.len() == wire::LOG_CHANGE_KIND_COUNT as usize);
     assert!(ObjectKind::ALL.len() == wire::LOG_OBJECT_KIND_COUNT as usize);

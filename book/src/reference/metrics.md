@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-125 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 466 counter and gauge series from the 12 shards,
+128 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 471 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 101 703 bytes — a worst case computed from
+declares, and the document they render into is bounded at 102 941 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -273,6 +273,7 @@ already live, which is a very different thing.
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
 | `librefirewall_console_records_total` | counter | `console` | `outcome`&nbsp;(`malformed`, `printed`, `unknown`, `unrenderable`, `write_failed`) | Records the console path resolved, by outcome; each outcome accuses a different party. |
+| `librefirewall_console_transcript_lines_total` | counter | `console` | `outcome`&nbsp;(`dropped`, `relayed`) | Printed lines the console offered the domain that writes the medium, by whether that domain had room: a drop is a gap in the recorded transcript and never a stalled console. |
 | `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain could not publish because its ring had no slot. |
 | `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
@@ -352,6 +353,8 @@ misreporting rather than a lost record.
 | `librefirewall_recording_tap_dropped_by_writer_total` | counter | `recorder` | — | Observations the forwarder says the ring had no slot for; its claim about itself. |
 | `librefirewall_recording_tap_records_total` | counter | `recorder` | — | Observations the recorder drained from the tap ring. |
 | `librefirewall_recording_tap_refused_total` | counter | `recorder` | — | Tap annotations the recorder would not decode; the forwarder's fault, expected to stay zero. |
+| `librefirewall_recording_transcript_lines_total` | counter | `recorder` | — | Console lines those batches carried, which is what a management server stores as this appliance's log. |
+| `librefirewall_recording_transcripts_total` | counter | `recorder` | `outcome`&nbsp;(`dropped`, `written`) | Batches of console transcript lines the recorder framed into the connection history, and those it could not: one no segment could hold. |
 | `librefirewall_recording_wraps_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Times a ring returned to its first segment, evicting the oldest history it held. |
 
 The download's other half is on the management domain, because that is the domain that serves it:

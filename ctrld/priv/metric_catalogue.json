@@ -1,6 +1,6 @@
 {
-  "fingerprint": 2546199403,
-  "slots": 466,
+  "fingerprint": 512655786,
+  "slots": 471,
   "series": [
     {"domain": "forwarder", "family": "librefirewall_forwarded_frames_total", "labels": {"pipeline": "0"}},
     {"domain": "forwarder", "family": "librefirewall_route_drops_total", "labels": {"pipeline": "0", "reason": "unowned"}},
@@ -356,6 +356,8 @@
     {"domain": "console", "family": "librefirewall_console_records_total", "labels": {"outcome": "unknown"}},
     {"domain": "console", "family": "librefirewall_console_records_total", "labels": {"outcome": "unrenderable"}},
     {"domain": "console", "family": "librefirewall_console_records_total", "labels": {"outcome": "write_failed"}},
+    {"domain": "console", "family": "librefirewall_console_transcript_lines_total", "labels": {"outcome": "relayed"}},
+    {"domain": "console", "family": "librefirewall_console_transcript_lines_total", "labels": {"outcome": "dropped"}},
     {"domain": "console", "family": "librefirewall_uart_bytes_written_total", "labels": {}},
     {"domain": "console", "family": "librefirewall_uart_transmitter_timeouts_total", "labels": {}},
     {"domain": "console", "family": "librefirewall_uart_init_failures_total", "labels": {}},
@@ -408,6 +410,9 @@
     {"domain": "recorder", "family": "librefirewall_recording_snapshots_total", "labels": {"outcome": "written"}},
     {"domain": "recorder", "family": "librefirewall_recording_snapshots_total", "labels": {"outcome": "missed"}},
     {"domain": "recorder", "family": "librefirewall_recording_snapshots_total", "labels": {"outcome": "dropped"}},
+    {"domain": "recorder", "family": "librefirewall_recording_transcripts_total", "labels": {"outcome": "written"}},
+    {"domain": "recorder", "family": "librefirewall_recording_transcripts_total", "labels": {"outcome": "dropped"}},
+    {"domain": "recorder", "family": "librefirewall_recording_transcript_lines_total", "labels": {}},
     {"domain": "recorder", "family": "librefirewall_recording_records_unclocked_total", "labels": {}},
     {"domain": "recorder", "family": "librefirewall_log_records_dropped_total", "labels": {}},
     {"domain": "recorder", "family": "librefirewall_log_records_refused_total", "labels": {}},

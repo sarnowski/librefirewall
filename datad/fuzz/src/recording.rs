@@ -69,7 +69,7 @@ use lfw_capture_ring::{
 use lfw_metrics::SNAPSHOT_SLOTS;
 use lfw_recorder::deck::{
     Area, COMPLETION_BUDGET, Completion, Deck, Ended, Job, Medium, Polled, Refused, SEGMENT_BYTES,
-    STAGING_END, Served, TAP_BUDGET, Transfer,
+    STAGING_END, Served, TAP_BUDGET, Transcript, Transfer,
 };
 use lfw_recorder::{
     Flush, InterfaceName, Locate, MAX_INTERFACES, Recorded, Sink, SinkConfig, prologue_len,
@@ -77,8 +77,9 @@ use lfw_recorder::{
 };
 use wire::{
     CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadReader, DownloadReply, DownloadRequest, DownloadSink,
-    StatsRelay, TAP_SNAP_LEN, TapAnnotation, TapClassification, TapConsume, TapDecision,
-    TapDirection, TapDropReason, TapEvent, TapFlow, TapFlowState, TapOutcome, TapRecords, TapRule,
+    LogRelay, LogRelayConsume, RELAY_LINE_BYTES, StatsRelay, TAP_SNAP_LEN, TapAnnotation,
+    TapClassification, TapConsume, TapDecision, TapDirection, TapDropReason, TapEvent, TapFlow,
+    TapFlowState, TapOutcome, TapRecords, TapRule,
 };
 
 use crate::guard::Guarded;
@@ -143,11 +144,20 @@ enum Step {
     /// wholly arbitrary generation, odd values included, is `wire::StatsRelay`'s
     /// own property to hold, and it does.
     Publish { unix_nanos: u64, values: Vec<u64> },
+    /// The console publishes a printed line into the transcript relay. The
+    /// origin, the instant and the length are all the adversary's; the bytes are
+    /// printable because that is what a console grammar renders, and arbitrary
+    /// bytes over the block are `crate::transcript_block`'s.
+    Print {
+        origin: u8,
+        unix_nanos: Option<u64>,
+        line: Vec<u8>,
+    },
 }
 
 fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
     let tag = u8::arbitrary(unstructured).ok()?;
-    Some(match tag % 7 {
+    Some(match tag % 8 {
         0 => Step::Observe {
             packet_id: u64::arbitrary(unstructured).ok()?,
             timestamp: u64::arbitrary(unstructured).ok()?,
@@ -174,6 +184,15 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             len: u32::arbitrary(unstructured).ok()?,
         },
         2 | 3 => Step::Pass,
+        7 => Step::Print {
+            origin: u8::arbitrary(unstructured).ok()?,
+            unix_nanos: Option::<u64>::arbitrary(unstructured).ok()?,
+            line: {
+                let len = u16::arbitrary(unstructured).ok()? as usize % (RELAY_LINE_BYTES + 8);
+                let byte = u8::arbitrary(unstructured).ok()?;
+                vec![0x20u8.saturating_add(byte % 95); len]
+            },
+        },
         5 => Step::Publish {
             unix_nanos: u64::arbitrary(unstructured).ok()?,
             values: {
@@ -625,6 +644,12 @@ pub fn recording_pass(data: &[u8]) {
     let mut demands = 0usize;
     // The relay page, written by a peer this side may assume nothing about.
     let relay = Box::new(StatsRelay::zero());
+    // And the transcript relay, likewise: the console writes its slots, their
+    // lengths and their origins, and this side assumes nothing about any of them.
+    let lines = Box::new(LogRelay::zero());
+    let lines_consume = Box::new(LogRelayConsume::zero());
+    let mut printer = lines.writer(&lines_consume);
+    let mut transcript = Transcript::new(lines_consume.reader(&lines));
 
     for _ in 0..MAX_STEPS {
         let Some(step) = take_step(&mut unstructured) else {
@@ -658,9 +683,25 @@ pub fn recording_pass(data: &[u8]) {
                 }
             }
             Step::Publish { unix_nanos, values } => relay.publish(unix_nanos, &values),
+            Step::Print {
+                origin,
+                unix_nanos,
+                line,
+            } => {
+                // Total and non-blocking: the answer is observed and never
+                // depended on, a refusal being a counted drop and nothing more.
+                let _ = printer.publish(origin, unix_nanos, &line);
+            }
             Step::Pass => {
                 let before = deck.counters();
-                deck.poll(&mut medium, &mut reader, &mut scratch, None, Some(&relay));
+                deck.poll(
+                    &mut medium,
+                    &mut reader,
+                    &mut scratch,
+                    None,
+                    Some(&relay),
+                    Some(&mut transcript),
+                );
                 let after = deck.counters();
                 // Boundedness: the pass's own constants, never the peers'.
                 assert!(

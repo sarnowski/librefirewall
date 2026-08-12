@@ -107,10 +107,10 @@ use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
     DOWNLOAD_REQUEST_REGION_SIZE, ENDPOINT_REGION_SIZE, INSTALL_STAGING_REGION_SIZE,
-    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, OWNERSHIP_REGION_SIZE,
-    RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
-    SIGN_REQUEST_REGION_SIZE, STATS_RELAY_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
-    TAP_RECORDS_REGION_SIZE,
+    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RELAY_CONSUME_REGION_SIZE,
+    LOG_RELAY_REGION_SIZE, OWNERSHIP_REGION_SIZE, RELAY_REPLY_REGION_SIZE,
+    RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE,
+    STATS_RELAY_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -292,6 +292,22 @@ const LOG_WITHHELD: &str = "no writing domain maps another writing domain's ring
      cannot rewrite it, and cannot silence it by advancing a consume cursor that is not its own \
      — every pair of writing domains is disjoint here, and this row is what makes that true \
      (systems/qemu-x86_64/librefirewall.system, beside the log regions)";
+
+/// As [`LOG_WITHHELD`], for the pair that carries printed console lines to the
+/// domain that writes the medium — and the rule that keeps this pair from
+/// becoming a way around the eleven grants it exists to preserve.
+const LOG_RELAY_WITHHELD: &str = "the recorder still maps no log ring but its own, in either \
+     direction, and no third domain maps either half of this pair. That is the whole reason it \
+     exists: the alternative was eleven read grants on the domain holding a block device and a \
+     DMA-capable controller, which would have deleted the isolation those pairs are granted for. \
+     What crosses here is a line the console has already printed rather than a record a peer \
+     wrote, so a compromised console can put in the recording only what it could equally have put \
+     on the serial port — which it can do anyway, owning the port and being the sole renderer. The \
+     recorder's grant on the lines is READ-ONLY, so a compromise of it declines to frame a line \
+     and cannot forge one into the recording a management server believes; the console's grant on \
+     the cursor is read-only, so it cannot claim the recorder has read a line it has not and \
+     overwrite one without counting the drop; and the forwarder maps neither side, exactly as it \
+     maps no log ring but its own";
 
 /// What the management port's regions withhold, and it is the isolation
 /// required of a port that carries no forwarded traffic: the
@@ -1407,6 +1423,32 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("crypto"), read_write("console")],
         withheld: Some(LOG_WITHHELD),
+    },
+    // The transcript relay: the one pair of log regions that runs from the
+    // console domain outward rather than into it, and the reason the recorder can
+    // put another domain's words on the medium without mapping that domain's
+    // ring. The two rows mirror each other exactly as a log pair's do, and for
+    // the same reason: both domains map both halves and only the authority
+    // differs, so the perms are per grant.
+    RegionRule {
+        name: "log_relay",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RELAY_REGION_SIZE",
+            bytes: LOG_RELAY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("console"), read_only("recorder")],
+        withheld: Some(LOG_RELAY_WITHHELD),
+    },
+    RegionRule {
+        name: "log_relay_consume",
+        size: ExpectedSize {
+            rust_name: "wire::LOG_RELAY_CONSUME_REGION_SIZE",
+            bytes: LOG_RELAY_CONSUME_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("console"), read_write("recorder")],
+        withheld: Some(LOG_RELAY_WITHHELD),
     },
     // The metric shards: one per protection domain, each with exactly one
     // writer and — for the nine that are not the reader's own — exactly one
