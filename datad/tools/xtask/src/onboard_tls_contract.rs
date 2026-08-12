@@ -162,6 +162,12 @@ pub struct Attempt {
 /// it cost something real: every frame draws a console record, and a domain whose
 /// log ring fills faster than a 115200-baud console drains it drops records —
 /// including the second of the two a session's account is written as.
+///
+/// One pass given, for the callers that have no capture to read: the clients that
+/// drive this port's *other* surfaces run against a request and a response, so
+/// what they wait for is the pass that follows a reply they already hold. The
+/// clients on the port itself have an account to wait for and wait for it
+/// ([`drive`]), which is what a session's record being droppable demands.
 pub(crate) fn settle() {
     std::thread::sleep(SETTLE);
 }
@@ -170,29 +176,68 @@ pub(crate) fn settle() {
 /// periodic wakeup, so a wait spans one whatever the boot is doing.
 const SETTLE: Duration = Duration::from_millis(200);
 
-/// Run every client against the forwarded port, letting the appliance settle
-/// between them.
+/// Run every client against the forwarded port, waiting after each for the
+/// appliance's own account of the session it just ended.
 ///
-/// [`settle`] is called after each attempt because a session's last handover and
-/// the pass that publishes its account both happen after the client's connection
-/// is gone, and a client that opened the next connection before both had run
-/// would leave two sessions racing for one slot. Nothing is put on the wire to
-/// make them happen — the appliance's own periodic wakeup does that.
+/// A session's last handover and the pass that publishes its account both happen
+/// after the client's connection is gone, and a client that opened the next
+/// connection before both had run would leave two sessions racing for one slot.
+/// Nothing is put on the wire to make them happen — the appliance's own periodic
+/// wakeup does that.
+///
+/// **The wait is on the account and not on a duration, and that is what keeps
+/// the last one readable.** Every frame this port takes draws a console record,
+/// and a domain's ring holds a bounded number of them: four sessions opened back
+/// to back put a client's whole handshake into that ring faster than the console
+/// drains it, and the records that fall out are the ones written last — a
+/// session's account and the port's totals. Those totals are judged (`judge`
+/// holds `onboard-accepted` to the number of clients this boot ran), so a run
+/// that raced the console was judging whether a record had survived a flood the
+/// run itself caused. Waiting for session *n* to be accounted for before opening
+/// session *n+1* leaves the ring drained when the account is written, and it
+/// costs a healthy boot nothing: the account is normally there within a pass or
+/// two.
+///
+/// Bounded by passes, and falling through rather than failing when they are
+/// spent: the boot's own wait on the whole set and the judgement that follows it
+/// are what decide the run, and a wait that reported a missing record here would
+/// be a second verdict on the same fact.
 ///
 /// # Errors
 /// A client that could not be run at all, which is the harness's own failure
 /// rather than the appliance's.
-pub(crate) fn drive(onboard_port: u16) -> Result<Vec<Attempt>, String> {
+pub(crate) fn drive(
+    onboard_port: u16,
+    mut capture: impl FnMut() -> Vec<u8>,
+) -> Result<Vec<Attempt>, String> {
     let mut attempts = Vec::new();
     for client in CLIENTS {
         attempts.push(match client.arguments {
             Some(arguments) => speak_tls(&client, arguments, onboard_port)?,
             None => say_nothing(&client, onboard_port)?,
         });
-        settle();
+        await_account(attempts.len() as u64, &mut capture);
     }
     Ok(attempts)
 }
+
+/// Wait until the appliance has accounted for `sessions` of them, or until the
+/// passes are spent.
+fn await_account(sessions: u64, capture: &mut impl FnMut() -> Vec<u8>) {
+    for _ in 0..ACCOUNT_POLLS {
+        if accounted_for(&capture(), sessions) {
+            return;
+        }
+        std::thread::sleep(SETTLE);
+    }
+}
+
+/// Passes one session's account is given before the next client opens.
+///
+/// Far more than a healthy boot needs, on [`crate::forward_harness`]'s wait for
+/// the whole set: what it costs when the appliance is prompt is one pass, and
+/// what being too small costs is the flood this wait exists to avoid.
+const ACCOUNT_POLLS: usize = 64;
 
 /// One `openssl s_client` run, whatever it makes of the port.
 ///
@@ -297,8 +342,18 @@ fn say_nothing(client: &Client, port: u16) -> Result<Attempt, String> {
 /// terminating domain's account of each handshake, and the port's own totals
 /// beside them.
 pub(crate) fn reported(serial: &[u8]) -> bool {
+    accounted_for(serial, ATTEMPTS)
+}
+
+/// Whether the capture already carries both domains' accounts of `sessions` of
+/// them.
+///
+/// One predicate for the wait between clients and for the wait on the whole set,
+/// so the two cannot come apart: what a boot waits for and what it is judged on
+/// are the same records, asked about a different number of sessions.
+fn accounted_for(serial: &[u8], sessions: u64) -> bool {
     let text = String::from_utf8_lossy(serial);
-    handshake_records(&text).len() >= CLIENTS.len()
+    handshake_records(&text).len() as u64 >= sessions
         && ours(&text, Domain::Management).iter().any(|record| {
             // The port's own count, and not merely that a totals record exists:
             // the two domains report on their own passes, so the network end is
@@ -307,7 +362,7 @@ pub(crate) fn reported(serial: &[u8]) -> bool {
             // the last of them still owed.
             value(record, ACCEPTED)
                 .and_then(|accepted| accepted.parse::<u64>().ok())
-                .is_some_and(|accepted| accepted >= ATTEMPTS)
+                .is_some_and(|accepted| accepted >= sessions)
         })
 }
 

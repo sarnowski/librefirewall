@@ -6325,10 +6325,23 @@ fn describe_management(
         return format!("management injection stopped: {error}");
     }
     if injected.is_empty() {
+        // Both preconditions, each with the value it actually held, and never one
+        // of them stated as the cause. The burst waits on two independent facts —
+        // every routed probe having crossed, and the capture showing every port
+        // up — and a clause that named the second while the first was the one
+        // outstanding sent a reader to the console to look for a record that was
+        // already there. What the port itself made of the wire goes beside them,
+        // because a run that put nothing on that wire and a run whose peer said
+        // nothing back are different failures: this is the second's only
+        // evidence.
         return format!(
-            "the management frames were never injected: the capture does not yet show every port \
-             up (ports_are_ready is {})",
-            management_contract::ports_are_ready(output)
+            "the management frames were never injected, so the burst's two preconditions are what \
+             to read: every routed probe across (the probes above say which had not) and every \
+             port up (ports_are_ready is {}). What did cross that wire meanwhile: {}; {}; {}",
+            management_contract::ports_are_ready(output),
+            wire.client.seen(),
+            wire.station.seen(),
+            wire.onboard.seen()
         );
     }
     format!(
@@ -6729,6 +6742,25 @@ fn run_boot(
         // What the harness's own TCP client owes the management port, waiting for
         // the port to have acknowledged everything ahead of it.
         let mut client_pending: VecDeque<Vec<u8>> = VecDeque::new();
+        // And what the station on the far end of the appliance's dial owes it,
+        // kept apart from the queue above and released ahead of it.
+        //
+        // The two are not the same kind of frame. Everything in `client_pending`
+        // is this harness's own initiative — it opens that connection, it decides
+        // when each segment goes, and nothing at the far end is counting while it
+        // waits. A station frame is an ANSWER: the appliance asked, and it is
+        // holding a bound of its own open for the reply. Its neighbour cache
+        // spends a fixed number of requests a fixed interval apart and then
+        // reports the next hop unreachable, so an answer that arrives after that
+        // interval is not a late answer, it is no answer — and the appliance is
+        // right to say nobody replied.
+        //
+        // Sharing one queue made the harness's own leisurely exchange stand in
+        // front of that answer. Both go out under the same gate below and one
+        // frame is still in flight at a time, so nothing about how the pipeline
+        // is fed changes; what changes is which frame takes the next opening when
+        // both are waiting, and only one of the two is being timed.
+        let mut station_pending: VecDeque<Vec<u8>> = VecDeque::new();
         let mut last_management_inject = Instant::now();
         inject_probes(&mut endpoints, &probes, |probe| {
             probe.wave == wave && !probe.waits()
@@ -6793,12 +6825,15 @@ fn run_boot(
                                     if let ManagementReply::Tcp(step) = reply {
                                         management.client.step = step;
                                     }
-                                    // The station's own answers are queued
-                                    // beside the client's and released against
-                                    // the console's count exactly as those are:
-                                    // the appliance drains one pipeline, and a
-                                    // frame put on the wire faster than its
-                                    // driver refills is a frame lost.
+                                    // The station's own answers are released
+                                    // against the console's count exactly as the
+                                    // client's are — the appliance drains one
+                                    // pipeline, and a frame put on the wire
+                                    // faster than its driver refills is a frame
+                                    // lost — but into a queue of their own, so
+                                    // the reply the appliance is timing takes the
+                                    // next opening rather than the segment this
+                                    // harness happened to compose first.
                                     if let ManagementReply::Dial(step) = reply {
                                         // The step this segment moved the station
                                         // to, if it moved it at all: a station
@@ -6810,7 +6845,7 @@ fn run_boot(
                                         let moved = management.station.step != step;
                                         management.station.step = step;
                                         while let Some(next) = management.station.owed.pop_front() {
-                                            client_pending.push_back(next);
+                                            station_pending.push_back(next);
                                         }
                                         match step {
                                             DialStep::Resolved if moved => {
@@ -6827,7 +6862,15 @@ fn run_boot(
                                                 // equality, and breaking out at
                                                 // the instant the connection came
                                                 // up would race the record of it.
-                                                settling_since = Some(Instant::now());
+                                                //
+                                                // A restart and never a start, and
+                                                // this is the caller that makes
+                                                // the difference: the appliance
+                                                // opens this connection when it
+                                                // chooses, so a handshake can
+                                                // complete while the harness is
+                                                // still injecting.
+                                                restart_settling(&mut settling_since);
                                             }
                                             DialStep::Unasked
                                             | DialStep::Resolved
@@ -6851,7 +6894,7 @@ fn run_boot(
                                         // at the instant the session ended would
                                         // race the records of it.
                                         if moved && step.finished() {
-                                            settling_since = Some(Instant::now());
+                                            restart_settling(&mut settling_since);
                                         }
                                     }
                                     if matches!(reply, ManagementReply::Tcp(_)) {
@@ -6882,7 +6925,7 @@ fn run_boot(
                                             // equality, and breaking out at the
                                             // instant the exchange closed would
                                             // race that record.
-                                            settling_since = Some(Instant::now());
+                                            restart_settling(&mut settling_since);
                                         }
                                     } else {
                                         answered.push(management_probe.answered(reply));
@@ -7367,7 +7410,15 @@ fn run_boot(
                         // itself would prove only that the appliance agrees with
                         // the appliance.
                         if test.onboard.handshakes() {
-                            let driven = onboard_tls_contract::drive(onboard_port);
+                            // The capture as it stands, drained afresh each time
+                            // the contract asks: what it waits for between its
+                            // clients is the appliance's own account of the
+                            // session that just ended, and a snapshot taken
+                            // before the clients ran could never carry one.
+                            let driven = onboard_tls_contract::drive(onboard_port, || {
+                                drain(&serial_receiver, &mut output);
+                                output.clone()
+                            });
                             match driven {
                                 Ok(made) => handshakes = made,
                                 Err(verdict) => {
@@ -7760,22 +7811,40 @@ fn run_boot(
             // including the second of the two a session's account is written as,
             // which is a failure of this harness's own making. So this station
             // falls silent once its session is open and waits for the records.
-            // One queued client frame per pass, and only once the port has
+            // One queued frame per pass, and only once the port has
             // reported every frame ahead of it — the burst gate applied to the
             // exchange, so no two frames are ever in flight to a driver that may
             // not have refilled. [`MANAGEMENT_REPORT_GRACE`] bounds the wait for
             // the same reason it bounds the one at the end of the run: a frame
             // that really was lost must be reported as the count it is rather
             // than as a queue that never drains.
+            //
+            // THE STATION'S ANSWERS TAKE THE OPENING FIRST. Both queues feed one
+            // pipeline under one gate, so the choice here is only which of two
+            // waiting frames goes now and which goes at the next opening — but
+            // the appliance is timing one of them and not the other. It asks
+            // about its next hop a bounded number of times a bounded interval
+            // apart, so a reply that misses the interval it was asked in is one
+            // the appliance correctly reports as never having come; the client's
+            // own exchange, by contrast, is paced entirely by this harness and
+            // has nothing counting at the far end. A single FIFO put this
+            // harness's own segment in front of an answer that was already owed,
+            // and an attempt was judged short of replies the station had
+            // composed and not yet sent.
             if let Some(wire) = management.as_mut()
-                && let Some(next) = client_pending.front()
                 && (management_contract::frames_reported(&output) >= injected.frames as u64
                     || last_management_inject.elapsed() >= MANAGEMENT_REPORT_GRACE)
             {
-                wire.inject(next);
-                injected = wire.injected;
-                last_management_inject = Instant::now();
-                client_pending.pop_front();
+                let owed = if station_pending.is_empty() {
+                    &mut client_pending
+                } else {
+                    &mut station_pending
+                };
+                if let Some(next) = owed.pop_front() {
+                    wire.inject(&next);
+                    injected = wire.injected;
+                    last_management_inject = Instant::now();
+                }
             }
             if observed_claim.is_none()
                 && let Some(claim) = management.as_ref().and_then(|wire| wire.station.claim())
@@ -7913,6 +7982,37 @@ fn run_boot(
             })
             .collect(),
     })
+}
+
+/// Push the settle window out to now — **and only where one is already running**.
+///
+/// The window is not a timer that anything may start. Its presence is the run's
+/// phase: while it is `None` the harness is still putting frames on the wire —
+/// re-injecting the dataplane probes, and releasing the management burst once
+/// the routed ones have crossed and the ports have reported themselves up — and
+/// both of those are guarded on it being `None`. It is started in one place, by
+/// the pass that finds every management frame sent, and that is what makes those
+/// phases finish before anything is judged.
+///
+/// What the events below own is the *end* of it: each is a frame that landed
+/// late, and breaking out at that instant would race the record of it, so the
+/// window is pushed out to give the appliance a whole one to report in. That is
+/// a restart, and a restart of nothing is nothing.
+///
+/// Starting one here instead closed the injection phases for good. Two of the
+/// three callers cannot reach that state — the client's exchange and the
+/// onboarding session are both opened by this harness after the window has
+/// begun — but the third is the connection the APPLIANCE opens, on a schedule
+/// no part of this run drives. A boot whose dial completed its handshake before
+/// the routed probes had crossed stopped re-injecting them and never released
+/// the management burst at all, then spent its whole budget waiting for an ARP
+/// reply to a request it had not sent. The appliance was healthy throughout and
+/// had nothing left to answer, so its console fell quiet too, which read as a
+/// node that had stopped.
+fn restart_settling(settling_since: &mut Option<Instant>) {
+    if settling_since.is_some() {
+        *settling_since = Some(Instant::now());
+    }
 }
 
 /// Whether every probe the filter admits that must be delivered has been.
