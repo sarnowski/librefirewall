@@ -9,6 +9,16 @@ defmodule Ctrld.Channel.Handler do
   the appliance restarts each recording ring from, and the appliance answers with
   its own carrying a version. Everything after that is frames.
 
+  ## What this server acknowledges
+
+  The positions its ingest has durably stored each ring up to, which is the one
+  thing it knows that the appliance cannot. They go out twice over: in the
+  greeting, where they are the appliance's resume points, and again as `ack`
+  frames while the session carries data, where they are what moves the
+  appliance's own durable reader cursor on. Both read `Ctrld.Telemetry.Cursor`
+  rather than a second notion of progress, so a position this server promises is
+  always one an insert has been acknowledged for.
+
   ## Adversary
 
   A **semi-trusted appliance, up to and including a compromised one**. It chose
@@ -55,6 +65,7 @@ defmodule Ctrld.Channel.Handler do
   alias Ctrld.Appliances
   alias Ctrld.Appliances.Appliance
   alias Ctrld.Channel.{Decoder, Frame, Identity, Ingest}
+  alias Ctrld.Telemetry.Cursor
   alias ThousandIsland.Socket
 
   require Logger
@@ -65,6 +76,14 @@ defmodule Ctrld.Channel.Handler do
   # bound on a peer that completed a handshake and then did not get on with it,
   # which no working appliance does: its greeting is the first thing it writes.
   @default_greeting_timeout :timer.seconds(30)
+
+  # The acknowledgement cadence the framing contract owes an appliance: once per
+  # five seconds of received data, and once per eight mebibytes of ring bytes.
+  # Whichever comes first, because the two answer different appliances — a busy
+  # one reaches the volume long before the period, and a quiet one would wait
+  # indefinitely on the volume alone.
+  @default_ack_period :timer.seconds(5)
+  @default_ack_bytes 8 * 1024 * 1024
 
   @typedoc """
   A session's state.
@@ -78,6 +97,11 @@ defmodule Ctrld.Channel.Handler do
   would never meet it. `ending` is how the session was decided to end where this
   end decided it, so the one line a close writes names the real cause rather than
   the transport's view of it.
+
+  `acked_at` and `acked_after` are when the last acknowledgement went out and the
+  received tally it went out on, which between them are the whole of the cadence:
+  the period is measured from an instant this end chose and the volume from a
+  tally only whole frames move, so neither is a bound a peer resets at will.
   """
   @type state :: %{
           device_id: String.t() | nil,
@@ -87,6 +111,8 @@ defmodule Ctrld.Channel.Handler do
           greet_by: integer() | nil,
           received: non_neg_integer(),
           unanswered: non_neg_integer(),
+          acked_at: integer() | nil,
+          acked_after: non_neg_integer(),
           ending: term() | nil
         }
 
@@ -99,9 +125,32 @@ defmodule Ctrld.Channel.Handler do
   """
   @spec greeting_timeout() :: pos_integer()
   def greeting_timeout do
+    setting(:greeting_timeout, @default_greeting_timeout)
+  end
+
+  @doc """
+  How long a session may carry received data before an acknowledgement is owed.
+
+  The deployment's value is the contract's five seconds; the suite shortens it,
+  for `greeting_timeout/0`'s reason exactly.
+  """
+  @spec ack_period() :: pos_integer()
+  def ack_period, do: setting(:ack_period, @default_ack_period)
+
+  @doc """
+  How many received ring bytes owe an acknowledgement whatever the clock says.
+
+  The deployment's value is the contract's eight mebibytes; the suite lowers it,
+  a test that shipped that much to prove the volume bound having nothing to say
+  that a smaller one does not.
+  """
+  @spec ack_bytes() :: pos_integer()
+  def ack_bytes, do: setting(:ack_bytes, @default_ack_bytes)
+
+  defp setting(key, default) do
     :ctrld
     |> Application.get_env(__MODULE__, [])
-    |> Keyword.get(:greeting_timeout, @default_greeting_timeout)
+    |> Keyword.get(key, default)
   end
 
   @impl ThousandIsland.Handler
@@ -116,7 +165,10 @@ defmodule Ctrld.Channel.Handler do
   def handle_data(bytes, socket, state) do
     case Decoder.absorb(state.decoder, bytes) do
       {:ok, frames, decoder} ->
-        frames |> dispatch(socket, %{state | decoder: decoder}) |> still_owed_a_greeting()
+        frames
+        |> dispatch(socket, %{state | decoder: decoder})
+        |> acknowledge(socket)
+        |> still_owed_a_greeting()
 
       {:refused, refusal, frames, decoder} ->
         # The frames that completed before the violation were whole frames and
@@ -164,16 +216,20 @@ defmodule Ctrld.Channel.Handler do
     {:ok, appliance} = Appliances.session_opened(appliance, DateTime.utc_now())
     timeout = greeting_timeout()
 
+    now = System.monotonic_time(:millisecond)
+
     state = %{
       new_state()
       | device_id: device_id,
         appliance: appliance,
-        greet_by: System.monotonic_time(:millisecond) + timeout
+        greet_by: now + timeout,
+        acked_at: now
     }
 
     Logger.info("ctrld: channel session opened for appliance #{device_id}")
 
-    greeting = {:hello, {:server, log_cursor(appliance), capture_cursor(appliance)}}
+    {log, capture} = cursors(device_id)
+    greeting = {:hello, {:server, log, capture}}
 
     case send_frame(socket, greeting) do
       :ok ->
@@ -191,17 +247,62 @@ defmodule Ctrld.Channel.Handler do
   end
 
   # The positions up to which this server has durably ingested each ring, which
-  # are the appliance's resume points. Both are the beginning, and that is a
-  # statement about the appliance rather than about this server's ingest: an
-  # appliance keeps no reader cursor across a reboot and re-ships each ring from
-  # zero whatever it is told, so a cursor naming anywhere else would be a promise
-  # about a resume point neither end acts on. What it costs is bytes and not
-  # rows — `Ctrld.Telemetry.Cursor` is what an ingest holds its real position in,
-  # and a re-shipped run below it produces no row a second time. Naming a
-  # position nothing here has stored would be the other way round, and that one
-  # loses recordings.
-  defp log_cursor(%Appliance{}), do: 0
-  defp capture_cursor(%Appliance{}), do: 0
+  # are the appliance's resume points — read from the one place a position is
+  # held rather than kept a second time here, so what the greeting promises and
+  # what an ingest would skip cannot come apart.
+  #
+  # It is a promise, and the direction it may err in is one way only. A position
+  # **below** what this server holds costs bytes and never rows: the appliance
+  # re-ships a run the ingest recognises and skips. A position **above** it names
+  # a resume point nothing here has stored, and the recordings between the two
+  # are lost for good. So the mark is the ingest's own, which never moves past an
+  # insert the store acknowledged.
+  defp cursors(device_id) do
+    {Cursor.position(device_id, :log), Cursor.position(device_id, :capture)}
+  end
+
+  # The acknowledgement the framing contract owes an appliance while a session
+  # is carrying data: the same two positions the greeting named, as they stand
+  # now. It is what moves an appliance's own durable reader cursor on, so a
+  # session that only ever greeted would leave every reconnect resuming from
+  # wherever the last greeting found the ingest.
+  #
+  # **Owed on received data and never on a timer**, which is what keeps it off
+  # the record bound this session states: a peer that says nothing is acked
+  # nothing, and one that floods is acked at this end's cadence rather than at
+  # its own. No line goes with it either — an acknowledgement is a frame, and
+  # the session's two records are its opening and its ending.
+  defp acknowledge({:continue, %{greeted?: true} = state} = carried, socket) do
+    now = System.monotonic_time(:millisecond)
+
+    if owed?(state, now) do
+      {log, capture} = cursors(state.device_id)
+
+      case send_frame(socket, {:ack, log, capture}) do
+        :ok ->
+          {:continue, %{state | acked_at: now, acked_after: state.received}}
+
+        # A peer that was gone before the acknowledgement could reach it, on the
+        # greeting's terms exactly: a connection this end could not write to is
+        # a connection to close, under a name of its own so an operator reading
+        # the closing line is not left with the transport's view of it.
+        {:error, reason} ->
+          {:close, %{state | ending: {:ack_not_sent, reason}}}
+      end
+    else
+      carried
+    end
+  end
+
+  defp acknowledge(carried, _socket), do: carried
+
+  # Whichever bound comes first, and the volume is measured against the tally at
+  # the last acknowledgement rather than reset by one: a frame that arrives while
+  # the period is running still counts toward the next.
+  defp owed?(%{received: received, acked_after: acked_after, acked_at: acked_at}, now) do
+    received - acked_after >= ack_bytes() or
+      (received > acked_after and now - acked_at >= ack_period())
+  end
 
   defp dispatch([], _socket, state), do: {:continue, state}
 
@@ -303,11 +404,11 @@ defmodule Ctrld.Channel.Handler do
       {:ok, bytes} ->
         Socket.send(socket, bytes)
 
-      # Unreachable from anything a peer sends: the only frame this build
-      # composes is the server greeting, and every field in it is a constant of
-      # `log_cursor/1` and `capture_cursor/1`. So a refusal here is a defect in
-      # this module or in the codec, and it fails visibly rather than closing a
-      # session as though the appliance had done something.
+      # Unreachable from anything a peer sends: the two frames this build
+      # composes are the server greeting and the acknowledgement, and every field
+      # in either is a position out of `cursors/1`. So a refusal here is a defect
+      # in this module or in the codec, and it fails visibly rather than closing
+      # a session as though the appliance had done something.
       {:error, refusal} ->
         raise "ctrld composed an unsendable channel frame: #{inspect(refusal)}"
     end
@@ -336,6 +437,8 @@ defmodule Ctrld.Channel.Handler do
       greet_by: nil,
       received: 0,
       unanswered: 0,
+      acked_at: nil,
+      acked_after: 0,
       ending: nil
     }
   end
@@ -357,6 +460,9 @@ defmodule Ctrld.Channel.Handler do
 
   def describe({:greeting_not_sent, reason}),
     do: "this server's greeting was not sent: #{inspect(reason)}"
+
+  def describe({:ack_not_sent, reason}),
+    do: "this server's acknowledgement was not sent: #{inspect(reason)}"
 
   def describe({:failed, reason}), do: "the connection failed: #{inspect(reason)}"
   def describe({:framing, refusal}), do: "the framing was broken: #{describe_refusal(refusal)}"

@@ -26,7 +26,15 @@ config :ctrld, CtrldWeb.Endpoint,
 # every run. The greeting deadline stays well clear of what a test needs to read
 # one frame and write another on a loaded machine.
 config :ctrld, Ctrld.Channel.Transport, handshake_timeout: 250
-config :ctrld, Ctrld.Channel.Handler, greeting_timeout: 1_000
+
+# The acknowledgement cadence is shortened for the same reason and one more of
+# its own: the deployment's volume bound is eight mebibytes, and a test shipping
+# that much to prove an acknowledgement is owed on volume would prove nothing a
+# few hundred bytes do not.
+config :ctrld, Ctrld.Channel.Handler,
+  greeting_timeout: 1_000,
+  ack_period: 250,
+  ack_bytes: 512
 
 # In test we don't send emails
 config :ctrld, Ctrld.Mailer, adapter: Swoosh.Adapters.Test

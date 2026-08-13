@@ -3715,12 +3715,17 @@ delivered anchor and matches the profile in every field.
   framing agree on bytes neither of them composed. The group that blocked such a scenario outright is
   no longer what stands in the way; what it needs is a boot that dials this server rather than a
   stand-in.
-- **The ingest still resumes from the beginning of a ring.** The acknowledgement this server greets
-  an appliance with names position zero for both rings, which is honest about the appliance rather
-  than about the ingest: an appliance keeps no reader cursor across a reboot and re-ships each ring
-  from its beginning whatever it is told. What that costs is bytes on the wire and re-decoding, and
-  no duplicate row — the durable cursor is what settles that — but an acknowledgement that named the
-  stored position would cost neither, and it is the next thing to wire.
+- **The acknowledgement names what the ingest holds.** The greeting carries each ring's stored
+  position as the appliance's resume point, and an `ack` frame carries it again while a session is
+  receiving data — once per five seconds of it and once per eight mebibytes of ring bytes, whichever
+  comes first, so a busy appliance is answered at the rate it ships and a quiet one is answered at
+  all. Both read the same durable per-ring cursor the ingest gates rows on, so what is promised and
+  what would be skipped cannot come apart. The direction it may err in is one way only: a position
+  **below** the mark costs a re-shipped run this server recognises and skips, while one **above** it
+  would name a resume point nothing here has stored and lose every recording between the two — which
+  is why the mark is never anything but the ingest's own, and why it moves only behind an insert the
+  store acknowledged. It costs no console line: an acknowledgement is a frame, and a session's
+  records stay its opening and its ending however much it carries.
 - **A ring that is lost is lost.** A shipment that jumped, a stream a refusal ended, and rows a
   store would not take for longer than the hold allows are each counted, logged and emitted, and
   none of them is re-fetched: the channel has a range read for exactly that and nothing here calls

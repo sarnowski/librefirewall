@@ -25,6 +25,7 @@ defmodule Ctrld.Channel.ListenerTest do
   alias Ctrld.Appliances
   alias Ctrld.Channel.{Frame, Handler, Ingest, Listener, Transport}
   alias Ctrld.PKI.EndpointCertificate
+  alias Ctrld.Telemetry.Cursor
 
   @moduletag :capture_log
 
@@ -48,6 +49,67 @@ defmodule Ctrld.Channel.ListenerTest do
       assert {:ok, {:hello, {:server, log, capture}}} = read_frame(socket)
       assert log == 0
       assert capture == 0
+
+      :ok = :ssl.close(socket)
+    end
+
+    test "the greeting carries what the ingest has durably stored", %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, certificate: certificate, key: key} = onboarded_appliance()
+
+      # The one place a position is held, written as an ingest writes it. What
+      # the greeting must then carry is these two numbers and not a second
+      # notion of progress kept beside them.
+      :ok = Cursor.advance(appliance.device_id, :log, 65_536)
+      :ok = Cursor.advance(appliance.device_id, :capture, 131_072)
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 65_536, 131_072}}} = read_frame(socket)
+
+      :ok = :ssl.close(socket)
+    end
+
+    test "a session carrying data is acknowledged, and one that only greeted is not", %{
+      anchor: anchor
+    } do
+      port = start_listener()
+      %{appliance: appliance, certificate: certificate, key: key} = onboarded_appliance()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+
+      # A greeting is not received data, so nothing is owed for it. The bound is
+      # generous against the configured period, so a passing assertion here is
+      # the rule and not the timing.
+      :ok = send_frame(socket, {:hello, :appliance})
+      assert {:error, :timeout} = :ssl.recv(socket, 0, Handler.ack_period() * 4)
+
+      # The ingest stores a run and the appliance ships past it, which is the
+      # whole shape an acknowledgement exists to close: the position that comes
+      # back is the ingest's own and not the position the frame stated.
+      :ok = Cursor.advance(appliance.device_id, :log, 4_096)
+      :ok = send_frame(socket, {:up_records, 4_096, String.duplicate("l", 32)})
+
+      assert {:ok, {:ack, 4_096, 0}} = read_frame(socket, true)
+
+      :ok = :ssl.close(socket)
+    end
+
+    test "the volume bound acknowledges without waiting for the period", %{anchor: anchor} do
+      port = start_listener()
+      %{certificate: certificate, key: key} = onboarded_appliance()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+
+      # One frame past the configured volume, delivered at once: a peer that
+      # reaches the bound is acknowledged on the frame that reaches it rather
+      # than on the clock, which is what keeps a busy appliance's reader cursor
+      # moving at the rate it is actually shipping.
+      :ok = send_frame(socket, {:up_records, 0, String.duplicate("r", Handler.ack_bytes())})
+
+      assert {:ok, {:ack, 0, 0}} = read_frame(socket, true)
 
       :ok = :ssl.close(socket)
     end
@@ -470,9 +532,13 @@ defmodule Ctrld.Channel.ListenerTest do
     end
   end
 
-  defp read_frame(socket) do
+  # `greeted?` is the reader's own state and not the socket's: the codec refuses
+  # a first frame that is not the greeting, so a frame read after one has to say
+  # that one has been read. Defaulted to the state a fresh connection is in, so
+  # the greeting is read the way a peer reads it.
+  defp read_frame(socket, greeted? \\ false) do
     {:ok, header} = :ssl.recv(socket, Frame.header_length(), 5_000)
-    {:ok, type, length} = Frame.read_header(header, :server, false)
+    {:ok, type, length} = Frame.read_header(header, :server, greeted?)
 
     payload =
       if length == 0 do
