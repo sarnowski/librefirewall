@@ -1918,9 +1918,15 @@ pub const CONFIG_SLOTS: usize = 4 + GENERATION_OUTCOMES;
 /// in `pd_runtime` holds this array to as it does the transport's: an operator
 /// reading a refusal on the console and graphing the refusal rate must be reading
 /// one thing.
-pub const GENERATION_OUTCOMES: usize = 3;
-pub const GENERATION_OUTCOME_NAMES: [&str; GENERATION_OUTCOMES] =
-    ["applied", "refused", "unchanged"];
+pub const GENERATION_OUTCOMES: usize = 6;
+pub const GENERATION_OUTCOME_NAMES: [&str; GENERATION_OUTCOMES] = [
+    "applied",
+    "refused",
+    "unchanged",
+    "staged",
+    "confirmed",
+    "reverted",
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfigSample {
@@ -1946,6 +1952,18 @@ impl ConfigSample {
             &CONFIGURATION_SUBMISSIONS,
             &[Label::new("outcome", GENERATION_OUTCOME_NAMES[2])],
         ),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[3])],
+        ),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[4])],
+        ),
+        s(
+            &CONFIGURATION_SUBMISSIONS,
+            &[Label::new("outcome", GENERATION_OUTCOME_NAMES[5])],
+        ),
         plain(&CONFIGURATION_READS),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
@@ -1958,6 +1976,9 @@ impl ConfigSample {
             self.submissions[0],
             self.submissions[1],
             self.submissions[2],
+            self.submissions[3],
+            self.submissions[4],
+            self.submissions[5],
             self.reads,
             self.log.dropped,
             self.log.refused,

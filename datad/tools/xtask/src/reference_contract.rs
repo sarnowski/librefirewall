@@ -164,6 +164,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // no session to open. Named where the decisions are, so scanning the
     // domain's main file alone would leave the group uncompared.
     ("pds/crypto/src/channel.rs", Vocabulary::Causes(&["crypto"])),
+    // The management channel's configuration operations: the ways an exchange with
+    // the domain that decides about a document does not happen. Named where the
+    // variants are, so scanning the domain's main file alone would leave the group
+    // uncompared.
+    (
+        "pds/crypto/src/configuration.rs",
+        Vocabulary::Causes(&["crypto"]),
+    ),
     // Taking delivery of an onboarding package: the room an upload is validated
     // in, which this domain reserves out of its own arena before it places a
     // byte. Named where the decision is, so scanning the domain's main file

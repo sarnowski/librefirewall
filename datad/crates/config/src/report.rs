@@ -17,6 +17,7 @@ use wire::ConfigImage;
 use crate::{
     ConfigError,
     diff::{Change, Records},
+    provisional::ProvisionalError,
     runtime::{BuildError, image_from},
     store::{CommitOutcome, Datastore, Generation},
 };
@@ -55,6 +56,13 @@ pub enum CommitReport {
     /// Every rule passed and the generation counter has no successor to assign,
     /// so nothing is in force from this document either.
     Exhausted,
+    /// A commit with nothing staged. Unreachable through
+    /// [`commit_and_report`], which stages the document it is given; it is what a
+    /// caller that commits as a separate step meets, and it is a variant rather
+    /// than folded into [`Self::Exhausted`] because the two are different
+    /// mistakes — one is an appliance with no numbers left, the other a requester
+    /// that has not sent a document.
+    NoCandidate,
 }
 
 impl CommitReport {
@@ -62,7 +70,7 @@ impl CommitReport {
     pub const fn image(self) -> Option<ConfigImage> {
         match self {
             Self::Published { image, .. } => Some(image),
-            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted => None,
+            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted | Self::NoCandidate => None,
         }
     }
 
@@ -73,7 +81,7 @@ impl CommitReport {
     pub const fn generation(self) -> u32 {
         match self {
             Self::Published { image, .. } => image.generation,
-            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted => 0,
+            Self::Unchanged | Self::Rejected { .. } | Self::Exhausted | Self::NoCandidate => 0,
         }
     }
 
@@ -85,7 +93,7 @@ impl CommitReport {
     pub const fn state(self) -> DomainState {
         match self {
             Self::Published { .. } | Self::Unchanged => DomainState::Ready,
-            Self::Rejected { .. } | Self::Exhausted => DomainState::Refused,
+            Self::Rejected { .. } | Self::Exhausted | Self::NoCandidate => DomainState::Refused,
         }
     }
 }
@@ -128,6 +136,250 @@ pub fn commit_and_report(store: &mut Datastore, document: &[u8], sink: &dyn Sink
         }
     };
 
+    report_commit(outcome, image, sink)
+}
+
+/// What staging a document did.
+///
+/// Two outcomes and no third: a document either becomes the candidate or names
+/// the rule it broke. There is no "unchanged" here — staging is not keyed by
+/// content, because whether a candidate matches what is running is a question the
+/// commit asks and answering it early would refuse a document an operator has
+/// every right to stage and then commit alongside another change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageReport {
+    /// The document is the candidate, and `generation` is the one committing it
+    /// would assign.
+    Staged { generation: u32 },
+    /// The document broke a rule; nothing is staged from it and whatever was
+    /// staged before is untouched.
+    Rejected { reason: RejectReason, detail: u32 },
+}
+
+/// Read `document` and hold it as the candidate, committing nothing. `sink` is
+/// told which of the two outcomes it was before this returns.
+///
+/// The same reader, the same rules and the same refusals as a one-step
+/// submission: this exists so a caller that commits separately can be told what
+/// validating produced, and not so a second set of rules can apply. A document
+/// whose model cannot become a handover artifact is refused **here** rather than
+/// at the commit, so a staging that succeeded is one a commit will not turn down
+/// for a reason the operator was never told.
+pub fn stage_and_report(store: &mut Datastore, document: &[u8], sink: &dyn Sink) -> StageReport {
+    let staged = match store.stage(document) {
+        Ok(staged) => staged,
+        Err(error) => {
+            let (reason, detail) = (rejection(error), offset(error));
+            refuse(store.running(), reason, detail, sink);
+            return StageReport::Rejected { reason, detail };
+        }
+    };
+    if let Err(error) = image_from(&staged.model, staged.generation) {
+        let reason = build_rejection(error);
+        refuse(store.running(), reason, 0, sink);
+        return StageReport::Rejected { reason, detail: 0 };
+    }
+    let generation = staged.generation.to_bits();
+    sink.emit(&Event::ConfigGeneration {
+        generation,
+        outcome: GenerationOutcome::Staged,
+        changes: 0,
+    });
+    StageReport::Staged { generation }
+}
+
+/// Commit the candidate provisionally, reporting it exactly as a one-step
+/// submission is reported.
+///
+/// The image is rebuilt from the model the commit applied rather than from the
+/// one staging held: a caller may have staged and committed across two requests,
+/// and an image built at staging time would be an artifact for a generation the
+/// commit may since have numbered differently.
+pub fn commit_provisionally_and_report(store: &mut Datastore, sink: &dyn Sink) -> CommitReport {
+    let Some(generation) = store.next_generation() else {
+        sink.emit(&Event::ConfigGeneration {
+            generation: store.running().to_bits(),
+            outcome: GenerationOutcome::Refused,
+            changes: 0,
+        });
+        return CommitReport::Exhausted;
+    };
+    let Some(model) = store.candidate_model() else {
+        // Nothing staged. Reported as a refusal against the generation that
+        // therefore stays running, with no reason token — nothing about a
+        // configuration is wrong, there being no configuration.
+        sink.emit(&Event::ConfigGeneration {
+            generation: store.running().to_bits(),
+            outcome: GenerationOutcome::Refused,
+            changes: 0,
+        });
+        return CommitReport::NoCandidate;
+    };
+    // Before the commit, on `commit_and_report`'s terms: a model that cannot
+    // become an artifact must not move the configuration somewhere unpublishable.
+    let image = match image_from(&model, generation) {
+        Ok(image) => image,
+        Err(error) => return refuse(store.running(), build_rejection(error), 0, sink),
+    };
+    let mut emitted = ChangeRecords {
+        generation: generation.to_bits(),
+        sequence: 0,
+        sink,
+    };
+    let outcome = match store.commit_provisionally(&mut emitted) {
+        Ok(outcome) => outcome,
+        // Unreachable: both of `CommitError`'s causes were decided above off the
+        // same store. Answered rather than asserted, this running on a path a
+        // peer paces.
+        Err(_) => {
+            sink.emit(&Event::ConfigGeneration {
+                generation: store.running().to_bits(),
+                outcome: GenerationOutcome::Refused,
+                changes: 0,
+            });
+            return CommitReport::Exhausted;
+        }
+    };
+    report_commit(outcome, image, sink)
+}
+
+/// What confirming or reverting a provisional commit did.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing needs an allocator; the value is a temporary destructured at once"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionalReport {
+    /// The provisional commit is permanent under `generation`.
+    Confirmed { generation: u32 },
+    /// What the provisional commit displaced is in force again under
+    /// `generation`, and this is the image the consumer is handed. `abandoned` is
+    /// the generation given up.
+    Reverted {
+        image: ConfigImage,
+        generation: u32,
+        abandoned: u32,
+        changes: u32,
+    },
+    /// Nothing was awaiting confirmation. `generation` is what stays running.
+    NotProvisional { generation: u32 },
+    /// A confirmation of a generation that is not the provisional one.
+    /// `provisional` is the one that is, and it stays outstanding.
+    GenerationMismatch { provisional: u32 },
+}
+
+/// Keep the provisional commit `generation` names, and say so.
+pub fn confirm_and_report(
+    store: &mut Datastore,
+    generation: u32,
+    sink: &dyn Sink,
+) -> ProvisionalReport {
+    match store.confirm(Generation::from_bits(generation)) {
+        Ok(confirmed) => {
+            let generation = confirmed.to_bits();
+            sink.emit(&Event::ConfigGeneration {
+                generation,
+                outcome: GenerationOutcome::Confirmed,
+                changes: 0,
+            });
+            ProvisionalReport::Confirmed { generation }
+        }
+        Err(ProvisionalError::NotProvisional) => {
+            let generation = store.running().to_bits();
+            sink.emit(&Event::ConfigGeneration {
+                generation,
+                outcome: GenerationOutcome::Refused,
+                changes: 0,
+            });
+            ProvisionalReport::NotProvisional { generation }
+        }
+        Err(ProvisionalError::GenerationMismatch { provisional }) => {
+            sink.emit(&Event::ConfigGeneration {
+                generation: provisional.to_bits(),
+                outcome: GenerationOutcome::Refused,
+                changes: 0,
+            });
+            ProvisionalReport::GenerationMismatch {
+                provisional: provisional.to_bits(),
+            }
+        }
+        // A rollback's refusal, which a confirmation cannot reach: `confirm`
+        // assigns no generation. Reported as the mismatch it amounts to rather
+        // than asserted away, this running on a path a peer paces.
+        Err(ProvisionalError::GenerationsExhausted { latest }) => {
+            ProvisionalReport::GenerationMismatch {
+                provisional: latest.to_bits(),
+            }
+        }
+    }
+}
+
+/// Put back whatever the provisional commit displaced, and say so.
+///
+/// The image is built **before** the store is moved, exactly as a commit's is: a
+/// restored configuration that could not become an artifact must not leave the
+/// consumer running a generation nobody can publish.
+pub fn revert_and_report(store: &mut Datastore, sink: &dyn Sink) -> ProvisionalReport {
+    let running = store.running().to_bits();
+    let Some(displaced) = store.displaced_model() else {
+        sink.emit(&Event::ConfigGeneration {
+            generation: running,
+            outcome: GenerationOutcome::Refused,
+            changes: 0,
+        });
+        return ProvisionalReport::NotProvisional {
+            generation: running,
+        };
+    };
+    let Some(generation) = store.next_generation() else {
+        sink.emit(&Event::ConfigGeneration {
+            generation: running,
+            outcome: GenerationOutcome::Refused,
+            changes: 0,
+        });
+        return ProvisionalReport::NotProvisional {
+            generation: running,
+        };
+    };
+    let image = match image_from(&displaced, generation) {
+        Ok(image) => image,
+        Err(error) => {
+            refuse(store.running(), build_rejection(error), 0, sink);
+            return ProvisionalReport::NotProvisional {
+                generation: running,
+            };
+        }
+    };
+    let mut emitted = ChangeRecords {
+        generation: generation.to_bits(),
+        sequence: 0,
+        sink,
+    };
+    match store.roll_back(&mut emitted) {
+        Ok(rolled) => {
+            let changes = saturating(rolled.changes);
+            sink.emit(&Event::ConfigGeneration {
+                generation: rolled.generation.to_bits(),
+                outcome: GenerationOutcome::Reverted,
+                changes,
+            });
+            ProvisionalReport::Reverted {
+                image,
+                generation: rolled.generation.to_bits(),
+                abandoned: rolled.abandoned.to_bits(),
+                changes,
+            }
+        }
+        // Unreachable: both refusals were decided above, off the same store.
+        // Answered rather than asserted, this running on a path a peer paces.
+        Err(_) => ProvisionalReport::NotProvisional {
+            generation: running,
+        },
+    }
+}
+
+/// Turn a commit's outcome into the report both commit paths answer with.
+fn report_commit(outcome: CommitOutcome, image: ConfigImage, sink: &dyn Sink) -> CommitReport {
     let generation = outcome.generation().to_bits();
     match outcome {
         CommitOutcome::Unchanged { .. } => {
@@ -265,6 +517,195 @@ mod tests {
             .map(|index| sink.get(index).expect("in range"))
             .collect();
         (report, events)
+    }
+
+    /// The channel's four steps against one store, each with its own sink so the
+    /// records of one step cannot be read as another's.
+    fn steps(store: &mut Datastore, document: &str) -> (StageReport, Vec<Event>) {
+        let sink = RecordingSink::<CAPACITY>::new();
+        let report = stage_and_report(store, document.as_bytes(), &sink);
+        assert_eq!(sink.dropped(), 0, "the fixture sink overran");
+        let events = (0..sink.len())
+            .map(|index| sink.get(index).expect("in range"))
+            .collect();
+        (report, events)
+    }
+
+    fn committed(store: &mut Datastore) -> (CommitReport, Vec<Event>) {
+        let sink = RecordingSink::<CAPACITY>::new();
+        let report = commit_provisionally_and_report(store, &sink);
+        assert_eq!(sink.dropped(), 0, "the fixture sink overran");
+        let events = (0..sink.len())
+            .map(|index| sink.get(index).expect("in range"))
+            .collect();
+        (report, events)
+    }
+
+    fn settled(store: &mut Datastore, confirm: Option<u32>) -> (ProvisionalReport, Vec<Event>) {
+        let sink = RecordingSink::<CAPACITY>::new();
+        let report = match confirm {
+            Some(generation) => confirm_and_report(store, generation, &sink),
+            None => revert_and_report(store, &sink),
+        };
+        assert_eq!(sink.dropped(), 0, "the fixture sink overran");
+        let events = (0..sink.len())
+            .map(|index| sink.get(index).expect("in range"))
+            .collect();
+        (report, events)
+    }
+
+    #[test]
+    fn staging_holds_the_document_and_moves_nothing() {
+        let mut store = Datastore::new();
+        let (report, events) = steps(&mut store, ONE_PORT);
+
+        assert_eq!(report, StageReport::Staged { generation: 1 });
+        assert_eq!(
+            events,
+            [Event::ConfigGeneration {
+                generation: 1,
+                outcome: GenerationOutcome::Staged,
+                changes: 0,
+            }]
+        );
+        // Nothing is running from it, which is the whole point of a staging.
+        assert_eq!(store.running(), Generation::ZERO);
+    }
+
+    #[test]
+    fn staging_refuses_a_document_by_the_same_rules_a_submission_does() {
+        let mut store = Datastore::new();
+        let (report, events) = steps(&mut store, "<!DOCTYPE x><configuration/>");
+
+        assert_eq!(
+            report,
+            StageReport::Rejected {
+                reason: RejectReason::Doctype,
+                detail: 0,
+            }
+        );
+        // One record, naming the rule and where: a refused staging says the same
+        // thing a refused submission does, in the same vocabulary.
+        assert_eq!(
+            events,
+            [Event::ConfigRejected {
+                generation: 0,
+                reason: RejectReason::Doctype,
+                offset: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_four_steps_apply_a_generation_and_then_confirm_it() {
+        let mut store = Datastore::new();
+        assert_eq!(
+            steps(&mut store, ONE_PORT).0,
+            StageReport::Staged { generation: 1 }
+        );
+        let (report, _) = committed(&mut store);
+        let image = report.image().expect("a staged candidate publishes");
+        assert_eq!(image.generation, 1);
+        assert_eq!(store.provisional(), Some(Generation::from_bits(1)));
+
+        let (settled, events) = settled(&mut store, Some(1));
+        assert_eq!(settled, ProvisionalReport::Confirmed { generation: 1 });
+        assert_eq!(
+            events,
+            [Event::ConfigGeneration {
+                generation: 1,
+                outcome: GenerationOutcome::Confirmed,
+                changes: 0,
+            }]
+        );
+        assert_eq!(store.provisional(), None);
+    }
+
+    #[test]
+    fn an_unconfirmed_generation_is_reverted_and_the_image_is_the_one_put_back() {
+        let mut store = Datastore::new();
+        steps(&mut store, ONE_PORT);
+        committed(&mut store);
+        steps(&mut store, EMPTY);
+        let (report, _) = committed(&mut store);
+        assert_eq!(report.generation(), 2);
+
+        let (settled, events) = settled(&mut store, None);
+        let ProvisionalReport::Reverted {
+            image,
+            generation,
+            abandoned,
+            changes,
+        } = settled
+        else {
+            panic!("a provisional commit reverts: {settled:?}");
+        };
+        // A new generation carrying the OLD configuration: one interface again.
+        assert_eq!(generation, 3);
+        assert_eq!(abandoned, 2);
+        assert_eq!(image.generation, 3);
+        assert_eq!(image.interface_count, 1);
+        assert!(changes > 0);
+        assert!(matches!(
+            events.last(),
+            Some(Event::ConfigGeneration {
+                generation: 3,
+                outcome: GenerationOutcome::Reverted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_commit_with_nothing_staged_is_told_apart_from_an_exhausted_counter() {
+        let mut store = Datastore::new();
+        let (report, events) = committed(&mut store);
+
+        assert_eq!(report, CommitReport::NoCandidate);
+        assert_eq!(report.image(), None);
+        assert_eq!(report.generation(), 0);
+        assert_eq!(report.state(), DomainState::Refused);
+        assert!(matches!(
+            events.first(),
+            Some(Event::ConfigGeneration {
+                outcome: GenerationOutcome::Refused,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn confirming_and_reverting_nothing_are_told_apart_by_their_own_report() {
+        let mut store = Datastore::new();
+        steps(&mut store, ONE_PORT);
+        committed(&mut store);
+        settled(&mut store, Some(1));
+
+        assert_eq!(
+            settled(&mut store, Some(1)).0,
+            ProvisionalReport::NotProvisional { generation: 1 }
+        );
+        assert_eq!(
+            settled(&mut store, None).0,
+            ProvisionalReport::NotProvisional { generation: 1 }
+        );
+    }
+
+    #[test]
+    fn a_confirmation_of_another_generation_names_the_one_outstanding() {
+        let mut store = Datastore::new();
+        steps(&mut store, ONE_PORT);
+        committed(&mut store);
+
+        assert_eq!(
+            settled(&mut store, Some(7)).0,
+            ProvisionalReport::GenerationMismatch { provisional: 1 }
+        );
+        // Still outstanding, so the deadline still reverts it.
+        assert!(matches!(
+            settled(&mut store, None).0,
+            ProvisionalReport::Reverted { abandoned: 1, .. }
+        ));
     }
 
     #[test]

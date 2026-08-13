@@ -136,7 +136,7 @@ pub const LOG_OBJECT_KIND_COUNT: u8 = 4;
 pub const LOG_FIELD_COUNT: u8 = 18;
 
 /// `lfw_log::GenerationOutcome::ALL`.
-pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 3;
+pub const LOG_GENERATION_OUTCOME_COUNT: u8 = 6;
 
 /// `lfw_log::RejectReason::ALL`.
 pub const LOG_REJECT_REASON_COUNT: u8 = 38;

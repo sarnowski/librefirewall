@@ -28,11 +28,22 @@
 //!
 //! # What this build says, and what composes it
 //!
-//! The greeting, and the two upstream frames that carry the recording rings.
-//! The greeting is the exchange that makes a session worth anything: this end
-//! sends it the moment the record layer will carry one, and the server's is what
-//! sets [`ManagementChannel::agreed`] — the single fact the redial schedule in
-//! the domain that owns the network may start afresh on.
+//! The greeting, the two upstream frames that carry the recording rings, and the
+//! configuration operations the server pushes down. The greeting is the exchange
+//! that makes a session worth anything: this end sends it the moment the record
+//! layer will carry one, and the server's is what sets
+//! [`ManagementChannel::agreed`] — the single fact the redial schedule in the
+//! domain that owns the network may start afresh on.
+//!
+//! **A configuration operation is carried out here and decided elsewhere.** A
+//! staged document crosses to the domain that owns the datastore and comes back as
+//! a result line this end frames; a commit is made provisionally and **ends the
+//! session**, because the confirmation must arrive on a connection opened after
+//! it; a confirmation on a later session keeps it, and a deadline this appliance
+//! armed from its own clock puts the previous configuration back where none does.
+//! Nothing about a document is read here — [`crate::configuration`] carries the
+//! delegation and the deadline, and the reader of an attacker's XML is a domain
+//! that holds no network region at all.
 //!
 //! **The frames are composed here and the ring bytes come from elsewhere.** The
 //! domain that owns the network reads the recorder's window and has no
@@ -45,11 +56,13 @@
 //! What that does not buy is honesty about content: the bytes and the position
 //! are still that domain's. What the split bounds is the frame **type**.
 //!
-//! **A frame that is not the greeting is counted and dropped.** It is not a
-//! violation: a server that speaks the rest of the protocol to an appliance that
-//! has not shipped its half yet is a server running ahead of this build, and
-//! refusing it would make an upgrade of one end an outage of the pair. What
-//! bounds it is the decoder, which holds one frame's worth and never two.
+//! **A frame this build does not act on is counted and dropped.** It is not a
+//! violation: a server that speaks a part of the protocol an appliance has not
+//! shipped yet is a server running ahead of this build, and refusing it would make
+//! an upgrade of one end an outage of the pair. What bounds it is the decoder,
+//! which holds one frame's worth and never two. Today that is the acknowledgement
+//! and the range read — the ring cursors are the reading domain's and a byte
+//! extent of a recording is the recorder's, and neither is reachable from here.
 //!
 //! # No key, no traffic secret, no plaintext and no peer certificate leaves
 //!
@@ -66,20 +79,20 @@ use lfw_channel::{
 };
 use lfw_log::{DomainDetail, Refusal, RefusalDetail};
 use lfw_tls::{Bump, CHANNEL_OUTCOME_RECORDS, ChannelClient, CryptoProvider, Turn};
-use pd_runtime::{Answered, SHIPPED_RING_BYTES};
+use pd_runtime::{Answered, MAX_ANSWER_LEN, SHIPPED_RING_BYTES};
 
+use crate::configuration::{ChannelConfig, ConfigFailure, StageResult};
 use crate::delegate::{HeldAnchor, HeldCertificate};
 
 /// The most console records one channel session owes.
 ///
 /// Two outcomes' worth — the handshake's, and how a session that came up then
-/// ended — plus the framing's account at each of the two states it has, the one
-/// rule a peer may have broken, and the one shipment this end may have refused
-/// to compose. A sum and not a bound anybody guesses at, and none of its terms a
-/// peer's to multiply: there is no third outcome, whatever a server does on the
-/// wire, the framing has no third state, and a refused shipment ends the session
-/// that carried it.
-pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 4;
+/// ended — plus the framing's account at each of its two states, the one rule a
+/// peer may have broken, the one shipment this end may have refused, and the one
+/// configuration operation a pass may have failed. A sum, and none of its terms a
+/// peer's to multiply: a refused shipment ends the session that carried it, and a
+/// pass carries out one configuration operation.
+pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 5;
 
 /// Bytes of plaintext this end composes for its own greeting.
 ///
@@ -89,6 +102,16 @@ pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 4;
 const APPLIANCE_GREETING_LEN: usize = lfw_channel::HEADER_LEN + lfw_channel::APPLIANCE_HELLO_LEN;
 
 const _: () = assert!(APPLIANCE_GREETING_LEN == 10);
+
+/// Bytes of plaintext one validate-result frame occupies at most: the header and
+/// the longest line the configuration vocabulary can compose.
+///
+/// A named constant rather than a call, on the greeting's terms: it is what the
+/// array is sized by, and a mismatch would be an encode this end refuses on a path
+/// with nothing to refuse it to.
+const RESULT_FRAME_LEN: usize = lfw_channel::HEADER_LEN + MAX_ANSWER_LEN;
+
+const _: () = assert!(RESULT_FRAME_LEN <= lfw_channel::MAX_FRAME_LEN);
 
 /// Bytes of plaintext one upstream frame occupies, and the ring position in
 /// front of its ring bytes. Sized by the relay's bound rather than the framing's
@@ -204,6 +227,16 @@ pub struct ManagementChannel {
     /// decides how often is claimed.
     spare: Option<&'static mut [u8; MAX_FRAME_LEN]>,
     session: Option<Dialogue<'static>>,
+    /// The delegation to the domain that owns the datastore, and the one commit
+    /// that may be awaiting confirmation. **Outside the session**, which is the
+    /// whole of how the fresh-connection rule is kept: a commit made on one
+    /// session is confirmed on a later one, so what remembers it cannot be a value
+    /// the close of a session takes with it.
+    config: ChannelConfig,
+    /// Which session is running, counted from the first this domain ever opened —
+    /// a number this appliance assigns, so the fresh-connection check is a
+    /// comparison rather than a claim the peer could restate.
+    serial: u64,
     /// Where one upstream frame is composed before the record layer takes it. A
     /// field because it is one frame's worth and a protection domain's stack is
     /// not where that belongs.
@@ -220,6 +253,7 @@ impl ManagementChannel {
         arena: &'static Bump,
         mark: usize,
         held: Option<&'static mut [u8; MAX_FRAME_LEN]>,
+        config: ChannelConfig,
     ) -> Self {
         Self {
             arena,
@@ -228,6 +262,8 @@ impl ManagementChannel {
             identity: None,
             spare: held,
             session: None,
+            config,
+            serial: 0,
             composed: [0; UPSTREAM_FRAME_LEN],
             staged: [None; CHANNEL_RECORDS],
         }
@@ -245,7 +281,13 @@ impl ManagementChannel {
         self.identity.is_some()
     }
 
-    /// The instant a chain is judged against on the next open.
+    /// The instant a chain is judged against on the next open, and the reading a
+    /// confirmation deadline is measured against on this pass.
+    ///
+    /// Refreshed on every pass rather than only at the open, because the deadline
+    /// is what it drives: a reading taken once per session would leave an appliance
+    /// whose server greeted it and then went quiet holding an unconfirmed
+    /// configuration for as long as the session stayed up.
     pub const fn at(&mut self, now: u64) {
         self.now = now;
     }
@@ -277,6 +319,14 @@ impl ManagementChannel {
         self.recover();
         self.arena.reset_to(self.mark);
         self.staged = [None; CHANNEL_RECORDS];
+        // A fresh session is a fresh connection, so the serial moves before
+        // anything else can compare against it.
+        self.serial = self.serial.saturating_add(1);
+        // And before a session exists, so a deadline that passed while this
+        // appliance had no connection at all is honoured on the dial rather than
+        // on the first byte the new server happens to send: a commit nobody came
+        // back to confirm is reverted whether or not anybody ever speaks again.
+        self.revert_if_expired();
         let Some(identity) = self.identity.as_ref() else {
             // A session on the channel with nothing to open one with. Its own
             // token rather than silence: an appliance whose store published a
@@ -352,7 +402,12 @@ impl ManagementChannel {
         answer: &mut [u8],
     ) -> Answered {
         let Self {
-            session, composed, ..
+            session,
+            composed,
+            config,
+            serial,
+            now,
+            ..
         } = self;
         let Some(dialogue) = session.as_mut() else {
             // Nothing opened, so there is nothing to say and nothing to wait
@@ -366,7 +421,7 @@ impl ManagementChannel {
             };
         };
         let first = dialogue.client.advance(received, answer);
-        dialogue.read_frames();
+        let carried = dialogue.read_frames(config, *now, *serial);
         dialogue.greet();
         let refused = shipment.and_then(|shipment| dialogue.compose(shipment, composed));
         // A second turn, which is what encrypts anything the frame reading just
@@ -380,9 +435,20 @@ impl ManagementChannel {
         if let Some(cause) = refused {
             self.stage([DomainDetail::Refusal(refusal(cause))]);
         }
+        if let Some(failure) = carried.failure {
+            self.stage([DomainDetail::Refusal(failure.refusal())]);
+        }
+        // The deadline, read against this pass's own instant. After the frames,
+        // so a confirmation that arrived in this delivery is honoured before the
+        // deadline it beat is judged.
+        let reverted = self.revert_if_expired();
         Answered {
             sent: second.sent,
-            finished: second.finished || refused.is_some(),
+            // A commit ends the session, and that **is** the fresh-connection
+            // rule: closing makes a later connection the only place a
+            // confirmation can arrive. A revert ends it because the
+            // configuration under the session just changed.
+            finished: second.finished || refused.is_some() || carried.committed || reverted,
             agreed,
         }
     }
@@ -416,6 +482,25 @@ impl ManagementChannel {
         }
         self.recover();
         self.arena.reset_to(self.mark);
+    }
+
+    /// Put the previous configuration back where the confirmation deadline has
+    /// passed, answering whether one happened — which a caller inside a session
+    /// turns into ending it, the server being owed a dial under what is in force.
+    fn revert_if_expired(&mut self) -> bool {
+        let Some(outcome) = self.config.expired(self.now) else {
+            return false;
+        };
+        // A revert that happened says so through the domain that did it: the
+        // datastore's own generation record carries the generation and the
+        // outcome. A second here would restate a fact this domain did not decide.
+        match outcome {
+            Ok(_) => true,
+            Err(failure) => {
+                self.stage([DomainDetail::Refusal(failure.refusal())]);
+                false
+            }
+        }
     }
 
     /// Take the reassembly buffer back off whatever session held it.
@@ -530,23 +615,31 @@ impl Dialogue<'_> {
         None
     }
 
-    /// Read everything the record layer decrypted as frames.
+    /// Read everything the record layer decrypted as frames, carrying out what
+    /// each one asks for.
     ///
     /// Bounded by the plaintext in hand rather than by a count: the decoder takes
     /// no byte past the end of the frame it is assembling, so the loop consumes
     /// at least one byte per turn and ends when there are none left.
-    fn read_frames(&mut self) {
+    ///
+    /// **A configuration operation ends the reading**, whichever way it went: each
+    /// costs a notification and a bounded read at a priority above this one, so a
+    /// peer that could multiply them inside one pass would be choosing how long
+    /// this domain spends away from the session it carries. The frames behind it
+    /// stay in the decoder, so stopping is a pause and not a loss.
+    fn read_frames(&mut self, config: &mut ChannelConfig, now: u64, serial: u64) -> Carried {
+        let mut carried = Carried::default();
         if self.violation.is_some() {
             // A stream whose framing is wrong has no next frame — where the
             // following header starts is exactly what has been lost — so nothing
             // more is read from it and the plaintext is left where it is.
-            return;
+            return carried;
         }
         loop {
             let taken = {
                 let plaintext = self.client.received();
                 if plaintext.is_empty() {
-                    return;
+                    return carried;
                 }
                 self.decoder.absorb(plaintext)
             };
@@ -560,13 +653,21 @@ impl Dialogue<'_> {
                         // delimiter at both ends is what keeps a truncated
                         // session from passing for a complete one.
                         self.client.close();
-                        return;
+                        return carried;
                     }
                     Decoded::Frame(frame) => {
-                        if let Frame::Hello(Hello::Server { .. }) = frame {
-                            self.agreed = true;
-                        }
                         self.received = self.received.saturating_add(1);
+                        let acted = act(frame, config, now, serial, &mut carried);
+                        match acted {
+                            Acted::Greeted => self.agreed = true,
+                            Acted::Result { line, len } => {
+                                self.answer_stage(&line, len, &mut carried);
+                            }
+                            Acted::Nothing => {}
+                        }
+                        if carried.done {
+                            return carried;
+                        }
                     }
                 }
             }
@@ -575,8 +676,41 @@ impl Dialogue<'_> {
                 // a peer that has already broken the protocol — handled above —
                 // or a frame the buffer is mid-way through. Either way there is
                 // no progress to be had this turn.
-                return;
+                return carried;
             }
+        }
+    }
+
+    /// Frame the result line a staging produced and hand it to the record layer,
+    /// into an array of exactly one result frame's length — so the only refusal the
+    /// encoder can raise is one this appliance's own composer caused.
+    fn answer_stage(&mut self, line: &[u8; MAX_ANSWER_LEN], len: usize, carried: &mut Carried) {
+        let Some(line) = line.get(..len) else {
+            // Unreachable: the length is the composer's own count into the array
+            // this borrows. Answered rather than asserted, on every other
+            // unreachable branch in this file's terms.
+            carried.failure = Some(ConfigFailure::Faulted);
+            return;
+        };
+        let frame = Frame::UpConfigValidateResult { line };
+        let mut composed = [0_u8; RESULT_FRAME_LEN];
+        let Ok(written) = encode(Side::Appliance, &frame, &mut composed) else {
+            carried.failure = Some(ConfigFailure::Faulted);
+            return;
+        };
+        debug_assert_eq!(written, encoded_len(&frame));
+        if self
+            .client
+            .push(composed.get(..written).unwrap_or_default())
+            == written
+        {
+            self.sent = self.sent.saturating_add(1);
+        } else {
+            // The record layer would not take the whole frame, so half of it is
+            // queued or none is. Its own token: a session already holding too much
+            // is a different thing to look at from a document this appliance could
+            // not decide about.
+            carried.failure = Some(ConfigFailure::Faulted);
         }
     }
 
@@ -633,6 +767,87 @@ impl Dialogue<'_> {
             sent: self.sent,
             received: self.received,
         }
+    }
+}
+
+/// What reading a delivery's frames left for the pass that called it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Carried {
+    /// The one configuration operation that did not happen, where one did not.
+    failure: Option<ConfigFailure>,
+    /// Whether a commit was made, which ends the session.
+    committed: bool,
+    /// Whether the reading is over for this pass.
+    done: bool,
+}
+
+/// What acting on one frame produced.
+enum Acted {
+    /// The server's greeting.
+    Greeted,
+    /// A result line owed back, framed by the caller.
+    Result {
+        line: [u8; MAX_ANSWER_LEN],
+        len: usize,
+    },
+    /// Nothing goes back for this frame.
+    Nothing,
+}
+
+/// Carry out what one frame asks for.
+///
+/// A free function because of the borrow: a decoded frame borrows the decoder
+/// inside the session, so a method on the session could not also take the
+/// delegation that lives outside it. Every frame is named rather than folded into
+/// a wildcard, so one added to the protocol is a compile error here.
+fn act(
+    frame: Frame<'_>,
+    config: &mut ChannelConfig,
+    now: u64,
+    serial: u64,
+    carried: &mut Carried,
+) -> Acted {
+    match frame {
+        Frame::Hello(Hello::Server { .. }) => Acted::Greeted,
+        Frame::DownConfigStage { document } => {
+            let (StageResult { line, len }, failure) = config.stage(document);
+            carried.failure = failure;
+            carried.done = true;
+            Acted::Result { line, len }
+        }
+        Frame::DownConfigCommit {
+            generation,
+            confirm_deadline_secs,
+        } => {
+            match config.commit(generation, confirm_deadline_secs, now, serial) {
+                Ok(_) => carried.committed = true,
+                Err(failure) => carried.failure = Some(failure),
+            }
+            carried.done = true;
+            Acted::Nothing
+        }
+        Frame::DownCommitConfirm { generation } => {
+            if let Err(failure) = config.confirm(generation, serial) {
+                carried.failure = Some(failure);
+            }
+            carried.done = true;
+            Acted::Nothing
+        }
+        // The acknowledgement's cursors belong to the domain that reads the
+        // recorder's window and moves them, and a byte extent of a recording
+        // belongs to the domain that owns the medium. Neither is reachable from
+        // here, so both are counted as received and dropped — which is what a
+        // server running ahead of this build gets, rather than a closed
+        // connection.
+        Frame::Ack { .. } | Frame::DownRangeRead { .. } => Acted::Nothing,
+        // Frames this end sends. A server that sent one is refused by the
+        // decoder's own direction check before it becomes a value, so these arms
+        // exist to keep the match total rather than to be reached.
+        Frame::Hello(Hello::Appliance)
+        | Frame::UpRecords { .. }
+        | Frame::UpCapture { .. }
+        | Frame::UpConfigValidateResult { .. }
+        | Frame::UpRangeData { .. } => Acted::Nothing,
     }
 }
 

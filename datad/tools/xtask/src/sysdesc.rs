@@ -547,6 +547,22 @@ const CONFIG_SUBMISSION_WITHHELD: &str = "the FORWARDER maps NEITHER submission 
      not running. The two mappers are the two ends of one conversation and the perms carry which \
      end speaks in which direction";
 
+const CHANNEL_CONFIG_WITHHELD: &str = "the MANAGEMENT domain maps NEITHER of these regions, in \
+     either direction, and that is the point of their being a second pair: a submission channel \
+     admits one requester, so the domain that owns the management PORT and the domain that \
+     terminates the management CHANNEL each hold their own and cannot answer for the other. No \
+     dataplane domain, driver or recorder maps either, on `cfg_request`'s terms. And the \
+     cryptography domain maps NO part of `cfg` or `cfgack`: it may ask that a document be decided \
+     and can neither publish a handover nor acknowledge one, so what it holds is the authority a \
+     management plane has by definition and no part of applying it";
+
+const CONFIG_DELEGATION_RECEIVE_ONLY: &str = "the CONFIG domain holds no send \
+     capability on the cryptography domain: its answer is published into a region that domain \
+     reads and taken out of it in a bounded spin, a configuration operation happening inside a \
+     TLS session's own pass with no continuation a notification could resume. What the reverse \
+     capability would be is a wakeup on the domain holding a management server's session, granted \
+     to the domain that parses that server's documents, and consumed by nothing";
+
 const CONFIG_ACK_WITHHELD: &str = "the management domain reads `cfg` and maps `cfgack` NOT AT \
      ALL, which is what makes it a weaker consumer of the handover than the forwarder rather than \
      a second one. The forwarder is the consumer of the two-phase commit: it reads the OFFERED \
@@ -1099,6 +1115,30 @@ const REGIONS: &[RegionRule] = &[
         cacheability: Cacheability::Cached,
         grants: &[read_only("management"), read_write("config")],
         withheld: Some(CONFIG_SUBMISSION_WITHHELD),
+    },
+    // The management channel's own submission channel: the same ABI, a second
+    // instance, with the cryptography domain as requester. Its own rule rather
+    // than a widening of the pair above, because the *grants* are what differ —
+    // the management domain is not among the mappers at all.
+    RegionRule {
+        name: "chan_cfg_request",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_REQUEST_REGION_SIZE",
+            bytes: CONFIG_REQUEST_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("crypto"), read_only("config")],
+        withheld: Some(CHANNEL_CONFIG_WITHHELD),
+    },
+    RegionRule {
+        name: "chan_cfg_reply",
+        size: ExpectedSize {
+            rust_name: "wire::CONFIG_REPLY_REGION_SIZE",
+            bytes: CONFIG_REPLY_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_only("crypto"), read_write("config")],
+        withheld: Some(CHANNEL_CONFIG_WITHHELD),
     },
     RegionRule {
         name: "dl_request",
@@ -1993,6 +2033,23 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         domain: "crypto",
         id: "1",
         notification: Notification::MaySend,
+    },
+    // The configuration delegation, one-directional and the key holder's channel
+    // over again: the asker must be able to signal a decider that blocks in the
+    // event loop, and the decider must not signal back — a configuration
+    // operation happens inside a TLS session's own pass and has no continuation a
+    // notification could resume, so the answer is read in a bounded spin.
+    ChannelEnd {
+        domain: "crypto",
+        id: "2",
+        notification: Notification::MaySend,
+    },
+    ChannelEnd {
+        domain: "config",
+        id: "2",
+        notification: Notification::MayNotSend {
+            claim: CONFIG_DELEGATION_RECEIVE_ONLY,
+        },
     },
     // The periodic wakeup, one-directional. The clock domain must be able to
     // signal: it is the only domain hardware tells that an interval has

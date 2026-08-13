@@ -51,6 +51,7 @@ pub mod entity;
 pub mod gateway;
 pub mod hash;
 pub mod model;
+mod provisional;
 pub mod render;
 pub mod report;
 pub mod rule;
@@ -69,8 +70,12 @@ pub use gateway::Gateway;
 pub use hash::{ContentHash, content_hash};
 pub use lfw_log::Identifier;
 pub use model::{Full, Model};
+pub use provisional::{ProvisionalError, RolledBack};
 pub use render::{DocumentDoesNotFit, fits_the_document_bound, render, rendered_len};
-pub use report::{CommitReport, commit_and_report};
+pub use report::{
+    CommitReport, ProvisionalReport, StageReport, commit_and_report,
+    commit_provisionally_and_report, confirm_and_report, revert_and_report, stage_and_report,
+};
 pub use rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction};
 pub use runtime::{BuildError, image_from};
 pub use schema::parse;

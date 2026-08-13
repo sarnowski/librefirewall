@@ -1254,7 +1254,7 @@ fn every_refusal_names_the_field_and_the_value() {
             "change token 3 is not below 3",
             "object token 3 is not below 4",
             "field token 6 is not below 18",
-            "outcome token 3 is not below 3",
+            "outcome token 3 is not below 6",
             "reason token 30 is not below 38",
             "from value kind 9 names no value",
             "to value 256 does not fit a byte",

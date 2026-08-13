@@ -43,6 +43,37 @@
 //! arrives over the channel, is staged, validated and committed against the same
 //! store, and takes the next generation.
 //!
+//! # Two ports into one store, and why that is not two stores
+//!
+//! This domain answers **two** submission channels with one datastore behind
+//! them: the management domain's, which carries an administrator's `POST` as a
+//! single stage-validate-commit step, and the cryptography domain's, which
+//! carries the management channel's operations as the separate steps that
+//! protocol takes — stage, commit, confirm, revert.
+//!
+//! One store, because there is one configuration. Two channels, because a channel
+//! is the unit of grant and the two requesters are two domains: a single region
+//! pair written by both would let either of them answer for the other, and the
+//! two are at different points in the trust order — the domain that terminates
+//! the management channel is not the domain that owns the management port.
+//!
+//! **A candidate is the store's and not a port's.** Nothing here remembers which
+//! port staged a document, and that is deliberate: an appliance has one
+//! configuration and therefore one candidate, so a commit takes whatever was
+//! staged last. What keeps two requesters from committing each other's work is
+//! not bookkeeping but the generation the commit names — a commit for a
+//! generation that is not the one a commit would assign is refused rather than
+//! applied to whatever happens to be staged.
+//!
+//! # The commit the channel makes is provisional, and this domain holds no timer
+//!
+//! A channel commit keeps the configuration it displaced, so it can be put back;
+//! confirming gives that up and reverting restores it. **When** an unconfirmed
+//! commit is reverted is decided by the domain that owns the sessions, because
+//! "no confirmation arrived over a fresh connection" is a fact about sessions and
+//! this domain has none. What lives here is the store and the two operations over
+//! it; what lives there is the deadline.
+//!
 //! # Why the answer does not wait for the dataplane
 //!
 //! A submission is answered as soon as this domain has committed it, and the
@@ -62,7 +93,10 @@
 //! ships. A typed [`Event`] in this domain's own ring, rendered by the console,
 //! works in both.
 
-use config::{CommitReport, Datastore, MAX_DOCUMENT_BYTES};
+use config::{
+    CommitReport, Datastore, MAX_DOCUMENT_BYTES, ProvisionalReport, StageReport,
+    commit_provisionally_and_report, confirm_and_report, revert_and_report, stage_and_report,
+};
 use lfw_log::{Domain, DomainDetail, DomainState, Event, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
@@ -90,12 +124,28 @@ const CONSUMER: Channel = Channel::new(0);
 /// the other has spoken.
 const MANAGEMENT: Channel = Channel::new(1);
 
+// The cryptography domain, which carries the management channel's configuration
+// operations, has NO constant here and that is the whole statement: this end of
+// that channel holds no send capability, so there is no identifier for this
+// domain to notify it by.
+//
+// That is the signing delegation's shape and its reasoning, with the roles
+// exchanged: the asking domain reads for its answer in a bounded spin, because a
+// configuration operation happens inside a session's own pass and has no
+// continuation a notification could resume, and this domain sits above it in
+// priority so the spin ends on its first iteration. A reverse capability would be
+// a wakeup on the domain that terminates a management server's session, granted
+// to the domain that parses that server's documents, and consumed by nothing.
+
 #[protection_domain]
 fn init() -> ConfigDomain {
     let handover: &'static ConfigHandover = attach_region!(cfg_vaddr: ConfigHandover);
     let ack: &'static ConfigAck = attach_region!(cfgack_vaddr: ConfigAck);
     let request: &'static ConfigRequest = attach_region!(cfg_request_vaddr: ConfigRequest);
     let reply: &'static ConfigReply = attach_region!(cfg_reply_vaddr: ConfigReply);
+    let channel_request: &'static ConfigRequest =
+        attach_region!(chan_cfg_request_vaddr: ConfigRequest);
+    let channel_reply: &'static ConfigReply = attach_region!(chan_cfg_reply_vaddr: ConfigReply);
     let log: &'static LogRecords = attach_region!(log_records_vaddr: LogRecords);
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
@@ -137,6 +187,7 @@ fn init() -> ConfigDomain {
         handover,
         ack,
         responder: reply.responder(request),
+        channel: channel_reply.responder(channel_request),
         publisher,
         store,
         document: [0; MAX_DOCUMENT_BYTES],
@@ -168,12 +219,17 @@ const fn submission_of(report: CommitReport) -> SubmissionCounters {
         applied: 0,
         refused: 0,
         unchanged: 0,
+        staged: 0,
+        confirmed: 0,
+        reverted: 0,
         reads: 0,
     };
     match report {
         CommitReport::Published { .. } => counters.applied = 1,
         CommitReport::Unchanged => counters.unchanged = 1,
-        CommitReport::Rejected { .. } | CommitReport::Exhausted => counters.refused = 1,
+        CommitReport::Rejected { .. } | CommitReport::Exhausted | CommitReport::NoCandidate => {
+            counters.refused = 1;
+        }
     }
     counters
 }
@@ -183,10 +239,16 @@ const fn submission_of(report: CommitReport) -> SubmissionCounters {
 struct ConfigDomain {
     handover: &'static ConfigHandover,
     ack: &'static ConfigAck,
-    /// The answering end of the submission channel. Kept for the domain's life
-    /// because it holds this domain's position in that channel's sequence; a
-    /// second responder would answer a request the first has already served.
+    /// The answering end of the management domain's submission channel. Kept for
+    /// the domain's life because it holds this domain's position in that
+    /// channel's sequence; a second responder would answer a request the first
+    /// has already served.
     responder: ConfigResponder<'static>,
+    /// The answering end of the cryptography domain's, which carries the
+    /// management channel's operations. Its own responder for the same reason
+    /// there are two regions: a sequence is a channel's, and one responder over
+    /// two channels would answer each request under the other's number.
+    channel: ConfigResponder<'static>,
     publisher: ConfigPublisher,
     /// The running configuration and the candidate a submission becomes.
     store: Datastore,
@@ -231,12 +293,221 @@ impl ConfigDomain {
         match demand.operation() {
             Some(ConfigOperation::Submit) => self.submit(demand),
             Some(ConfigOperation::Read) => self.state_running(demand),
+            // The four steps of the management channel's own transaction, asked
+            // for on the port that carries a single-step submission. Answered as
+            // no operation rather than served: this port's requester answers a
+            // client holding a TCP connection open and has nowhere to keep a
+            // candidate between two requests, so serving a step here would leave
+            // an appliance provisionally committed with nothing that can confirm
+            // it.
+            Some(
+                ConfigOperation::Stage
+                | ConfigOperation::Commit
+                | ConfigOperation::Confirm
+                | ConfigOperation::Rollback,
+            )
             // The word named no operation. Answered rather than ignored: a
             // requester left waiting cannot tell a refusal from a hang.
-            None => {
+            | None => {
                 self.responder.answer(demand, ConfigAnswer::NoSuchOperation);
                 MANAGEMENT.notify();
             }
+        }
+    }
+
+    /// Answer whatever the cryptography domain has asked on the management
+    /// channel's behalf.
+    ///
+    /// One demand per wakeup, on [`Self::serve`]'s terms, and no notification
+    /// afterwards: this domain holds no send capability on that one, which reads
+    /// for its answer in a bounded spin.
+    fn serve_channel(&mut self) {
+        let Some(demand) = self.channel.take() else {
+            return;
+        };
+        match demand.operation() {
+            Some(ConfigOperation::Stage) => self.stage(demand),
+            Some(ConfigOperation::Commit) => self.commit(demand),
+            Some(ConfigOperation::Confirm) => self.confirm(demand),
+            Some(ConfigOperation::Rollback) => self.revert(demand),
+            // A one-step submission or a document read over the channel's port.
+            // Refused rather than served, and for a sharper reason than the
+            // mirror above: a step-free commit over a channel would skip exactly
+            // the confirmation the protocol exists to require, and a document
+            // read has a frame of its own that this port is not.
+            Some(ConfigOperation::Submit | ConfigOperation::Read) | None => {
+                self.channel.answer(demand, ConfigAnswer::NoSuchOperation);
+            }
+        }
+    }
+
+    /// Hold the submitted document as the candidate and validate it, committing
+    /// nothing.
+    ///
+    /// The bytes are copied out of the region first, on [`Self::submit`]'s terms.
+    fn stage(&mut self, demand: ConfigDemand) {
+        let Self {
+            channel, document, ..
+        } = self;
+        let taken = channel.document(&demand, document);
+        let answer = match stage_and_report(&mut self.store, taken, &self.sink) {
+            StageReport::Staged { generation } => {
+                self.submissions.staged = self.submissions.staged.saturating_add(1);
+                ConfigAnswer::Staged { generation }
+            }
+            StageReport::Rejected { reason, detail } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::Rejected {
+                    generation: self.store.running().to_bits(),
+                    // The discriminant is the wire encoding of the reason, as it
+                    // is in a log record: the vocabulary is appended to and never
+                    // reordered.
+                    reason: reason as u32,
+                    detail,
+                }
+            }
+        };
+        self.channel.answer(demand, answer);
+    }
+
+    /// Commit the candidate provisionally, held to the generation the request
+    /// names.
+    ///
+    /// The generation is checked **before** anything is committed, and that check
+    /// is the whole of what keeps two requesters from committing each other's
+    /// work: a server naming a generation that is not the one a commit would
+    /// assign has staged against a store that has moved under it, and applying
+    /// whatever happens to be staged would be committing a document it never saw.
+    fn commit(&mut self, demand: ConfigDemand) {
+        let running = self.store.running().to_bits();
+        let Some(next) = self.store.next_generation() else {
+            self.submissions.refused = self.submissions.refused.saturating_add(1);
+            self.channel.answer(
+                demand,
+                ConfigAnswer::Exhausted {
+                    generation: running,
+                },
+            );
+            return;
+        };
+        if next.to_bits() != demand.generation() {
+            self.submissions.refused = self.submissions.refused.saturating_add(1);
+            self.channel.answer(
+                demand,
+                ConfigAnswer::GenerationMismatch {
+                    generation: next.to_bits(),
+                },
+            );
+            return;
+        }
+        let answer = match commit_provisionally_and_report(&mut self.store, &self.sink) {
+            CommitReport::Published { image, changes } => {
+                self.submissions.applied = self.submissions.applied.saturating_add(1);
+                self.generation = image.generation;
+                self.offer(&image);
+                ConfigAnswer::Applied {
+                    generation: image.generation,
+                    changes,
+                }
+            }
+            CommitReport::Unchanged => {
+                self.submissions.unchanged = self.submissions.unchanged.saturating_add(1);
+                ConfigAnswer::Unchanged {
+                    generation: self.store.running().to_bits(),
+                }
+            }
+            CommitReport::NoCandidate => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::NoCandidate {
+                    generation: self.store.running().to_bits(),
+                }
+            }
+            CommitReport::Rejected { reason, detail } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::Rejected {
+                    generation: self.store.running().to_bits(),
+                    reason: reason as u32,
+                    detail,
+                }
+            }
+            CommitReport::Exhausted => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::Exhausted {
+                    generation: self.store.running().to_bits(),
+                }
+            }
+        };
+        self.channel.answer(demand, answer);
+    }
+
+    /// Keep the provisional commit the request names.
+    fn confirm(&mut self, demand: ConfigDemand) {
+        let answer = match confirm_and_report(&mut self.store, demand.generation(), &self.sink) {
+            ProvisionalReport::Confirmed { generation } => {
+                self.submissions.confirmed = self.submissions.confirmed.saturating_add(1);
+                ConfigAnswer::Confirmed { generation }
+            }
+            ProvisionalReport::NotProvisional { generation } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::NotProvisional { generation }
+            }
+            ProvisionalReport::GenerationMismatch { provisional } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::GenerationMismatch {
+                    generation: provisional,
+                }
+            }
+            // A confirmation cannot revert anything, `confirm_and_report` having
+            // no path to it. Answered rather than asserted, on every other
+            // unreachable branch here's terms.
+            ProvisionalReport::Reverted { generation, .. } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::NotProvisional { generation }
+            }
+        };
+        self.channel.answer(demand, answer);
+    }
+
+    /// Put back whatever the provisional commit displaced.
+    fn revert(&mut self, demand: ConfigDemand) {
+        let answer = match revert_and_report(&mut self.store, &self.sink) {
+            ProvisionalReport::Reverted {
+                image, generation, ..
+            } => {
+                self.submissions.reverted = self.submissions.reverted.saturating_add(1);
+                self.generation = image.generation;
+                self.offer(&image);
+                ConfigAnswer::RolledBack { generation }
+            }
+            ProvisionalReport::NotProvisional { generation } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::NotProvisional { generation }
+            }
+            // Neither is reachable from a revert: `revert_and_report` names no
+            // generation to match and confirms nothing. Answered rather than
+            // asserted.
+            ProvisionalReport::Confirmed { generation }
+            | ProvisionalReport::GenerationMismatch {
+                provisional: generation,
+            } => {
+                self.submissions.refused = self.submissions.refused.saturating_add(1);
+                ConfigAnswer::NotProvisional { generation }
+            }
+        };
+        self.channel.answer(demand, answer);
+    }
+
+    /// Hand `image` to the forwarding domain and wake it.
+    ///
+    /// A stale offer is unreachable — the generation a commit or a revert assigns
+    /// is strictly newer than any this publisher has offered — and is reported
+    /// rather than dropped, a generation nobody was offered being one nobody
+    /// runs.
+    fn offer(&mut self, image: &wire::ConfigImage) {
+        if self.publisher.offer(self.handover, image).is_ok() {
+            CONSUMER.notify();
+        } else {
+            announce(&self.sink, DomainState::Refused);
         }
     }
 
@@ -265,11 +536,7 @@ impl ConfigDomain {
                 // assigned is strictly newer than any this publisher has offered —
                 // and is reported rather than dropped, a generation nobody was
                 // offered being one nobody runs.
-                if self.publisher.offer(self.handover, &image).is_ok() {
-                    CONSUMER.notify();
-                } else {
-                    announce(&self.sink, DomainState::Refused);
-                }
+                self.offer(&image);
                 self.responder.answer(
                     demand,
                     ConfigAnswer::Applied {
@@ -301,7 +568,12 @@ impl ConfigDomain {
                     },
                 );
             }
-            CommitReport::Exhausted => {
+            // The one-step path stages the document it is given, so it reaches
+            // neither: a commit here always has a candidate, and a counter with
+            // no successor is refused before the document is read. Answered as
+            // the exhaustion they amount to rather than asserted, for the reason
+            // every other unreachable branch in this domain is.
+            CommitReport::Exhausted | CommitReport::NoCandidate => {
                 self.submissions.refused = self.submissions.refused.saturating_add(1);
                 self.responder.answer(
                     demand,
@@ -344,9 +616,10 @@ impl ConfigDomain {
 impl Handler for ConfigDomain {
     type Error = Infallible;
 
-    /// Either neighbour has said something. Microkit coalesces notifications and a
-    /// wakeup names no generation, so both questions are asked of the regions
-    /// rather than of the wakeup.
+    /// A neighbour has said something. Microkit coalesces notifications and a
+    /// wakeup names no generation, so every question is asked of the regions
+    /// rather than of the wakeup — the two submission ports included, so a
+    /// wakeup from one is not a reason to leave the other's request standing.
     ///
     /// The acknowledgement first: releasing a generation the consumer has staged
     /// is what a commit already in flight is waiting on, and a submission that
@@ -360,6 +633,7 @@ impl Handler for ConfigDomain {
             CONSUMER.notify();
         }
         self.serve();
+        self.serve_channel();
         self.publish();
         Ok(())
     }

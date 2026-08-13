@@ -782,7 +782,7 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
 `nic-driver` domain raises, 30 the `clock` domain raises, 25 the `management` domain raises, 46
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 160 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 169 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -1024,6 +1024,7 @@ of a vector's contents.
 | the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
 | a shipment of ring bytes this end would not compose into a frame (none carries a `detail=`) | `channel-shipment-too-long`, `channel-shipment-before-greeting`, `channel-shipment-not-taken` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
+| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
 server's.** `channel-identity-absent` is a node whose store published somewhere to dial and whose
@@ -1043,6 +1044,26 @@ on its way out than this design allows, so a whole frame would not fit behind wh
 ends the session rather than dropping the shipment, and the reason is that the cursor moves on the
 answer: a shipment dropped quietly would be a gap in the recording the management server has no way
 to notice. A re-dial ships the same bytes again.
+
+**The nine `channel-config-*` tokens are how a configuration operation the server pushed failed, and
+they are the only place the failure is visible on this node.** What *happened* to a configuration is
+the deciding domain's own `LFW-CFG` record — `outcome=staged`, `outcome=applied`, `outcome=confirmed`,
+`outcome=reverted` — carrying the generation, under `domain=config`; these say that the exchange
+about it did not complete, and each names a different party. Four are the server's mistake:
+`channel-config-generation-mismatch` is a commit or a confirmation naming a generation this
+appliance would not act on, and the generation it *would* is on the `domain=config` record beside it;
+`channel-config-no-candidate` is a commit with nothing staged; `channel-config-not-provisional` is a
+confirmation of a commit nobody made, or of one already settled; and
+`channel-config-generation-too-wide` is a generation past the width a configuration generation has,
+refused rather than narrowed because a truncated number names a different commit.
+`channel-config-confirm-not-fresh` is the fresh-connection rule: a confirmation arriving on the very
+session that made the commit proves nothing about a configuration that breaks *new* connections, so
+it is refused and the deadline still runs. `channel-config-generations-exhausted` is this appliance
+out of generations, which no resubmission helps. And the remaining two are this appliance's own
+halves disagreeing: `channel-config-unanswered` is the deciding domain not answering inside the
+budget — a wedged or faulted domain, whose own records are what to read next — and
+`channel-config-faulted` is it answering something the request cannot be answered with, which should
+never appear.
 
 **The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
 rule of the channel's own protocol that the far end broke, and the context the code has for each —

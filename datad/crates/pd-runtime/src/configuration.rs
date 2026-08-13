@@ -303,6 +303,16 @@ impl<'chan> Configurations<'chan> {
                 let _: ConfigFault = fault;
                 stage.refuse(Status::ServiceUnavailable);
             }
+            // The six answers to the four operations this half never issues,
+            // unreachable rather than unexpected: `ConfigStatus::answers` refuses
+            // each against a submission or a read before it becomes a poll.
+            // Answered rather than asserted, on the two above's terms.
+            ConfigPoll::Staged { .. }
+            | ConfigPoll::Confirmed { .. }
+            | ConfigPoll::RolledBack { .. }
+            | ConfigPoll::NoCandidate { .. }
+            | ConfigPoll::NotProvisional { .. }
+            | ConfigPoll::GenerationMismatch { .. } => stage.refuse(Status::ServiceUnavailable),
         }
     }
 
@@ -346,16 +356,23 @@ fn expired(now: Option<Monotonic>, deadline: Option<Monotonic>) -> bool {
     }
 }
 
-/// The three things a submission can have become, in the console's own words.
+/// What a configuration operation became, in the console's own words.
 ///
-/// The tokens are `lfw_log::GenerationOutcome`'s, so a line an operator reads on
-/// the console and the line they read out of `curl` say the same thing about the
-/// same event.
+/// The tokens are `lfw_log::GenerationOutcome`'s, so the console line, the line
+/// out of `curl` and the line the management channel carries all say the same
+/// thing about the same event — a second spelling of `unchanged` here is how the
+/// three would come to disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Outcome {
+pub enum Outcome {
     Applied,
     Refused,
     Unchanged,
+    /// The document is the candidate and nothing is committed.
+    Staged,
+    /// A provisional commit was made permanent.
+    Confirmed,
+    /// A provisional commit was undone and what it displaced is running again.
+    Reverted,
 }
 
 impl Outcome {
@@ -364,8 +381,53 @@ impl Outcome {
             Self::Applied => lfw_log::GenerationOutcome::Applied.name(),
             Self::Refused => lfw_log::GenerationOutcome::Refused.name(),
             Self::Unchanged => lfw_log::GenerationOutcome::Unchanged.name(),
+            Self::Staged => lfw_log::GenerationOutcome::Staged.name(),
+            Self::Confirmed => lfw_log::GenerationOutcome::Confirmed.name(),
+            Self::Reverted => lfw_log::GenerationOutcome::Reverted.name(),
         }
     }
+}
+
+/// The reject reason a peer-written word names, for a caller outside this module
+/// that has to render one. Re-exported rather than reimplemented: what an
+/// undecodable value is substituted with is a decision, and it has one copy.
+#[must_use]
+pub fn reject_reason_of(bits: u32) -> RejectReason {
+    reason_of(bits)
+}
+
+/// Compose the one line a configuration operation is reported with, **without a
+/// line ending**, answering its length.
+///
+/// The management channel's result frame is exactly one line and the frame is
+/// what delimits it, so a newline in the payload is a byte the far end refuses.
+/// [`write_answer`] is this walk plus that ending, which is what keeps the HTTP
+/// answer and the channel's result the same grammar rather than two.
+pub fn write_result_line(
+    out: &mut [u8; MAX_ANSWER_LEN],
+    generation: u32,
+    outcome: Outcome,
+    changes: u32,
+    rejection: Option<(RejectReason, u32)>,
+) -> usize {
+    let mut at = 0usize;
+    put(out, &mut at, b"generation=");
+    number(out, &mut at, generation);
+    put(out, &mut at, b" outcome=");
+    put(out, &mut at, outcome.token().as_bytes());
+    match rejection {
+        Some((reason, detail)) => {
+            put(out, &mut at, b" rejected=");
+            put(out, &mut at, reason.name().as_bytes());
+            put(out, &mut at, b" offset=");
+            number(out, &mut at, detail);
+        }
+        None => {
+            put(out, &mut at, b" changes=");
+            number(out, &mut at, changes);
+        }
+    }
+    at
 }
 
 /// The reject reason a word out of the reply region names.
@@ -397,23 +459,7 @@ fn write_answer(
     changes: u32,
     rejection: Option<(RejectReason, u32)>,
 ) -> usize {
-    let mut at = 0usize;
-    put(out, &mut at, b"generation=");
-    number(out, &mut at, generation);
-    put(out, &mut at, b" outcome=");
-    put(out, &mut at, outcome.token().as_bytes());
-    match rejection {
-        Some((reason, detail)) => {
-            put(out, &mut at, b" rejected=");
-            put(out, &mut at, reason.name().as_bytes());
-            put(out, &mut at, b" offset=");
-            number(out, &mut at, detail);
-        }
-        None => {
-            put(out, &mut at, b" changes=");
-            number(out, &mut at, changes);
-        }
-    }
+    let mut at = write_result_line(out, generation, outcome, changes, rejection);
     put(out, &mut at, b"\n");
     at
 }

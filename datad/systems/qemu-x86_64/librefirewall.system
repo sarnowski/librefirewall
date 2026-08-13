@@ -446,6 +446,53 @@
     <memory_region name="cfg_request" size="0x11000" />
     <memory_region name="cfg_reply" size="0x11000" />
 
+    <!-- THE MANAGEMENT CHANNEL'S OWN SUBMISSION CHANNEL: the same ABI, a second
+         instance, between the domain that terminates the channel and the domain
+         that decides about a document.
+
+         WHY A SECOND PAIR AND NOT THE ONE ABOVE. A submission channel admits ONE
+         requester — its sequence number is the whole correlation, and a second
+         writer would answer under numbers the first has outstanding — so two
+         requesting domains are two channels by construction rather than by
+         preference. And the two requesters are two domains at different points in
+         the trust order: the domain that owns the management PORT is not the
+         domain that terminates the management CHANNEL, and a region pair either
+         could write would let each answer for the other. The CONFIG domain maps
+         `chan_cfg_request` READ-ONLY and `chan_cfg_reply` READ-WRITE; the CRYPTO
+         domain maps them the other way round, exactly as MANAGEMENT holds the pair
+         above.
+
+         WHAT THE CRYPTO DOMAIN GAINS, STATED PLAINLY: the ability to submit a
+         configuration document and to ask that a commit be made, confirmed or put
+         back. That is the authority a management plane has by definition, and this
+         is the domain a management server's session terminates in — so it is the
+         one place in this system where that authority can arrive at all. What it
+         does NOT gain is any part of deciding: the reply region is the config
+         domain's to write, so this domain cannot tell itself that a document was
+         accepted, and it maps no part of `cfg`, the handover region the forwarding
+         domain actually reads.
+
+         AND WHAT THE CONFIG DOMAIN GAINS: nothing but a second question to answer.
+         It maps one more region read-only and one more read-write, holds no new
+         device, no pool, no ring and no network region, and its whole reach is
+         still the handover it publishes and the two channels it answers.
+
+         WHY THE DOCUMENT DOES NOT TRAVEL THE RELAY. The cryptography domain
+         already speaks to the management domain over `relay_request`/`relay_reply`,
+         and routing a staged document through them was considered and rejected:
+         one relay item carries `wire::MAX_RELAY_PAYLOAD` and a document is four
+         times that, so a document would have to be split across items and
+         reassembled — which is a second framing layer, inside the domain that
+         holds two frame pipelines, over bytes a management server chose. A region
+         pair the deciding domain reads directly costs one more mapping in each of
+         two domains and adds no parser anywhere.
+
+         Sizes and placement are `cfg_request`'s: seventeen pages each, at
+         0x3_300_000 and 0x3_400_000, clear of that pair's windows so neither can
+         grow into the other. Neither carries phys_addr, for the same reason. -->
+    <memory_region name="chan_cfg_request" size="0x11000" />
+    <memory_region name="chan_cfg_reply" size="0x11000" />
+
     <!-- THE CONNECTION TABLE, and by two orders of magnitude the largest region
          in this system: 68 MiB and one page, `pd_runtime::FLOW_TABLE_REGION_SIZE`
          — a million entries of one cache line each, plus a bucket head per
@@ -1369,6 +1416,8 @@
         <map mr="cfgack" vaddr="0x3_008_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
         <map mr="cfg_request" vaddr="0x3_100_000" perms="r" cached="true" setvar_vaddr="cfg_request_vaddr" />
         <map mr="cfg_reply" vaddr="0x3_200_000" perms="rw" cached="true" setvar_vaddr="cfg_reply_vaddr" />
+        <map mr="chan_cfg_request" vaddr="0x3_300_000" perms="r" cached="true" setvar_vaddr="chan_cfg_request_vaddr" />
+        <map mr="chan_cfg_reply" vaddr="0x3_400_000" perms="rw" cached="true" setvar_vaddr="chan_cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
@@ -2096,6 +2145,8 @@
         <map mr="relay_reply" vaddr="0x7_300_000" perms="rw" cached="true" setvar_vaddr="relay_reply_vaddr" />
         <map mr="install_staging" vaddr="0x7_400_000" perms="rw" cached="true" setvar_vaddr="install_staging_vaddr" />
         <map mr="endpoint" vaddr="0x3_00b_000" perms="r" cached="true" setvar_vaddr="endpoint_vaddr" />
+        <map mr="chan_cfg_request" vaddr="0x3_300_000" perms="rw" cached="true" setvar_vaddr="chan_cfg_request_vaddr" />
+        <map mr="chan_cfg_reply" vaddr="0x3_400_000" perms="r" cached="true" setvar_vaddr="chan_cfg_reply_vaddr" />
     </protection_domain>
 
     <!-- The store domain: the one holder of the appliance's own identity, and
@@ -2590,6 +2641,52 @@
     <channel>
         <end pd="management" id="3" notify="true" />
         <end pd="crypto" id="1" notify="true" />
+    </channel>
+
+    <!-- THE CONFIGURATION DELEGATION, one-directional: the domain that terminates
+         the management channel wakes the domain that decides about a document.
+
+         WHY IT EXISTS. A configuration operation the management server pushed
+         arrives in the cryptography domain, and the deciding domain blocks in the
+         Microkit event loop — which is what makes it free at the highest priority
+         in this system — so a request written into `chan_cfg_request` is invisible
+         to it until something says so. This row is that something.
+
+         THE REVERSE DIRECTION IS REFUSED, and `notify="false"` on the config end
+         is what refuses it. It is the key holder's channel over again, with the
+         roles exchanged: the asking domain reads for its answer in a BOUNDED SPIN,
+         because a configuration operation happens inside a TLS session's own pass
+         and has no continuation a notification could resume — so an answering
+         signal would arrive after the only moment it could have been used. What a
+         reverse capability WOULD be is a wakeup on the domain that holds a
+         management server's session, granted to the domain that parses that
+         server's documents, consumed by nothing.
+
+         AND THAT IS WHY THE CONFIG DOMAIN SITS AT PRIORITY 3 AND THE CRYPTO DOMAIN
+         AT 2. A responder BELOW its requester cannot answer a spin: the asker would
+         not yield until its budget gave up, and the delegation would refuse on
+         every operation, deterministically. Above it, the notification preempts
+         into the decider immediately, it decides and publishes, and the asker's
+         next read finds the answer — the spin terminating on its first iteration
+         in practice, with its budget there for the byzantine case. Both domains
+         already sat at those priorities for the management port's own reasons, so
+         this row adds no priority change.
+
+         WHAT THE SEND CAPABILITY IS WORTH TO WHOEVER TAKES THE CRYPTOGRAPHY
+         DOMAIN: a wakeup on a domain that holds no device, no pool and no
+         dataplane ring, plus the submission of a document that domain will judge
+         against every rule it judges an administrator's by. It buys no frame, no
+         medium and no key.
+
+         BOUNDED IN BOTH DIRECTIONS. One request is in flight at a time — the ABI's
+         window is one — the decider answers at most one demand per wakeup, and the
+         asking domain carries out AT MOST ONE configuration operation per pass,
+         leaving any further frames in its decoder for the next one. So a server
+         that fills a delivery with staged documents costs a constant per pass and
+         never an unbounded run at a priority above the dataplane. -->
+    <channel>
+        <end pd="crypto" id="2" notify="true" />
+        <end pd="config" id="2" notify="false" />
     </channel>
 
     <!-- THE PERIODIC WAKEUP, one-directional, and the only channel in this file

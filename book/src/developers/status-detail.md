@@ -1113,6 +1113,26 @@ state every configuration it accepts, which is a semantic rule: a document whose
 outgrow the document bound is refused with `rendering-too-large` rather than committed, because a
 policy an operator can read and cannot resubmit is one they cannot edit.
 
+**A configuration also travels the management channel now, as the four steps that protocol takes
+apart.** The domain that terminates the channel decodes a pushed document, hands it to the domain that
+owns the datastore over a submission channel of its own — the management port's ABI, a second
+instance, because a submission channel admits one requester and the two requesting domains sit at
+different points in the trust order — and answers with `UP_CONFIG_VALIDATE_RESULT`: one line of the
+configuration records' own field vocabulary, composed by the very function that composes the `POST`
+answer, so the console, `curl` and the channel cannot come to say three different things about one
+event. A commit names the generation the staging reported and is refused where the two disagree,
+which is what keeps two requesters from committing each other's work: the number is asked of the
+store rather than remembered in the asking domain. The commit is **provisional** — what it displaced
+is kept — and the session ends on it, which is the fresh-connection rule made structural. The
+deadline lives with the domain that holds the sessions and not with the datastore, because "no
+confirmation over a connection opened after the commit" is a fact about connections and the deciding
+domain has none; that domain holds the store and the two operations over it, and needs no clock and no
+wakeup for either. Every way an operation can fail has a console token of its own — nine of them,
+telling a server that named the wrong generation apart from one confirming a commit nobody made, from
+a confirmation on the committing session, from a deciding domain that stopped answering — and what
+*happened* to a configuration stays the deciding domain's own `LFW-CFG` record, under
+`outcome=staged`, `outcome=confirmed` or `outcome=reverted` beside the generation.
+
 **Held by** the host tests in `datad/crates/config` (the renderer round-trips the shipped document and both
 sides of the statable bound), `datad/crates/http` (the body framing: one `Content-Length`, decimal, `POST`
 only, no `Transfer-Encoding`, refused past the caller's bound), `datad/crates/ip-endpoint` (a body split
@@ -1182,22 +1202,35 @@ claims.
   this by erasing the surface: configuration travels the authenticated channel, and nothing listens
   on an onboarded appliance. Until that exists this is the largest gap in this document, and the
   port must not be exposed to an untrusted network.
-- **No rollback.** The [configuration design](../design/configuration.md)'s return to an earlier
-  version does not exist. The datastore holds the running configuration and at most one candidate, so
-  there is no version history to roll back *to*, and with no persistence there is none worth holding:
-  a generation cannot outlive a reboot. What is implemented of the design's versioning is monotonic
-  generations and the content comparison beside them that makes re-committing what is already running
-  an `unchanged` outcome rather than a new version.
-- **No commit-confirm, and now it is a real gap rather than an unreachable one.** The
-  candidate/commit half of the [configuration design](../design/configuration.md)'s transaction model
-  exists; the confirm half does not. What was missing until now was the mechanism: an automatic
-  revert needs a deadline, and the configuration domain holds no timer and no interrupt. The clock
-  domain's periodic wakeup is that mechanism, and it currently reaches only the management domain —
-  giving the confirm half a way to be built rather than building it. What has changed besides is the
-  stakes. Until a document could be submitted there
-  was no management channel to sever, so commit-confirm protected nothing; now a document that
-  validates and moves the management address is a document that locks an operator out of the node it
-  was committed on, with nothing to undo it.
+- **Rollback reaches one version back and no further.** The datastore now keeps what a provisional
+  commit displaced, so the change a commit-confirm cycle failed to confirm is undone — but that is one
+  step, not the [configuration design](../design/configuration.md)'s return to an *earlier version*.
+  There is still no version history: the store medium's fixed configuration slot array is written by
+  nothing, so no version outlives a reboot and nothing can be rolled back *to* except the
+  configuration that was running a moment ago. What is implemented of the design's versioning is
+  monotonic generations, the content comparison beside them that makes re-committing what is already
+  running an `unchanged` outcome, and this one-step reversal.
+- **Commit-confirm exists over the management channel and nowhere else.** A commit the channel makes
+  is provisional; the appliance ends the session; a confirmation on a session opened afterwards makes
+  it permanent; and a deadline the appliance arms from its own clock reverts it where none arrives. The
+  fresh-connection rule is enforced by construction rather than hoped for — the commit closes the
+  session, and a confirmation that somehow arrives on the committing session is refused under
+  `channel-config-confirm-not-fresh`, the session serial being a number this appliance assigns. The
+  deadline the server asks for is clamped between five seconds and ten minutes, so neither a commit
+  that could never be confirmed nor an indefinite hold is expressible from the wire, and a reversal
+  consumes the commit it undoes, so an unreachable server costs one reversal rather than a loop.
+  **What has no commit-confirm is `POST /config`**, and deliberately: that path answers a client on a
+  TCP connection and has nowhere to keep a decision open, so a commit there is final the instant it
+  happens. The consequence to keep straight is that the surface with no authentication is also the one
+  with no safety net, which is one more reason the next phase erases it.
+- **No boot proves the sequence.** What is held is host-level — the datastore's provisional commit,
+  confirmation and reversal, the report layer's records, and the widened submission ABI in both
+  directions — plus the boot every scenario still takes with the new region pair and the new
+  notification channel in place. A scenario that stages a document over the channel from the harness's
+  management server, reads the validation result, commits, reconnects and confirms, and a second that
+  lets the deadline pass, do not exist: `openssl s_server` sends what it reads on standard input, and
+  driving a multi-step exchange across a reconnect needs the harness to write into that pipe on what
+  it sees in the transcript rather than once before the boot.
 - **A submission is answered when it is committed, not when the dataplane has switched.** The
   configuration domain holds no timer, so it cannot bound a wait on the forwarding domain's
   acknowledgement — and a refusal by that domain is the *absence* of one, so waiting would hang a
@@ -3758,7 +3791,7 @@ naming the generation and segment the medium held, a superblock that came out at
 and a later segment than it went in at, and the previous boot's durable bytes still byte for byte
 where it left them. Five scenarios share a store medium across boots, in two groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes, **one session at a time**: the next client is not opened until the appliance has accounted for the session before it, because every frame that port takes draws a console record and a domain's log ring holds a bounded number of them, so four sessions opened back to back would crowd out the very accounts the boot is judged on. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **4 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued. That boot attaches a recorder medium **two earlier boots wrote**, because a fresh one never reaches the state a deployed appliance is in: a resumed recording begins at the segment its boot opened, a channel cursor begins at zero, and what the appliance does about that disagreement is the whole of whether it ships at all after a restart. It must resynchronise both recordings off position zero and say so, drain both, and then — on a burst injected on the strength of the console saying it had drained them, so that what follows did not exist when it said so — ship past that drain, with the server receiving more than one upstream frame at strictly advancing positions and the first from where that recording begins on the medium. The other three are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. Each of those four boots **ends on the record it owes** rather than beside it: the domain that terminates a session writes its outcome on the pass that decided the session, which is later than the traffic, the scrape and the recordings the same boot also waits for, so a run that stopped on those alone would kill the guest with the channel's own record still unwritten and read an appliance that was about to speak as one that never did. The wait asks only whether the record has appeared, never how often the appliance re-dialled — that is the appliance's own decision — and it is bounded by the same total budget every boot takes, so an appliance that genuinely never reports fails on that budget rather than hanging the gate. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock and the recording pass added with this work. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 32 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock, the recording pass, and the management channel's stepped configuration transaction — whose input is the *order* of the operations a compromised server chooses rather than a document, that order being where the interesting sequences are. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 33 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |

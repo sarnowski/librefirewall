@@ -59,7 +59,7 @@ in the *next* one.
 ## Metric inventory
 
 128 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 471 counter and gauge series from the 12 shards,
+domains publishing that family. A scrape is 474 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
 declares, and the document they render into is bounded at 102 941 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
@@ -480,7 +480,7 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 | `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
 | `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. **Only the forwarder carries `applied`**: the management port's endpoint reads a committed image for its own address and never applies one, so it reports `refused` alone. |
 | `librefirewall_configuration_reads_total` | counter | `config` | — | Times the running configuration document was read out of this node. |
-| `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`) | Documents submitted to this node over the management API, by what the configuration domain decided: `applied` moved the generation, `unchanged` was the configuration already running, `refused` broke a rule and changed nothing. |
+| `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`, `staged`, `confirmed`, `reverted`) | Configuration operations this node decided, by outcome. Three come from either path: `applied` moved the generation, `unchanged` was the configuration already running, and `refused` broke a rule — or, for an operation rather than a document, could not be carried out. Three come only from the management channel, which takes a commit apart into steps: `staged` held a document as the candidate without committing it, `confirmed` made a provisional commit permanent, and `reverted` put back what one displaced because no confirmation arrived over a fresh connection. |
 
 ### The hardware probe
 

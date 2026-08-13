@@ -607,14 +607,14 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     // to a generation that applied.
     let config = ConfigSample {
         generation: 7,
-        submissions: [11, 13, 17],
+        submissions: [11, 13, 17, 31, 37, 41],
         reads: 19,
         log: LogSample {
             dropped: 23,
             refused: 29,
         },
     };
-    assert_eq!(config.values(), [7, 11, 13, 17, 19, 23, 29]);
+    assert_eq!(config.values(), [7, 11, 13, 17, 31, 37, 41, 19, 23, 29]);
     assert_eq!(config.values().len(), CONFIG_SLOTS);
 
     // The store domain's, which is the only shard carrying four independent
@@ -1181,7 +1181,7 @@ proptest! {
 /// attacker, and that is a number to re-state deliberately rather than to inherit.
 #[test]
 fn the_declared_bound_is_the_number_the_staging_buffer_is_sized_by() {
-    assert_eq!(MAX_EXPOSITION_LEN, 102_941);
+    assert_eq!(MAX_EXPOSITION_LEN, 103_249);
 }
 
 /// A sample's fields land on the series that declare them, positionally.

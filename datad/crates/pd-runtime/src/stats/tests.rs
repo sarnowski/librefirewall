@@ -313,6 +313,9 @@ fn the_submission_counters_land_under_the_outcomes_they_name() {
             applied: 11,
             refused: 13,
             unchanged: 17,
+            staged: 23,
+            confirmed: 29,
+            reverted: 31,
             reads: 19,
         },
         log_sample(0, 0),
@@ -324,7 +327,17 @@ fn the_submission_counters_land_under_the_outcomes_they_name() {
         .copied()
         .zip(sample.submissions)
         .collect();
-    assert_eq!(named, [("applied", 11), ("refused", 13), ("unchanged", 17)]);
+    assert_eq!(
+        named,
+        [
+            ("applied", 11),
+            ("refused", 13),
+            ("unchanged", 17),
+            ("staged", 23),
+            ("confirmed", 29),
+            ("reverted", 31),
+        ]
+    );
     // And the console's own vocabulary is that list, in that order: an operator
     // reading `outcome=refused` on a serial line and graphing the refused series
     // must be reading one thing.

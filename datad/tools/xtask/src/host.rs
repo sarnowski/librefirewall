@@ -202,6 +202,7 @@ const FUZZ_TARGETS: &[&str] = &[
     "transcript_block",
     "config_document",
     "config_submission",
+    "config_transaction",
     "spsc_ring_peer",
     "log_ring",
     "virtqueue_poll",
