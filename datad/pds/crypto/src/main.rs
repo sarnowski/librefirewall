@@ -122,6 +122,7 @@ use alloc::sync::Arc;
 
 mod arena;
 mod channel;
+mod configuration;
 mod delegate;
 mod upload;
 
@@ -149,12 +150,13 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    ClockCalibration, DownloadSink, InstallStaging, LogConsume, LogRecords, ManagementEndpoint,
-    RelayRefusal, RelayReply, RelayRequest, SignReply, SignRequest,
+    ClockCalibration, ConfigReply, ConfigRequest, DownloadSink, InstallStaging, LogConsume,
+    LogRecords, ManagementEndpoint, RelayRefusal, RelayReply, RelayRequest, SignReply, SignRequest,
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
 use channel::{CHANNEL_RECORDS, ChannelIdentity, ManagementChannel, Shipment};
+use configuration::ChannelConfig;
 
 use delegate::{Delegated, DelegationError, HeldAnchor, HeldCertificate, HeldKey};
 use upload::PackageUpload;
@@ -319,6 +321,15 @@ const KEY_HOLDER: Channel = Channel::new(0);
 /// holds; it is worth no key, the relay's ABI having no field for one.
 const MANAGEMENT: Channel = Channel::new(1);
 
+/// The domain that owns the configuration datastore, which decides what a document
+/// the management server pushed is worth.
+///
+/// **Send only, and it is the key holder's channel over again**: the decider holds
+/// no send capability back, a configuration operation having no continuation a
+/// notification could resume, so its answer is read in a bounded spin — and it
+/// sits above this domain in priority to end that spin at once.
+const DECIDER: Channel = Channel::new(2);
+
 /// The bytes the direct proof signs.
 ///
 /// A fixed string and not a digest of anything: what is being proved is that a
@@ -449,6 +460,12 @@ fn init() -> Crypto {
     // cached across one, on the dialling domain's terms: an appliance adopted
     // while running takes its owner within a boot.
     let endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
+    // The configuration delegation's two regions, whose directions mirror the
+    // signing delegation's. This domain cannot write its own answer about a
+    // document — it cannot tell itself that a configuration was accepted.
+    let config_request: &'static ConfigRequest =
+        attach_region!(chan_cfg_request_vaddr: ConfigRequest);
+    let config_reply: &'static ConfigReply = attach_region!(chan_cfg_reply_vaddr: ConfigReply);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
     // One requester for the whole boot, and behind an `Arc` because the library's
@@ -487,9 +504,31 @@ fn init() -> Crypto {
         .try_into()
         .ok()
         .map(alloc::boxed::Box::leak);
+    // Where a configuration answer is copied to: one document's worth, allocated
+    // and leaked on the framing buffer's terms, because the ABI's poll takes a
+    // whole region-length array and 64 KiB on this stack is a fault one frame
+    // deeper. The `None` refuses every operation under its own token.
+    let config_answer: Option<&'static mut [u8; wire::MAX_DOCUMENT_BYTES]> =
+        alloc::vec![0_u8; wire::MAX_DOCUMENT_BYTES]
+            .into_boxed_slice()
+            .try_into()
+            .ok()
+            .map(alloc::boxed::Box::leak);
     let mark = arena.mark();
     let established = outcome.established.take();
-    let mut channel = ManagementChannel::new(arena, mark, held);
+    let mut channel = ManagementChannel::new(
+        arena,
+        mark,
+        held,
+        ChannelConfig::attach(
+            config_request,
+            config_reply,
+            DECIDER,
+            config_answer,
+            staging,
+            Arc::clone(&delegated),
+        ),
+    );
     if let Some(identity) = channel_identity(established.as_ref(), endpoint) {
         channel.adopted(identity);
     }

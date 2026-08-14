@@ -25,6 +25,7 @@ use crate::{
     hash::{ContentHash, content_hash},
     load,
     model::Model,
+    provisional::Displaced,
 };
 
 /// Which configuration, in the order they were committed.
@@ -52,7 +53,7 @@ impl Generation {
 
     /// Saturating, so the counter has no wrap to be pushed through: a successor
     /// equal to its own generation is no progress, and the commit is refused.
-    const fn next(self) -> Self {
+    pub(crate) const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
 }
@@ -132,10 +133,19 @@ impl CommitOutcome {
 /// already running; the model is what a diff is taken against.
 #[derive(Clone, Debug)]
 pub struct Datastore {
-    generation: Generation,
-    hash: ContentHash,
-    model: Model,
-    candidate: Option<Model>,
+    // Crate-visible rather than private, and only to the one module that carries
+    // the provisional-commit lifecycle: those operations are this store's own and
+    // sit in a module of their own because they are about time rather than about a
+    // document. Nothing outside the crate reaches a field.
+    pub(crate) generation: Generation,
+    pub(crate) hash: ContentHash,
+    pub(crate) model: Model,
+    pub(crate) candidate: Option<Model>,
+    /// What the outstanding provisional commit displaced, or `None` where no
+    /// commit is awaiting confirmation.
+    ///
+    /// At most one; the provisional module's header is why.
+    pub(crate) displaced: Option<Displaced>,
 }
 
 impl Datastore {
@@ -146,6 +156,7 @@ impl Datastore {
             hash: ContentHash::EMPTY,
             model: Model::EMPTY,
             candidate: None,
+            displaced: None,
         }
     }
 
@@ -190,17 +201,28 @@ impl Datastore {
     }
 
     /// Make the candidate the running configuration, handing every value that
-    /// moved to `records`.
-    ///
-    /// Nothing reaches `records` unless the commit happens: every way this can
-    /// refuse is decided before the diff is walked, so a record the caller sees
-    /// is a change the running configuration actually took.
+    /// moved to `records`. Nothing reaches `records` unless the commit happens.
     ///
     /// # Errors
     /// [`CommitError::NoCandidate`] with nothing staged, or
     /// [`CommitError::GenerationsExhausted`]; the candidate survives either,
     /// nothing having happened to it.
     pub fn commit(&mut self, records: &mut dyn Records) -> Result<CommitOutcome, CommitError> {
+        let outcome = self.apply(records, false)?;
+        // Final the instant it happens, so a previous provisional commit's
+        // displaced configuration is given up: an operator who commits over an
+        // unconfirmed change has decided.
+        self.displaced = None;
+        Ok(outcome)
+    }
+
+    /// The commit both public forms run, `provisional` deciding only whether what
+    /// it displaces is kept.
+    pub(crate) fn apply(
+        &mut self,
+        records: &mut dyn Records,
+        provisional: bool,
+    ) -> Result<CommitOutcome, CommitError> {
         let next = self.candidate.ok_or(CommitError::NoCandidate)?;
         let hash = content_hash(&next);
         // The digest is a fast path and never the decision: `Unchanged` assigns
@@ -220,6 +242,14 @@ impl Datastore {
         }
 
         let changes = diff(&self.model, &next, records);
+        if provisional {
+            self.displaced = Some(Displaced {
+                provisional: generation,
+                generation: self.generation,
+                hash: self.hash,
+                model: self.model,
+            });
+        }
         self.generation = generation;
         self.hash = hash;
         self.model = next;

@@ -1184,7 +1184,6 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
         self.responder.take()
     }
 
-    /// Whether a session is running here.
     #[must_use]
     pub const fn holds_a_session(&self) -> bool {
         self.session.is_some()

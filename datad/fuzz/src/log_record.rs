@@ -169,7 +169,8 @@ const DETAIL_RECORDING_RESUMED: u8 = 53;
 const DETAIL_RECORDING_FRESH: u8 = 54;
 const DETAIL_CHANNEL_SHIPPING: u8 = 55;
 const DETAIL_CHANNEL_ACKED: u8 = 56;
-const DETAIL_COUNT: u8 = 57;
+const DETAIL_CONFIGURED: u8 = 57;
+const DETAIL_COUNT: u8 = 58;
 
 /// How many ways a handshake on the management channel may end, and how many
 /// ways a delivered anchor may refuse the certificate a server presented.
@@ -668,7 +669,11 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 // reads its words out of that array and none of them reaches a
                 // word outside it.
                 | DETAIL_RECORDING_RESUMED
-                | DETAIL_RECORDING_FRESH => {
+                | DETAIL_RECORDING_FRESH
+                // And which configuration version is running, out of which slot,
+                // of what size and from where: four words out of that same array
+                // and none of them past it.
+                | DETAIL_CONFIGURED => {
                     kept.operands = record.operands;
                 }
                 DETAIL_REFUSAL => {
@@ -868,6 +873,24 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
             (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
                 value: record.operands[3],
             })
+        }
+        // The running configuration ranges two words and in this order: the slot
+        // index first, because a word too wide to be one is a record naming
+        // sectors no medium has, and then the flag in the fourth word where every
+        // other flag sits. The generation and the length are unranged, every bit
+        // pattern of each being a version a commit could stand at and a size a
+        // domain could have been handed. Restated as the two checks they are, so
+        // the harness never asks the code under test what either bound is.
+        DETAIL_CONFIGURED => {
+            if record.operands[1] > u64::from(u8::MAX) {
+                Some(LogRecordError::SlotNumberTooWide {
+                    value: record.operands[1],
+                })
+            } else {
+                (record.operands[3] > 1).then_some(LogRecordError::OperandFlagNotBoolean {
+                    value: record.operands[3],
+                })
+            }
         }
         // The three details whose first operand word is a protocol registry
         // code point, which every TLS registry numbers in sixteen bits: a
@@ -2098,6 +2121,24 @@ mod tests {
                     // detail really leaves, so the seed is the region a boot
                     // publishes rather than a shape only this harness builds.
                     operands: [4096, 0, 0, 1],
+                    ..domain_record()
+                }),
+            ),
+            // And the configuration version a boot found running on its own
+            // medium, committed for the recording superblock's sharper reason:
+            // it can be refused for either of two words, so a cold run reaches
+            // its accepted shape — the one the render path walks — only by
+            // drawing the discriminant and then two ranged words together.
+            (
+                "valid_domain_configured",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CONFIGURED,
+                    // A generation, the slot at the widest a slot index goes so
+                    // a rule that narrowed it is refused here, a length, and the
+                    // flag at 1 — the reading that says the version came off the
+                    // medium rather than out of this boot, and the value a
+                    // uniform draw over `u64` never lands on.
+                    operands: [7, u64::from(u8::MAX), 4096, 1],
                     ..domain_record()
                 }),
             ),

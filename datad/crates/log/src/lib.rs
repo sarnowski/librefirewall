@@ -60,6 +60,8 @@ mod identifier;
 mod record;
 mod render;
 mod ring;
+#[cfg(test)]
+mod shapes;
 mod stamp;
 
 use core::cell::Cell;

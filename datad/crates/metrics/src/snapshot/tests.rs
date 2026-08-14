@@ -220,8 +220,8 @@ fn the_fingerprint_separates_every_field_it_covers() {
 /// that is noticed.
 #[test]
 fn the_catalogue_is_the_size_and_shape_this_build_states() {
-    assert_eq!(SNAPSHOT_SLOTS, 471);
-    assert_eq!(SNAPSHOT_BYTES, 20 + 471 * 8);
+    assert_eq!(SNAPSHOT_SLOTS, 474);
+    assert_eq!(SNAPSHOT_BYTES, 20 + 474 * 8);
     assert_ne!(CATALOGUE_FINGERPRINT, 0);
 }
 

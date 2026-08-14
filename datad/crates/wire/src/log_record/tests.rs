@@ -775,10 +775,10 @@ fn every_shape_discriminant_outside_its_set_is_refused() {
         ),
         (
             LogRecord {
-                detail: 57,
+                detail: 58,
                 ..domain_record()
             },
-            LogRecordError::DetailKindUnknown { detail: 57 },
+            LogRecordError::DetailKindUnknown { detail: 58 },
         ),
         // The dialled channel's own two token words, on the onboarding port's
         // terms: an outcome or a certificate refusal past its set names nothing
@@ -1254,7 +1254,7 @@ fn every_refusal_names_the_field_and_the_value() {
             "change token 3 is not below 3",
             "object token 3 is not below 4",
             "field token 6 is not below 18",
-            "outcome token 3 is not below 3",
+            "outcome token 3 is not below 6",
             "reason token 30 is not below 38",
             "from value kind 9 names no value",
             "to value 256 does not fit a byte",
@@ -1338,10 +1338,11 @@ fn each_shape_discriminant_decodes_exactly_what_it_encodes() {
         LogDetailKind::RecordingFresh,
         LogDetailKind::ChannelShipping,
         LogDetailKind::ChannelAcked,
+        LogDetailKind::Configured,
     ] {
         assert_eq!(LogDetailKind::from_bits(detail.to_bits()), Some(detail));
     }
-    assert_eq!(LogDetailKind::from_bits(57), None);
+    assert_eq!(LogDetailKind::from_bits(58), None);
 
     for value in [
         LogValueKind::Absent,

@@ -1038,3 +1038,136 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The version history: what makes a document a slot, and a slot a document
+// ---------------------------------------------------------------------------
+
+/// A slot array holding one version, so a generation has something to advance
+/// past. `place` is what a commit does, so the fixture is the state a second
+/// commit really meets.
+fn holding(generation: u64) -> Slots {
+    let mut slots = Slots::empty();
+    slots.place(slot(0), entry(generation, 16), true);
+    slots
+}
+
+#[test]
+fn a_staged_entry_describes_the_bytes_it_was_taken_over() {
+    let document = b"<configuration/>";
+    let staged = staged_entry(4, document, &Slots::empty()).expect("a document at a generation");
+    assert_eq!(staged.generation, 4);
+    assert_eq!(staged.len, document.len());
+    assert_eq!(document_matches(&staged, document), Ok(()));
+}
+
+#[test]
+fn a_document_that_is_not_one_is_refused_by_the_rule_it_broke() {
+    let bound = vec![0_u8; DOCUMENT_BYTES + 1];
+    assert_eq!(
+        staged_entry(1, &[], &Slots::empty()),
+        Err(DocumentError::Empty)
+    );
+    assert_eq!(
+        staged_entry(1, &bound, &Slots::empty()),
+        Err(DocumentError::PastBound {
+            len: DOCUMENT_BYTES + 1,
+            bound: DOCUMENT_BYTES,
+        })
+    );
+    assert_eq!(
+        staged_entry(0, b"x", &Slots::empty()),
+        Err(DocumentError::GenerationZero)
+    );
+}
+
+/// A generation that does not advance is a replay, and the equal case is the one
+/// that matters: re-committing the running version under its own number would
+/// leave two slots claiming to be newest.
+#[test]
+fn a_generation_that_does_not_advance_past_the_array_is_refused() {
+    let slots = holding(7);
+    for named in [1, 6, 7] {
+        assert_eq!(
+            staged_entry(named, b"x", &slots),
+            Err(DocumentError::NotNewest { named, newest: 7 })
+        );
+    }
+    assert!(staged_entry(8, b"x", &slots).is_ok());
+}
+
+/// The one check standing between a rollback and a document somebody swapped on
+/// the medium, and the length disagreement beside it — the pair a reader checks
+/// a disk against.
+#[test]
+fn a_slot_that_is_not_what_the_record_says_is_refused_by_name() {
+    let document = b"<configuration/>";
+    let staged = staged_entry(2, document, &Slots::empty()).expect("a document");
+    let mut swapped = *document;
+    swapped[1] = b'X';
+    assert_eq!(
+        document_matches(&staged, &swapped),
+        Err(DocumentError::DigestMismatch)
+    );
+    assert_eq!(
+        document_matches(&staged, b"short"),
+        Err(DocumentError::PastBound {
+            len: 5,
+            bound: document.len(),
+        })
+    );
+}
+
+#[test]
+fn every_document_refusal_carries_a_token_of_its_own() {
+    let causes = [
+        DocumentError::Empty,
+        DocumentError::PastBound { len: 0, bound: 0 },
+        DocumentError::GenerationZero,
+        DocumentError::NotNewest {
+            named: 0,
+            newest: 0,
+        },
+        DocumentError::ArrayFull,
+        DocumentError::DigestMismatch,
+    ]
+    .map(DocumentError::cause);
+    let mut sorted = causes;
+    sorted.sort_unstable();
+    let mut unique = sorted;
+    let deduplicated: Vec<&str> = {
+        unique.sort_unstable();
+        let mut seen: Vec<&str> = Vec::new();
+        for cause in unique {
+            if !seen.contains(&cause) {
+                seen.push(cause);
+            }
+        }
+        seen
+    };
+    assert_eq!(deduplicated.len(), causes.len());
+}
+
+/// The array's own rule, which the writer above depends on: reuse takes the
+/// lowest generation and never the running slot, so a commit cannot overwrite the
+/// configuration in force.
+#[test]
+fn reuse_takes_the_lowest_generation_and_never_the_running_slot() {
+    let mut slots = Slots::empty();
+    for index in 0..SLOT_COUNT {
+        // Descending, so the lowest generation is not the first slot either.
+        slots.place(slot(index), entry((SLOT_COUNT - index) as u64, 16), false);
+    }
+    slots.place(slot(SLOT_COUNT - 1), entry(1, 16), true);
+    let reuse = slots
+        .next_for_reuse()
+        .expect("a full array still has a target");
+    assert_ne!(reuse.slot(), slot(SLOT_COUNT - 1));
+    assert_eq!(
+        reuse,
+        Reuse::Displaces {
+            slot: slot(SLOT_COUNT - 2),
+            generation: 2,
+        }
+    );
+}

@@ -236,10 +236,11 @@ use lfw_log::{
 use lfw_metrics::StatsShard;
 use lfw_package::{Operands, PackageError};
 use lfw_store::{
-    ChainFault, CheckedState, Cleared, Copies, IdentityError, InstallError, Onboarding,
-    RESET_REQUEST_BYTES, RESET_REQUEST_SECTOR, ResetRequest, STATE_A_SECTOR, STATE_COPY_BYTES,
-    STORE_SECTORS, State, StateError, StateWrite, StoredCertificate, StoredEndpoint, decode_state,
-    encode_state, mint, read_package, verify,
+    ChainFault, CheckedState, Cleared, Copies, DocumentError, IdentityError, InstallError,
+    Onboarding, RESET_REQUEST_BYTES, RESET_REQUEST_SECTOR, ResetRequest, Reuse, STATE_A_SECTOR,
+    STATE_COPY_BYTES, STORE_SECTORS, SlotEntry, SlotIndex, State, StateError, StateWrite,
+    StoredCertificate, StoredEndpoint, decode_state, encode_state, mint, read_package, slot_sector,
+    staged_entry, verify,
 };
 use pd_runtime::{
     BlockCounters, PdClock, StoreIdentity, StoreSigning, attach_region, log_sample,
@@ -317,6 +318,24 @@ const _: () = assert!(MAX_INSTALL_ARCHIVE == lfw_package::ARCHIVE_BOUND);
 /// past it is answered by name rather than ignored.
 const INSTALLS_PER_BOOT: u32 = 8;
 
+/// Configuration versions one boot records, and so the console records one can
+/// produce.
+///
+/// Sixteen, twice an install's budget and for the same two reasons with
+/// different weights. A commit is cheaper than an install — a copy, a digest and
+/// two transfers, with no archive walk and no signature — and it is the ordinary
+/// working traffic of a managed appliance rather than the once-in-a-lifetime
+/// event an onboarding is, so a fleet pushing several policy changes in one
+/// uptime must not meet a bound. What it still bounds is the peer's reach into
+/// this domain's console ring and its medium: past it, every commit is refused
+/// by name, and an operator is told once.
+///
+/// It is deliberately **not** the slot count. The array reuses its lowest
+/// generation, so a boot may legitimately commit more versions than there are
+/// slots; a budget equal to the array would make the history's own reuse rule
+/// unreachable.
+const CONFIG_RECORDS_PER_BOOT: u32 = 16;
+
 /// Poll iterations one completion is waited for.
 ///
 /// `lfw_blk::smoke`'s budget, reused rather than re-chosen: it is the same
@@ -387,6 +406,11 @@ enum StartupError {
     /// The generator was seeded and did not advance between two draws, which no
     /// published vector can catch: a vector fixes the seed and reads one draw.
     GeneratorStalled,
+    /// A configuration slot does not hold the document the record says it does.
+    /// **Input, not a fault**: the bytes came off a medium with no provenance,
+    /// and the record's digest is what stands between a version history and a
+    /// document somebody swapped.
+    Document(DocumentError),
 }
 
 /// Why one transfer of the record did not happen.
@@ -423,6 +447,11 @@ enum Step {
     ResetClear,
     /// Overwriting what the medium held.
     Overwrite,
+    /// Writing a configuration document into its slot, which is the transfer the
+    /// record naming that slot is ordered behind.
+    SlotWrite,
+    /// Reading one back, which start-up does for the running slot alone.
+    SlotRead,
 }
 
 impl Step {
@@ -461,6 +490,16 @@ impl Step {
             (Self::Overwrite, TransferError::Failed) => "reset-overwrite-failed",
             (Self::Overwrite, TransferError::Short { .. }) => "reset-overwrite-short",
             (Self::Overwrite, TransferError::Silent) => "reset-overwrite-unanswered",
+            (Self::SlotWrite, TransferError::Refused) => "slot-write-refused",
+            (Self::SlotWrite, TransferError::Misattributed) => "slot-write-misattributed",
+            (Self::SlotWrite, TransferError::Failed) => "slot-write-failed",
+            (Self::SlotWrite, TransferError::Short { .. }) => "slot-write-short",
+            (Self::SlotWrite, TransferError::Silent) => "slot-write-unanswered",
+            (Self::SlotRead, TransferError::Refused) => "slot-read-refused",
+            (Self::SlotRead, TransferError::Misattributed) => "slot-read-misattributed",
+            (Self::SlotRead, TransferError::Failed) => "slot-read-failed",
+            (Self::SlotRead, TransferError::Short { .. }) => "slot-read-short",
+            (Self::SlotRead, TransferError::Silent) => "slot-read-unanswered",
         }
     }
 }
@@ -519,6 +558,11 @@ impl StartupError {
             Self::GeneratorStalled => Refusal {
                 cause: "generator-repeated-a-draw",
                 detail: RefusalDetail::None,
+                signalled: true,
+            },
+            Self::Document(error) => Refusal {
+                cause: error.cause(),
+                detail: document_detail(*error),
                 signalled: true,
             },
         }
@@ -885,6 +929,29 @@ struct Established {
     /// kept apart anyway, because a mint on a *first* boot is the same event with
     /// an entirely different cause.
     reset: Option<Cleared>,
+    /// Which configuration version the slot array names as running, read back off
+    /// the medium and held to the digest the record carries for it.
+    ///
+    /// `None` is an array that names none, which is every appliance no management
+    /// plane has yet pushed a configuration to — an ordinary state and not a
+    /// failure, so it is a `None` and not a refusal. `Some(Err)` is a slot the
+    /// medium did not give back: the boot goes on, because a configuration
+    /// history is not what the appliance needs to come up, and the refusal
+    /// reaches the console under its own token rather than being folded into the
+    /// identity's.
+    configuration: Option<Result<RunningDocument, Refusal>>,
+}
+
+/// The configuration version a boot found running on its medium.
+///
+/// The three fields are the console record's, carried out of the establishing
+/// run rather than reread: what they are about is a slot this boot has already
+/// held to the record naming it, and a second reading would be a second answer.
+#[derive(Clone, Copy)]
+struct RunningDocument {
+    generation: u64,
+    slot: u8,
+    bytes: u64,
 }
 
 #[protection_domain]
@@ -976,6 +1043,32 @@ fn init() -> Store {
                     published: !established.endpoint.is_absent(),
                 },
             );
+            // And which configuration version came back with it, where the array
+            // names one. An appliance whose array names none says nothing here:
+            // the absence of a line is the absence of a version, and a line
+            // spelling zeroes would be a version of no bytes at generation zero,
+            // which is what the table reserves for an empty slot.
+            match established.configuration {
+                Some(Ok(running)) => announce(
+                    &sink,
+                    DomainState::Ready,
+                    DomainDetail::Configured {
+                        generation: running.generation,
+                        slot: running.slot,
+                        bytes: running.bytes,
+                        restored: true,
+                    },
+                ),
+                // The slot did not give back what the record says is in it. Its
+                // own record rather than a failure of the boot: the identity is
+                // established either way, and an operator holding this node needs
+                // to be told that its version history is not what it says it is
+                // rather than left to infer it from a line that never appeared.
+                Some(Err(cause)) => {
+                    announce(&sink, DomainState::Refused, DomainDetail::Refusal(cause));
+                }
+                None => {}
+            }
             (
                 StoreIdentity {
                     established: true,
@@ -1013,6 +1106,7 @@ fn init() -> Store {
         faults,
         signing: StoreSigning::default(),
         installs: 0,
+        config_records: 0,
         owner,
         endpoint,
     };
@@ -1129,6 +1223,23 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 .map_err(|error| EstablishError::Other(StartupError::Record(error)))?;
             let identity = verify(state.get())
                 .map_err(|error| EstablishError::Other(StartupError::Identity(error)))?;
+            // The running slot, after the record it is named by has been held to
+            // itself and never before: a table out of a record this build refuses
+            // is a set of sector numbers nothing stands behind, and reading one
+            // would be this domain acting on a claim it had already declined.
+            let running = running_slot(state.get());
+            let configuration = running.map(|(slot, entry)| {
+                medium
+                    .verify_document(slot, &entry)
+                    .map(|()| RunningDocument {
+                        generation: entry.generation,
+                        // `SlotIndex` is `< SLOT_COUNT`, which the assertion in
+                        // `lfw_store` places inside a byte, so the cast is total.
+                        slot: slot.get() as u8,
+                        bytes: entry.len as u64,
+                    })
+                    .map_err(establish_refusal)
+            });
             Ok(Established {
                 device: device_word(state.get().device_id()),
                 fingerprint: identity.fingerprint,
@@ -1138,6 +1249,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 endpoint: state.get().endpoint(),
                 minted: false,
                 reset: None,
+                configuration,
             })
         }
         // A fresh medium — or one whose record is beyond use. Both are the same
@@ -1147,6 +1259,17 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
         // record at all" reaches here.
         None => medium.mint_identity(&mut region, now),
     }
+}
+
+/// The slot the table names as running and what it says is in it.
+///
+/// `None` where nothing is named, which `Slots::decoded` has already made mean
+/// exactly that: a named slot holding no entry is a record it refuses, so a name
+/// that survived to here has an entry behind it.
+fn running_slot(state: &lfw_store::State) -> Option<(SlotIndex, SlotEntry)> {
+    let slots = state.slots();
+    let slot = slots.running()?;
+    slots.entry(slot).map(|entry| (slot, entry))
 }
 
 /// A device identifier as the one number a console record carries it in.
@@ -1246,6 +1369,9 @@ impl<'region> Medium<'region> {
             endpoint: minted.state.endpoint(),
             minted: true,
             reset: None,
+            // A minted record's array holds nothing, so there is no running
+            // version to have read back.
+            configuration: None,
         })
     }
 
@@ -1405,13 +1531,66 @@ impl<'region> Medium<'region> {
         for (slot, byte) in staged.iter_mut().zip(image.iter()) {
             *slot = *byte;
         }
-        // Exactly the copies `encode_state` wrote, at the sector it named: the
-        // transfer follows that decision rather than restating it.
-        let Some(span) = IoSpan::at_offset(0, sectors_bytes(sectors)) else {
+        // Exactly the copies `encode_state` wrote, at the sector it named AND at
+        // the offset where it put them: it composes an odd-generation record into
+        // the second half of the buffer, so a transfer fixed at the front would
+        // send the copy it deliberately left alone to the other copy's sector.
+        let at = sectors_bytes(sector.saturating_sub(STATE_A_SECTOR)) as usize;
+        let Some(span) = IoSpan::at_offset(at, sectors_bytes(sectors)) else {
             return Err(EstablishError::Step(Step::Write, TransferError::Refused));
         };
         self.transfer(Step::Write, Operation::Write, sector, span)?;
         self.barrier()
+    }
+
+    /// Write the first `len` bytes of the snapshot half of the staging window
+    /// into `slot`, and wait for the flush behind them.
+    ///
+    /// **This runs before the record that names the slot, and the ordering is the
+    /// decision.** A slot whose bytes are on the medium and whose table entry is
+    /// not is invisible: the previous record is intact, still names the previous
+    /// running slot, and does not mention this one — so a power cut here costs the
+    /// commit and nothing else. The reverse order would leave a record naming a
+    /// slot whose bytes never landed; the digest would catch it, and that is the
+    /// point — it would be caught as *corruption* rather than as an absent commit,
+    /// and an operator would go looking for a medium that had failed.
+    ///
+    /// The trailing bytes of the last sector are zeroed first, so a slot never
+    /// carries the tail of the version it replaced.
+    fn write_document(&mut self, slot: SlotIndex, len: usize) -> Result<(), EstablishError> {
+        let span = document_span(SNAPSHOT_AT, len)?;
+        let padded = span.bytes() as usize;
+        let window = self.io.staging(span);
+        for byte in window.iter_mut().skip(len).take(padded.saturating_sub(len)) {
+            *byte = 0;
+        }
+        self.transfer(Step::SlotWrite, Operation::Write, slot_sector(slot), span)?;
+        self.barrier()
+    }
+
+    /// Read the document `entry` describes out of `slot` and hold it to that
+    /// description.
+    ///
+    /// The bytes land at the front of the staging window, which this domain alone
+    /// maps and no peer writes, so the digest is taken over what the device
+    /// delivered. It is the whole of what says a slot read back is the version the
+    /// record claims: a medium is a thing somebody can have been holding, and a
+    /// slot with no digest behind it would be a rollback target an adversary
+    /// chose.
+    fn verify_document(
+        &mut self,
+        slot: SlotIndex,
+        entry: &SlotEntry,
+    ) -> Result<(), EstablishError> {
+        let span = document_span(0, entry.len)?;
+        self.transfer(Step::SlotRead, Operation::Read, slot_sector(slot), span)?;
+        let window = self.io.staging(span);
+        // Bounded by the span, which `document_span` sized from the entry's own
+        // length — so the slice is the document's bytes and not a prefix of the
+        // padding behind them.
+        let document = window.get(..entry.len).unwrap_or_default();
+        lfw_store::document_matches(entry, document)
+            .map_err(|error| EstablishError::Other(StartupError::Document(error)))
     }
 
     /// Both copies as one span of the staging window, at its front.
@@ -1524,6 +1703,51 @@ const SNAPSHOT_SPAN: IoSpan = match IoSpan::at_offset(SNAPSHOT_AT, MAX_INSTALL_A
     Some(span) => span,
     None => panic!("the archive snapshot is inside the staging window"),
 };
+
+/// The whole sectors `len` bytes of document occupy, at `offset` in the staging
+/// window.
+///
+/// Rounded **up**, because a device addresses in sectors and a document is not a
+/// whole number of them: the tail is padding the writer zeroes and the reader
+/// ignores, the length that says where the document ends being the record's.
+///
+/// # Errors
+/// [`EstablishError`] naming the write step where the length is past what a slot
+/// holds or the span will not sit in the window. Neither is reachable — every
+/// caller has already ranged the length against [`lfw_store::DOCUMENT_BYTES`],
+/// and the assertion at the head of this file places both halves of the window —
+/// and both are answered rather than asserted, because the length reaching here
+/// began as a claim of a peer's.
+fn document_span(offset: usize, len: usize) -> Result<IoSpan, EstablishError> {
+    if len == 0 || len > lfw_store::DOCUMENT_BYTES {
+        return Err(EstablishError::Step(
+            Step::SlotWrite,
+            TransferError::Refused,
+        ));
+    }
+    let sectors = len.div_ceil(SECTOR_SIZE);
+    let bytes = u32::try_from(sectors.saturating_mul(SECTOR_SIZE)).unwrap_or(u32::MAX);
+    IoSpan::at_offset(offset, bytes).ok_or(EstablishError::Step(
+        Step::SlotWrite,
+        TransferError::Refused,
+    ))
+}
+
+/// The numbers a document refusal carries, in the order its token names them.
+const fn document_detail(error: DocumentError) -> RefusalDetail {
+    match error {
+        DocumentError::PastBound { len, bound } => RefusalDetail::Two(len as u64, bound as u64),
+        DocumentError::NotNewest { named, newest } => RefusalDetail::Two(named, newest),
+        DocumentError::Empty
+        | DocumentError::GenerationZero
+        | DocumentError::ArrayFull
+        | DocumentError::DigestMismatch => RefusalDetail::None,
+        // A variant added upstream reaches the console under its own token and no
+        // numbers, which is a smaller loss than a wrong pair — `cause` is the one
+        // place that names them, and it is exhaustive where the variants are.
+        _ => RefusalDetail::None,
+    }
+}
 
 /// The narrowest span of the staging window, as the unreachable fallback above's
 /// value. `IoSpan::new` refuses only a length past the window, and one sector is
@@ -1638,6 +1862,9 @@ struct Store {
     /// Installs served this boot, against [`INSTALLS_PER_BOOT`]. Saturating, so
     /// the equality that emits the one exhausted record holds exactly once.
     installs: u32,
+    /// Configuration versions recorded this boot, against
+    /// [`CONFIG_RECORDS_PER_BOOT`], on `installs`' terms exactly.
+    config_records: u32,
     /// The one region this domain writes that no request of a peer's is behind:
     /// whether this appliance has an owner, which the forwarding domain maps
     /// read-only and refuses every frame against until it says so.
@@ -1646,6 +1873,27 @@ struct Store {
     /// domain maps read-only. Written by this domain alone, at the three moments
     /// the record it comes out of can change: a mint, a reload, and an install.
     endpoint: &'static ManagementEndpoint,
+}
+
+/// What one accepted configuration document became, as the record an operator
+/// reads.
+struct Recorded {
+    generation: u64,
+    slot: u8,
+    bytes: u64,
+}
+
+/// One document rule's refusal as the console record of it.
+///
+/// Signalled, because every one of them is reached after the device is up and
+/// answering: what refuses here is a rule of this domain's about bytes a peer
+/// staged, not a device that stopped.
+fn document_refusal(error: DocumentError) -> Refusal {
+    Refusal {
+        cause: error.cause(),
+        detail: document_detail(error),
+        signalled: true,
+    }
 }
 
 /// What one accepted package changed, as the two records an operator reads.
@@ -1722,6 +1970,7 @@ impl Store {
             Some(SignOperation::Anchor) => self.anchor(demand),
             Some(SignOperation::Sign) => self.sign(demand),
             Some(SignOperation::Install) => self.install(demand),
+            Some(SignOperation::RecordConfig) => self.record_config(demand),
         }
     }
 
@@ -1994,6 +2243,177 @@ impl Store {
             anchor,
             anchor_fingerprint,
             generation,
+        })
+    }
+
+    /// Record the staged configuration document as a new version of the history,
+    /// or say which rule refused it.
+    ///
+    /// Every refusal reaches the console by name, on an install's terms: a
+    /// configuration commit is the appliance changing what it enforces, and the
+    /// rule that stopped one is a thing an operator has to be told. What keeps
+    /// that bounded is [`CONFIG_RECORDS_PER_BOOT`] rather than the peer's
+    /// restraint.
+    fn record_config(&mut self, demand: SignDemand) {
+        if self.config_records >= CONFIG_RECORDS_PER_BOOT {
+            // Exactly one record, on the install budget's terms: every later
+            // attempt is a count and nothing else, so a peer cannot choose how
+            // many lines this domain writes.
+            if self.config_records == CONFIG_RECORDS_PER_BOOT {
+                self.report(Refusal {
+                    cause: "config-records-exhausted",
+                    detail: RefusalDetail::One(u64::from(CONFIG_RECORDS_PER_BOOT)),
+                    signalled: true,
+                });
+            }
+            self.config_records = self.config_records.saturating_add(1);
+            self.refuse(demand, SignRefusal::InstallRefused);
+            return;
+        }
+        // A boot that brought up no device has no history to add to. Answered as
+        // a signing request is, rather than as a refused document: nothing about
+        // the document was wrong.
+        if self.medium.is_none() {
+            self.refuse(demand, SignRefusal::NoIdentity);
+            return;
+        }
+        self.config_records = self.config_records.saturating_add(1);
+        // Read before the demand is consumed, and at a fixed width: the stated
+        // length is about the staging region for this operation, so it is no
+        // bound on the message field.
+        let generation = demand.config_generation(&self.responder);
+        match self.place_document(generation, demand.stated_len()) {
+            Ok(recorded) => {
+                announce(
+                    &self.sink,
+                    DomainState::Ready,
+                    DomainDetail::Configured {
+                        generation: recorded.generation,
+                        slot: recorded.slot,
+                        bytes: recorded.bytes,
+                        restored: false,
+                    },
+                );
+                self.responder.config_recorded(demand);
+            }
+            Err(refusal) => {
+                self.report(refusal);
+                self.refuse(demand, SignRefusal::InstallRefused);
+            }
+        }
+        self.recount();
+    }
+
+    /// Snapshot the staged document, choose the slot it takes, write it, and make
+    /// the table naming it durable.
+    ///
+    /// The record is read back off the medium rather than kept from the boot, for
+    /// the reason [`Self::take_ownership`] reads it back: what is about to be
+    /// rewritten is what is on the disk now. It is held to itself again for the
+    /// same reason — a record that no longer verifies is not one to write a slot
+    /// table into — and the identity check is the same one, because the record
+    /// carrying the table is the record carrying the key.
+    ///
+    /// **Nothing here touches the trust anchor, the endpoint or the key.** The
+    /// state that leaves this function differs from the one that entered it in
+    /// the slot table and the generation alone, `State::record_document` being
+    /// the only mutation — so a document is not a path to whom this appliance
+    /// trusts or where it dials, whatever a management plane puts in one.
+    fn place_document(&mut self, generation: u64, stated_len: u32) -> Result<Recorded, Refusal> {
+        let Self {
+            sink,
+            medium,
+            staging,
+            ..
+        } = self;
+        // Checked by the caller, and answered rather than asserted because
+        // nothing a peer asks for may fault this domain.
+        let Some(medium) = medium.as_mut() else {
+            return Err(Refusal {
+                cause: "config-no-medium",
+                detail: RefusalDetail::None,
+                signalled: false,
+            });
+        };
+
+        let mut region = [0_u8; BOTH_COPIES];
+        medium.read_state(&mut region).map_err(establish_refusal)?;
+        let image = decode_state(&region).ok_or(Refusal {
+            cause: "config-record-absent",
+            detail: RefusalDetail::None,
+            signalled: true,
+        })?;
+        let checked = image.check().map_err(|error| Refusal {
+            cause: record_cause(error),
+            detail: record_detail(error),
+            signalled: true,
+        })?;
+        verify(checked.get()).map_err(|error| Refusal {
+            cause: error.cause(),
+            detail: RefusalDetail::None,
+            signalled: true,
+        })?;
+        let mut state = checked.into_inner();
+
+        // The snapshot, for the reason an install takes one: the region is the
+        // asking domain's to write and it can write it again at any instant, so a
+        // document digested through a borrow of it would be a document whose bytes
+        // were somebody else's by the time they reached a sector. What is read and
+        // what is transferred from here on is this domain's own copy.
+        let snapshot = medium.io.staging(SNAPSHOT_SPAN);
+        staging.copy(snapshot);
+        // The stated length is a claim, so it is ranged against this domain's own
+        // copy before it is a length of anything — and the entry is minted from
+        // the bytes that ranging admitted, which is what makes the digest a digest
+        // of what is about to be written.
+        let document = snapshot.get(..stated_len as usize).ok_or_else(|| {
+            document_refusal(DocumentError::PastBound {
+                len: stated_len as usize,
+                bound: snapshot.len(),
+            })
+        })?;
+        let entry = staged_entry(generation, document, state.slots()).map_err(document_refusal)?;
+        let reuse = state
+            .slots()
+            .next_for_reuse()
+            .ok_or_else(|| document_refusal(DocumentError::ArrayFull))?;
+        let slot = reuse.slot();
+        // What this write costs, before it costs it: an operator asking "which
+        // version did I lose" after a rollback failed is asking about this line.
+        if let Reuse::Displaces { generation, .. } = reuse {
+            announce(
+                sink,
+                DomainState::Ready,
+                DomainDetail::Refusal(Refusal {
+                    cause: "config-slot-displaced",
+                    detail: RefusalDetail::Two(slot.get() as u64, generation),
+                    signalled: false,
+                }),
+            );
+        }
+
+        // The bytes, and the flush behind them, BEFORE the record that names
+        // them — see `Medium::write_document` on why that ordering is the one a
+        // power cut is survived under.
+        medium
+            .write_document(slot, entry.len)
+            .map_err(establish_refusal)?;
+        state.record_document(slot, entry, true);
+        // The copy the generation's parity selects, so the record the appliance is
+        // currently relying on is not the one being written; the barrier inside is
+        // what makes the new one durable rather than merely submitted.
+        medium
+            .commit(&mut region, &state, Copies::Parity)
+            .map_err(establish_refusal)?;
+        // The record carries the private scalar, and this domain's copy of it has
+        // no reason to outlive the write.
+        zeroize(&mut region);
+        Ok(Recorded {
+            generation: entry.generation,
+            // `SlotIndex` is `< SLOT_COUNT`, which `lfw_store` places inside a
+            // byte, so the cast is total.
+            slot: slot.get() as u8,
+            bytes: entry.len as u64,
         })
     }
 

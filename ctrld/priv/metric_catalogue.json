@@ -1,6 +1,6 @@
 {
-  "fingerprint": 512655786,
-  "slots": 471,
+  "fingerprint": 1620972380,
+  "slots": 474,
   "series": [
     {"domain": "forwarder", "family": "librefirewall_forwarded_frames_total", "labels": {"pipeline": "0"}},
     {"domain": "forwarder", "family": "librefirewall_route_drops_total", "labels": {"pipeline": "0", "reason": "unowned"}},
@@ -365,6 +365,9 @@
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "applied"}},
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "refused"}},
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "unchanged"}},
+    {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "staged"}},
+    {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "confirmed"}},
+    {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "reverted"}},
     {"domain": "config", "family": "librefirewall_configuration_reads_total", "labels": {}},
     {"domain": "config", "family": "librefirewall_log_records_dropped_total", "labels": {}},
     {"domain": "config", "family": "librefirewall_log_records_refused_total", "labels": {}},

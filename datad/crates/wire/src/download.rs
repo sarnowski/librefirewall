@@ -808,10 +808,8 @@ impl DownloadDemand {
         self.sequence
     }
 
-    /// How far the management server says it has durably taken each recording,
-    /// as the domain that composes the channel's frames judged the claim.
-    /// **Still to be clamped**: bounded already by what this appliance sent, and
-    /// not by what a recording's writer has reached.
+    /// The claim as the frame-composing domain judged it. **Still to be
+    /// clamped** by the recorder against its own writer.
     #[must_use]
     pub const fn acknowledged(&self) -> Acknowledged {
         self.acked

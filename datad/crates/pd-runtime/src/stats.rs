@@ -416,14 +416,19 @@ pub fn management_sample(
 
 /// What the deciding domain has decided, in the console's own outcome order.
 ///
-/// A struct rather than three arguments: the array `ConfigSample` publishes is
-/// keyed by position, and three counts handed over out of order would attribute a
+/// A struct rather than six arguments: the array `ConfigSample` publishes is
+/// keyed by position, and counts handed over out of order would attribute a
 /// refusal to a generation that applied.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubmissionCounters {
     pub applied: u64,
     pub refused: u64,
     pub unchanged: u64,
+    /// The three the management channel's two-step path produces and the one-step
+    /// path cannot.
+    pub staged: u64,
+    pub confirmed: u64,
+    pub reverted: u64,
     /// Times the running document was stated out of this node.
     pub reads: u64,
 }
@@ -443,6 +448,9 @@ pub const fn config_sample(
             submissions.applied,
             submissions.refused,
             submissions.unchanged,
+            submissions.staged,
+            submissions.confirmed,
+            submissions.reverted,
         ],
         reads: submissions.reads,
         log,

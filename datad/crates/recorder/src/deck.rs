@@ -197,7 +197,6 @@ impl Which {
         }
     }
 
-    /// The download channel's own name for this recording.
     #[must_use]
     pub const fn sink(self) -> DownloadSink {
         match self {
@@ -206,7 +205,6 @@ impl Which {
         }
     }
 
-    /// The recording the download channel's own name refers to.
     #[must_use]
     pub const fn named(sink: DownloadSink) -> Self {
         match sink {

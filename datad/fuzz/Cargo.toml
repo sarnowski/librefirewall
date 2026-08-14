@@ -325,6 +325,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "config_transaction"
+path = "fuzz_targets/config_transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "store_state"
 path = "fuzz_targets/store_state.rs"
 test = false

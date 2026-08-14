@@ -2254,6 +2254,53 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         data: DataMedium::Fresh,
     },
+    // And the pair that proves a committed configuration is durable, which is the
+    // one claim about this appliance no single boot can make.
+    //
+    // The first pushes a document over the channel and commits it; the second
+    // boots **the medium the first one wrote** and must come back running that
+    // version, read off the disk and held to the digest its own record names the
+    // slot by. A shared file rather than a copy, which is the whole mechanism: a
+    // copy would let the second boot pass against a medium the first never
+    // touched.
+    //
+    // The first attaches a copy of the owned medium rather than a fresh one,
+    // because a configuration commit needs an appliance with an owner to dial
+    // out — and the second must not, so its store is carried from the first and
+    // never from `onboarding-adopted`.
+    Scenario {
+        name: "channel-configuration-committed",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::CommitsAConfiguration,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
+    },
+    Scenario {
+        name: "channel-configuration-reloaded",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        // Socket-backed, and deliberately: what this boot reads is its own
+        // medium, so a host process at the far end of its channel would be a
+        // second thing for the run to arrange and nothing this claim rests on.
+        management: ManagementRole::Station,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::RestoresACommittedConfiguration,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // The medium the boot above committed on. It must precede this one in
+        // this table, and `StoreDisk::carried` says so by name when it does not.
+        store: StoreMedium::CarriedFrom("channel-configuration-committed"),
+        data: DataMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -2507,6 +2554,14 @@ fn judge_carried_media(
             StoreMedium::CarriedFrom(source) => (source, false),
             StoreMedium::ResetRequestedOn(source) => (source, true),
         };
+        // A pair that holds the medium to its source in its own contract needs no
+        // identity here: the claim is made, and by the boot that inherited the
+        // file rather than by this walk. Skipped rather than made to judge an
+        // identity too, which would be a second reading of a fact the store
+        // scenarios already state and would cost this pair its subject.
+        if scenario.channel.states_the_carried_medium() {
+            continue;
+        }
         let Some(minted) = held(source) else {
             return Err(format!(
                 "system scenario {} inherits the store medium the {source} boot minted on, and \

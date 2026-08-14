@@ -1456,3 +1456,54 @@ proptest! {
         }
     }
 }
+
+/// The conversion a sink performs on every shape a domain can emit.
+///
+/// A domain builds an `Event<&'static str>` — the cause is a literal at the site
+/// that raised it — and the ring writer converts it to the `Event<Cause>` the ABI
+/// carries. That conversion is one exhaustive walk over every event and every
+/// detail, and until this test nothing drove it: the suite around it builds the
+/// converted form directly, so the walk was compiled on every run and executed on
+/// none of them.
+///
+/// What it asserts is that the conversion loses nothing: each shape comes back as
+/// itself, with the cause a `Cause` rather than a borrow and every other field
+/// where it was. A variant that reconstructed the wrong field — two numbers
+/// transposed inside a detail, say — is a console line naming the wrong quantity,
+/// and there is nothing else in this crate that would notice.
+#[test]
+fn every_shape_a_domain_emits_survives_the_conversion_a_sink_performs() {
+    for shape in crate::shapes::every_shape() {
+        let converted: Event<Cause> = shape
+            .try_into()
+            .unwrap_or_else(|error| panic!("{shape:?} would not convert: {error:?}"));
+        // And the converted form is one the ABI carries whole, which is the
+        // property the rest of this suite rests on for the shapes it builds
+        // directly.
+        assert_eq!(
+            round_trip(&converted).expect("the ABI carries it"),
+            converted
+        );
+    }
+}
+
+/// The same for every detail on its own, which is where the walk's bulk is: the
+/// event enumeration above carries one detail per domain and state pair, and the
+/// details outnumber those by an order of magnitude.
+#[test]
+fn every_detail_a_domain_emits_survives_the_conversion_a_sink_performs() {
+    for detail in crate::shapes::every_detail() {
+        let shape = Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail,
+        };
+        let converted: Event<Cause> = shape
+            .try_into()
+            .unwrap_or_else(|error| panic!("{detail:?} would not convert: {error:?}"));
+        assert_eq!(
+            round_trip(&converted).expect("the ABI carries it"),
+            converted
+        );
+    }
+}

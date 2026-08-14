@@ -681,10 +681,16 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// The first three come from a one-step submission, the last three from the
+    /// steps a management channel takes apart. `reverted` is one word because
+    /// every token here is also a metric label value, which carries no hyphen.
     GenerationOutcome {
         Applied => "applied",
         Refused => "refused",
         Unchanged => "unchanged",
+        Staged => "staged",
+        Confirmed => "confirmed",
+        Reverted => "reverted",
     }
 }
 
@@ -977,6 +983,18 @@ mod tests {
             (Value::Generation(7), "7"),
             (Value::Count(0), "0"),
             (Value::Id(id), "wan"),
+            // The two that carry a shape of their own rather than a number: a
+            // selector is the rule criterion a refusal names, and a prefix is one
+            // value written as two, so a renderer that dropped either half would
+            // put a network on the console that names a different range.
+            (Value::Selector(id), "wan"),
+            (
+                Value::Prefix {
+                    network: Ipv4Address::from_octets([10, 0, 1, 0]),
+                    prefix_length: 24,
+                },
+                "10.0.1.0/24",
+            ),
         ];
         for (value, expected) in cases {
             assert_eq!(std::format!("{value}"), expected);

@@ -143,6 +143,7 @@ pub mod blk;
 pub mod channel_frames;
 pub mod channel_tls;
 pub mod config_submission;
+pub mod config_transaction;
 pub mod document;
 pub mod driver;
 pub mod flow;
@@ -308,6 +309,10 @@ mod tests {
         (
             "config_submission",
             crate::config_submission::config_submission_harness,
+        ),
+        (
+            "config_transaction",
+            crate::config_transaction::config_transaction_harness,
         ),
         ("spsc_ring_peer", crate::spsc_ring::spsc_ring_harness),
         ("log_ring", crate::log_ring::log_ring_harness),

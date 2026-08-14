@@ -144,7 +144,6 @@ impl Acknowledged {
     /// what a refusal publishes.
     pub const NONE: Self = Self { log: 0, capture: 0 };
 
-    /// This claim's word for `recording`.
     #[must_use]
     pub const fn of(self, recording: DownloadSink) -> u64 {
         match recording {
@@ -776,8 +775,7 @@ pub enum RelayPoll<'buf> {
         /// Items this responder has answered, so a caller can report the relay
         /// working without a record byte reaching a surface.
         answered: u64,
-        /// How far the peer says it has durably taken each recording, as this
-        /// end judged the claim. A level, read off every answer.
+        /// The claim as this end judged it — a level, read off every answer.
         acked: Acknowledged,
     },
     /// The terminating end answered and produced nothing, saying why. Every

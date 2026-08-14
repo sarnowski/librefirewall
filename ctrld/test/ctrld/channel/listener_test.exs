@@ -23,6 +23,7 @@ defmodule Ctrld.Channel.ListenerTest do
   use Ctrld.DataCase, async: false
 
   alias Ctrld.Appliances
+  alias Ctrld.Appliances.ConfigurationVersion
   alias Ctrld.Channel.{Frame, Handler, Ingest, Listener, Transport}
   alias Ctrld.PKI.EndpointCertificate
   alias Ctrld.Telemetry.Cursor
@@ -444,6 +445,144 @@ defmodule Ctrld.Channel.ListenerTest do
     end
   end
 
+  describe "the configuration transaction an administrator drives" do
+    test "a document is staged, committed on the verdict, and confirmed on the next connection",
+         %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, actor: actor, certificate: certificate, key: key} = appliance_with()
+      document = amended_document()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :online end)
+
+      # The administrator's action, from this process. It returns as soon as the
+      # session has been asked, which is why the frame is waited for below rather
+      # than assumed to have gone already.
+      assert {:ok, staged} = Appliances.stage_configuration(reload(appliance), document, actor)
+      assert staged.generation == 2
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :staging
+
+      assert {:ok, {:down_config_stage, ^document}} = read_frame(socket, true)
+
+      # The appliance's verdict, in the appliance's own field vocabulary — the one
+      # `pd_runtime`'s result line composes, so what this proves is the grammar the
+      # pair actually shares rather than a shape invented here.
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=2 outcome=staged changes=3"}
+        )
+
+      # The commit follows the verdict with no second decision from anybody, and
+      # it names the generation the appliance stated rather than the one this
+      # server proposed.
+      assert {:ok, {:down_config_commit, 2, deadline}} = read_frame(socket, true)
+      assert deadline > 0
+
+      assert eventually(fn ->
+               version(appliance, 2) |> ConfigurationVersion.state() == :committed
+             end)
+
+      # The appliance closes on a commit, which is the protocol's way of forcing
+      # the confirmation onto a connection it establishes afterwards.
+      :ok = :ssl.close(socket)
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :offline end)
+      assert Appliances.awaiting_confirmation(appliance.device_id).generation == 2
+
+      # The fresh connection, and the confirmation on it.
+      assert {:ok, second} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(second)
+      :ok = send_frame(second, {:hello, :appliance})
+
+      assert {:ok, {:down_commit_confirm, 2}} = read_frame(second, true)
+
+      assert eventually(fn ->
+               version(appliance, 2) |> ConfigurationVersion.state() == :confirmed
+             end)
+
+      assert Appliances.awaiting_confirmation(appliance.device_id) == nil
+      :ok = :ssl.close(second)
+    end
+
+    test "a document the appliance refuses is not committed", %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, actor: actor, certificate: certificate, key: key} = appliance_with()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :online end)
+
+      assert {:ok, _staged} =
+               Appliances.stage_configuration(reload(appliance), amended_document(), actor)
+
+      assert {:ok, {:down_config_stage, _document}} = read_frame(socket, true)
+
+      refusal = "generation=1 outcome=refused rejected=unknown-element offset=41"
+      :ok = send_frame(socket, {:up_config_validate_result, refusal})
+
+      assert eventually(fn ->
+               version(appliance, 2) |> ConfigurationVersion.state() == :refused
+             end)
+
+      # The verdict is kept verbatim, because it names the rule and the offset an
+      # operator has to go and fix.
+      assert version(appliance, 2).validation_result == refusal
+      # And nothing was committed, which is the whole assertion: a refused
+      # document leaves the appliance on the generation it was already running.
+      assert version(appliance, 2).committed_at == nil
+      assert Appliances.awaiting_confirmation(appliance.device_id) == nil
+
+      :ok = :ssl.close(socket)
+    end
+
+    test "a validate result nobody asked for moves nothing", %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, certificate: certificate, key: key} = appliance_with()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+
+      # A verdict for a generation this server never staged. It is a legal frame
+      # from a semi-trusted peer, so it is dropped and counted rather than acted
+      # on — a peer that could move a version's state by asserting a verdict would
+      # be a peer that commits its own configuration.
+      :ok =
+        send_frame(socket, {:up_config_validate_result, "generation=9 outcome=staged changes=1"})
+
+      # Nothing to read back: no commit follows, and the session stays up. The
+      # upstream frame is what proves the session is still serving rather than a
+      # wait on a clock.
+      :ok = send_frame(socket, {:up_records, 1, "still talking"})
+      assert eventually(fn -> reload(appliance).connected_since != nil end)
+
+      assert Appliances.awaiting_confirmation(appliance.device_id) == nil
+      assert version(appliance, 1) |> ConfigurationVersion.state() == :delivered
+
+      :ok = :ssl.close(socket)
+    end
+
+    test "staging an appliance with no session is refused and still recorded" do
+      _port = start_listener()
+      %{appliance: appliance, actor: actor} = appliance_with()
+
+      assert Appliances.stage_configuration(appliance, amended_document(), actor) ==
+               {:error, :no_session}
+
+      # The version and its audit record are durable: the change was authorised
+      # and recorded, and the appliance was not there.
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :staging
+
+      assert Enum.any?(
+               Ctrld.Audit.list_events_for("appliance", appliance.device_id),
+               &(&1.action == "configuration.staged")
+             )
+    end
+  end
+
   describe "the listener's own refusals" do
     test "it will not start without an endpoint certificate to serve" do
       # Retire the one the setup issued, leaving the server nothing to offer.
@@ -483,6 +622,36 @@ defmodule Ctrld.Channel.ListenerTest do
   defp onboarded_appliance do
     %{appliance: appliance, key: key} = onboarded_fixture()
     %{appliance: appliance, certificate: appliance.certificate_der, key: key}
+  end
+
+  # The same, plus the administrator who onboarded it: the configuration tests
+  # need an actor to stage as, and it must be the appliance's own so the audit
+  # trail reads the way it would in a deployment.
+  defp appliance_with do
+    %{appliance: appliance, key: key, actor: actor} = onboarded_fixture()
+
+    %{
+      appliance: appliance,
+      certificate: appliance.certificate_der,
+      key: key,
+      actor: actor
+    }
+  end
+
+  # A second document, differing from the template so a staged generation is a
+  # change rather than a resubmission. The comment is the difference: the
+  # appliance's validator is what judges the content, and this end only has to
+  # send bytes it will accept.
+  defp amended_document do
+    Ctrld.Configuration.template()
+    |> String.replace("<rules>", "<rules>\n    <!-- amended -->", global: false)
+  end
+
+  defp version(appliance, generation) do
+    Ctrld.Repo.get_by!(ConfigurationVersion,
+      appliance_id: appliance.id,
+      generation: generation
+    )
   end
 
   # The groups are a parameter because the group is the whole subject of one
@@ -532,10 +701,11 @@ defmodule Ctrld.Channel.ListenerTest do
     end
   end
 
-  # `greeted?` is the reader's own state and not the socket's: the codec refuses
-  # a first frame that is not the greeting, so a frame read after one has to say
-  # that one has been read. Defaulted to the state a fresh connection is in, so
-  # the greeting is read the way a peer reads it.
+  # `greeted?` is the decoder's own state, and it is a parameter rather than a
+  # constant because a test reading a second down-frame is a test that has
+  # already read the greeting. It defaults to "not yet", so every first read
+  # asserts the rule the codec keeps — the server greets before it says anything
+  # else — and only a read that follows one says otherwise.
   defp read_frame(socket, greeted? \\ false) do
     {:ok, header} = :ssl.recv(socket, Frame.header_length(), 5_000)
     {:ok, type, length} = Frame.read_header(header, :server, greeted?)

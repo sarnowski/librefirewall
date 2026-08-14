@@ -169,7 +169,6 @@ impl From<PreloadError> for StartupError {
 }
 
 impl StartupError {
-    /// This refusal as the console record of it.
     fn refusal(&self) -> Refusal {
         match self {
             Self::StagingUnusable(IoRegionUnusable { paddr }) => Refusal {
@@ -463,8 +462,7 @@ fn open_recordings(
     Ok(Deck::new(capacity_sectors, stored, names, count, device)?)
 }
 
-/// One recording's extent and how this boot opened it, as the two — or three —
-/// records an operator gets.
+/// One recording's extent and how this boot opened it: two records, or three.
 fn announce_recording(sink: &dyn Sink, which: Which, opened: Opened) {
     let (start_sector, sectors) = which.extent();
     announce(

@@ -858,10 +858,9 @@ pub enum DomainDetail<C = &'static str> {
         capture_pending: u64,
     },
     /// How far the **management server** says it has durably taken each
-    /// recording, against how far this appliance has sent it. Both are positions
-    /// in that ring's own append space — the coordinate the reader cursors in
-    /// the ring superblocks are kept in — so the gap between the two is what is
-    /// in flight, and the acked number alone is what a reboot resumes from.
+    /// recording, against how far this appliance has sent it. Both sit in the
+    /// append space above; the gap is what is in flight, and the acked number
+    /// alone is the reader cursor a ring superblock keeps and a reboot resumes.
     ///
     /// Its own record rather than fields beside the shipping one: that one moves
     /// at this appliance's rate and this one at the far end's. **Two states and
@@ -873,6 +872,21 @@ pub enum DomainDetail<C = &'static str> {
         log_sent: u64,
         capture_acked: u64,
         capture_sent: u64,
+    },
+    /// Which configuration version the slot array holds as the running one, and
+    /// where on the medium it lives. Appended, never inserted.
+    ///
+    /// **The flag is why this is one record rather than two.** `false` is a
+    /// version this boot made durable, the write and the flush behind it both
+    /// having succeeded; `true` is one read back off the medium at start-up and
+    /// held to the digest the record names it by, which is the only way an
+    /// operator learns a reboot came back on the configuration the last one
+    /// committed. **No byte of the document has a representation here.**
+    Configured {
+        generation: u64,
+        slot: u8,
+        bytes: u64,
+        restored: bool,
     },
 }
 

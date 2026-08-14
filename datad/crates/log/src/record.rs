@@ -717,6 +717,15 @@ impl Event<Cause> {
                     record.detail = LogDetailKind::ChannelAcked.to_bits();
                     record.operands = [*log_acked, *log_sent, *capture_acked, *capture_sent];
                 }
+                DomainDetail::Configured {
+                    generation,
+                    slot,
+                    bytes,
+                    restored,
+                } => {
+                    record.detail = LogDetailKind::Configured.to_bits();
+                    record.operands = [*generation, u64::from(*slot), *bytes, u64::from(*restored)];
+                }
                 DomainDetail::Onboarded {
                     relayed,
                     received,
@@ -1236,6 +1245,20 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             capture_acked: *capture_acked,
             capture_sent: *capture_sent,
         },
+        // Total: `wire` ranged the slot to a byte and the flag to its two values,
+        // and a generation and a length are numbers every bit pattern of which a
+        // commit could have produced.
+        CheckedDetail::Configured {
+            generation,
+            slot,
+            bytes,
+            restored,
+        } => DomainDetail::Configured {
+            generation: *generation,
+            slot: *slot,
+            bytes: *bytes,
+            restored: *restored,
+        },
         // The token was ranged to the vocabulary by `wire`; the three counts are
         // tallies the emitting domain kept about its own session, so every bit
         // pattern of each is one it could have written.
@@ -1665,6 +1688,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         log_sent,
                         capture_acked,
                         capture_sent,
+                    },
+                    DomainDetail::Configured {
+                        generation,
+                        slot,
+                        bytes,
+                        restored,
+                    } => DomainDetail::Configured {
+                        generation,
+                        slot,
+                        bytes,
+                        restored,
                     },
                     DomainDetail::Onboarded {
                         relayed,

@@ -98,10 +98,12 @@ pub const CONFIG_REPLY_REGION_SIZE: usize =
 
 /// What a request asks the deciding domain to do.
 ///
-/// Two operations and no third: the transaction model has one write and one read,
-/// and an operation that only *validated* would be a third path through the same
-/// reader whose result nothing could act on — a candidate this channel has no way
-/// to hold between requests.
+/// Six operations across two transaction models. [`Self::Submit`] is one step —
+/// stage, validate and commit — because the requester behind it holds a client on
+/// a TCP connection. The four below it are those steps taken apart, for the
+/// requester that can hold a decision open: a management channel stages, reads
+/// the result, commits, and confirms. What each may be answered with is
+/// [`ConfigStatus::answers`], the whole of the cross-field rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigOperation {
     /// The region holds a document to become the candidate, be validated and be
@@ -109,6 +111,25 @@ pub enum ConfigOperation {
     Submit,
     /// Answer with the document the appliance is running.
     Read,
+    /// The region holds a document to become the candidate and be validated,
+    /// committing nothing. What is running is untouched whichever way it goes.
+    Stage,
+    /// Commit the candidate, which must be the generation
+    /// [`ConfigDemand::generation`] names. **Provisional**: the configuration
+    /// replaced is kept until the commit is confirmed or rolled back, so an
+    /// operator that loses its way to this appliance gets the previous one back.
+    Commit,
+    /// Keep the provisional commit [`ConfigDemand::generation`] names, giving up
+    /// the configuration it replaced.
+    Confirm,
+    /// Put the configuration a provisional commit replaced back in force, under a
+    /// generation of its own.
+    ///
+    /// It carries no generation to name: there is one provisional commit at a
+    /// time and the restored configuration is whichever one that displaced, so a
+    /// number here would be a second statement of a fact the store already holds
+    /// — and one a requester could get wrong.
+    Rollback,
 }
 
 impl ConfigOperation {
@@ -117,7 +138,27 @@ impl ConfigOperation {
         match self {
             Self::Submit => 0,
             Self::Read => 1,
+            Self::Stage => 2,
+            Self::Commit => 3,
+            Self::Confirm => 4,
+            Self::Rollback => 5,
         }
+    }
+
+    /// Whether this operation reads the request region's document bytes. The
+    /// requester clears the length for every one that does not, so a stale length
+    /// cannot have the deciding domain copy out bytes no request put there.
+    #[must_use]
+    pub const fn carries_a_document(self) -> bool {
+        matches!(self, Self::Submit | Self::Stage)
+    }
+
+    /// Whether this operation names a generation in [`ConfigDemand::generation`]:
+    /// the two that act on a commit already made do, and every other publishes
+    /// zero, so a number left over from a previous request names nothing.
+    #[must_use]
+    pub const fn names_a_generation(self) -> bool {
+        matches!(self, Self::Commit | Self::Confirm)
     }
 
     /// `None` for every other bit pattern, on [`crate::Verdict::from_bits`]'s
@@ -130,9 +171,26 @@ impl ConfigOperation {
         match bits {
             0 => Some(Self::Submit),
             1 => Some(Self::Read),
+            2 => Some(Self::Stage),
+            3 => Some(Self::Commit),
+            4 => Some(Self::Confirm),
+            5 => Some(Self::Rollback),
             _ => None,
         }
     }
+
+    /// Every operation this channel has, in the order the word numbers them.
+    ///
+    /// Exposed so a caller that must cover the vocabulary — a test, a fuzz
+    /// harness — enumerates it rather than restating it.
+    pub const ALL: [Self; 6] = [
+        Self::Submit,
+        Self::Read,
+        Self::Stage,
+        Self::Commit,
+        Self::Confirm,
+        Self::Rollback,
+    ];
 }
 
 /// The status word of a reply, as it appears in the region.
@@ -159,6 +217,29 @@ pub enum ConfigStatus {
     Document,
     /// The request named no operation this appliance has.
     NoSuchOperation,
+    /// The document passed every rule and is held as the candidate. `generation`
+    /// is the one a commit of it would assign — which is what the requester names
+    /// when it commits, so the two ends cannot disagree about which candidate a
+    /// commit is for.
+    Staged,
+    /// The provisional commit is kept and the configuration it replaced is given
+    /// up. `generation` is the one now permanently in force.
+    Confirmed,
+    /// The configuration a provisional commit replaced is in force again, under
+    /// `generation` — a new one rather than the old number, because a
+    /// configuration going back into force is a change the dataplane takes like
+    /// any other and generations do not run backwards.
+    RolledBack,
+    /// A commit with nothing staged. Distinct from [`Self::Rejected`] because no
+    /// document was judged: there is no reason token and no offset to name.
+    NoCandidate,
+    /// A confirmation or a rollback with no provisional commit outstanding —
+    /// either none was made, or one already was confirmed or rolled back.
+    NotProvisional,
+    /// The generation the request named is not the one the operation would act
+    /// on. `generation` is the one the appliance holds, so a requester that has
+    /// lost track is told where it actually is rather than left to guess.
+    GenerationMismatch,
 }
 
 impl ConfigStatus {
@@ -171,6 +252,12 @@ impl ConfigStatus {
             Self::Exhausted => 3,
             Self::Document => 4,
             Self::NoSuchOperation => 5,
+            Self::Staged => 6,
+            Self::Confirmed => 7,
+            Self::RolledBack => 8,
+            Self::NoCandidate => 9,
+            Self::NotProvisional => 10,
+            Self::GenerationMismatch => 11,
         }
     }
 
@@ -185,6 +272,12 @@ impl ConfigStatus {
             3 => Some(Self::Exhausted),
             4 => Some(Self::Document),
             5 => Some(Self::NoSuchOperation),
+            6 => Some(Self::Staged),
+            7 => Some(Self::Confirmed),
+            8 => Some(Self::RolledBack),
+            9 => Some(Self::NoCandidate),
+            10 => Some(Self::NotProvisional),
+            11 => Some(Self::GenerationMismatch),
             _ => None,
         }
     }
@@ -194,18 +287,58 @@ impl ConfigStatus {
     /// The one cross-field rule of the protocol: a document answers a read and a
     /// generation answers a submission, and a responder that crosses them is
     /// answering a question nobody asked.
-    /// [`ConfigStatus::NoSuchOperation`] belongs to neither, being what an
+    /// [`ConfigStatus::NoSuchOperation`] belongs to no operation, being what an
     /// undecodable operation word is answered with.
+    ///
+    /// Several statuses answer more than one operation, and that is the two
+    /// transaction models meeting: a one-step submission and a separate commit
+    /// both end in a generation applied, unchanged or with none left to assign,
+    /// and both a staging and a submission can refuse a document by name. What no
+    /// status does is answer an operation it says nothing about — a confirmation
+    /// reported as a staging is a fault, whichever way round.
     #[must_use]
     pub const fn answers(self, operation: ConfigOperation) -> bool {
         match self {
-            Self::Applied | Self::Unchanged | Self::Rejected | Self::Exhausted => {
-                matches!(operation, ConfigOperation::Submit)
+            Self::Applied | Self::Unchanged | Self::Exhausted => {
+                matches!(operation, ConfigOperation::Submit | ConfigOperation::Commit)
+            }
+            Self::Rejected => {
+                matches!(operation, ConfigOperation::Submit | ConfigOperation::Stage)
             }
             Self::Document => matches!(operation, ConfigOperation::Read),
+            Self::Staged => matches!(operation, ConfigOperation::Stage),
+            Self::Confirmed => matches!(operation, ConfigOperation::Confirm),
+            Self::RolledBack => matches!(operation, ConfigOperation::Rollback),
+            Self::NoCandidate => matches!(operation, ConfigOperation::Commit),
+            Self::NotProvisional => matches!(
+                operation,
+                ConfigOperation::Confirm | ConfigOperation::Rollback
+            ),
+            Self::GenerationMismatch => matches!(
+                operation,
+                ConfigOperation::Commit | ConfigOperation::Confirm
+            ),
             Self::NoSuchOperation => false,
         }
     }
+
+    /// Every status this channel has, in the order the word numbers them.
+    ///
+    /// Exposed on [`ConfigOperation::ALL`]'s terms.
+    pub const ALL: [Self; 12] = [
+        Self::Applied,
+        Self::Unchanged,
+        Self::Rejected,
+        Self::Exhausted,
+        Self::Document,
+        Self::NoSuchOperation,
+        Self::Staged,
+        Self::Confirmed,
+        Self::RolledBack,
+        Self::NoCandidate,
+        Self::NotProvisional,
+        Self::GenerationMismatch,
+    ];
 }
 
 /// The request region: the document management is submitting, or the demand that
@@ -220,9 +353,15 @@ pub struct ConfigRequest {
     sequence: AtomicU32,
     operation: AtomicU32,
     len: AtomicU32,
-    /// Alignment only, on [`crate::DownloadRequest`]'s terms: nothing is placed
-    /// here and nothing reads it, so the bytes a peer leaves in it name nothing.
-    _pad: AtomicU32,
+    /// The generation the request acts on, meaningful for exactly the operations
+    /// [`ConfigOperation::names_a_generation`] admits and published as zero for
+    /// every other.
+    ///
+    /// It occupies what was alignment padding, so naming a generation costs this
+    /// region nothing. One omitted where it counts is answered with
+    /// [`ConfigStatus::GenerationMismatch`] rather than having zero read as a
+    /// generation — zero being no configuration at all.
+    generation: AtomicU32,
     /// One atomic per byte rather than packed into words, for the tap ring's
     /// reason: these are bytes off a network, so packing them would make the byte
     /// order of the region a thing this crate chooses rather than one it mirrors.
@@ -241,7 +380,7 @@ impl ConfigRequest {
             sequence: AtomicU32::new(0),
             operation: AtomicU32::new(0),
             len: AtomicU32::new(0),
-            _pad: AtomicU32::new(0),
+            generation: AtomicU32::new(0),
             document: [const { AtomicU8::new(0) }; MAX_DOCUMENT_BYTES],
         }
     }
@@ -416,6 +555,10 @@ mod peer {
             self.0.len.load(Ordering::Relaxed)
         }
 
+        pub(super) fn generation(&self) -> u32 {
+            self.0.generation.load(Ordering::Relaxed)
+        }
+
         pub(super) fn copy_into(&self, into: &mut [u8]) {
             for (byte, cell) in into.iter_mut().zip(&self.0.document) {
                 *byte = cell.load(Ordering::Relaxed);
@@ -504,6 +647,22 @@ pub enum ConfigPoll<'buf> {
     Exhausted { generation: u32 },
     /// The running document, already bounded by what the region holds.
     Document { generation: u32, bytes: &'buf [u8] },
+    /// The document passed every rule and is the candidate; `generation` is what a
+    /// commit of it would assign.
+    Staged { generation: u32 },
+    /// The provisional commit is permanent and `generation` is in force.
+    Confirmed { generation: u32 },
+    /// What the provisional commit replaced is in force again, under
+    /// `generation`.
+    RolledBack { generation: u32 },
+    /// A commit with nothing staged; `generation` is still running.
+    NoCandidate { generation: u32 },
+    /// A confirmation or a rollback with no provisional commit outstanding;
+    /// `generation` is still running.
+    NotProvisional { generation: u32 },
+    /// The generation the request named is not the one the operation acts on;
+    /// `generation` is the one the appliance holds.
+    GenerationMismatch { generation: u32 },
     /// The operation word named no operation.
     NoSuchOperation,
     /// The reply carried this request's sequence and could not be believed.
@@ -541,9 +700,7 @@ impl ConfigRequester<'_> {
     /// Issuing a second request abandons the first, on
     /// [`crate::DownloadRequester::request`]'s terms.
     pub fn submit(&mut self, document: &[u8]) -> PendingConfigRequest {
-        let published = self.publish_document(document);
-        self.request.len.store(published, Ordering::Relaxed);
-        self.issue(ConfigOperation::Submit)
+        self.issue_document(ConfigOperation::Submit, document)
     }
 
     /// Ask for the running document.
@@ -552,8 +709,40 @@ impl ConfigRequester<'_> {
     /// deciding domain reads it whatever the operation, and a stale length would
     /// have it copy out bytes no request put there.
     pub fn read(&mut self) -> PendingConfigRequest {
-        self.request.len.store(0, Ordering::Relaxed);
-        self.issue(ConfigOperation::Read)
+        self.issue(ConfigOperation::Read, 0)
+    }
+
+    /// Hold `document` as the candidate and validate it, committing nothing.
+    ///
+    /// Truncated to the region on [`Self::submit`]'s terms.
+    pub fn stage(&mut self, document: &[u8]) -> PendingConfigRequest {
+        self.issue_document(ConfigOperation::Stage, document)
+    }
+
+    /// Commit the candidate `generation` names, provisionally.
+    pub fn commit(&mut self, generation: u32) -> PendingConfigRequest {
+        self.issue(ConfigOperation::Commit, generation)
+    }
+
+    /// Keep the provisional commit `generation` names.
+    pub fn confirm(&mut self, generation: u32) -> PendingConfigRequest {
+        self.issue(ConfigOperation::Confirm, generation)
+    }
+
+    /// Put back whatever the outstanding provisional commit replaced.
+    pub fn roll_back(&mut self) -> PendingConfigRequest {
+        self.issue(ConfigOperation::Rollback, 0)
+    }
+
+    /// Publish `document` and issue `operation` over it.
+    fn issue_document(
+        &mut self,
+        operation: ConfigOperation,
+        document: &[u8],
+    ) -> PendingConfigRequest {
+        let published = self.publish_document(document);
+        self.request.len.store(published, Ordering::Relaxed);
+        self.issue(operation, 0)
     }
 
     /// Look once for the answer to `pending`, copying any document into `into`.
@@ -620,6 +809,12 @@ impl ConfigRequester<'_> {
                 detail: self.reply.detail(),
             },
             ConfigStatus::Exhausted => ConfigPoll::Exhausted { generation },
+            ConfigStatus::Staged => ConfigPoll::Staged { generation },
+            ConfigStatus::Confirmed => ConfigPoll::Confirmed { generation },
+            ConfigStatus::RolledBack => ConfigPoll::RolledBack { generation },
+            ConfigStatus::NoCandidate => ConfigPoll::NoCandidate { generation },
+            ConfigStatus::NotProvisional => ConfigPoll::NotProvisional { generation },
+            ConfigStatus::GenerationMismatch => ConfigPoll::GenerationMismatch { generation },
             // Unreachable: both are decided above, and `answers` has already
             // refused a `Document` answering anything but a read.
             ConfigStatus::Document | ConfigStatus::NoSuchOperation => {
@@ -656,13 +851,20 @@ impl ConfigRequester<'_> {
         published
     }
 
-    fn issue(&mut self, operation: ConfigOperation) -> PendingConfigRequest {
+    fn issue(&mut self, operation: ConfigOperation, generation: u32) -> PendingConfigRequest {
         // Zero is *no request*, so it is stepped over rather than used: a wrapped
         // sequence must still name a request the responder can answer.
         self.sequence = match self.sequence.wrapping_add(1) {
             0 => 1,
             next => next,
         };
+        // Cleared for every operation that reads no document, so a length left
+        // over from the last request cannot have the deciding domain copy out
+        // bytes this one did not put there.
+        if !operation.carries_a_document() {
+            self.request.len.store(0, Ordering::Relaxed);
+        }
+        self.request.generation.store(generation, Ordering::Relaxed);
         self.request
             .operation
             .store(operation.to_bits(), Ordering::Relaxed);
@@ -695,6 +897,7 @@ pub struct ConfigDemand {
     sequence: u32,
     operation: Option<ConfigOperation>,
     len: u32,
+    generation: u32,
 }
 
 impl ConfigDemand {
@@ -724,6 +927,17 @@ impl ConfigDemand {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// The generation this request acts on, meaningful for exactly the operations
+    /// [`ConfigOperation::names_a_generation`] admits.
+    ///
+    /// An arbitrary number rather than a checked one: which generation the
+    /// appliance would act on is the deciding domain's to know, so this is the
+    /// claim and never the decision.
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// What a submission became, as the deciding domain reports it.
@@ -749,6 +963,26 @@ pub enum ConfigAnswer {
     Exhausted {
         generation: u32,
     },
+    /// The document is the candidate and `generation` is what committing it would
+    /// assign.
+    Staged {
+        generation: u32,
+    },
+    Confirmed {
+        generation: u32,
+    },
+    RolledBack {
+        generation: u32,
+    },
+    NoCandidate {
+        generation: u32,
+    },
+    NotProvisional {
+        generation: u32,
+    },
+    GenerationMismatch {
+        generation: u32,
+    },
     NoSuchOperation,
 }
 
@@ -757,6 +991,12 @@ impl ConfigAnswer {
     const fn status(self) -> ConfigStatus {
         match self {
             Self::Applied { .. } => ConfigStatus::Applied,
+            Self::Staged { .. } => ConfigStatus::Staged,
+            Self::Confirmed { .. } => ConfigStatus::Confirmed,
+            Self::RolledBack { .. } => ConfigStatus::RolledBack,
+            Self::NoCandidate { .. } => ConfigStatus::NoCandidate,
+            Self::NotProvisional { .. } => ConfigStatus::NotProvisional,
+            Self::GenerationMismatch { .. } => ConfigStatus::GenerationMismatch,
             Self::Unchanged { .. } => ConfigStatus::Unchanged,
             Self::Rejected { .. } => ConfigStatus::Rejected,
             Self::Exhausted { .. } => ConfigStatus::Exhausted,
@@ -770,7 +1010,13 @@ impl ConfigAnswer {
             Self::Applied { generation, .. }
             | Self::Unchanged { generation }
             | Self::Rejected { generation, .. }
-            | Self::Exhausted { generation } => generation,
+            | Self::Exhausted { generation }
+            | Self::Staged { generation }
+            | Self::Confirmed { generation }
+            | Self::RolledBack { generation }
+            | Self::NoCandidate { generation }
+            | Self::NotProvisional { generation }
+            | Self::GenerationMismatch { generation } => generation,
             Self::NoSuchOperation => 0,
         }
     }
@@ -835,6 +1081,7 @@ impl ConfigResponder<'_> {
             sequence,
             operation: ConfigOperation::from_bits(self.request.operation()),
             len,
+            generation: self.request.generation(),
         })
     }
 
@@ -942,19 +1189,52 @@ const _: () = {
     // values is harmless because no sequence ever matches them.
     assert!(ConfigOperation::Submit.to_bits() == 0);
     assert!(ConfigStatus::Applied.to_bits() == 0);
-    assert!(ConfigOperation::from_bits(2).is_none());
-    assert!(ConfigStatus::from_bits(6).is_none());
-    // The one cross-field rule, held where both halves are visible.
+    // Both vocabularies run from zero with no gap, so their extent is a fact
+    // about the two arrays rather than about a reading of the matches above.
+    let mut index = 0;
+    while index < ConfigOperation::ALL.len() {
+        assert!(ConfigOperation::ALL[index].to_bits() as usize == index);
+        index += 1;
+    }
+    assert!(ConfigOperation::from_bits(ConfigOperation::ALL.len() as u32).is_none());
+    let mut index = 0;
+    while index < ConfigStatus::ALL.len() {
+        assert!(ConfigStatus::ALL[index].to_bits() as usize == index);
+        index += 1;
+    }
+    assert!(ConfigStatus::from_bits(ConfigStatus::ALL.len() as u32).is_none());
+    // The cross-field rule, held where both halves are visible. Every operation
+    // has at least one status that answers it, so no request can be issued that
+    // the responder has no admissible answer for.
     assert!(ConfigStatus::Document.answers(ConfigOperation::Read));
     assert!(!ConfigStatus::Document.answers(ConfigOperation::Submit));
     assert!(ConfigStatus::Applied.answers(ConfigOperation::Submit));
+    assert!(ConfigStatus::Applied.answers(ConfigOperation::Commit));
     assert!(!ConfigStatus::Applied.answers(ConfigOperation::Read));
     assert!(!ConfigStatus::NoSuchOperation.answers(ConfigOperation::Read));
+    assert!(ConfigStatus::Staged.answers(ConfigOperation::Stage));
+    assert!(!ConfigStatus::Staged.answers(ConfigOperation::Submit));
+    assert!(ConfigStatus::Confirmed.answers(ConfigOperation::Confirm));
+    assert!(ConfigStatus::RolledBack.answers(ConfigOperation::Rollback));
+    let mut index = 0;
+    while index < ConfigOperation::ALL.len() {
+        let operation = ConfigOperation::ALL[index];
+        let mut answered = false;
+        let mut status = 0;
+        while status < ConfigStatus::ALL.len() {
+            if ConfigStatus::ALL[status].answers(operation) {
+                answered = true;
+            }
+            status += 1;
+        }
+        assert!(answered);
+        index += 1;
+    }
 
     assert!(offset_of!(ConfigRequest, sequence) == 0);
     assert!(offset_of!(ConfigRequest, operation) == 4);
     assert!(offset_of!(ConfigRequest, len) == 8);
-    assert!(offset_of!(ConfigRequest, _pad) == 12);
+    assert!(offset_of!(ConfigRequest, generation) == 12);
     assert!(offset_of!(ConfigRequest, document) == 16);
     assert!(align_of::<ConfigRequest>() == 4);
     assert!(size_of::<ConfigRequest>() == 16 + MAX_DOCUMENT_BYTES);

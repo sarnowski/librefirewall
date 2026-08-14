@@ -102,6 +102,42 @@ pub(crate) enum ChannelContract {
     /// traffic keys — and the appliance must report the alert it was given and
     /// no session coming up.
     RejectsTheAppliance,
+    /// [`Self::Established`]'s server, which then **pushes a configuration and
+    /// commits it**: a stage frame carrying the document the reconfiguration
+    /// scenario submits over HTTP, and a commit frame naming the generation that
+    /// document becomes.
+    ///
+    /// That document and not the addressing one, deliberately: this boot is
+    /// user-networked, so the run reaches its management port from the host, and
+    /// a document that moved the appliance's addresses would take the port with
+    /// it. What has to differ from the running configuration is the policy, which
+    /// is what makes the commit a new generation rather than an `unchanged`.
+    ///
+    /// What it is for is the medium and not the session. The appliance must put
+    /// the committed version into its configuration slot array and say so, which
+    /// is the only way a version survives a reboot — so what this contract reads
+    /// is the store domain's own record of a slot it wrote, beside the session
+    /// records that say the document got there.
+    ///
+    /// It owes no shipment and no frame tally: what those prove is proved by
+    /// [`Self::Established`], and a commit **ends the session** — commit-confirm
+    /// admits a confirmation only over a connection opened after it — so this
+    /// boot's connection closes where that one's stays up.
+    CommitsAConfiguration,
+    /// **Nothing is listening**, on [`Self::NoServer`]'s terms, and the boot's
+    /// subject is what the appliance came back *running* rather than what it
+    /// dials.
+    ///
+    /// The other half of [`Self::CommitsAConfiguration`], on the medium that one
+    /// wrote. What it holds the appliance to is a configuration slot read back
+    /// off that medium at start-up and held to the digest the record names it by
+    /// — which is the whole claim that a committed version is durable, and one no
+    /// single boot can make.
+    ///
+    /// No server, deliberately: a version restored off a disk is a fact about the
+    /// disk, and a boot that had to reach a management plane to demonstrate it
+    /// would be proving something else.
+    RestoresACommittedConfiguration,
 }
 
 impl ChannelContract {
@@ -109,13 +145,29 @@ impl ChannelContract {
     const fn serves(self) -> bool {
         matches!(
             self,
-            Self::Established | Self::AnchorRejectsTheServer | Self::RejectsTheAppliance
+            Self::Established
+                | Self::AnchorRejectsTheServer
+                | Self::RejectsTheAppliance
+                | Self::CommitsAConfiguration
         )
     }
 
     /// Whether the boot reads the appliance's own record of the channel.
     pub(crate) const fn judged(self) -> bool {
         !matches!(self, Self::Untouched)
+    }
+
+    /// Whether this boot's own contract holds the store medium it inherited to
+    /// what the boot before it wrote there.
+    ///
+    /// A carried medium is otherwise proved by the pair of store identities, which
+    /// is the only claim a boot whose subject is the identity can make. This one's
+    /// subject is the **configuration** on that medium, so it states the same kind
+    /// of thing about the same file — one version written by one boot and read
+    /// back by the next — and says so here rather than leaving the run to conclude
+    /// the pair proves nothing.
+    pub(crate) const fn states_the_carried_medium(self) -> bool {
+        matches!(self, Self::RestoresACommittedConfiguration)
     }
 
     /// Whether the capture already carries every console record this contract is
@@ -219,8 +271,64 @@ impl ChannelContract {
                 vec![OwedRecord::channel(&anchor_refused_the_server())]
             }
             Self::RejectsTheAppliance => vec![OwedRecord::channel(&appliance_refused())],
+            // The session, and then the slot it produced. The store record is
+            // what this boot is really for, and it is owed *beside* the session
+            // records rather than instead of them: a slot written without a
+            // session behind it would be a claim about a medium nothing pushed to.
+            Self::CommitsAConfiguration => {
+                let [placed, restored] = configured(false);
+                vec![
+                    OwedRecord::dial("established"),
+                    OwedRecord::channel(&established_session()),
+                    OwedRecord::store(&placed),
+                    OwedRecord::store(&restored),
+                ]
+            }
+            // The version the medium gave back, and nothing else: what this
+            // boot is about is the disk, and holding it to a dial outcome would
+            // make a restored version depend on where the appliance was pointed.
+            Self::RestoresACommittedConfiguration => {
+                let [placed, restored] = configured(true);
+                vec![OwedRecord::store(&placed), OwedRecord::store(&restored)]
+            }
         }
     }
+}
+
+/// The generation the pushed document becomes.
+///
+/// Two, and it is arithmetic rather than a choice: the document compiled into the
+/// image is committed as generation one on every boot, and the staged one is the
+/// next thing the datastore admits. Stated here once so the frame that names it
+/// and the record that must report it cannot come apart.
+pub(crate) const PUSHED_GENERATION: u64 = 2;
+
+/// The slot the pushed document takes.
+///
+/// Zero: the array fills empty slots in index order, and an appliance onboarded
+/// but never configured over its channel has an empty array. A boot that found
+/// something already there would be a boot on a medium this pair did not write.
+const PUSHED_SLOT: u64 = 0;
+
+/// The record a version reaches the console as, up to the size between the slot
+/// and the flag.
+///
+/// The size is left out on purpose: it is the document's own length, and a
+/// contract that named it would be a boot asserting how many bytes the gate's
+/// second document happens to be. What the pair of boots is about is the
+/// generation, the slot and where the answer came from.
+fn configured(restored: bool) -> [String; 2] {
+    [
+        format!(
+            "{}{}",
+            field("configured-generation", &PUSHED_GENERATION.to_string()),
+            field("configured-slot", &PUSHED_SLOT.to_string()),
+        ),
+        field(
+            "configured-restored",
+            if restored { "true" } else { "false" },
+        ),
+    ]
 }
 
 /// Records as a verdict lists them, and the word for having written none.
@@ -236,35 +344,40 @@ fn or_nothing(records: Vec<&str>) -> String {
 struct OwedRecord {
     /// The substring the record must carry, verbatim as [`judge`] asks for it.
     owed: String,
-    /// Whether the domain that owns the network wrote it, rather than the one
-    /// that terminates the session.
-    from_the_network: bool,
+    /// Which of the appliance's domains writes it.
+    from: Domain,
 }
 
 impl OwedRecord {
     fn dial(outcome: &str) -> Self {
         Self {
             owed: field("dial-outcome", outcome),
-            from_the_network: true,
+            from: Domain::Management,
         }
     }
 
     fn channel(owed: &str) -> Self {
         Self {
             owed: owed.to_owned(),
-            from_the_network: false,
+            from: Domain::Crypto,
+        }
+    }
+
+    /// A record of the domain that owns the medium, which is where a version
+    /// becoming durable is decided and therefore where it is said.
+    fn store(owed: &str) -> Self {
+        Self {
+            owed: owed.to_owned(),
+            from: Domain::Store,
         }
     }
 
     /// Whether the capture carries this record, read off the domain that writes
-    /// it — the same two sets [`judge`] reads.
+    /// it — the same sets [`judge`] reads.
     fn carried(&self, log: &str) -> bool {
-        let domain = if self.from_the_network {
-            management(log)
-        } else {
-            crypto(log)
-        };
-        domain.iter().any(|record| record.contains(&self.owed))
+        domain_records(log, self.from)
+            .iter()
+            .any(|record| record.contains(&self.owed))
     }
 }
 
@@ -352,6 +465,48 @@ const APPLIANCE_GREETING: [u8; 10] = [0, 0, 0, 2, 1, 0, 0, 0, 0, 1];
 /// The whole of what the harness sends: the greeting, and nothing after it.
 const GREETING_LEN: usize = 26;
 
+/// The stream a server that pushes a configuration writes: the greeting, then a
+/// stage frame carrying `document`, then a commit frame naming
+/// [`PUSHED_GENERATION`].
+///
+/// Composed here as bytes rather than through the appliance's own encoder, on
+/// [`SERVER_GREETING`]'s terms exactly: frames this harness built out of the code
+/// under test would prove that the appliance agrees with itself. The layout is
+/// the framing contract's — four bytes of payload length, one type byte, three
+/// reserved zeroes, then the payload — and the type bytes are the protocol's own
+/// numbering written out.
+///
+/// It is written whole and up front because `openssl s_server` sends what it
+/// reads on standard input. The appliance reads the three frames in order: it
+/// answers the stage with a result frame, and the commit ends the session, so
+/// nothing follows.
+fn configuration_push(document: &[u8]) -> Result<Vec<u8>, String> {
+    let len = u32::try_from(document.len())
+        .map_err(|_| format!("a document of {} bytes is past a frame", document.len()))?;
+    // The greeting **proper** and not the whole array: its four trailing bytes are
+    // a deliberate partial second frame, and a real frame written after them would
+    // be read as the continuation of that fragment rather than as itself. The
+    // fragment is a boot of its own's subject; this boot's is what the server says
+    // next, so it says it on a frame boundary.
+    let mut stream = Vec::from(&SERVER_GREETING[..GREETING_LEN]);
+    // The stage frame: 0x05, and the document as its whole payload.
+    stream.extend_from_slice(&len.to_be_bytes());
+    stream.extend_from_slice(&[0x05, 0, 0, 0]);
+    stream.extend_from_slice(document);
+    // The commit frame: 0x07, a generation and the seconds a confirmation has.
+    // Ten bytes of payload, which is what the encoder puts there.
+    stream.extend_from_slice(&10_u32.to_be_bytes());
+    stream.extend_from_slice(&[0x07, 0, 0, 0]);
+    stream.extend_from_slice(&PUSHED_GENERATION.to_be_bytes());
+    // The longest this appliance will hold an unconfirmed commit for. The number
+    // is clamped by the appliance to its own bound whatever is asked, and no
+    // confirmation follows on this connection — a commit ends the session — so
+    // what it decides is only how long the boot has before the revert, and the
+    // boot is bounded by the record it waits for rather than by this.
+    stream.extend_from_slice(&600_u16.to_be_bytes());
+    Ok(stream)
+}
+
 /// Start the management server this boot's contract asks for.
 ///
 /// # Errors
@@ -389,7 +544,15 @@ pub(crate) fn serve(
     };
     hold_the_port()?;
     let greeting = into.join("channel-server-greeting.bin");
-    fs::write(&greeting, SERVER_GREETING)
+    let stream = match contract {
+        ChannelContract::CommitsAConfiguration => {
+            let document = fs::read(root.join(crate::image::SUBMITTED_DOCUMENT))
+                .map_err(|error| format!("read {}: {error}", crate::image::SUBMITTED_DOCUMENT))?;
+            configuration_push(&document)?
+        }
+        _ => Vec::from(SERVER_GREETING),
+    };
+    fs::write(&greeting, &stream)
         .map_err(|error| format!("write {}: {error}", greeting.display()))?;
     let transcript = into.join("channel-server.out");
     let verification = into.join("channel-server.err");
@@ -437,7 +600,7 @@ pub(crate) fn serve(
     // gone — which is a server that closes a channel it just agreed, and not
     // what any of these three boots is about.
     if let Some(pipe) = child.stdin.as_mut() {
-        pipe.write_all(&SERVER_GREETING)
+        pipe.write_all(&stream)
             .and_then(|()| pipe.flush())
             .map_err(|error| format!("hand the greeting to the management server: {error}"))?;
     }
@@ -672,6 +835,48 @@ pub(crate) fn judge(
                 ipv4(DIAL_DESTINATION)
             ))
         }
+        ChannelContract::CommitsAConfiguration => {
+            let Some(server) = server else {
+                return Err(String::from(
+                    "this boot's contract pushes a configuration and no management server was \
+                     started for it",
+                ));
+            };
+            let (transcript, verification) = server.finish()?;
+            expect_dial(log, "established")?;
+            expect_channel(log, &established_session())?;
+            expect_certificate(&verification, device)?;
+            expect_greeting(&transcript)?;
+            // The appliance's own account of the slot it wrote, which is what
+            // this boot is for. It is read off the domain that owns the medium:
+            // the session records above say the document arrived, and only this
+            // one says it became durable.
+            for owed in configured(false) {
+                expect_store(log, &owed)?;
+            }
+            Ok(format!(
+                "  answered   channel               appliance->server  {}:{DIAL_PORT}  the \
+                 server pushed a second configuration document and committed it at generation \
+                 {PUSHED_GENERATION}, and the appliance wrote it into configuration slot \
+                 {PUSHED_SLOT} of its own medium behind a flush and reported the version it now \
+                 holds",
+                ipv4(DIAL_DESTINATION)
+            ))
+        }
+        ChannelContract::RestoresACommittedConfiguration => {
+            // Nothing was started: what this boot proves is about the disk the
+            // boot before it wrote, and reaching a management plane to show it
+            // would be proving something else.
+            let _ = server.map(Server::finish).transpose()?;
+            for owed in configured(true) {
+                expect_store(log, &owed)?;
+            }
+            Ok(format!(
+                "  answered   configuration         medium->appliance  slot {PUSHED_SLOT}  the \
+                 appliance came back on generation {PUSHED_GENERATION} read off the medium the \
+                 boot before it committed to, held to the digest its own record names that slot by"
+            ))
+        }
         ChannelContract::AnchorRejectsTheServer => {
             let _ = server.map(Server::finish).transpose()?;
             expect_channel(log, &anchor_refused_the_server())?;
@@ -742,6 +947,24 @@ fn expect_channel(log: &str, owed: &str) -> Result<(), String> {
         "the appliance never wrote a record carrying `{owed}`. What the domain that terminates \
          the session did write:\n  {}",
         channel_records(log).join("\n  ")
+    ))
+}
+
+/// One record of the domain that owns the medium, verbatim.
+///
+/// Its own reader rather than [`expect_channel`] with a domain parameter, because
+/// what it says on failure is different: the session's records are what a reader
+/// of a channel failure goes to, and a slot that was not written sends one to the
+/// store's instead.
+fn expect_store(log: &str, owed: &str) -> Result<(), String> {
+    let written = domain_records(log, Domain::Store);
+    if written.iter().any(|record| record.contains(owed)) {
+        return Ok(());
+    }
+    Err(format!(
+        "the appliance never wrote a record carrying `{owed}`. What the domain that owns the \
+         medium did write:\n  {}",
+        or_nothing(written)
     ))
 }
 

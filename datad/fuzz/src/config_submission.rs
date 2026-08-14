@@ -288,6 +288,9 @@ fn answer_of(report: CommitReport, running: Generation) -> ConfigAnswer {
         CommitReport::Exhausted => ConfigAnswer::Exhausted {
             generation: running.to_bits(),
         },
+        CommitReport::NoCandidate => ConfigAnswer::NoCandidate {
+            generation: running.to_bits(),
+        },
     }
 }
 
@@ -358,6 +361,12 @@ fn assert_report(
         CommitReport::Exhausted => {
             assert_eq!(store.running(), Generation::from_bits(u32::MAX));
         }
+        // Unreachable through the one-step path, which stages the document it is
+        // given before committing it. Asserted rather than ignored, on
+        // `Exhausted`'s terms.
+        CommitReport::NoCandidate => {
+            unreachable!("a submission stages before it commits");
+        }
     }
 }
 
@@ -397,7 +406,17 @@ fn assert_answer(endpoint: &Endpoint, answer: ConfigAnswer, running: Generation)
         ConfigAnswer::Rejected { .. } | ConfigAnswer::Exhausted { .. } => {
             assert!(text.contains(" outcome=refused"));
         }
-        ConfigAnswer::NoSuchOperation => unreachable!("this harness asks one operation"),
+        // Every answer only the management channel's stepped path produces, and
+        // the word an undecodable operation is answered with. This harness asks
+        // one operation, and `assert_report` above has already refused a report
+        // that could have produced any of them.
+        ConfigAnswer::Staged { .. }
+        | ConfigAnswer::Confirmed { .. }
+        | ConfigAnswer::RolledBack { .. }
+        | ConfigAnswer::NoCandidate { .. }
+        | ConfigAnswer::NotProvisional { .. }
+        | ConfigAnswer::GenerationMismatch { .. }
+        | ConfigAnswer::NoSuchOperation => unreachable!("this harness asks one operation"),
     }
 }
 

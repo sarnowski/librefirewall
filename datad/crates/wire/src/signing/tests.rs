@@ -875,6 +875,13 @@ proptest! {
                     // could never have reached this arm.
                     prop_assert_eq!(len, 0);
                 }
+                SignPoll::ConfigRecorded => {
+                    prop_assert_eq!(offset, 0);
+                    prop_assert_eq!(asked, SignOperation::RecordConfig);
+                    // A recorded-configuration answer carries nothing either, on
+                    // the install verdict's terms exactly.
+                    prop_assert_eq!(len, 0);
+                }
                 SignPoll::Refused(_) => prop_assert_eq!(offset, 0),
                 SignPoll::Faulted(_) => {
                     prop_assert_eq!(offset, 0);

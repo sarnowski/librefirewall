@@ -164,6 +164,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // no session to open. Named where the decisions are, so scanning the
     // domain's main file alone would leave the group uncompared.
     ("pds/crypto/src/channel.rs", Vocabulary::Causes(&["crypto"])),
+    // The management channel's configuration operations: the ways an exchange with
+    // the domain that decides about a document does not happen. Named where the
+    // variants are, so scanning the domain's main file alone would leave the group
+    // uncompared.
+    (
+        "pds/crypto/src/configuration.rs",
+        Vocabulary::Causes(&["crypto"]),
+    ),
     // Taking delivery of an onboarding package: the room an upload is validated
     // in, which this domain reserves out of its own arena before it places a
     // byte. Named where the decision is, so scanning the domain's main file
@@ -195,6 +203,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // leave half this vocabulary uncompared.
     (
         "crates/store/src/identity.rs",
+        Vocabulary::Causes(&["store"]),
+    ),
+    // And the version history's, on the identity's terms exactly:
+    // `lfw_store::DocumentError::cause` is the one place that knows what each
+    // rule about a document or the array it would join means, so scanning the
+    // domain alone would leave the whole vocabulary uncompared.
+    (
+        "crates/store/src/document.rs",
         Vocabulary::Causes(&["store"]),
     ),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus

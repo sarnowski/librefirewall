@@ -234,7 +234,13 @@ fn a_reply_to_another_request_is_not_read_at_all() {
 fn every_way_a_reply_can_be_unbelievable_is_a_counted_fault() {
     let sequence = 1;
     let cases: [(u32, u32, ConfigFault); 4] = [
-        (6, 0, ConfigFault::StatusUnknown { status: 6 }),
+        (
+            ConfigStatus::ALL.len() as u32,
+            0,
+            ConfigFault::StatusUnknown {
+                status: ConfigStatus::ALL.len() as u32,
+            },
+        ),
         (
             ConfigStatus::Applied.to_bits(),
             MAX_DOCUMENT_BYTES as u32 + 1,
@@ -485,5 +491,239 @@ proptest! {
         let mut into = buffer();
         let polled = requester.poll(pending, &mut into);
         prop_assert!(matches!(polled, ConfigPoll::Unchanged { .. }), "{polled:?}");
+    }
+}
+
+/// The four steps a management channel takes cross the channel and come back as
+/// the answers they belong to, each carrying the generation it is about.
+#[test]
+fn the_channels_four_operations_round_trip_with_their_answers() {
+    let cases: [(ConfigOperation, ConfigAnswer, ConfigPoll<'static>); 4] = [
+        (
+            ConfigOperation::Stage,
+            ConfigAnswer::Staged { generation: 7 },
+            ConfigPoll::Staged { generation: 7 },
+        ),
+        (
+            ConfigOperation::Commit,
+            ConfigAnswer::Applied {
+                generation: 7,
+                changes: 3,
+            },
+            ConfigPoll::Applied {
+                generation: 7,
+                changes: 3,
+            },
+        ),
+        (
+            ConfigOperation::Confirm,
+            ConfigAnswer::Confirmed { generation: 7 },
+            ConfigPoll::Confirmed { generation: 7 },
+        ),
+        (
+            ConfigOperation::Rollback,
+            ConfigAnswer::RolledBack { generation: 8 },
+            ConfigPoll::RolledBack { generation: 8 },
+        ),
+    ];
+    for (operation, answer, expected) in cases {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let mut responder = channel.responder();
+        let pending = match operation {
+            ConfigOperation::Stage => requester.stage(b"<configuration/>"),
+            ConfigOperation::Commit => requester.commit(7),
+            ConfigOperation::Confirm => requester.confirm(7),
+            ConfigOperation::Rollback => requester.roll_back(),
+            other => panic!("not a channel operation: {other:?}"),
+        };
+        let demand = responder.take().expect("a request");
+        assert_eq!(demand.operation(), Some(operation));
+        responder.answer(demand, answer);
+        let mut into = buffer();
+        assert_eq!(requester.poll(pending, &mut into), expected);
+        assert_eq!(requester.faults(), 0);
+    }
+}
+
+/// The generation word is the request's, and it reaches the deciding domain for
+/// exactly the two operations that act on a commit already made.
+#[test]
+fn only_a_commit_and_a_confirmation_carry_a_generation() {
+    for operation in ConfigOperation::ALL {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let mut responder = channel.responder();
+        // Every issue path, with a generation where one is admissible. The handle
+        // is dropped rather than polled: what this test reads is the demand the
+        // far end takes, and the answer never comes.
+        let _issued = match operation {
+            ConfigOperation::Submit => requester.submit(b"<configuration/>"),
+            ConfigOperation::Read => requester.read(),
+            ConfigOperation::Stage => requester.stage(b"<configuration/>"),
+            ConfigOperation::Commit => requester.commit(11),
+            ConfigOperation::Confirm => requester.confirm(11),
+            ConfigOperation::Rollback => requester.roll_back(),
+        };
+        let demand = responder.take().expect("a request");
+        if operation.names_a_generation() {
+            assert_eq!(demand.generation(), 11, "{operation:?}");
+        } else {
+            assert_eq!(demand.generation(), 0, "{operation:?}");
+        }
+    }
+}
+
+/// An operation that reads no document is issued with the length cleared, so a
+/// stale one cannot have the deciding domain copy out bytes this request did not
+/// put there.
+#[test]
+fn an_operation_carrying_no_document_clears_the_length_the_last_one_left() {
+    let channel = Channel::zero();
+    let mut requester = channel.requester();
+    let mut responder = channel.responder();
+
+    let _issued = requester.stage(&document(3, 512));
+    let staged = responder.take().expect("a request");
+    assert_eq!(staged.len(), 512);
+    responder.answer(staged, ConfigAnswer::Staged { generation: 1 });
+
+    for operation in ConfigOperation::ALL {
+        if operation.carries_a_document() {
+            continue;
+        }
+        let _issued = match operation {
+            ConfigOperation::Read => requester.read(),
+            ConfigOperation::Commit => requester.commit(1),
+            ConfigOperation::Confirm => requester.confirm(1),
+            ConfigOperation::Rollback => requester.roll_back(),
+            other => panic!("carries a document: {other:?}"),
+        };
+        let demand = responder.take().expect("a request");
+        assert!(demand.is_empty(), "{operation:?}");
+        assert_eq!(demand.len(), 0, "{operation:?}");
+        responder.answer(demand, ConfigAnswer::NoSuchOperation);
+    }
+}
+
+/// The cross-field rule over the whole widened vocabulary: an answer belonging to
+/// no operation asked is a counted fault, whichever pair is crossed.
+#[test]
+fn an_answer_that_belongs_to_another_operation_is_a_fault() {
+    let crossings: [(ConfigOperation, ConfigAnswer); 5] = [
+        (
+            ConfigOperation::Stage,
+            ConfigAnswer::Confirmed { generation: 1 },
+        ),
+        (
+            ConfigOperation::Confirm,
+            ConfigAnswer::Staged { generation: 1 },
+        ),
+        (
+            ConfigOperation::Rollback,
+            ConfigAnswer::Confirmed { generation: 1 },
+        ),
+        (
+            ConfigOperation::Commit,
+            ConfigAnswer::RolledBack { generation: 1 },
+        ),
+        (
+            ConfigOperation::Submit,
+            ConfigAnswer::NoCandidate { generation: 1 },
+        ),
+    ];
+    for (operation, answer) in crossings {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let mut responder = channel.responder();
+        let pending = match operation {
+            ConfigOperation::Submit => requester.submit(b"<configuration/>"),
+            ConfigOperation::Stage => requester.stage(b"<configuration/>"),
+            ConfigOperation::Commit => requester.commit(1),
+            ConfigOperation::Confirm => requester.confirm(1),
+            ConfigOperation::Rollback => requester.roll_back(),
+            other => panic!("not asked here: {other:?}"),
+        };
+        let demand = responder.take().expect("a request");
+        responder.answer(demand, answer);
+        let mut into = buffer();
+        assert!(
+            matches!(
+                requester.poll(pending, &mut into),
+                ConfigPoll::Faulted(ConfigFault::AnswersAnotherOperation { .. })
+            ),
+            "{operation:?} answered with {answer:?} was believed"
+        );
+        assert_eq!(requester.faults(), 1);
+    }
+}
+
+/// The three refusals the channel's own steps carry, each reaching the requester
+/// as itself and naming the generation the appliance holds.
+#[test]
+fn the_channels_refusals_reach_the_requester_as_themselves() {
+    let cases: [(ConfigOperation, ConfigAnswer, ConfigPoll<'static>); 3] = [
+        (
+            ConfigOperation::Commit,
+            ConfigAnswer::NoCandidate { generation: 4 },
+            ConfigPoll::NoCandidate { generation: 4 },
+        ),
+        (
+            ConfigOperation::Confirm,
+            ConfigAnswer::NotProvisional { generation: 4 },
+            ConfigPoll::NotProvisional { generation: 4 },
+        ),
+        (
+            ConfigOperation::Commit,
+            ConfigAnswer::GenerationMismatch { generation: 5 },
+            ConfigPoll::GenerationMismatch { generation: 5 },
+        ),
+    ];
+    for (operation, answer, expected) in cases {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let mut responder = channel.responder();
+        let pending = match operation {
+            ConfigOperation::Commit => requester.commit(5),
+            ConfigOperation::Confirm => requester.confirm(5),
+            other => panic!("not asked here: {other:?}"),
+        };
+        let demand = responder.take().expect("a request");
+        responder.answer(demand, answer);
+        let mut into = buffer();
+        assert_eq!(requester.poll(pending, &mut into), expected);
+        assert_eq!(requester.faults(), 0, "a refusal is not a fault");
+    }
+}
+
+proptest! {
+    /// Every status word a peer can write is either a status this build knows or a
+    /// counted fault, and no value of it is ever read as an answer to an operation
+    /// it does not belong to.
+    #[test]
+    fn no_status_word_answers_an_operation_it_does_not_belong_to(
+        status in 0u32..40,
+        which in 0usize..6,
+    ) {
+        let channel = Channel::zero();
+        let mut requester = channel.requester();
+        let operation = ConfigOperation::ALL[which % ConfigOperation::ALL.len()];
+        let pending = match operation {
+            ConfigOperation::Submit => requester.submit(b"<configuration/>"),
+            ConfigOperation::Read => requester.read(),
+            ConfigOperation::Stage => requester.stage(b"<configuration/>"),
+            ConfigOperation::Commit => requester.commit(1),
+            ConfigOperation::Confirm => requester.confirm(1),
+            ConfigOperation::Rollback => requester.roll_back(),
+        };
+        forge_reply(&channel, pending.sequence(), status, 0);
+        let mut into = buffer();
+        let polled = requester.poll(pending, &mut into);
+        match ConfigStatus::from_bits(status) {
+            Some(decoded) if decoded.answers(operation) => {
+                prop_assert!(!matches!(polled, ConfigPoll::Faulted(_)));
+            }
+            _ => prop_assert!(matches!(polled, ConfigPoll::Faulted(_) | ConfigPoll::NoSuchOperation)),
+        }
     }
 }

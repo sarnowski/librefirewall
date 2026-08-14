@@ -775,10 +775,9 @@ impl Sink {
     /// Take a management server's word for how far it has durably ingested this
     /// recording, and answer whether that moved the reader cursor. `position`
     /// came off the wire and is clamped three ways. **Never past the writer**: a
-    /// ring refuses a cursor ahead of its writer and a refused state is a
-    /// checkpoint not written, so a claim past the end would stop this appliance
-    /// making *any* of it durable. **Never behind the oldest byte the medium
-    /// holds**, and **never backward**.
+    /// ring refuses a cursor ahead of its writer, so a claim past the end would
+    /// stop this appliance making *any* of it durable. **Never behind the oldest
+    /// byte the medium holds**, and **never backward**.
     pub fn acknowledge_reader(&mut self, position: u64) -> bool {
         let segment = self.ring.geometry().segment_bytes() as u64;
         if segment == 0 {
