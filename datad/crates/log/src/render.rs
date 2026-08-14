@@ -595,6 +595,18 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
              channel-capture-shipped={capture_position} \
              channel-capture-pending={capture_pending}"
         ),
+        // `configured-restored=false` is a version this boot committed, `true`
+        // one it resumed off the medium.
+        DomainDetail::Configured {
+            generation,
+            slot,
+            bytes,
+            restored,
+        } => write!(
+            cursor,
+            " configured-generation={generation} configured-slot={slot} \
+             configured-bytes={bytes} configured-restored={restored}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -1800,6 +1812,14 @@ mod tests {
                         capture_position,
                         capture_pending,
                     }
+                },
+            ),
+            (any::<(u64, u8, u64)>(), any::<bool>()).prop_map(
+                |((generation, slot, bytes), restored)| DomainDetail::Configured {
+                    generation,
+                    slot,
+                    bytes,
+                    restored,
                 },
             ),
             (any::<(u64, u64, u64)>(), (0..OnboardEnd::ALL.len())).prop_map(

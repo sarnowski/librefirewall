@@ -857,6 +857,22 @@ pub enum DomainDetail<C = &'static str> {
         capture_position: u64,
         capture_pending: u64,
     },
+    /// Which configuration version the slot array holds as the running one, and
+    /// where on the medium it lives. Appended, never inserted, the four travelling
+    /// together on the details above's terms.
+    ///
+    /// **The flag is why this is one record rather than two.** `false` is a
+    /// version this boot made durable, the write and the flush behind it both
+    /// having succeeded; `true` is one read back off the medium at start-up and
+    /// held to the digest the record names it by, which is the only way an
+    /// operator learns a reboot came back on the configuration the last one
+    /// committed. **No byte of the document has a representation here.**
+    Configured {
+        generation: u64,
+        slot: u8,
+        bytes: u64,
+        restored: bool,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

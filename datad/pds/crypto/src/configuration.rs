@@ -39,13 +39,17 @@
 //! rollback consumes the commit it undoes, so an unreachable server costs one
 //! reversal and then nothing however long it stays away.
 
+use alloc::sync::Arc;
+
 use lfw_log::{Refusal, RefusalDetail};
 use pd_runtime::{MAX_ANSWER_LEN, Outcome, reject_reason_of, write_result_line};
 use sel4_microkit::Channel;
 use wire::{
-    ConfigPoll, ConfigReply, ConfigRequest, ConfigRequester, MAX_DOCUMENT_BYTES,
-    PendingConfigRequest,
+    ConfigPoll, ConfigReply, ConfigRequest, ConfigRequester, InstallStaging, MAX_DOCUMENT_BYTES,
+    PendingConfigRequest, StagedUpload,
 };
+
+use crate::delegate::Delegated;
 
 /// Reads of the reply region before the deciding domain is given up on.
 ///
@@ -116,6 +120,13 @@ pub enum ConfigFailure {
     /// A confirmation on the very session that made the commit, which proves
     /// nothing about a configuration that breaks new connections.
     NotAFreshConnection,
+    /// The configuration is in force and the holder of the medium would not make
+    /// it durable, so it will not survive a reboot. **Reported, not reverted**:
+    /// undoing a commit would leave two domains disagreeing.
+    NotDurable,
+    /// A commit whose document this domain never staged where the holder reads:
+    /// unreachable, and its own token rather than [`Self::Faulted`].
+    NothingStaged,
 }
 
 impl ConfigFailure {
@@ -131,6 +142,8 @@ impl ConfigFailure {
             Self::Exhausted => "channel-config-generations-exhausted",
             Self::GenerationTooWide => "channel-config-generation-too-wide",
             Self::NotAFreshConnection => "channel-config-confirm-not-fresh",
+            Self::NotDurable => "channel-config-not-durable",
+            Self::NothingStaged => "channel-config-nothing-staged",
         }
     }
 
@@ -180,22 +193,39 @@ pub struct ChannelConfig {
     // reads on the console. A tally here would be a second count of one event, and
     // the two would come to disagree.
     awaiting: Option<Awaiting>,
+    /// The region the holder of the medium reads a document out of, which this
+    /// domain maps read-write and that one read-only.
+    ///
+    /// **The document bytes are kept here and nowhere else in this domain.** The
+    /// deciding domain does not keep them, so the write falls to the domain that
+    /// had them last — at staging time, a commit frame carrying none.
+    staging: &'static InstallStaging,
+    /// What the last staging put there; `None` once a commit has consumed it.
+    staged: Option<StagedUpload>,
+    /// The holder of the medium, asked once per commit and only after the
+    /// generation is assigned — the only order that number admits.
+    holder: Arc<Delegated>,
 }
 
 impl ChannelConfig {
     /// Take the asking side of the channel — once per domain; a second would
     /// restart at sequence zero and reuse numbers the first has outstanding.
-    pub const fn attach(
+    pub fn attach(
         request: &'static ConfigRequest,
         reply: &'static ConfigReply,
         decider: Channel,
         answer: Option<&'static mut [u8; MAX_DOCUMENT_BYTES]>,
+        staging: &'static InstallStaging,
+        holder: Arc<Delegated>,
     ) -> Self {
         Self {
             requester: request.requester(reply),
             answer,
             decider,
             awaiting: None,
+            staging,
+            staged: None,
+            holder,
         }
     }
 
@@ -212,6 +242,12 @@ impl ChannelConfig {
         let mut line = [0_u8; MAX_ANSWER_LEN];
         match poll {
             Ok(Answered::Staged { generation }) => {
+                // Where the holder can read them, and only for a document the
+                // deciding domain accepted: a region holding a refused one would
+                // be a commit away from a version nothing validated.
+                let mut cursor = self.staging.upload().cursor();
+                let took = cursor.write(document);
+                self.staged = (took == document.len()).then(|| cursor.finish());
                 let len = write_result_line(&mut line, generation, Outcome::Staged, 0, None);
                 (StageResult { line, len }, None)
             }
@@ -261,6 +297,10 @@ impl ChannelConfig {
                     deadline: now.saturating_add(allowed),
                     session,
                 });
+                // The history, after the configuration is in force: nothing names
+                // a version until the deciding domain has. A failure is answered
+                // and not undone — see `NotDurable`.
+                self.persist(generation)?;
                 Ok(generation)
             }
             // The content was already running, so nothing was displaced and there
@@ -298,6 +338,23 @@ impl ChannelConfig {
             Ok(_) => Err(ConfigFailure::Faulted),
             Err(failure) => Err(failure),
         }
+    }
+
+    /// Ask the holder of the medium to make the staged document a slot of the
+    /// version history, under the generation the deciding domain assigned.
+    ///
+    /// The token is consumed either way, so a second commit with nothing staged is
+    /// refused by name rather than writing what is there.
+    ///
+    /// # Errors
+    /// [`ConfigFailure::NothingStaged`] and [`ConfigFailure::NotDurable`].
+    fn persist(&mut self, generation: u32) -> Result<(), ConfigFailure> {
+        let Some(staged) = self.staged.take() else {
+            return Err(ConfigFailure::NothingStaged);
+        };
+        self.holder
+            .record_config(u64::from(generation), staged)
+            .map_err(|_| ConfigFailure::NotDurable)
     }
 
     /// Put the previous configuration back where the deadline has passed at `now`,

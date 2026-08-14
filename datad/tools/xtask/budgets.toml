@@ -33,7 +33,7 @@
 "crates/config/src/hash.rs" = 0.4409
 "crates/config/src/lib.rs" = 0.4651
 "crates/config/src/model.rs" = 0.2500
-"crates/config/src/provisional.rs" = 0.4872
+"crates/config/src/provisional.rs" = 0.4847
 "crates/config/src/render.rs" = 0.3541
 "crates/config/src/report.rs" = 0.2584
 "crates/config/src/rule.rs" = 0.2115
@@ -75,12 +75,12 @@
 "crates/ip-endpoint/src/outbound.rs" = 0.4305
 "crates/ip-endpoint/src/route.rs" = 0.5247
 "crates/log/src/console.rs" = 0.5075
-"crates/log/src/detail.rs" = 0.6270
+"crates/log/src/detail.rs" = 0.6269
 "crates/log/src/event.rs" = 0.5090
 "crates/log/src/identifier.rs" = 0.2775
 "crates/log/src/lib.rs" = 0.4110
-"crates/log/src/record.rs" = 0.1306
-"crates/log/src/render.rs" = 0.2194
+"crates/log/src/record.rs" = 0.1298
+"crates/log/src/render.rs" = 0.2188
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
 "crates/metrics/src/catalog.rs" = 0.1156
@@ -125,10 +125,11 @@
 "crates/recorder/src/preload.rs" = 0.4270
 "crates/routing/src/lib.rs" = 0.3270
 "crates/rtc/src/lib.rs" = 0.5119
+"crates/store/src/document.rs" = 0.5065
 "crates/store/src/identity.rs" = 0.4926
 "crates/store/src/install.rs" = 0.4343
 "crates/store/src/layout.rs" = 0.6170
-"crates/store/src/lib.rs" = 0.7664
+"crates/store/src/lib.rs" = 0.7523
 "crates/store/src/reset.rs" = 0.5297
 "crates/store/src/slots.rs" = 0.2922
 "crates/store/src/state.rs" = 0.2266
@@ -186,10 +187,10 @@
 "pds/console/src/com1.rs" = 0.6400
 "pds/console/src/main.rs" = 0.4884
 "pds/crypto/src/arena.rs" = 0.4863
-"pds/crypto/src/channel.rs" = 0.4148
-"pds/crypto/src/configuration.rs" = 0.4072
-"pds/crypto/src/delegate.rs" = 0.5373
-"pds/crypto/src/main.rs" = 0.4084
+"pds/crypto/src/channel.rs" = 0.4140
+"pds/crypto/src/configuration.rs" = 0.4061
+"pds/crypto/src/delegate.rs" = 0.5343
+"pds/crypto/src/main.rs" = 0.4070
 "pds/crypto/src/upload.rs" = 0.4205
 "pds/forwarder/src/main.rs" = 0.4752
 "pds/hardware-probe/src/main.rs" = 0.4226
@@ -197,7 +198,7 @@
 "pds/management/src/main.rs" = 0.4504
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3018
-"pds/store/src/main.rs" = 0.4532
+"pds/store/src/main.rs" = 0.4455
 
 [unsafe-blocks]
 "crates/blk" = 8

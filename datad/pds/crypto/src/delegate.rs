@@ -267,7 +267,8 @@ impl Delegated {
             Answer::Signature { .. }
             | Answer::Certificate { .. }
             | Answer::Anchor { .. }
-            | Answer::Installed => Err(DelegationError::Faulted),
+            | Answer::Installed
+            | Answer::ConfigRecorded => Err(DelegationError::Faulted),
         }
     }
 
@@ -295,7 +296,38 @@ impl Delegated {
             Answer::Signature { .. }
             | Answer::Identity(_)
             | Answer::Certificate { .. }
-            | Answer::Anchor { .. } => Err(DelegationError::Faulted),
+            | Answer::Anchor { .. }
+            | Answer::ConfigRecorded => Err(DelegationError::Faulted),
+        }
+    }
+
+    /// Ask the holder to record the configuration document staged in the region
+    /// this domain wrote as the running version, under `generation`.
+    ///
+    /// [`Self::install`]'s shape with a different subject, and it carries the same
+    /// two disclaimers. The token is a convenience of this side and not a defence:
+    /// the holder ranges the stated length against its own region. And a refusal
+    /// comes back carrying nothing — **which** rule refused the document is on the
+    /// holder's console, beside the slot and the generation that place it.
+    ///
+    /// The generation is the deciding domain's and travels unchanged: this domain
+    /// neither mints one nor checks one, holding no datastore to check it against.
+    ///
+    /// # Errors
+    /// [`DelegationError`], naming which way the exchange failed.
+    pub fn record_config(
+        &self,
+        generation: u64,
+        staged: StagedUpload,
+    ) -> Result<(), DelegationError> {
+        match self.exchange(Ask::RecordConfig { generation, staged }, None)? {
+            Answer::ConfigRecorded => Ok(()),
+            // Unreachable for [`Self::held_key`]'s reason, and a fault for it.
+            Answer::Signature { .. }
+            | Answer::Identity(_)
+            | Answer::Certificate { .. }
+            | Answer::Anchor { .. }
+            | Answer::Installed => Err(DelegationError::Faulted),
         }
     }
 
@@ -325,7 +357,8 @@ impl Delegated {
             Answer::Signature { .. }
             | Answer::Identity(_)
             | Answer::Anchor { .. }
-            | Answer::Installed => Err(DelegationError::Faulted),
+            | Answer::Installed
+            | Answer::ConfigRecorded => Err(DelegationError::Faulted),
         }
     }
 
@@ -361,7 +394,8 @@ impl Delegated {
             Answer::Signature { .. }
             | Answer::Identity(_)
             | Answer::Certificate { .. }
-            | Answer::Installed => Err(DelegationError::Faulted),
+            | Answer::Installed
+            | Answer::ConfigRecorded => Err(DelegationError::Faulted),
         }
     }
 
@@ -419,6 +453,10 @@ impl Delegated {
             // sequence's own release store is what makes those bytes visible to
             // the holder before the demand that names them is.
             Ask::Install(staged) => requester.install(staged),
+            // The document is not in this pair of regions either, on the
+            // archive's terms exactly; what travels in the request beside the
+            // staged length is the generation the deciding domain assigned.
+            Ask::RecordConfig { generation, staged } => requester.record_config(generation, staged),
         };
         // After the request is published and not before: the notification is what
         // makes the holder look, and a signal ahead of the sequence would be a
@@ -479,6 +517,7 @@ impl Delegated {
                 }
                 SignPoll::Refused(_) => return Err(DelegationError::Refused),
                 SignPoll::Installed => return Ok(Answer::Installed),
+                SignPoll::ConfigRecorded => return Ok(Answer::ConfigRecorded),
                 SignPoll::Faulted(_) => return Err(DelegationError::Faulted),
             }
         }
@@ -531,6 +570,10 @@ enum Answer {
     /// an operator on the holder's console, where they were decided and made
     /// durable.
     Installed,
+    /// The document staged in the region is now a slot of the configuration
+    /// history, durably. It carries nothing on [`Self::Installed`]'s terms: which
+    /// slot took it and what that displaced are the holder's console.
+    ConfigRecorded,
 }
 
 /// What one exchange asks for.
@@ -543,6 +586,15 @@ enum Answer {
 enum Ask<'a> {
     Message(SignOperation, &'a [u8]),
     Install(StagedUpload),
+    /// A configuration document staged in that same region, and the generation
+    /// the deciding domain assigned it. The generation rides here rather than in
+    /// a `Message` beside an empty slice for the reason the install's length
+    /// does: the subject is the region, and pairing a length with a message would
+    /// be the pairing [`StagedUpload`] exists to prevent.
+    RecordConfig {
+        generation: u64,
+        staged: StagedUpload,
+    },
 }
 
 impl TlsSignOperation for Delegated {

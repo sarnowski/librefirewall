@@ -205,6 +205,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "crates/store/src/identity.rs",
         Vocabulary::Causes(&["store"]),
     ),
+    // And the version history's, on the identity's terms exactly:
+    // `lfw_store::DocumentError::cause` is the one place that knows what each
+    // rule about a document or the array it would join means, so scanning the
+    // domain alone would leave the whole vocabulary uncompared.
+    (
+        "crates/store/src/document.rs",
+        Vocabulary::Causes(&["store"]),
+    ),
     // The closed vocabularies themselves: `RejectReason`'s tokens, plus
     // `Domain`'s and `Field`'s hyphenated ones. Every one of them is reachable
     // as an `ALL` array, so scanning this file would be the second copy.

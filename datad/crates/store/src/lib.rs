@@ -83,6 +83,7 @@
 //! and the record is the copy a reader would have to believe anyway — so the
 //! slot carries no self-description at all.
 
+mod document;
 mod identity;
 mod install;
 mod layout;
@@ -93,6 +94,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use document::{DocumentError, matches as document_matches, staged_entry};
 pub use identity::{Identity, IdentityError, Minted, mint, verify};
 pub use install::{Adoption, ChainFault, InstallError, read as read_package};
 pub use layout::{

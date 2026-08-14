@@ -327,6 +327,9 @@ pub enum LogDetailKind {
     /// and how much of each it still owes the server. Appended, never inserted,
     /// and one discriminant and not two: the question is about the channel.
     ChannelShipping,
+    /// Which configuration version the slot array holds as the running one, out of
+    /// which slot, of what size, and whether it was read back. Appended.
+    Configured,
 }
 
 impl LogDetailKind {
@@ -389,6 +392,7 @@ impl LogDetailKind {
             Self::RecordingResumed => 53,
             Self::RecordingFresh => 54,
             Self::ChannelShipping => 55,
+            Self::Configured => 56,
         }
     }
 
@@ -451,6 +455,7 @@ impl LogDetailKind {
             53 => Some(Self::RecordingResumed),
             54 => Some(Self::RecordingFresh),
             55 => Some(Self::ChannelShipping),
+            56 => Some(Self::Configured),
             _ => None,
         }
     }
@@ -1073,6 +1078,15 @@ impl LogRecord {
                 capture_position: self.operands[2],
                 capture_pending: self.operands[3],
             },
+            // The generation and the length are unranged, every bit pattern of
+            // each being one a commit could produce. The slot is ranged to a byte
+            // and the flag sits in the FOURTH word beside every other.
+            Some(LogDetailKind::Configured) => CheckedDetail::Configured {
+                generation: self.operands[0],
+                slot: slot_number(self.operands[1])?,
+                bytes: self.operands[2],
+                restored: flag(self.operands[3])?,
+            },
             // A sector and a flag, the flag in the fourth word where this ABI puts
             // every one, so a word that is neither 0 nor 1 makes it unreadable.
             Some(LogDetailKind::RecordingFresh) => CheckedDetail::RecordingFresh {
@@ -1417,6 +1431,12 @@ fn sequence_bits(raw: u64) -> Result<u32, LogRecordError> {
 /// would otherwise render as an address truncated into a different one.
 fn address_bits(raw: u64) -> Result<u32, LogRecordError> {
     u32::try_from(raw).map_err(|_| LogRecordError::AddressTooWide { value: raw })
+}
+
+/// A configuration slot index carried in an operand word: a byte, the width the
+/// store's own index type has, refused on [`address_bits`]'s terms.
+fn slot_number(raw: u64) -> Result<u8, LogRecordError> {
+    u8::try_from(raw).map_err(|_| LogRecordError::SlotNumberTooWide { value: raw })
 }
 
 /// A protocol registry code point, which is sixteen bits wide wherever TLS
@@ -1904,6 +1924,13 @@ pub enum CheckedDetail {
         capture_position: u64,
         capture_pending: u64,
     },
+    /// Which version is running, out of which slot, and whether it was read back.
+    Configured {
+        generation: u64,
+        slot: u8,
+        bytes: u64,
+        restored: bool,
+    },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.
     Onboarded {
@@ -2141,6 +2168,10 @@ pub enum LogRecordError {
     AddressTooWide {
         value: u64,
     },
+    /// An operand carrying a slot index wider than the byte one has.
+    SlotNumberTooWide {
+        value: u64,
+    },
     DomainUnknown {
         domain: u8,
     },
@@ -2274,6 +2305,9 @@ impl fmt::Display for LogRecordError {
             }
             Self::AddressTooWide { value } => {
                 write!(f, "address word {value} does not fit thirty-two bits")
+            }
+            Self::SlotNumberTooWide { value } => {
+                write!(f, "slot word {value} does not fit eight bits")
             }
             Self::OperandFlagNotBoolean { value } => {
                 write!(f, "operand flag {value} is neither 0 nor 1")

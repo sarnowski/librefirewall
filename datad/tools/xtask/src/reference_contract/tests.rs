@@ -122,6 +122,10 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
             &["install-endpoint-loopback"],
         ),
         ("crates/store/src/identity.rs", &["stored-scalar-unusable"]),
+        (
+            "crates/store/src/document.rs",
+            &["document-digest-mismatch"],
+        ),
         ("crates/log/src/event.rs", &["duplicate-port"]),
         ("crates/wire/src/lib.rs", &["source-port"]),
         ("crates/tcp/src/connection.rs", &["close-wait"]),
@@ -170,6 +174,7 @@ fn sound_console() -> String {
                     "store-medium-too-small",
                     "install-endpoint-loopback",
                     "stored-scalar-unusable",
+                    "document-digest-mismatch",
                 ][..],
             ),
         ],
@@ -201,7 +206,11 @@ fn sound_console() -> String {
             ),
             (
                 vec!["store"],
-                &["store-medium-too-small", "stored-scalar-unusable"][..],
+                &[
+                    "store-medium-too-small",
+                    "stored-scalar-unusable",
+                    "document-digest-mismatch",
+                ][..],
             ),
             (vec!["store", "crypto"], &["install-endpoint-loopback"][..]),
         ],
@@ -319,6 +328,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
                 "store-medium-too-small",
                 "install-endpoint-loopback",
                 "stored-scalar-unusable",
+                "document-digest-mismatch",
             ],
         ),
     ]);

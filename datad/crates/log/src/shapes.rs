@@ -249,6 +249,18 @@ pub(crate) fn every_detail() -> Vec<DomainDetail> {
             capture_position: u64::MAX,
             capture_pending: u64::MAX,
         },
+        DomainDetail::Configured {
+            generation: u64::MAX,
+            slot: u8::MAX,
+            bytes: u64::MAX,
+            restored: false,
+        },
+        DomainDetail::Configured {
+            generation: u64::MAX,
+            slot: u8::MAX,
+            bytes: u64::MAX,
+            restored: true,
+        },
         DomainDetail::Onboarded {
             relayed: u64::MAX,
             received: u64::MAX,

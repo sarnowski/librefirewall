@@ -782,8 +782,8 @@ node: an operator holding a silent appliance still has only the external act.
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
 `nic-driver` domain raises, 30 the `clock` domain raises, 25 the `management` domain raises, 46
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 169 the `crypto` domain
-raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 171 the `crypto` domain
+raises, and 175 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
@@ -1024,7 +1024,7 @@ of a vector's contents.
 | the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
 | a shipment of ring bytes this end would not compose into a frame (none carries a `detail=`) | `channel-shipment-too-long`, `channel-shipment-before-greeting`, `channel-shipment-not-taken` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
-| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh` |
+| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-not-durable`, `channel-config-nothing-staged` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
 server's.** `channel-identity-absent` is a node whose store published somewhere to dial and whose
@@ -1064,6 +1064,17 @@ halves disagreeing: `channel-config-unanswered` is the deciding domain not answe
 budget — a wedged or faulted domain, whose own records are what to read next — and
 `channel-config-faulted` is it answering something the request cannot be answered with, which should
 never appear.
+
+`channel-config-not-durable` is the one token here that is **not** a refused operation. The commit
+happened — the deciding domain is enforcing the new document and the fleet has been told so — and
+the domain that owns the medium would not write it into the version history, so the configuration in
+force will not survive a reboot. It is reported rather than reverted, because undoing a commit here
+would leave two domains disagreeing about what is running; **which** rule the holder refused it
+under is on that holder's console, under a `document-` or `config-` token beside the slot and the
+generation. `channel-config-nothing-staged` is a commit whose document this domain never placed in
+the region the holder reads, which the deciding domain's own refusal of a commit with nothing staged
+makes unreachable — reaching it means the two stagings have come apart, and it is that and not the
+delegation an operator should be sent to.
 
 **The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
 rule of the channel's own protocol that the far end broke, and the context the code has for each —
@@ -1162,12 +1173,15 @@ having been told to run.
 | reading the factory-reset request sector (same `detail=` rule) | `reset-read-refused`, `reset-read-misattributed`, `reset-read-failed`, `reset-read-short`, `reset-read-unanswered` |
 | clearing that request, which everything irreversible sits behind (same `detail=` rule) | `reset-clear-refused`, `reset-clear-misattributed`, `reset-clear-failed`, `reset-clear-short`, `reset-clear-unanswered` |
 | overwriting what the medium held (same `detail=` rule) | `reset-overwrite-refused`, `reset-overwrite-misattributed`, `reset-overwrite-failed`, `reset-overwrite-short`, `reset-overwrite-unanswered` |
+| writing a configuration document into its slot (same `detail=` rule) | `slot-write-refused`, `slot-write-misattributed`, `slot-write-failed`, `slot-write-short`, `slot-write-unanswered` |
+| reading one back (same `detail=` rule) | `slot-read-refused`, `slot-read-misattributed`, `slot-read-failed`, `slot-read-short`, `slot-read-unanswered` |
 | a record this build will not act on (`detail=` is the length, the slot index, or the stored slot count and slot size, as the token names) | `stored-layout-mismatch`, `stored-certificate-too-long`, `stored-document-too-long`, `stored-slot-named-twice`, `stored-slot-outside-array`, `stored-named-slot-empty`, `stored-record-unusable` |
 | an identity that does not hold to itself (none carries a `detail=`) | `stored-scalar-unusable`, `stored-public-key-mismatch`, `stored-certificate-key-mismatch`, `stored-certificate-absent` |
 | minting one (none carries a `detail=`) | `device-key-ungenerable`, `onboarding-certificate-unwritable`, `public-key-unencodable`, `certificate-too-long-for-record` |
 | the hardware entropy source (`detail=` is the CPUID word for the first and the failing draw's index for the next two; the last carries none) | `rdrand-not-supported`, `rdrand-exhausted`, `rdrand-output-stuck`, `generator-repeated-a-draw` |
 | installing an onboarding package, before a rule of it is read (`detail=` is the stated length and the bytes really staged for `install-archive-past-region`, the number of installs one boot serves for `installs-exhausted`, and absent on the rest) | `install-already-owned`, `install-archive-past-region`, `installs-exhausted`, `install-no-medium`, `install-record-absent`, `install-appliance-key-unencodable`, `install-certificate-too-long`, `install-record-refused-the-package`, `install-unusable` |
 | the one signature this appliance verifies for itself, under one algorithm, one curve and a path of length one (none carries a `detail=`) | `install-certificate-malformed`, `install-signature-algorithm-malformed`, `install-signature-malformed`, `install-anchor-key-malformed`, `install-signature-not-ecdsa-sha256`, `install-signature-algorithms-disagree`, `install-anchor-key-not-p256`, `install-signature-not-authentic` |
+| recording a configuration document as a version of the history (`detail=` is the stated length and the bound it crossed for `document-past-bound`, the generation named and the newest the array holds for `document-generation-not-newest`, the versions one boot records for `config-records-exhausted`, the slot and the generation it drops for `config-slot-displaced`, and absent on the rest) | `document-empty`, `document-past-bound`, `document-generation-zero`, `document-generation-not-newest`, `document-array-full`, `document-digest-mismatch`, `config-records-exhausted`, `config-no-medium`, `config-record-absent`, `config-slot-displaced` |
 
 The `install-` tokens above are this domain's own, and they say something about the **appliance**
 rather than about the package — the rules a package itself must satisfy are the shared catalogue
@@ -1190,6 +1204,25 @@ does not weigh name constraints, key usage, basic constraints, validity windows 
 are the validator's, and a second general policy engine in the domain holding the private key is
 what this appliance declines to have. So a token here after the other domain accepted the same
 package is not a second opinion — it means the two readings of one upload disagreed.
+
+The `document-` and `config-` tokens are the version history's, and they divide the same way the
+`install-` ones do: `document-` is a rule about the document or the array it would join, `config-` is
+about this domain's own budget, medium or record. `document-generation-not-newest` is the sharp one
+— a generation that does not advance past what the array already holds is a **replay**, a management
+plane re-committing a version the appliance has already seen under a number that would make it the
+newest, and refusing it is what keeps "the newest generation" and "the version last committed" the
+same thing.
+
+Two of them are not failures. `config-slot-displaced` is a write taking the array's **lowest**
+generation because every slot was occupied, and it names the slot and the version that went with it:
+the history is bounded, dropping its oldest entry is the intended behaviour, and the record exists
+because "which version did I lose" is a question an operator asks after a rollback finds nothing.
+`document-digest-mismatch` is the opposite kind of line — it appears at **start-up**, where the
+running slot is read back off the medium and held to the digest the record carries for it, and it
+says the medium did not give back the document the record says is in it. That is the one check
+standing between a configuration history and a document somebody swapped on a disk they were
+holding, and a node raising it comes up on the configuration compiled into its image rather than on
+whatever the slot contained.
 
 Every `stored-` token is a **physically present attacker's**, or a previous deployment's. This is the
 one domain whose input arrives on a disk somebody could have written at leisure, so a record that

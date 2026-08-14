@@ -520,7 +520,14 @@ fn init() -> Crypto {
         arena,
         mark,
         held,
-        ChannelConfig::attach(config_request, config_reply, DECIDER, config_answer),
+        ChannelConfig::attach(
+            config_request,
+            config_reply,
+            DECIDER,
+            config_answer,
+            staging,
+            Arc::clone(&delegated),
+        ),
     );
     if let Some(identity) = channel_identity(established.as_ref(), endpoint) {
         channel.adopted(identity);

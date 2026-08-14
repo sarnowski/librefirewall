@@ -239,6 +239,22 @@ pub enum SignOperation {
     /// byte string, so a caller is told there is nothing to trust yet instead of
     /// being handed zero bytes it might read as an anchor.
     Anchor,
+    /// Record the configuration document staged in [`crate::InstallStaging`] as
+    /// the running version, under the generation the request names.
+    ///
+    /// [`Self::Install`]'s shape with a different subject, reusing that region for
+    /// the same reasons and carrying both its disclaimers: the stated length is
+    /// **a claim**, and the answer is the status word alone.
+    ///
+    /// The generation travels in the message field as eight little-endian bytes,
+    /// read by [`SignDemand::config_generation`] at a fixed width. It is the
+    /// **deciding domain's** number, a holder that minted its own leaving the
+    /// appliance with two answers to "which version is running" — and the holder
+    /// still refuses one that does not advance past its array, which is a replay.
+    ///
+    /// **Nothing here reaches the trust anchor or the management endpoint**: the
+    /// holder writes a slot and the table naming it and no other field.
+    RecordConfig,
 }
 
 impl SignOperation {
@@ -250,6 +266,7 @@ impl SignOperation {
             Self::Certificate => 2,
             Self::Install => 3,
             Self::Anchor => 4,
+            Self::RecordConfig => 5,
         }
     }
 
@@ -266,6 +283,7 @@ impl SignOperation {
             2 => Some(Self::Certificate),
             3 => Some(Self::Install),
             4 => Some(Self::Anchor),
+            5 => Some(Self::RecordConfig),
             _ => None,
         }
     }
@@ -682,6 +700,9 @@ pub enum SignFault {
     LenPastCertificate { len: u32 },
     /// A refusal carrying bytes, which no answer means.
     BytesOnRefusal { status: SignStatus, len: u32 },
+    /// A recorded-configuration answer stating a length, which nothing there is a
+    /// length of. Its own variant rather than [`Self::BytesOnInstall`].
+    BytesOnConfigRecord { len: u32 },
     /// A signature of zero length under a success, which is not a signature.
     EmptySignature,
     /// A certificate of zero length under a success, which is not a certificate.
@@ -810,6 +831,9 @@ pub enum SignPoll<'buf> {
     /// [`SignRefusal::InstallRefused`] rather than as a variant here, so a caller
     /// that forgets to handle one gets the refusal arm it already has.
     Installed,
+    /// The holder wrote the staged configuration document to a slot and made the
+    /// record naming it durable. It carries nothing on [`Self::Installed`]'s terms.
+    ConfigRecorded,
     /// The holder answered and produced nothing, saying why.
     Refused(SignRefusal),
     /// The reply carried this request's sequence and could not be believed.
@@ -890,6 +914,39 @@ impl SignRequester<'_> {
         PendingSignature {
             sequence: self.sequence,
             operation: SignOperation::Install,
+        }
+    }
+
+    /// Ask the holder to record the configuration document `staged` names as the
+    /// running version, under `generation`.
+    ///
+    /// [`Self::install`]'s shape and its disclaimer. The generation goes in the
+    /// message field and the stated length stays the staging region's, which lets
+    /// the holder range the two separately.
+    pub fn record_config(&mut self, generation: u64, staged: StagedUpload) -> PendingSignature {
+        for (cell, byte) in self
+            .request
+            .message
+            .iter()
+            .zip(generation.to_le_bytes().iter())
+        {
+            cell.store(*byte, Ordering::Relaxed);
+        }
+        // Zero is *no request*, on `request`'s terms.
+        self.sequence = match self.sequence.wrapping_add(1) {
+            0 => 1,
+            next => next,
+        };
+        self.request
+            .operation
+            .store(SignOperation::RecordConfig.to_bits(), Ordering::Relaxed);
+        self.request.len.store(staged.len(), Ordering::Relaxed);
+        self.request
+            .sequence
+            .store(self.sequence, Ordering::Release);
+        PendingSignature {
+            sequence: self.sequence,
+            operation: SignOperation::RecordConfig,
         }
     }
 
@@ -996,6 +1053,12 @@ impl SignRequester<'_> {
                 self.reply.copy_anchor(target);
                 SignPoll::Anchor { anchor: target }
             }
+            SignOperation::RecordConfig => {
+                if len != 0 {
+                    return self.fault(SignFault::BytesOnConfigRecord { len });
+                }
+                SignPoll::ConfigRecorded
+            }
         }
     }
 
@@ -1068,6 +1131,18 @@ impl SignDemand {
         let target = into.get_mut(..self.len as usize)?;
         responder.request.copy_message(target);
         Some(target)
+    }
+
+    /// The configuration generation a [`SignOperation::RecordConfig`] request
+    /// names, read at a **fixed** eight bytes out of the message field.
+    ///
+    /// It does not consult the stated length, which is why it is a method of its
+    /// own: that length is about the staging region here, so ranging the message
+    /// by it would refuse a document larger than a message.
+    pub fn config_generation(&self, responder: &SignResponder<'_>) -> u64 {
+        let mut bytes = [0_u8; size_of::<u64>()];
+        responder.request.copy_message(&mut bytes);
+        u64::from_le_bytes(bytes)
     }
 }
 
@@ -1194,6 +1269,11 @@ impl SignResponder<'_> {
         self.publish(demand, SignOperation::Install, SignStatus::Ok, 0);
     }
 
+    /// Answer `demand` with the verdict that the staged document is now a slot.
+    pub fn config_recorded(&mut self, demand: SignDemand) {
+        self.publish(demand, SignOperation::RecordConfig, SignStatus::Ok, 0);
+    }
+
     /// Answer `demand` with nothing, saying why. Publishes a zero length, which is
     /// what makes [`SignFault::BytesOnRefusal`] a fault the requester can raise
     /// against a peer that does otherwise.
@@ -1266,7 +1346,9 @@ const _: () = {
     assert!(SignOperation::Sign.to_bits() == 0);
     assert!(SignRefusal::from_status(SignStatus::Ok).is_none());
     assert!(SignStatus::from_bits(7).is_none());
-    assert!(SignOperation::from_bits(5).is_none());
+    assert!(SignOperation::from_bits(6).is_none());
+    // `config_generation` reads bytes that are there whatever a length says.
+    assert!(size_of::<u64>() <= MAX_SIGN_MESSAGE);
 
     assert!(offset_of!(SignRequest, sequence) == 0);
     assert!(offset_of!(SignRequest, operation) == 4);
