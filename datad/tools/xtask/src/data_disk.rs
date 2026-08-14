@@ -329,13 +329,13 @@ impl DataDisk {
     /// thing that notices is a process on the host side reading the file the
     /// guest wrote.
     ///
-    /// `resumed` says whether a previous boot wrote this medium, which decides
-    /// **where the walk begins**. A boot that resumed opened the segment after
-    /// the one it read, so the extent's written bytes start there rather than at
-    /// payload byte zero and a walk from zero stops at the unsealed tail its
-    /// predecessor left. It is the harness's own fact — which image was attached
-    /// — rather than one read back off the disk, so no recorder can make its
-    /// extent judged from a later segment by writing one.
+    /// **The walk begins at payload byte zero on every medium**, carried or not.
+    /// A boot that resumed picked the recording up at the byte its predecessor
+    /// stopped on — a block boundary, because what the device takes always ends
+    /// on one — and opened a pcapng section there, so the whole extent is one
+    /// walkable stream across every boot that ever wrote it. Starting anywhere
+    /// later would be this harness declining to read the join it exists to
+    /// judge.
     ///
     /// `conversations` says whether this boot opened one, which decides what the
     /// **history** extent owes and nothing else. A conversation is opened by a
@@ -350,11 +350,7 @@ impl DataDisk {
     /// extent whose payload segments hold no walkable pcapng, one the walk did
     /// not follow to exactly the byte the superblock's durable cursor names, or
     /// an extent that holds no packet block where this boot owed one.
-    pub(crate) fn judge_recordings(
-        &self,
-        conversations: bool,
-        resumed: bool,
-    ) -> Result<String, String> {
+    pub(crate) fn judge_recordings(&self, conversations: bool) -> Result<String, String> {
         let mut file = OpenOptions::new()
             .read(true)
             .open(&self.path)
@@ -407,38 +403,16 @@ impl DataDisk {
                     self.path.display()
                 ));
             }
-            // Past segment 0, which holds the superblock and no record — and,
-            // on a medium a previous boot wrote, past the segments that boot
-            // left: this one opened the segment after the one it read, so the
-            // bytes in front of it are its predecessor's and end wherever that
-            // boot stopped.
+            // Past segment 0, which holds the superblock and no record, and no
+            // further: every boot that ever wrote this extent appended to the
+            // one stream that starts here, so the walk below crosses each
+            // resume join rather than beginning after it.
             let segment_sectors = (SEGMENT_BYTES / SECTOR_SIZE) as u64;
-            let opened = if resumed { state.writer().sequence } else { 0 };
-            let from = usize::try_from(opened)
-                .ok()
-                .and_then(|opened| opened.checked_mul(SEGMENT_BYTES))
-                .unwrap_or(usize::MAX);
-            let Some(durable) = durable.checked_sub(from) else {
-                return Err(format!(
-                    "the superblock at sector {start_sector} places its durable cursor at payload \
-                     byte {durable}, behind the segment {opened} this boot opened\n  image: {}",
-                    self.path.display()
-                ));
-            };
-            // What the two numbers below are counted from, said once so the
-            // verdict cannot claim a coordinate the walk did not use.
-            let walked = if resumed {
-                "byte, of the segment this boot opened,"
-            } else {
-                "payload byte"
-            };
-            let payload_sectors = sectors
-                .saturating_sub(segment_sectors)
-                .saturating_sub(opened.saturating_mul(segment_sectors));
+            let payload_sectors = sectors.saturating_sub(segment_sectors);
             let mut payload = vec![0u8; payload_sectors as usize * SECTOR_SIZE];
             read_at(
                 &mut file,
-                (start_sector + segment_sectors + opened * segment_sectors) * SECTOR_SIZE as u64,
+                (start_sector + segment_sectors) * SECTOR_SIZE as u64,
                 &mut payload,
             )
             .map_err(|error| format!("read the extent at sector {start_sector}: {error}"))?;
@@ -498,7 +472,7 @@ impl DataDisk {
             }
             lines.push(format!(
                 "  sector {start_sector}: superblock generation {}, {} section header(s), {} \
-                 packet block(s); durable end at {walked} {durable}, written prefix ending \
+                 packet block(s); durable end at payload byte {durable}, written prefix ending \
                  at {} ({awaiting_checkpoint} byte(s) awaiting a checkpoint), nothing written \
                  beyond it",
                 state.write_generation(),
@@ -511,6 +485,49 @@ impl DataDisk {
             "both recording extents, read off the disk image after shutdown:\n{}",
             lines.join("\n")
         ))
+    }
+
+    /// What each extent already held **going into** this boot, parsed — in
+    /// [`Deck::extents`]'s order, which is the connection history and then the
+    /// capture. Empty on a boot that made its own medium.
+    ///
+    /// A recording outlives the node, so a download taken during a boot that
+    /// resumed one answers earlier boots' records as well as this boot's, while
+    /// every counter the appliance publishes is this boot's alone. What tells
+    /// the two apart is this: the durable prefix read off the file before QEMU
+    /// was started is exactly the part of the download that is not this boot's
+    /// doing, so a contract holding the recordings to the exposition can
+    /// subtract it and stay exact instead of standing down on a carried medium.
+    ///
+    /// # Errors
+    /// An inherited prefix that does not parse as pcapng, which would leave
+    /// whatever is subtracted from it meaningless.
+    pub(crate) fn carried_recordings(&self) -> Result<Vec<recording_contract::Parsed>, String> {
+        let mut carried = Vec::new();
+        for held in &self.inherited {
+            let start_sector = held.start_sector;
+            let parsed = recording_contract::parse(&held.durable).map_err(|error| {
+                format!(
+                    "the {} inherited byte(s) at sector {start_sector} are not a pcapng \
+                     recording: {error}\n  image: {}",
+                    held.durable.len(),
+                    self.path.display()
+                )
+            })?;
+            if parsed.consumed != held.durable.len() {
+                return Err(format!(
+                    "the extent at sector {start_sector} went into this boot with {} durable \
+                     byte(s) of which the block walk followed the extent's own lengths only to \
+                     {}, so what this boot inherited is not a whole number of blocks and nothing \
+                     can be counted out of it\n  image: {}",
+                    held.durable.len(),
+                    parsed.consumed,
+                    self.path.display()
+                ));
+            }
+            carried.push(parsed);
+        }
+        Ok(carried)
     }
 }
 
@@ -540,8 +557,9 @@ impl DataDisk {
     ///
     /// # Errors
     /// A recording that did not resume, one whose console record is missing or
-    /// carries numbers the medium does not bear out, a generation or sequence
-    /// that did not advance, or any byte of the inherited prefix that moved.
+    /// carries numbers the medium does not bear out, a generation or write
+    /// position that did not advance, or any byte of the inherited prefix that
+    /// moved.
     pub(crate) fn judge_resumed(&self, serial: &[u8]) -> Result<Option<String>, String> {
         if self.inherited.is_empty() {
             return Ok(None);
@@ -560,10 +578,10 @@ impl DataDisk {
             // nobody can read off the console is one a deployment cannot act on.
             let record = format!(
                 " recording-start={start_sector} recording=resumed recording-generation={} \
-                 recording-sequence={} recording-opened={}",
+                 recording-sequence={} recording-offset={}",
                 before.write_generation(),
                 before.writer().sequence,
-                before.writer().sequence.saturating_add(1),
+                before.writer().offset,
             );
             if !transcript.contains(&record) {
                 return Err(format!(
@@ -597,14 +615,14 @@ impl DataDisk {
                     before.write_generation()
                 ));
             }
-            if after.writer().sequence <= before.writer().sequence {
+            let went_in = position_of(before.writer());
+            let came_out = position_of(after.writer());
+            if came_out <= went_in {
                 return Err(format!(
-                    "the extent at sector {start_sector} came out of this boot writing segment {} \
-                     and went into it at segment {}. A resumed recording opens the segment after \
-                     the one it read — the previous boot's was left unsealed — so a sequence that \
-                     did not advance is a boot that reopened it",
-                    after.writer().sequence,
-                    before.writer().sequence
+                    "the extent at sector {start_sector} came out of this boot writing position \
+                     {came_out} and went into it at {went_in}. A resumed recording picks up at the \
+                     byte the medium named and appends past it, so a position that did not advance \
+                     is a boot that wrote nothing of its own"
                 ));
             }
 
@@ -633,14 +651,11 @@ impl DataDisk {
                 ));
             }
             lines.push(format!(
-                "  sector {start_sector}: resumed at generation {} segment {}, opened segment {}, \
-                 now at generation {} segment {}; the {} byte(s) the previous boot made durable \
+                "  sector {start_sector}: resumed at generation {} position {went_in}, now at \
+                 generation {} position {came_out}; the {} byte(s) the previous boot made durable \
                  are byte for byte where it left them",
                 before.write_generation(),
-                before.writer().sequence,
-                before.writer().sequence.saturating_add(1),
                 after.write_generation(),
-                after.writer().sequence,
                 held.durable.len(),
             ));
         }
@@ -649,6 +664,15 @@ impl DataDisk {
             lines.join("\n")
         )))
     }
+}
+
+/// A writer cursor as one number in the ring's own append space, which is what
+/// a boot advances along whether or not it crosses a segment.
+fn position_of(cursor: lfw_capture_ring::Cursor) -> u64 {
+    cursor
+        .sequence
+        .saturating_mul(SEGMENT_BYTES as u64)
+        .saturating_add(cursor.offset as u64)
 }
 
 /// What to add to a missing-resumption message when the node said the opposite,

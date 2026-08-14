@@ -432,11 +432,11 @@ pub struct RecorderCounters {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Opened {
     /// A superblock a previous boot left. `generation`/`sequence` are the medium's;
-    /// `opened` is the segment after the one read, its predecessor being unsealed.
+    /// `offset` is where in that segment this boot picked the recording up.
     Resumed {
         generation: u64,
         sequence: u64,
-        opened: u64,
+        offset: u64,
     },
     /// Neither copy decoded: an unwritten extent, or one beyond use.
     FreshMedium,
@@ -502,13 +502,13 @@ impl Recording {
             None => (Sink::new(config, staging), Opened::FreshMedium),
             Some(state) => match Sink::resume(config, &state, staging) {
                 Ok(sink) => {
-                    let opened = sink.cursor().sequence;
+                    let resumed = state.writer();
                     (
                         Ok(sink),
                         Opened::Resumed {
                             generation: state.write_generation(),
-                            sequence: state.writer().sequence,
-                            opened,
+                            sequence: resumed.sequence,
+                            offset: resumed.offset as u64,
                         },
                     )
                 }
@@ -1230,7 +1230,7 @@ impl Deck {
             }
         }
         if recording.in_flight.is_none() {
-            recording.in_flight = recording.sink.take_flush();
+            recording.in_flight = recording.sink.take_flush(staging);
             recording.submitted = false;
         }
         let Some(flush) = recording.in_flight.as_ref() else {

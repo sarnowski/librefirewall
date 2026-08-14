@@ -308,13 +308,13 @@ fn every_domain_detail_shape_survives_the_crossing() {
             start_sector: 2048,
             generation: 9,
             sequence: 3,
-            opened: 4,
+            offset: 4,
         },
         DomainDetail::RecordingResumed {
             start_sector: 0,
             generation: u64::MAX,
             sequence: 1,
-            opened: 2,
+            offset: 2,
         },
         // Both readings of a fresh extent, the flag carrying the whole of the
         // difference between an unwritten medium and a stranger's ring.

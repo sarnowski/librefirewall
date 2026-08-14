@@ -133,6 +133,39 @@ pub struct Surface<'a> {
     /// `librefirewall_recording_records_total` for this sink, read out of the
     /// exposition the same boot answered.
     pub published_records: u64,
+    /// What this recording's extent already held when the boot started, read
+    /// off the disk image before QEMU was spawned, or `None` on a medium this
+    /// boot made itself.
+    ///
+    /// **A recording outlives the node and a counter does not.** A boot that
+    /// resumed one serves earlier boots' records under the same download, so
+    /// every comparison below that holds the file to a published counter is
+    /// stated over the difference: what is here now, less what was here before.
+    /// That keeps each of them exact on a carried medium rather than standing
+    /// down on the one scenario where a recording has any history at all.
+    pub carried: Option<&'a Parsed>,
+}
+
+impl Surface<'_> {
+    fn inherited_packets(&self) -> u64 {
+        self.carried
+            .map_or(0, |carried| carried.packets.len() as u64)
+    }
+}
+
+/// How a verdict states a count taken over **this boot's own** records: the
+/// plain number on a medium this boot made, and the arithmetic on one it
+/// inherited, because a reader of the failure needs to see which of the two
+/// numbers moved.
+fn counted(held: u64, inherited: u64) -> String {
+    if inherited == 0 {
+        format!("{held}")
+    } else {
+        format!(
+            "{} ({held} in the file, {inherited} of them the medium's before this boot)",
+            held.saturating_sub(inherited)
+        )
+    }
 }
 
 /// What the harness knows independently of anything the appliance said.
@@ -148,6 +181,9 @@ pub struct Wire<'a> {
 pub struct Counted {
     pub target: &'static str,
     pub packets: usize,
+    /// How many of them were on the medium before this boot, which is what the
+    /// counter beside them is *not* an account of.
+    pub inherited: u64,
     pub published_records: u64,
     pub interfaces: usize,
     pub declared_snap_len: u32,
@@ -183,10 +219,18 @@ impl Agreement {
             let mut line = String::new();
             let _ = write!(
                 line,
-                "    {}: {} packet block(s); the recorder publishes {} record(s) for this sink; \
+                "    {}: {} packet block(s){}; the recorder publishes {} record(s) for this sink; \
                  {} interface block(s) declaring a snap length of {}; longest capture {}",
                 counted.target,
                 counted.packets,
+                match counted.inherited {
+                    0 => String::new(),
+                    inherited => format!(
+                        " of which {inherited} were on the medium before this boot, so {} are \
+                         this boot's",
+                        (counted.packets as u64).saturating_sub(inherited)
+                    ),
+                },
                 counted.published_records,
                 counted.interfaces,
                 counted.declared_snap_len,
@@ -297,6 +341,7 @@ fn count(surface: &Surface) -> Counted {
     Counted {
         target: surface.target,
         packets: surface.parsed.packets.len(),
+        inherited: surface.inherited_packets(),
         published_records: surface.published_records,
         interfaces: surface.parsed.interfaces.len(),
         declared_snap_len: surface
@@ -804,54 +849,57 @@ fn rule_differences(capture: &Surface, published: &Published) -> Vec<String> {
 /// that may have wrapped — so a recording legitimately holds fewer. Nothing
 /// legitimate makes it hold more: that direction is a recording describing
 /// decisions the appliance never counted, which is what this catches.
+///
+/// Every count is taken over this boot's own records, the medium's earlier ones
+/// subtracted, for [`Surface::carried`]'s reason. The subtraction is exact
+/// rather than approximate: what the medium held is a *prefix* of what the
+/// download answers, so the records it accounts for are the same records.
 fn exposition_differences(surface: &Surface, published: &Published) -> Vec<String> {
     let mut found = Vec::new();
-    let mut forwarded = 0u64;
-    let mut per_reason: BTreeMap<u8, u64> = BTreeMap::new();
-    for annotation in surface
-        .parsed
-        .packets
-        .iter()
-        .filter_map(|packet| packet.annotation)
-    {
-        if annotation.verdict == VERDICT_FORWARDED {
-            forwarded = forwarded.saturating_add(1);
-        } else if !annotation.is_revocation() {
-            // A conversation the appliance ended refused no frame, so it is
-            // attributable to no drop reason and belongs in neither total: the
-            // series it *is* attributable to is `librefirewall_flow_lifecycle_total`,
-            // which the revocation contract reads.
-            *per_reason.entry(annotation.drop_reason).or_insert(0) += 1;
-        }
-    }
-    if forwarded > published.forwarded_frames {
+    let (held_forwarded, held_reasons) = decisions(surface.parsed);
+    let (was_forwarded, was_reasons) = surface
+        .carried
+        .map_or_else(|| (0, BTreeMap::new()), decisions);
+    if held_forwarded.saturating_sub(was_forwarded) > published.forwarded_frames {
         found.push(format!(
-            "{} holds {forwarded} record(s) stating a forwarded frame and \
+            "{} holds {} record(s) stating a forwarded frame and \
              librefirewall_forwarded_frames_total sums to {}; a recording cannot describe \
              forwarding the appliance never counted",
-            surface.target, published.forwarded_frames
+            surface.target,
+            counted(held_forwarded, was_forwarded),
+            published.forwarded_frames
         ));
     }
-    for (reason, records) in per_reason {
+    for (reason, held) in held_reasons {
+        let inherited = was_reasons.get(&reason).copied().unwrap_or(0);
+        // A reason outside the vocabulary is a per-record law and not a
+        // comparison against a counter, so it is stated over every record in the
+        // file — a previous boot's included, this build having written those too.
         let Some(name) = DROP_REASONS.get(usize::from(reason).wrapping_sub(1)) else {
             found.push(format!(
-                "{} holds {records} record(s) naming drop reason {reason}, which is outside the \
+                "{} holds {held} record(s) naming drop reason {reason}, which is outside the \
                  {} this build's vocabulary declares",
                 surface.target,
                 DROP_REASONS.len()
             ));
             continue;
         };
+        let records = held.saturating_sub(inherited);
+        if records == 0 {
+            continue;
+        }
         match published.drop_reasons.get(*name) {
             None | Some(None) => found.push(format!(
-                "{} holds {records} record(s) refused as {name:?} and \
+                "{} holds {} record(s) refused as {name:?} and \
                  librefirewall_route_drops_total carries no series under that reason",
-                surface.target
+                surface.target,
+                counted(held, inherited)
             )),
-            Some(Some(counted)) if *counted < records => found.push(format!(
-                "{} holds {records} record(s) refused as {name:?} and the appliance counted \
-                 {counted}; a recording cannot describe refusals the appliance never made",
-                surface.target
+            Some(Some(appliance)) if *appliance < records => found.push(format!(
+                "{} holds {} record(s) refused as {name:?} and the appliance counted \
+                 {appliance}; a recording cannot describe refusals the appliance never made",
+                surface.target,
+                counted(held, inherited)
             )),
             Some(Some(_)) => {}
         }
@@ -860,6 +908,30 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
         }
     }
     found
+}
+
+/// What one recording's records say the appliance decided: how many state a
+/// forwarded frame, and how many name each drop reason.
+///
+/// Taken over a [`Parsed`] rather than over a [`Surface`] so the same walk reads
+/// the download and the prefix the medium already held, which is what makes
+/// subtracting one from the other a comparison of like with like.
+fn decisions(parsed: &Parsed) -> (u64, BTreeMap<u8, u64>) {
+    let mut forwarded = 0u64;
+    let mut per_reason: BTreeMap<u8, u64> = BTreeMap::new();
+    for annotation in parsed.packets.iter().filter_map(|packet| packet.annotation) {
+        if annotation.verdict == VERDICT_FORWARDED {
+            forwarded = forwarded.saturating_add(1);
+        } else if !annotation.is_revocation() {
+            // A conversation the appliance ended refused no frame, so it is
+            // attributable to no drop reason and belongs in neither total: the
+            // series it *is* attributable to is `librefirewall_flow_lifecycle_total`,
+            // which the revocation contract reads.
+            let records = per_reason.entry(annotation.drop_reason).or_insert(0);
+            *records = records.saturating_add(1);
+        }
+    }
+    (forwarded, per_reason)
 }
 
 /// The drop reasons this build's tap ABI encodes, in the order it encodes them —
@@ -952,15 +1024,32 @@ fn identities(surface: &Surface) -> BTreeMap<u64, usize> {
 /// statement that is quietly wrong whenever either happens. Nothing legitimate
 /// makes it hold *more* — that direction is a recorder answering blocks it
 /// never encoded, which is exactly what this catches.
+///
+/// On a medium a previous boot wrote, the counter is this boot's and the file is
+/// the medium's, so what is compared is the difference — and the other direction
+/// becomes a finding of its own: a download holding *fewer* records than the
+/// medium already held is a restart that cost a deployment its evidence, which
+/// is the whole thing resuming in place exists to prevent.
 fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
     let mut found = Vec::new();
     let held = surface.parsed.packets.len() as u64;
-    if held > surface.published_records {
+    let inherited = surface.inherited_packets();
+    if held < inherited {
         found.push(format!(
-            "{} answers {held} packet block(s) and the recorder publishes \
+            "{} answers {held} packet block(s) and the medium already held {inherited} going into \
+             this boot; a resumed recording continues at the byte its predecessor stopped on, so \
+             a download that offers fewer records than were already there has lost some",
+            surface.target
+        ));
+    }
+    if held.saturating_sub(inherited) > surface.published_records {
+        found.push(format!(
+            "{} answers {} packet block(s) and the recorder publishes \
              librefirewall_recording_records_total for this sink as {}; a recording cannot hold \
              observations the recorder never encoded",
-            surface.target, surface.published_records,
+            surface.target,
+            counted(held, inherited),
+            surface.published_records,
         ));
     }
     if surface.published_records == 0 && !may_be_empty {

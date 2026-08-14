@@ -182,9 +182,9 @@ pub enum DomainDetail<C = &'static str> {
     /// operator's question alone. The first says which extent — the same sector
     /// [`Self::Extent`] names, so a reader pairs the two by value rather than by
     /// counting records. `generation` and `sequence` are what the **medium** said,
-    /// checkable against a disk somebody is holding; `opened` is where this boot
-    /// went, the segment after the one read. No stored byte offset: a resumed
-    /// recording serves nothing before the segment it opened.
+    /// checkable against a disk somebody is holding; `offset` is how far into that
+    /// segment this boot picked the recording up, which is the byte the previous
+    /// boot's last write ended on and the first this one appends at.
     ///
     /// **No byte of a recording has a representation here**: a sector number and
     /// three counters are system state, and the traffic reaches no console line.
@@ -192,7 +192,7 @@ pub enum DomainDetail<C = &'static str> {
         start_sector: u64,
         generation: u64,
         sequence: u64,
-        opened: u64,
+        offset: u64,
     },
     /// A recording extent this boot **started over**, and which of the two reasons.
     /// The flag is not redundant with the record's presence: an extent nothing ever

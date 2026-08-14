@@ -161,6 +161,10 @@ pub enum RingStateError {
         offset: usize,
         segment_bytes: usize,
     },
+    /// A writer position off a sector boundary — not this layer's rule, but a caller's.
+    WriterOffsetNotSectorMultiple {
+        offset: usize,
+    },
     ReaderOffsetOutsideSegment {
         id: u32,
         offset: usize,

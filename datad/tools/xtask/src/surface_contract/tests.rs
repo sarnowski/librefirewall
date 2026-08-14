@@ -167,6 +167,7 @@ fn log_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
         snap_len: LOG_SNAP,
         parsed,
         published_records: published,
+        carried: None,
     }
 }
 
@@ -176,6 +177,17 @@ fn capture_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
         snap_len: CAPTURE_SNAP,
         parsed,
         published_records: published,
+        carried: None,
+    }
+}
+
+/// The same surface on a medium a previous boot wrote: `carried` is the prefix
+/// of `parsed` that boot left, which is what the counters beside it are *not* an
+/// account of.
+fn resumed<'a>(surface: Surface<'a>, carried: &'a Parsed) -> Surface<'a> {
+    Surface {
+        carried: Some(carried),
+        ..surface
     }
 }
 
@@ -776,6 +788,7 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
             snap_len: LOG_SNAP,
             parsed: &log,
             published_records: 4,
+            carried: None,
         },
         &capture_surface(&capture, 4),
         &wire(&probes),
@@ -807,6 +820,120 @@ fn a_recording_holding_more_than_the_recorder_published_is_a_finding() {
     .expect_err("four blocks against two encoded records is fabrication");
     assert!(error.contains("answers 4 packet block(s)"), "{error}");
     assert!(error.contains("as 2"), "{error}");
+}
+
+/// **A recording outlives the node and a counter does not.** A boot that resumed
+/// one answers earlier boots' records under the same download, and the exact
+/// statement is over the difference — so the same four blocks against two
+/// encoded records that fire above are a sound run here, because two of them
+/// were already on the medium.
+#[test]
+fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let carried_log = recording(LOG_SNAP, &SOUND[..2]);
+    let carried_capture = recording(CAPTURE_SNAP, &SOUND[..2]);
+    let probes = injected();
+    let agreement = judge(
+        &resumed(log_surface(&log, 2), &carried_log),
+        &resumed(capture_surface(&capture, 2), &carried_capture),
+        &wire(&probes),
+        &published(),
+        true,
+    )
+    .expect("two of the four blocks were on the medium before this boot");
+    assert_eq!(agreement.counted[1].packets, 4);
+    assert_eq!(agreement.counted[1].inherited, 2);
+    assert!(
+        agreement
+            .evidence()
+            .contains("of which 2 were on the medium before this boot, so 2 are this boot's"),
+        "{}",
+        agreement.evidence()
+    );
+}
+
+/// And the difference is still held: a boot that added more than it published
+/// fires exactly as it does on a fresh medium, with both numbers in the verdict
+/// so a reader sees which one moved.
+#[test]
+fn a_resumed_recording_holding_more_than_this_boot_published_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let carried = recording(CAPTURE_SNAP, &SOUND[..1]);
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &resumed(capture_surface(&capture, 2), &carried),
+        &wire(&probes),
+        &published(),
+        true,
+    )
+    .expect_err("three blocks of this boot's own against two encoded records is fabrication");
+    assert!(
+        error.contains("answers 3 (4 in the file, 1 of them the medium's before this boot)"),
+        "{error}"
+    );
+}
+
+/// The other direction on a carried medium, which is a finding of its own and
+/// has no counterpart on a fresh one: a download offering fewer records than the
+/// medium already held is a restart that cost a deployment its evidence.
+#[test]
+fn a_resumed_recording_offering_fewer_records_than_the_medium_held_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, &SOUND[..2]);
+    let carried = recording(CAPTURE_SNAP, SOUND);
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &resumed(capture_surface(&capture, 4), &carried),
+        &wire(&probes),
+        &published(),
+        true,
+    )
+    .expect_err("a resumed recording may not lose what the medium already held");
+    assert!(
+        error.contains("the medium already held 4 going into this boot"),
+        "{error}"
+    );
+}
+
+/// The decisions the exposition counts are held to this boot's own records too,
+/// and by the same subtraction: the appliance's forwarding counter restarts with
+/// the node and the file does not.
+#[test]
+fn a_resumed_recording_is_held_to_the_decisions_this_boot_counted() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let carried_log = recording(LOG_SNAP, &SOUND[..2]);
+    let carried_capture = recording(CAPTURE_SNAP, &SOUND[..2]);
+    let probes = injected();
+    // Every record in the fixture states a forwarded frame, so this boot's own
+    // two are exactly what the appliance counted.
+    let mut counted = published();
+    counted.forwarded_frames = 2;
+    judge(
+        &resumed(log_surface(&log, 2), &carried_log),
+        &resumed(capture_surface(&capture, 2), &carried_capture),
+        &wire(&probes),
+        &counted,
+        true,
+    )
+    .expect("two forwarded records of this boot's own against two forwarded frames");
+
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &counted,
+        true,
+    )
+    .expect_err("on a fresh medium all four records are this boot's and two were counted");
+    assert!(
+        error.contains("holds 4 record(s) stating a forwarded frame"),
+        "{error}"
+    );
 }
 
 /// The other side of the same inequality: a recording holding fewer than the

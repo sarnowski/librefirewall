@@ -219,12 +219,12 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
             start_sector,
             generation,
             sequence,
-            opened,
+            offset,
         } => write!(
             cursor,
             " recording-start={start_sector} recording=resumed \
              recording-generation={generation} recording-sequence={sequence} \
-             recording-opened={opened}"
+             recording-offset={offset}"
         ),
         DomainDetail::RecordingFresh {
             start_sector,
@@ -1686,7 +1686,7 @@ mod tests {
                 start_sector: u64::MAX,
                 generation: u64::MAX,
                 sequence: u64::MAX,
-                opened: u64::MAX,
+                offset: u64::MAX,
             },
             DomainDetail::RecordingFresh {
                 start_sector: u64::MAX,
@@ -1940,11 +1940,11 @@ mod tests {
                 sectors,
             }),
             any::<(u64, u64, u64, u64)>().prop_map(
-                |(start_sector, generation, sequence, opened)| DomainDetail::RecordingResumed {
+                |(start_sector, generation, sequence, offset)| DomainDetail::RecordingResumed {
                     start_sector,
                     generation,
                     sequence,
-                    opened,
+                    offset,
                 },
             ),
             any::<(u64, bool)>().prop_map(|(start_sector, rebound)| DomainDetail::RecordingFresh {

@@ -132,8 +132,9 @@ pub fn judge(
         ));
     }
 
-    // Every line, before the anchor is looked for: a line the boot never printed
-    // is the finding worth reporting first, and reporting it needs the line.
+    // Every line's origin, whichever boot framed it: a byte read at the wrong
+    // offset is the finding worth reporting first, and reporting it needs the
+    // line.
     for (at, line) in carried.iter().enumerate() {
         if Domain::ALL.get(line.origin as usize).is_none() {
             return Err(format!(
@@ -146,6 +147,28 @@ pub fn judge(
                 line.line
             ));
         }
+    }
+
+    // Where this boot's own transcript is anchored. A recording on a medium an
+    // earlier boot wrote carries that boot's console lines too — the ring
+    // outlives the node, which is the whole reason it is on a disk — so the
+    // anchor is looked for from the end: an earlier boot printed one of its own,
+    // and this boot's is the last. Everything from it on is this boot's and is
+    // held to the console; what precedes it is bring-up and inherited history,
+    // which a line carrying no instant makes indistinguishable by content alone.
+    let anchor_at = carried
+        .iter()
+        .rposition(|line| line.line.contains(demanded.anchored_on));
+    let Some(anchor_at) = anchor_at else {
+        return Err(format!(
+            "GET {target} carries no line containing {:?}, so the transcript it holds is not the \
+             one this boot printed past its own bring-up — the relay filled early and the \
+             recording carries only what it took first",
+            demanded.anchored_on
+        ));
+    };
+    let inherited = anchor_at;
+    for (at, line) in carried.iter().enumerate().skip(anchor_at) {
         if !transcript.contains(&line.line) {
             return Err(format!(
                 "GET {target}'s line {} of {} is not one this boot printed: {:?}. The recording \
@@ -157,16 +180,9 @@ pub fn judge(
             ));
         }
     }
-
-    let anchor = carried
-        .iter()
-        .find(|line| line.line.contains(demanded.anchored_on));
-    let Some(anchor) = anchor else {
+    let Some(anchor) = carried.get(anchor_at) else {
         return Err(format!(
-            "GET {target} carries no line containing {:?}, so the transcript it holds is not the \
-             one this boot printed past its own bring-up — the relay filled early and the \
-             recording carries only what it took first",
-            demanded.anchored_on
+            "GET {target}'s anchor moved while it was being read"
         ));
     };
 
@@ -181,9 +197,10 @@ pub fn judge(
         .collect();
     let mut lines = vec![
         format!(
-            "    {target}: {} console line(s) in {batches} batch(es), every one of them printed \
-             on this boot's serial console",
-            carried.len()
+            "    {target}: {} console line(s) in {batches} batch(es), the last {} of them held \
+             to this boot's serial console and {inherited} before its anchor",
+            carried.len(),
+            carried.len() - inherited
         ),
         format!(
             "    {} of them carry an instant and {} were emitted before this node had a clock",

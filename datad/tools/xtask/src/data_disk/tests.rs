@@ -228,7 +228,7 @@ fn a_recording_walked_to_the_superblocks_durable_end_passes() {
         &payload,
     );
     let verdict = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect("both extents are recordings");
     assert!(verdict.contains("durable end at payload byte"), "{verdict}");
     assert!(verdict.contains("generation 7"), "{verdict}");
@@ -258,7 +258,7 @@ fn a_recording_the_walk_stops_short_of_the_durable_end_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect_err("the walk stopped before the superblock's end");
     assert!(error.contains("durable end at payload byte"), "{error}");
     assert!(
@@ -287,7 +287,7 @@ fn a_superblock_one_flush_behind_the_written_prefix_is_reported_and_not_refused(
         &payload,
     );
     let verdict = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect("a checkpoint behind the payload is the ordinary state");
     assert!(
         verdict.contains(&format!("durable end at payload byte {behind}")),
@@ -319,7 +319,7 @@ fn bytes_past_the_written_prefix_are_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect_err("bytes past the walkable prefix are not the recording");
     assert!(
         error.contains("holds a non-zero byte at payload offset"),
@@ -341,7 +341,7 @@ fn a_superblock_claiming_nothing_durable_is_a_finding() {
         &payload,
     );
     let error = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect_err("a cursor at zero says nothing reached the medium");
     assert!(
         error.contains("no byte of the recording is durable"),
@@ -383,12 +383,12 @@ fn an_empty_history_is_allowed_only_where_no_conversation_was_carried() {
     );
 
     let error = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect_err("a boot that carried traffic owes a history");
     assert!(error.contains("holds no packet block"), "{error}");
 
     let verdict = disk
-        .judge_recordings(false, false)
+        .judge_recordings(false)
         .expect("a boot that carried nothing owes no history");
     assert!(verdict.contains("packet block(s)"), "{verdict}");
 }
@@ -398,9 +398,47 @@ fn an_extent_with_no_superblock_at_all_is_a_finding() {
     let scratch = Scratch::new("no-superblock");
     let disk = DataDisk::create(&scratch.root, "no-superblock").expect("created");
     let error = disk
-        .judge_recordings(true, false)
+        .judge_recordings(true)
         .expect_err("a zeroed extent carries no superblock");
     assert!(error.contains("no decodable superblock"), "{error}");
+}
+
+/// **The join two boots leave in one extent is walked, not stepped over.** A
+/// resumed recording continues at the byte its predecessor stopped on and opens
+/// a pcapng section there, so an extent several boots wrote is one stream from
+/// payload byte zero — and this walk begins there whatever segment the writer
+/// has reached. Written past a segment boundary deliberately: a walk that began
+/// at the writer's own segment would pass this and read none of the join.
+#[test]
+fn an_extent_two_boots_wrote_is_walked_whole_across_the_join() {
+    let scratch = Scratch::new("resume-join");
+    let disk = DataDisk::create(&scratch.root, "resume-join").expect("created");
+    // One boot's worth, twice: each opens a section of its own, which is the
+    // shape a resume leaves, and two of them run past a segment.
+    let boot = crate::recording_contract::tests::recording(1200, 400);
+    let mut payload = boot.clone();
+    let mut sections = 1;
+    while payload.len() <= SEGMENT_BYTES {
+        payload.extend_from_slice(&boot);
+        sections += 1;
+    }
+    let writer = Cursor {
+        sequence: 1,
+        offset: payload.len() - SEGMENT_BYTES,
+    };
+    both_extents_record(&disk, writer, &payload);
+
+    let verdict = disk
+        .judge_recordings(true)
+        .expect("both extents are one recording across the join");
+    assert!(
+        verdict.contains(&format!("durable end at payload byte {}", payload.len())),
+        "{verdict}"
+    );
+    assert!(
+        verdict.contains(&format!("{sections} section header(s)")),
+        "a walk that began at the writer's segment would have read one, saw: {verdict}"
+    );
 }
 
 /// A wrapped ring is named as out of this walk's reach rather than waved

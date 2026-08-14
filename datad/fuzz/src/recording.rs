@@ -594,9 +594,19 @@ fn seed_superblock(
             ) else {
                 return;
             };
+            // Sector-aligned unless the draw says otherwise. An honest medium
+            // only ever stores a whole number of sectors, so an offset drawn
+            // freely would put the resume path out of reach one time in five
+            // hundred; drawing the forgery deliberately keeps both the position
+            // a sink continues from and the one it must refuse in play.
+            let drawn = (any_u64(unstructured) as usize) % (SEGMENT_BYTES + 1);
             let cursor = Cursor {
                 sequence: any_u64(unstructured),
-                offset: (any_u64(unstructured) as usize) % (SEGMENT_BYTES + 1),
+                offset: if any_u64(unstructured).is_multiple_of(8) {
+                    drawn
+                } else {
+                    drawn - drawn % SECTOR_SIZE
+                },
             };
             let Ok(state) = RingState::new(geometry, any_u64(unstructured), cursor, &[]) else {
                 return;
@@ -1599,7 +1609,7 @@ pub fn recorder_sink(data: &[u8]) {
                     }
                     "acknowledge"
                 } else {
-                    if let Some(flush) = sink.take_flush() {
+                    if let Some(flush) = sink.take_flush(staging.out()) {
                         assert_flush_is_whole_staged_sectors(&flush, staging.capacity());
                         assert_flush_placed(&flush, &geometry, &sink, contract_kept);
                         assert!(

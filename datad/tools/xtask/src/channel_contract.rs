@@ -968,7 +968,8 @@ fn expect_records(transcript: &[u8], resumed: bool) -> Result<(usize, u64), Stri
          length, the type byte {UP_RECORDS_TYPE:#04x}, three reserved zeroes, a big-endian ring \
          position and then the ring's own bytes. The server's transcript was:\n{}",
         if resumed {
-            "the segment this boot opened, which is where a recording a previous boot wrote begins"
+            "where the recording begins on the medium a previous boot wrote, which is position 0 \
+             until the ring has wrapped"
         } else {
             "ring position 0"
         },
@@ -979,15 +980,18 @@ fn expect_records(transcript: &[u8], resumed: bool) -> Result<(usize, u64), Stri
 /// Whether `position` is where a recording begins on the medium this boot
 /// attached.
 ///
-/// Zero on a fresh one. On a medium a previous boot wrote it is the segment this
-/// boot opened — which this harness does not know the number of, and does not
-/// have to: what it holds is that the appliance did not resume at zero and did
-/// not resume mid-segment, and a segment is the unit a boot opens.
+/// Zero on a fresh one, and a segment boundary on either — which on a medium a
+/// previous boot wrote is **zero as well** until the ring has wrapped, because a
+/// boot resumes inside the segment it read rather than in the one after it, so
+/// nothing an earlier boot put on the medium stops being this one's to ship. A
+/// wrap is the only thing that moves it, and the segment is the unit it moves
+/// by; how many the medium this run assembled has seen is not something this
+/// harness knows or has to.
 fn begins_a_recording(position: u64, resumed: bool) -> bool {
     if !resumed {
         return position == 0;
     }
-    position > 0 && position.is_multiple_of(SEGMENT_BYTES as u64)
+    position.is_multiple_of(SEGMENT_BYTES as u64)
 }
 
 /// Every upstream frame the server received, as `(type, position, ring bytes)`,

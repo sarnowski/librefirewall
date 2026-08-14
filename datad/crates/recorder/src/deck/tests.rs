@@ -539,31 +539,25 @@ fn a_resumed_recording_tells_a_channel_cursor_where_to_carry_on_from() {
     run(&mut deck, &mut medium, &ring, &mut reader, 24, 600, 8);
     let mut scratch = [0u8; TAP_SNAP_LEN];
 
+    // A cursor that stood at zero when the node went down still stands at a
+    // position this boot serves: the recording was resumed inside the segment
+    // the medium named, so nothing an earlier boot wrote left the ring.
     deck.demand(ring_demand(DownloadSink::Log, 0, 512));
-    let begins = match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
-        Some(Answer::Refused(DownloadRefusal::Overrun, _, first)) => first,
-        other => panic!("a resumed recording refuses position zero as an overrun: {other:?}"),
-    };
-    assert!(begins > 0, "a resumed recording does not begin at zero");
-
-    // And the position it named is one this recording actually serves, which is
-    // the whole of what makes the refusal actionable.
-    deck.demand(ring_demand(DownloadSink::Log, begins, 512));
     match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
         Some(Answer::Bytes(bytes, _)) => assert!(
             !bytes.is_empty(),
-            "the position a refused reader is sent to answered nothing"
+            "a resumed recording answered position zero with no bytes"
         ),
-        other => panic!("the position the refusal named is not readable: {other:?}"),
+        other => panic!("a resumed recording refused position zero: {other:?}"),
     }
 }
 
 #[test]
 fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() {
     // The defect this whole path exists to close, stated end to end: two boots
-    // share one device, and the second must come up on the segment after the
-    // one the first left open — with the first boot's bytes still where it put
-    // them.
+    // share one device, and the second must come up inside the segment the first
+    // left open and at the offset it left — with the first boot's bytes still
+    // where it put them.
     let mut medium = Fake::new();
     let first = boot(&mut medium, &Ring::new(), 24);
     assert_eq!(first, [Opened::FreshMedium, Opened::FreshMedium]);
@@ -581,7 +575,7 @@ fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() 
         let Opened::Resumed {
             generation,
             sequence,
-            opened,
+            offset,
         } = resumed
         else {
             panic!("recording {index} did not resume: {resumed:?}");
@@ -593,10 +587,10 @@ fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() 
         );
         assert_eq!(sequence, after_first[index].writer().sequence);
         assert_eq!(
-            opened,
-            sequence + 1,
-            "a resumed recording opens the segment after the one it read, the \
-             previous boot's having been left unsealed"
+            offset,
+            after_first[index].writer().offset as u64,
+            "a resumed recording continues at the position the medium named, so \
+             nothing the previous boot made durable stops being servable"
         );
     }
 
@@ -608,16 +602,18 @@ fn a_second_boot_of_one_medium_continues_the_ring_rather_than_writing_over_it() 
             after.write_generation() > before.write_generation(),
             "recording {index} did not checkpoint past the generation it resumed"
         );
+        let stopped = before.writer().sequence as usize * SEGMENT_BYTES + before.writer().offset;
+        let reached = after.writer().sequence as usize * SEGMENT_BYTES + after.writer().offset;
         assert!(
-            after.writer().sequence > before.writer().sequence,
-            "recording {index} reopened the segment the first boot had written"
+            reached > stopped,
+            "recording {index} did not write past where the first boot stopped"
         );
     }
 
     // And the first boot's payload is still on the medium: the second boot
-    // opened the next segment, so nothing it wrote landed on the bytes the
-    // first left. Compared over the first boot's own written prefix, which is
-    // what its durable cursor names.
+    // picked up at the byte the first stopped on, so nothing it wrote landed on
+    // the bytes before it. Compared over the first boot's own written prefix,
+    // which is what its durable cursor names.
     for (index, ((start, _), before)) in Deck::extents().iter().zip(&after_first).enumerate() {
         let written = before.writer().sequence as usize * SEGMENT_BYTES + before.writer().offset;
         let payload_at = SEGMENT_BYTES;
@@ -971,7 +967,12 @@ enum Answer {
         DownloadRefusal,
         #[expect(dead_code, reason = "read by the Debug a failing match prints")] u64,
         /// Where the recording now begins, which is the whole of what makes an
-        /// overrun something a reader carries on from.
+        /// overrun something a reader carries on from. Nothing here matches on
+        /// it: a resumed recording no longer refuses a position an earlier boot
+        /// shipped, so the only way to reach this arm is a wrap, and where a
+        /// wrap sends a reader is held at sink level on a ring small enough to
+        /// wrap in a test.
+        #[expect(dead_code, reason = "read by the Debug a failing match prints")]
         u64,
     ),
 }
@@ -1128,9 +1129,12 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
     run(&mut deck, &mut medium, &ring, &mut reader, 4, 128, 8);
 
     let mut scratch = [0u8; TAP_SNAP_LEN];
+    // Everything the run staged reaches the medium first, so the read the
+    // demand below issues is the operation the failure lands on.
+    for _ in 0..8 {
+        deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
+    }
     deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
-    // The seal reaches the medium first; the read after it is the one broken.
-    deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     medium.fail = 1;
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {

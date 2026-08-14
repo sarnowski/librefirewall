@@ -263,7 +263,17 @@ fn preload_refusal(error: PreloadError) -> Refusal {
 /// somebody's evidence, and the two numbers are what disagreed.
 fn rebound_refusal(start_sector: u64, error: lfw_capture_ring::RingStateError) -> Refusal {
     Refusal {
-        cause: "recording-extent-rebound",
+        // Two reasons an extent that decoded is recorded over, and an operator
+        // acts on them differently: a geometry that is somebody else's means
+        // this is not the disk it was, while a write position no run of this
+        // ring leaves means the superblock itself is untrustworthy on a disk
+        // that is otherwise the right one.
+        cause: match error {
+            lfw_capture_ring::RingStateError::WriterOffsetNotSectorMultiple { .. } => {
+                "recording-writer-unaligned"
+            }
+            _ => "recording-extent-rebound",
+        },
         detail: match error {
             lfw_capture_ring::RingStateError::StartSectorMismatch { stored, .. }
             | lfw_capture_ring::RingStateError::SectorsMismatch { stored, .. } => {
@@ -272,7 +282,10 @@ fn rebound_refusal(start_sector: u64, error: lfw_capture_ring::RingStateError) -
             lfw_capture_ring::RingStateError::SegmentBytesMismatch { stored, .. } => {
                 RefusalDetail::Two(start_sector, stored as u64)
             }
-            // `RingState::check` compares the three fields above and nothing
+            lfw_capture_ring::RingStateError::WriterOffsetNotSectorMultiple { offset } => {
+                RefusalDetail::Two(start_sector, offset as u64)
+            }
+            // `RingState::check` compares the four fields above and nothing
             // else, so a variant here is one added upstream: it reaches the
             // console as its cause and this extent's sector, which is a smaller
             // loss than a second number that means nothing.
@@ -466,12 +479,12 @@ fn announce_recording(sink: &dyn Sink, which: Which, opened: Opened) {
         Opened::Resumed {
             generation,
             sequence,
-            opened,
+            offset,
         } => DomainDetail::RecordingResumed {
             start_sector,
             generation,
             sequence,
-            opened,
+            offset,
         },
         Opened::FreshMedium => DomainDetail::RecordingFresh {
             start_sector,

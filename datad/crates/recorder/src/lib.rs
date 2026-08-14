@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 use lfw_capture_ring::{
-    Append, Copies, Cursor, Geometry, Located, ReaderCursor, Ring, RingState, RingStateError,
+    Append, Copies, Cursor, Fit, Geometry, Located, ReaderCursor, Ring, RingState, RingStateError,
     SECTOR_SIZE, SUPERBLOCK_BYTES, SuperblockWrite, encode_superblock,
 };
 use lfw_pcapng::{
@@ -339,15 +339,12 @@ pub struct Sink {
     /// with the new sequence would write them over the next segment.
     staged_sequence: u64,
     /// Segment byte offset the staging buffer's first byte holds. Always a
-    /// multiple of `SECTOR_SIZE`.
+    /// multiple of `SECTOR_SIZE`, which `Sink::resume` refuses a state without.
     staged_from: usize,
     /// Bytes of staging currently holding appended, unflushed record data.
     staged_len: usize,
     /// Everything the device has acknowledged.
     durable: Cursor,
-    /// The oldest sequence a download may claim. A resumed sink starts it at the
-    /// segment this boot opened, its predecessor having been left unsealed.
-    first_claimable: u64,
     reader: Option<Cursor>,
     /// Whether the superblock region may still hold another ring's — so until a
     /// checkpoint of this one reached the device, and never for a resumed sink.
@@ -389,7 +386,6 @@ impl Sink {
                 sequence: 0,
                 offset: 0,
             },
-            first_claimable: 0,
             reader: None,
             superblock_stale: true,
             flushing: false,
@@ -400,28 +396,38 @@ impl Sink {
         Ok(sink)
     }
 
-    /// Resume from a superblock a previous boot left, its segment's prologue
-    /// composed into `staging` as [`Sink::new`]'s is.
+    /// Resume from a superblock a previous boot left, continuing in the segment
+    /// its writer cursor names at the offset it names, a pcapng section opened
+    /// there — so the predecessor's unpadded tail lies beyond this boot's own
+    /// write cursor rather than inside a segment it has closed.
     ///
     /// # Errors
-    /// As [`Sink::new`], plus [`SinkError::State`] when the stored state does
-    /// not describe this deployment's geometry.
+    /// As [`Sink::new`], plus [`SinkError::State`] for a stored state that is
+    /// not this deployment's geometry or names a position no run of this left.
     pub fn resume(
         config: SinkConfig,
         state: &RingState,
         staging: &mut [u8],
     ) -> Result<Self, SinkError> {
         let checked = state.check(&config.geometry).map_err(SinkError::State)?;
+        // A flush addresses the staging buffer's first byte by the sector, so a
+        // position between two is one this ring never wrote and one a resumed
+        // write would land short of.
+        if !checked.writer().offset.is_multiple_of(SECTOR_SIZE) {
+            return Err(SinkError::State(
+                RingStateError::WriterOffsetNotSectorMultiple {
+                    offset: checked.writer().offset,
+                },
+            ));
+        }
         let mut sink = Self::new(config, staging)?;
         let prologue = sink.ring.prologue_len();
         sink.ring = Ring::resume(checked, prologue);
-        sink.ring.roll();
-        sink.staged_sequence = sink.ring.cursor().sequence;
-        sink.durable = Cursor {
-            sequence: sink.staged_sequence,
-            offset: 0,
-        };
-        sink.first_claimable = sink.staged_sequence;
+        let at = sink.ring.cursor();
+        sink.staged_sequence = at.sequence;
+        sink.staged_from = at.offset;
+        sink.staged_len = 0;
+        sink.durable = at;
         // Carried across the restart, and republished until one moves it.
         sink.reader = checked
             .readers()
@@ -430,9 +436,18 @@ impl Sink {
             .find(|reader| reader.id == CHANNEL_READER_ID)
             .map(|reader| reader.cursor);
         sink.superblock_stale = false;
-        sink.staged_from = 0;
-        sink.staged_len = 0;
-        sink.write_prologue(staging).map_err(SinkError::Encode)?;
+        // Through `fit`, which counts nothing: a header is not an oversized record.
+        match sink.ring.fit(prologue) {
+            Fit::Fits(_) => {
+                if let Append::Placed(reservation) = sink.ring.append(prologue) {
+                    reservation.commit();
+                    sink.write_prologue(staging).map_err(SinkError::Encode)?;
+                }
+            }
+            Fit::SegmentFull | Fit::Oversized { .. } => {
+                sink.close_segment(staging).map_err(SinkError::Encode)?;
+            }
+        }
         Ok(sink)
     }
 
@@ -535,9 +550,7 @@ impl Sink {
         if claim > self.ring.slack() {
             return Recorded::SegmentFull;
         }
-        // The free tail *is* the bound: taking the slice and asking how much
-        // room there is are one operation, so the two cannot drift apart.
-        let out: &mut [u8] = staging.get_mut(self.staged_len..).unwrap_or_default();
+        let out = self.free(staging);
         let written = match write_enhanced_packet(out, &epb) {
             Ok(written) => written,
             Err(EncodeError::OutOfSpace { needed, capacity }) => {
@@ -597,7 +610,7 @@ impl Sink {
         if claim > self.ring.slack() {
             return Recorded::SegmentFull;
         }
-        let out: &mut [u8] = staging.get_mut(self.staged_len..).unwrap_or_default();
+        let out = self.free(staging);
         let written = match lfw_pcapng::write_custom_block(out, &body) {
             Ok(written) => written,
             Err(EncodeError::OutOfSpace { needed, capacity }) => {
@@ -675,11 +688,16 @@ impl Sink {
     }
 
     /// Whole sectors of the staging buffer ready for the device, or `None` when
-    /// there are none or a flush is already outstanding.
-    pub fn take_flush(&mut self) -> Option<Flush> {
+    /// there are none, one is outstanding, or the seal below cannot be composed.
+    ///
+    /// The open sector is completed first, so what the device takes ends on a
+    /// **block** boundary: the position the superblock then names is where the
+    /// next boot writes, and a truncated head there would derail every walk.
+    pub fn take_flush(&mut self, staging: &mut [u8]) -> Option<Flush> {
         if self.flushing {
             return None;
         }
+        self.seal(staging).ok()?;
         let whole = (self.staged_len / SECTOR_SIZE) * SECTOR_SIZE;
         if whole == 0 {
             return None;
@@ -798,8 +816,7 @@ impl Sink {
     /// Pin what a download will deliver.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        let (oldest, _) = self.ring.readable();
-        let first = oldest.max(self.first_claimable);
+        let (first, _) = self.ring.readable();
         // Empty rather than clamping the segment count: a clamp keeps
         // `durable.offset` in the total and hands a reader that many bytes out of
         // `first`, which is a different segment entirely.
@@ -827,14 +844,12 @@ impl Sink {
             .saturating_add(self.durable.offset as u64)
     }
 
-    /// The oldest position still on the medium, in [`Self::durable_position`]'s
-    /// append space. Not always zero and not always where a wrap left it — a
-    /// **resumed** sink begins at the segment it opened — so a reader is told it.
+    /// The oldest position still on the medium, in [`Self::durable_position`]'s append space.
     #[must_use]
     pub fn first_position(&self) -> u64 {
         let (oldest, _) = self.ring.readable();
         let segment = self.ring.geometry().segment_bytes() as u64;
-        oldest.max(self.first_claimable).saturating_mul(segment)
+        oldest.saturating_mul(segment)
     }
 
     /// Where absolute ring position `position` lives on the device. The
@@ -976,6 +991,12 @@ impl Sink {
             target.copy_from_slice(&rule.to_le_bytes());
         }
         annotation
+    }
+
+    /// The staging a record may use: what is unwritten, less a seal's room.
+    fn free<'a>(&self, staging: &'a mut [u8]) -> &'a mut [u8] {
+        let end = staging.len().saturating_sub(TAIL_RESERVE);
+        staging.get_mut(self.staged_len..end).unwrap_or_default()
     }
 
     fn pad(&mut self, pad: usize, staging: &mut [u8]) -> Result<usize, EncodeError> {

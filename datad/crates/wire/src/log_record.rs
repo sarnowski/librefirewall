@@ -1069,7 +1069,7 @@ impl LogRecord {
                 start_sector: self.operands[0],
                 generation: self.operands[1],
                 sequence: self.operands[2],
-                opened: self.operands[3],
+                offset: self.operands[3],
             },
             // Four positions, none ranged, on `RecordingResumed`'s terms.
             Some(LogDetailKind::ChannelShipping) => CheckedDetail::ChannelShipping {
@@ -1903,7 +1903,7 @@ pub enum CheckedDetail {
         start_sector: u64,
         generation: u64,
         sequence: u64,
-        opened: u64,
+        offset: u64,
     },
     /// A recording extent a boot opened fresh, and whether over another ring.
     RecordingFresh {

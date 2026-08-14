@@ -457,10 +457,10 @@ impl Event<Cause> {
                     start_sector,
                     generation,
                     sequence,
-                    opened,
+                    offset,
                 } => {
                     record.detail = LogDetailKind::RecordingResumed.to_bits();
-                    record.operands = [*start_sector, *generation, *sequence, *opened];
+                    record.operands = [*start_sector, *generation, *sequence, *offset];
                 }
                 DomainDetail::RecordingFresh {
                     start_sector,
@@ -969,12 +969,12 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             start_sector,
             generation,
             sequence,
-            opened,
+            offset,
         } => DomainDetail::RecordingResumed {
             start_sector: *start_sector,
             generation: *generation,
             sequence: *sequence,
-            opened: *opened,
+            offset: *offset,
         },
         // The flag was ranged when the record was checked, so what is left is a
         // sector nothing can make unreadable.
@@ -1411,12 +1411,12 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         start_sector,
                         generation,
                         sequence,
-                        opened,
+                        offset,
                     } => DomainDetail::RecordingResumed {
                         start_sector,
                         generation,
                         sequence,
-                        opened,
+                        offset,
                     },
                     DomainDetail::RecordingFresh {
                         start_sector,

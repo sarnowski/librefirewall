@@ -2208,13 +2208,14 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         // The recorder medium earlier boots wrote, and **not** a fresh one: an
-        // appliance that has been running for a while has rebooted, so its
-        // recordings begin at the segment this boot opened rather than at
-        // position zero — and a channel cursor starts at zero whatever the
-        // medium says. That disagreement is the state a deployed appliance is
-        // actually in and the one a fresh medium never reaches, so a boot on a
-        // fresh one proves the channel ships for exactly the appliance that has
-        // never been restarted.
+        // appliance that has been running for a while has rebooted, and a
+        // resumed recording is a different object from a fresh one — its ring
+        // carries a previous boot's segments, its writer picks up inside the
+        // segment the medium named, and its prologue sits mid-segment. What this
+        // boot holds is that none of that costs the channel anything: the server
+        // greets at position zero, and a recording a previous boot wrote is
+        // still readable from there, so the session ships the medium whole
+        // instead of resynchronising past what the last boot left.
         data: DataMedium::CarriedFrom("recording-download"),
     },
     // The delivered anchor refusing the server, which is the channel's most
@@ -3595,18 +3596,35 @@ fn judge_recordings(
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
 
+    // What each extent held before the boot, in `Deck::extents`' order, which is
+    // the connection history and then the capture — the same order the two
+    // downloads and the two expectations above are in. A boot that made its own
+    // medium carries none, and each surface is then compared against nothing.
+    let [carried_log, carried_capture] = match booted.carried_recordings.as_slice() {
+        [] => [None, None],
+        [log, capture] => [Some(log), Some(capture)],
+        other => {
+            return Err(format!(
+                "this boot inherited {} recording extent(s) and the contract is stated over two, \
+                 so nothing says which download the counts belong to",
+                other.len()
+            ));
+        }
+    };
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
             target: pd_runtime::LOG_TARGET,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN,
             parsed: log_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "log")?,
+            carried: carried_log,
         },
         &surface_contract::Surface {
             target: pd_runtime::CAPTURE_TARGET,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN,
             parsed: capture_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "capture")?,
+            carried: carried_capture,
         },
         &surface_contract::Wire {
             injected: &booted.injected,
@@ -3858,7 +3876,12 @@ fn boot(
         }
         BootContract::Cryptography => DataDiskVerdict::NotThisBootsSubject,
     };
-    let booted = forward_harness::run_boot_test(
+    // What each recording extent held before this boot, taken off the image
+    // while it still says so: the boot below writes over the superblock that
+    // names it, so a reading after it would be a reading of this boot's own
+    // work. Empty on every boot that made its own medium.
+    let carried_recordings = data.carried_recordings()?;
+    let mut booted = forward_harness::run_boot_test(
         command,
         backends,
         BootTest {
@@ -3874,6 +3897,7 @@ fn boot(
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;
+    booted.carried_recordings = carried_recordings;
 
     // The data disk, judged after the boot contract and never instead of it.
     // Which verdict is owed follows from the contract, and the pair is what
@@ -3946,13 +3970,8 @@ fn boot(
         // harness attached rather than from the recording, which would be the
         // recording judging itself.
         let conversations = matches!(owner, Ownership::Owned);
-        // Whether a previous boot wrote this medium, which decides where the
-        // extent's written bytes begin. The harness's own fact — which image it
-        // attached — rather than the recorder's, so a fresh extent is still
-        // walked whole.
-        let resumed = matches!(bench.data, DataMedium::CarriedFrom(_));
         let on_disk = data
-            .judge_recordings(conversations, resumed)
+            .judge_recordings(conversations)
             .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
         println!("  data disk {run_label}: {on_disk}");
         append_evidence(

@@ -6444,6 +6444,17 @@ pub struct Booted {
     /// order, on every boot whose management port a real client can reach.
     /// Empty on every socket-backed boot.
     pub recordings: Vec<Download>,
+    /// What each of those two extents already held **going into** this boot, in
+    /// the same order. Empty on every boot that made its own medium.
+    ///
+    /// Filled by the caller rather than here, because it is a fact about the
+    /// image that was attached and not about anything the guest did: this
+    /// function never opens the medium, and the reading has to be taken before
+    /// QEMU is spawned to mean anything at all. What it is for is
+    /// [`crate::surface_contract::Surface::carried`] — a download taken on a
+    /// resumed recording answers earlier boots' records, and this is what tells
+    /// them from the ones this boot's counters are an account of.
+    pub carried_recordings: Vec<recording_contract::Parsed>,
     /// Every frame this boot put on a dataplane port, with the probe that put
     /// it there and whether the appliance's tap must have observed it.
     ///
@@ -7959,6 +7970,7 @@ fn run_boot(
         dataplane_frames,
         policy,
         recordings,
+        carried_recordings: Vec::new(),
         handshakes,
         requests,
         installs,

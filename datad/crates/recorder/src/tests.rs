@@ -154,7 +154,7 @@ impl Harness {
     }
 
     fn drain(&mut self) {
-        while let Some(flush) = self.sink.take_flush() {
+        while let Some(flush) = self.sink.take_flush(&mut self.staging) {
             let sequence = self.sink.staged_sequence();
             self.device.apply(&flush, sequence, &self.staging);
             self.sink.acknowledge(flush, &mut self.staging);
@@ -863,22 +863,27 @@ fn a_sink_survives_a_reboot_through_its_superblock() {
 
     let mut staging = vec![0u8; STAGING];
     let resumed = Sink::resume(config(2048, 4), &state, &mut staging).expect("a resumed sink");
+    assert_eq!(
+        resumed.cursor().sequence,
+        state.writer().sequence,
+        "a resumed ring continues in the segment the medium named"
+    );
     assert!(
-        resumed.cursor().sequence > 0,
-        "a resumed ring continues past what the last boot left open"
+        resumed.cursor().offset > state.writer().offset,
+        "and past the offset it named, by the section header opened there"
     );
     assert!(
         resumed.staged() > 0,
-        "and its segment's prologue is staged without a second call to ask for it"
+        "which is staged without a second call to ask for it"
     );
 }
 
 #[test]
-fn a_resumed_recording_claims_no_byte_of_the_segment_the_last_boot_left_open() {
-    // The previous boot's open segment was never padded to its end, so its tail
-    // still holds an older wrap's bytes. A snapshot is one contiguous range, so
-    // the only honest range is one starting after it — counting it would put
-    // those bytes mid-body under an exact length.
+fn a_resumed_recording_keeps_every_byte_the_last_boot_made_durable() {
+    // The whole of what a restart must not cost. The previous boot's open
+    // segment was never padded, and a boot that opened the segment *after* it
+    // would have had to disown the whole of it — including the bytes the medium
+    // really took — because a snapshot is one contiguous range.
     let mut harness = Harness::new(2048, 4);
     let bytes = frame(256, 6);
     for index in 0..4u64 {
@@ -886,18 +891,102 @@ fn a_resumed_recording_claims_no_byte_of_the_segment_the_last_boot_left_open() {
     }
     harness.seal();
     let state = harness.checkpoint();
+    let before = harness.sink.durable_position();
     assert!(
-        harness.sink.snapshot().total_len() > 0,
+        before > 0,
         "the boot being resumed from did record something"
     );
 
-    let mut staging = vec![0u8; STAGING];
-    let resumed = Sink::resume(config(2048, 4), &state, &mut staging).expect("a resumed sink");
+    let device = harness.device.clone();
+    let resumed = Harness::resumed(2048, 4, &state, device);
     assert_eq!(
-        resumed.snapshot().total_len(),
-        0,
-        "a resumed recording promises nothing until it has made bytes durable itself"
+        resumed.sink.durable_position(),
+        before,
+        "a resumed recording ends exactly where the medium says it ends"
     );
+    assert_eq!(
+        resumed.sink.first_position(),
+        0,
+        "and begins where it began, nothing having wrapped"
+    );
+    assert_eq!(
+        resumed.sink.snapshot().total_len(),
+        before,
+        "so a download offers the whole of what survived the restart"
+    );
+}
+
+#[test]
+fn a_stored_writer_between_two_sectors_is_refused_rather_than_staged_short() {
+    // Only a forged or corrupt superblock can carry one: every position this
+    // ring records is the end of a whole-sector flush. Continuing at it would
+    // address the staging buffer's first byte by the sector below it, and put
+    // this boot's first write over bytes the medium had already taken.
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
+    harness.seal();
+    let honest = harness.checkpoint();
+    let writer = honest.writer();
+    assert!(
+        writer.offset.is_multiple_of(SECTOR_SIZE),
+        "what this ring actually stores"
+    );
+
+    let forged = RingState::new(
+        honest.geometry(),
+        honest.write_generation(),
+        Cursor {
+            sequence: writer.sequence,
+            offset: writer.offset + 1,
+        },
+        &[],
+    )
+    .expect("a cursor the geometry still holds");
+    let mut staging = vec![0u8; STAGING];
+    assert_eq!(
+        Sink::resume(config(2048, 4), &forged, &mut staging).err(),
+        Some(SinkError::State(
+            RingStateError::WriterOffsetNotSectorMultiple {
+                offset: writer.offset + 1,
+            }
+        )),
+        "refused by name, so the extent is recorded over loudly rather than short"
+    );
+}
+
+#[test]
+fn a_resumed_recording_hands_out_no_byte_past_what_the_medium_took() {
+    // The hazard the resume point answers. The segment being continued still
+    // holds the previous wrap's bytes from the durable cursor to its end, and
+    // they are unreachable rather than merely refused: that segment is this
+    // boot's *open* one, so the ring reports it readable only as far as the
+    // cursor, and the cursor is where the device stopped acknowledging.
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    for index in 0..4u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+    let state = harness.checkpoint();
+    let durable = harness.sink.durable_position();
+
+    let device = harness.device.clone();
+    let mut resumed = Harness::resumed(2048, 4, &state, device);
+    assert_eq!(
+        resumed.sink.find(durable),
+        Locate::PastEnd,
+        "the first byte the medium never took is past the end"
+    );
+    assert_eq!(
+        resumed.sink.find(durable + SEGMENT as u64 / 2),
+        Locate::PastEnd,
+        "and so is the middle of the tail behind it"
+    );
+    // Even after this boot has staged its own section header, nothing moves
+    // until the device has taken it.
+    assert!(resumed.sink.staged() > 0, "a section header is staged");
+    assert_eq!(resumed.sink.find(durable), Locate::PastEnd);
 }
 
 #[test]
@@ -1009,9 +1098,12 @@ fn only_one_flush_is_outstanding_at_a_time() {
     for index in 0..4u64 {
         harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
     }
-    let flush = harness.sink.take_flush().expect("whole sectors");
+    let flush = harness
+        .sink
+        .take_flush(&mut harness.staging)
+        .expect("whole sectors");
     assert!(
-        harness.sink.take_flush().is_none(),
+        harness.sink.take_flush(&mut harness.staging).is_none(),
         "a second flush while one is outstanding"
     );
     let sequence = harness.sink.staged_sequence();
@@ -1024,9 +1116,16 @@ fn only_one_flush_is_outstanding_at_a_time() {
 fn nothing_to_flush_is_not_a_flush() {
     let mut staging = vec![0u8; STAGING];
     let mut sink = Sink::new(config(2048, 4), &mut staging).expect("a legal sink");
-    // A prologue alone is shorter than a sector.
-    assert!(sink.take_flush().is_none());
-    assert!(sink.staged() > 0);
+    // A prologue is shorter than a sector and still goes over, its own sector
+    // completed first so that what the device takes ends on a block boundary.
+    let flush = sink
+        .take_flush(&mut staging)
+        .expect("the prologue's own sector");
+    assert_eq!(flush.len(), SECTOR_SIZE);
+    sink.acknowledge(flush, &mut staging);
+    // And an empty buffer is nothing to hand over at all.
+    assert_eq!(sink.staged(), 0);
+    assert!(sink.take_flush(&mut staging).is_none());
 }
 
 #[test]
@@ -1366,13 +1465,21 @@ fn a_ring_position_the_writer_wrapped_past_is_an_overrun_and_not_other_bytes() {
 }
 
 #[test]
-fn a_resumed_ring_refuses_the_positions_the_previous_boot_left() {
+fn a_resumed_ring_serves_a_position_an_earlier_boot_had_already_shipped() {
+    // What a management server is owed across a reboot: the position it
+    // acknowledged is still a position this appliance can read, so the stream
+    // picks up where the two ends agreed rather than at a resynchronisation.
     let mut harness = Harness::new(2048, 6);
     let bytes = frame(400, 3);
     for _ in 0..12 {
         harness.record(&tap(1, 0, bytes.len() as u32), &bytes);
     }
     harness.seal();
+    // Where a server that had ingested the first third of the ring would stand.
+    // Not a position anything is parsed from — a channel cursor only ever names
+    // the end of a whole block — but one this appliance must still be able to
+    // read, which is the whole of what the restart must not cost.
+    let acknowledged = harness.sink.durable_position() / 3;
     let state = harness.checkpoint();
 
     let device = harness.device.clone();
@@ -1381,15 +1488,18 @@ fn a_resumed_ring_refuses_the_positions_the_previous_boot_left() {
         resumed.record(&tap(1, 0, bytes.len() as u32), &bytes);
     }
     resumed.seal();
-    // The segment this boot opened is where its claimable history begins: the
-    // previous boot left its last segment unsealed, so those bytes are not this
-    // recording's to hand over even though the ring still holds them.
-    assert_eq!(resumed.sink.find(0), Locate::Overrun);
-    let opened = resumed.sink.cursor().sequence * SEGMENT as u64;
-    assert!(matches!(resumed.sink.find(opened), Locate::Live(_)));
-    let body = resumed.shipped(opened);
+    assert_eq!(resumed.sink.first_position(), 0, "nothing has wrapped");
+    assert!(matches!(resumed.sink.find(acknowledged), Locate::Live(_)));
+    // And the whole of what the medium now holds is still one pcapng stream,
+    // with a section opened at the resume point — so the records this boot
+    // appended are read against this boot's interfaces and not the last one's.
+    let body = resumed.shipped(0);
     assert!(!body.is_empty());
-    assert_eq!(parse(&body).sections, 1, "the segment this boot opened");
+    let sections = parse(&body).sections;
+    assert!(
+        sections >= 3,
+        "each segment crossed and the resume point inside one open a section, saw {sections}"
+    );
 }
 
 #[test]
@@ -1410,25 +1520,39 @@ fn the_first_position_is_where_a_refused_reader_must_carry_on_from() {
     assert_eq!(harness.sink.first_position(), 0);
     assert!(matches!(harness.sink.find(0), Locate::Live(_)));
 
+    // A restart does not move it: the resumed sink continues in the segment it
+    // read, so nothing that was on the medium stops being on it.
     let device = harness.device.clone();
     let mut resumed = Harness::resumed(2048, 6, &state, device);
     for _ in 0..6 {
         resumed.record(&tap(1, 0, bytes.len() as u32), &bytes);
     }
     resumed.seal();
-    let first = resumed.sink.first_position();
-    assert!(first > 0, "a resumed ring does not begin at zero");
-    assert_eq!(resumed.sink.find(0), Locate::Overrun);
+    assert_eq!(resumed.sink.first_position(), 0);
+    assert!(matches!(resumed.sink.find(0), Locate::Live(_)));
+
+    // A wrap is what does move it, and then the position it names is readable
+    // and the byte before it is not.
+    let mut wrapped = Harness::new(2048, 3);
+    let wide = frame(400, 9);
+    while wrapped.sink.counters().wraps < 2 {
+        wrapped.record(&tap(1, 0, wide.len() as u32), &wide);
+    }
+    wrapped.drain();
+    let first = wrapped.sink.first_position();
     assert!(
-        matches!(resumed.sink.find(first), Locate::Live(_)),
+        first > 0,
+        "a ring that has wrapped no longer begins at zero"
+    );
+    assert!(
+        matches!(wrapped.sink.find(first), Locate::Live(_)),
         "the position a refused reader is sent to must itself be readable"
     );
     assert!(
-        first <= resumed.sink.durable_position(),
+        first <= wrapped.sink.durable_position(),
         "a reader sent past the durable end would be told to skip bytes that exist"
     );
-    // And it is the *first* such position: one byte earlier is still gone.
-    assert_eq!(resumed.sink.find(first - 1), Locate::Overrun);
+    assert_eq!(wrapped.sink.find(first - 1), Locate::Overrun);
 }
 
 #[test]
@@ -1555,7 +1679,7 @@ fn a_block_the_open_segment_cannot_hold_is_answered_segment_full() {
                 placed += 1;
                 // Staging is smaller than a segment, so it is drained as it
                 // fills; the segment is what this test wants to run out.
-                if let Some(flush) = sink.take_flush() {
+                if let Some(flush) = sink.take_flush(&mut staging) {
                     sink.acknowledge(flush, &mut staging);
                 }
             }
