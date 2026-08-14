@@ -595,6 +595,16 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
              channel-capture-shipped={capture_position} \
              channel-capture-pending={capture_pending}"
         ),
+        DomainDetail::ChannelAcked {
+            log_acked,
+            log_sent,
+            capture_acked,
+            capture_sent,
+        } => write!(
+            cursor,
+            " channel-log-acked={log_acked} channel-log-sent={log_sent} \
+             channel-capture-acked={capture_acked} channel-capture-sent={capture_sent}"
+        ),
         DomainDetail::Refusal(Refusal {
             cause,
             detail,
@@ -1826,6 +1836,12 @@ mod tests {
                 capture_position: u64::MAX,
                 capture_pending: u64::MAX,
             },
+            DomainDetail::ChannelAcked {
+                log_acked: u64::MAX,
+                log_sent: u64::MAX,
+                capture_acked: u64::MAX,
+                capture_sent: u64::MAX,
+            },
             DomainDetail::Onboarded {
                 relayed: u64::MAX,
                 received: u64::MAX,
@@ -2091,6 +2107,16 @@ mod tests {
                         log_pending,
                         capture_position,
                         capture_pending,
+                    }
+                },
+            ),
+            any::<(u64, u64, u64, u64)>().prop_map(
+                |(log_acked, log_sent, capture_acked, capture_sent)| {
+                    DomainDetail::ChannelAcked {
+                        log_acked,
+                        log_sent,
+                        capture_acked,
+                        capture_sent,
                     }
                 },
             ),

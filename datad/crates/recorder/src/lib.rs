@@ -35,8 +35,8 @@
 #![forbid(unsafe_code)]
 
 use lfw_capture_ring::{
-    Append, Copies, Cursor, Geometry, Located, Ring, RingState, RingStateError, SECTOR_SIZE,
-    SUPERBLOCK_BYTES, SuperblockWrite, encode_superblock,
+    Append, Copies, Cursor, Geometry, Located, ReaderCursor, Ring, RingState, RingStateError,
+    SECTOR_SIZE, SUPERBLOCK_BYTES, SuperblockWrite, encode_superblock,
 };
 use lfw_pcapng::{
     CustomBinary, EncodeError, EnhancedPacket, InterfaceDescription, LinkType,
@@ -321,6 +321,11 @@ pub struct SinkCounters {
     pub download_overruns: u64,
 }
 
+/// Which reader the **management channel's** cursor is in the superblock's
+/// reader table. The identifier is what makes a cursor survive a restart *as
+/// that reader's*; one and not zero, so a slot is legible in a hex dump.
+pub const CHANNEL_READER_ID: u32 = 1;
+
 /// One recording sink.
 #[derive(Debug)]
 pub struct Sink {
@@ -343,6 +348,7 @@ pub struct Sink {
     /// The oldest sequence a download may claim. A resumed sink starts it at the
     /// segment this boot opened, its predecessor having been left unsealed.
     first_claimable: u64,
+    reader: Option<Cursor>,
     /// Whether the superblock region may still hold another ring's — so until a
     /// checkpoint of this one reached the device, and never for a resumed sink.
     superblock_stale: bool,
@@ -384,6 +390,7 @@ impl Sink {
                 offset: 0,
             },
             first_claimable: 0,
+            reader: None,
             superblock_stale: true,
             flushing: false,
             pending_drops: 0,
@@ -415,6 +422,13 @@ impl Sink {
             offset: 0,
         };
         sink.first_claimable = sink.staged_sequence;
+        // Carried across the restart, and republished until one moves it.
+        sink.reader = checked
+            .readers()
+            .iter()
+            .flatten()
+            .find(|reader| reader.id == CHANNEL_READER_ID)
+            .map(|reader| reader.cursor);
         sink.superblock_stale = false;
         sink.staged_from = 0;
         sink.staged_len = 0;
@@ -723,7 +737,11 @@ impl Sink {
         &mut self,
         image: &mut [u8; SUPERBLOCK_BYTES],
     ) -> Result<SuperblockWrite, RingStateError> {
-        let state = self.ring.checkpoint(self.durable, &[])?;
+        let readers = self.reader.map(|cursor| ReaderCursor {
+            id: CHANNEL_READER_ID,
+            cursor,
+        });
+        let state = self.ring.checkpoint(self.durable, readers.as_slice())?;
         let copies = if self.superblock_stale {
             Copies::Both
         } else {
@@ -734,6 +752,47 @@ impl Sink {
 
     pub fn acknowledge_checkpoint(&mut self) {
         self.superblock_stale = false;
+    }
+
+    /// Take a management server's word for how far it has durably ingested this
+    /// recording, and answer whether that moved the reader cursor. `position`
+    /// came off the wire and is clamped three ways. **Never past the writer**: a
+    /// ring refuses a cursor ahead of its writer and a refused state is a
+    /// checkpoint not written, so a claim past the end would stop this appliance
+    /// making *any* of it durable. **Never behind the oldest byte the medium
+    /// holds**, and **never backward**.
+    pub fn acknowledge_reader(&mut self, position: u64) -> bool {
+        let segment = self.ring.geometry().segment_bytes() as u64;
+        if segment == 0 {
+            // Unreachable, and answered rather than divided by, on `find`'s terms.
+            return false;
+        }
+        let bounded = position
+            .max(self.first_position())
+            .min(self.durable_position());
+        let sequence = bounded / segment;
+        // Not redundant: a durable cursor at a segment's end puts
+        // `durable_position` one sequence past the writer.
+        let cursor = if sequence > self.durable.sequence {
+            self.durable
+        } else {
+            Cursor {
+                sequence,
+                offset: (bounded % segment) as usize,
+            }
+        };
+        let held = self.reader;
+        if held.is_some_and(|held| (cursor.sequence, cursor.offset) <= (held.sequence, held.offset))
+        {
+            return false;
+        }
+        self.reader = Some(cursor);
+        true
+    }
+
+    #[must_use]
+    pub const fn reader(&self) -> Option<Cursor> {
+        self.reader
     }
 
     /// Pin what a download will deliver.

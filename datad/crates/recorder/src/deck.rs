@@ -48,8 +48,8 @@ use lfw_capture_ring::{
 };
 use lfw_metrics::{SNAPSHOT_BYTES, SNAPSHOT_SLOTS, encode_snapshot};
 use wire::{
-    BATCH_BYTES, CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader, DownloadRefusal,
-    DownloadSink, LogRelayReader, RELAY_LINE_BYTES, StatsRelay, TAP_SNAP_LEN,
+    Acknowledged, BATCH_BYTES, CheckedTap, DOWNLOAD_WINDOW_LEN, DownloadDemand, DownloadReader,
+    DownloadRefusal, DownloadSink, LogRelayReader, RELAY_LINE_BYTES, StatsRelay, TAP_SNAP_LEN,
     TRANSCRIPT_MAX_ENTRIES, TapReader, TranscriptBatch, TranscriptEntry,
 };
 
@@ -194,6 +194,15 @@ impl Which {
         match self {
             Self::Log => Area::Log,
             Self::Capture => Area::Capture,
+        }
+    }
+
+    /// The download channel's own name for this recording.
+    #[must_use]
+    pub const fn sink(self) -> DownloadSink {
+        match self {
+            Self::Log => DownloadSink::Log,
+            Self::Capture => DownloadSink::Capture,
         }
     }
 
@@ -1352,6 +1361,9 @@ impl Deck {
     /// admits one outstanding request, so the old one is a request the
     /// requester has already abandoned.
     pub fn demand(&mut self, demand: DownloadDemand) {
+        // Before what the demand *asks* for is decided: the pair rides every
+        // request, refused ones included.
+        self.acknowledge(demand.acknowledged());
         let Some(sink) = demand.sink() else {
             self.download = Download::Answered {
                 demand,
@@ -1398,6 +1410,23 @@ impl Deck {
                     total_len: 0,
                     first: 0,
                 };
+            }
+        }
+    }
+
+    /// Give both recordings the positions the management server says it has
+    /// durably taken, and arm a checkpoint for each whose cursor moved.
+    ///
+    /// Every bound on the claim is the sink's. Armed rather than written, so it
+    /// rides the checkpoint the payload's barrier already orders — it needs none
+    /// of its own, a cursor persisted early naming bytes already on the medium.
+    fn acknowledge(&mut self, acked: Acknowledged) {
+        for recording in &mut self.recordings {
+            if recording
+                .sink
+                .acknowledge_reader(acked.of(recording.which.sink()))
+            {
+                recording.checkpoint_due = true;
             }
         }
     }

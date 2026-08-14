@@ -144,8 +144,8 @@ use lfw_metrics::{CRYPTO_PRIMITIVES, CryptoSample, StatsShard};
 use lfw_onboarding::{Identity, Onboarding as RequestSurface};
 use lfw_tls::{Bump, CryptoProvider, Negotiated, ServerKey, SessionError, prove_session};
 use pd_runtime::{
-    Answered, Half, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession, Terminating,
-    TerminatingPass, Terminator, attach_region, log_sample, read_timestamp_counter,
+    Acknowledged, Answered, Half, PdClock, RELAY_DEMANDS_PER_WAKEUP, TerminatedSession,
+    Terminating, TerminatingPass, Terminator, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -1732,6 +1732,17 @@ impl Terminator for Management {
 
     fn agreed(&self) -> bool {
         matches!(self.carrying, Some(Carrying::Channel)) && self.channel.agreed()
+    }
+
+    /// What the channel has been told the server holds, gated on the channel
+    /// being the half running now. The gate is the point: the onboarding half
+    /// acknowledges nothing, and a pair left standing from an ended channel
+    /// session would read as a fresh acknowledgement on the next connection.
+    fn acknowledged(&self) -> Acknowledged {
+        match self.carrying {
+            Some(Carrying::Channel) => self.channel.acknowledged(),
+            _ => Acknowledged::NONE,
+        }
     }
 
     fn closed(&mut self) {

@@ -570,7 +570,7 @@ pub use owner::{OwnershipChange, OwnershipWatch};
 pub use pipeline::{Configuration, Ownership, PolicySweep, Tracking};
 pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
 pub use relay::{
-    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Answered, ChannelStream,
+    ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Acknowledged, Answered, ChannelStream,
     DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Half, Relay, RelayFailure, RelayPass,
     RelayReport, RelaySession, Relayed, SHIPPED_RING_BYTES, TerminatedSession, Terminating,
     TerminatingPass, Terminator, Upstream,

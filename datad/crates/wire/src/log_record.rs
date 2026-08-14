@@ -327,6 +327,9 @@ pub enum LogDetailKind {
     /// and how much of each it still owes the server. Appended, never inserted,
     /// and one discriminant and not two: the question is about the channel.
     ChannelShipping,
+    /// How far the **management server** says it has durably taken each
+    /// recording, against how far this appliance sent it.
+    ChannelAcked,
 }
 
 impl LogDetailKind {
@@ -389,6 +392,7 @@ impl LogDetailKind {
             Self::RecordingResumed => 53,
             Self::RecordingFresh => 54,
             Self::ChannelShipping => 55,
+            Self::ChannelAcked => 56,
         }
     }
 
@@ -451,6 +455,7 @@ impl LogDetailKind {
             53 => Some(Self::RecordingResumed),
             54 => Some(Self::RecordingFresh),
             55 => Some(Self::ChannelShipping),
+            56 => Some(Self::ChannelAcked),
             _ => None,
         }
     }
@@ -1072,6 +1077,14 @@ impl LogRecord {
                 log_pending: self.operands[1],
                 capture_position: self.operands[2],
                 capture_pending: self.operands[3],
+            },
+            // Four positions again and none ranged: over-reach is judged where
+            // the frames are, not here.
+            Some(LogDetailKind::ChannelAcked) => CheckedDetail::ChannelAcked {
+                log_acked: self.operands[0],
+                log_sent: self.operands[1],
+                capture_acked: self.operands[2],
+                capture_sent: self.operands[3],
             },
             // A sector and a flag, the flag in the fourth word where this ABI puts
             // every one, so a word that is neither 0 nor 1 makes it unreadable.
@@ -1903,6 +1916,14 @@ pub enum CheckedDetail {
         log_pending: u64,
         capture_position: u64,
         capture_pending: u64,
+    },
+    /// How far the server has taken each recording, and how far this appliance
+    /// has sent it.
+    ChannelAcked {
+        log_acked: u64,
+        log_sent: u64,
+        capture_acked: u64,
+        capture_sent: u64,
     },
     /// What one onboarding session carried: how many items crossed the relay
     /// carrying it, how many bytes went each way, and which end finished it.

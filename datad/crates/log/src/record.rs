@@ -708,6 +708,15 @@ impl Event<Cause> {
                         *capture_pending,
                     ];
                 }
+                DomainDetail::ChannelAcked {
+                    log_acked,
+                    log_sent,
+                    capture_acked,
+                    capture_sent,
+                } => {
+                    record.detail = LogDetailKind::ChannelAcked.to_bits();
+                    record.operands = [*log_acked, *log_sent, *capture_acked, *capture_sent];
+                }
                 DomainDetail::Onboarded {
                     relayed,
                     received,
@@ -1215,6 +1224,18 @@ fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeEr
             capture_position: *capture_position,
             capture_pending: *capture_pending,
         },
+        // Four positions, none ranged, on `ChannelShipping`'s terms exactly.
+        CheckedDetail::ChannelAcked {
+            log_acked,
+            log_sent,
+            capture_acked,
+            capture_sent,
+        } => DomainDetail::ChannelAcked {
+            log_acked: *log_acked,
+            log_sent: *log_sent,
+            capture_acked: *capture_acked,
+            capture_sent: *capture_sent,
+        },
         // The token was ranged to the vocabulary by `wire`; the three counts are
         // tallies the emitting domain kept about its own session, so every bit
         // pattern of each is one it could have written.
@@ -1633,6 +1654,17 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                         log_pending,
                         capture_position,
                         capture_pending,
+                    },
+                    DomainDetail::ChannelAcked {
+                        log_acked,
+                        log_sent,
+                        capture_acked,
+                        capture_sent,
+                    } => DomainDetail::ChannelAcked {
+                        log_acked,
+                        log_sent,
+                        capture_acked,
+                        capture_sent,
                     },
                     DomainDetail::Onboarded {
                         relayed,

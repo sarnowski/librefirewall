@@ -77,6 +77,7 @@ fn records_cross_in_both_directions_under_one_sequence() {
             closed,
             agreed: _,
             answered,
+            acked: _,
         } => {
             assert_eq!(records, &b"\x16\x03\x03back"[..]);
             assert!(!closed);

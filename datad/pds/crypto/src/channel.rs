@@ -66,20 +66,34 @@ use lfw_channel::{
 };
 use lfw_log::{DomainDetail, Refusal, RefusalDetail};
 use lfw_tls::{Bump, CHANNEL_OUTCOME_RECORDS, ChannelClient, CryptoProvider, Turn};
-use pd_runtime::{Answered, SHIPPED_RING_BYTES};
+use pd_runtime::{Acknowledged, Answered, SHIPPED_RING_BYTES};
 
 use crate::delegate::{HeldAnchor, HeldCertificate};
 
 /// The most console records one channel session owes.
 ///
 /// Two outcomes' worth — the handshake's, and how a session that came up then
-/// ended — plus the framing's account at each of the two states it has, the one
-/// rule a peer may have broken, and the one shipment this end may have refused
-/// to compose. A sum and not a bound anybody guesses at, and none of its terms a
-/// peer's to multiply: there is no third outcome, whatever a server does on the
-/// wire, the framing has no third state, and a refused shipment ends the session
-/// that carried it.
-pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 4;
+/// ended — plus the framing's account at each of the two states it has, the
+/// delivery account at each of *its* two, the one rule a peer may have broken,
+/// the one shipment this end may have refused to compose, and the one
+/// over-reaching acknowledgement this end may have clamped. A sum and not a
+/// bound anybody guesses at, and none of its terms a peer's to multiply: there
+/// is no third outcome whatever a server does on the wire, neither account has
+/// a third state, a refused shipment ends the session that carried it, and the
+/// clamp is latched so a server sending a thousand impossible acknowledgements
+/// buys one line and not a thousand.
+pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 7;
+
+/// The recordings, in the order this file indexes its per-ring state by.
+const RINGS: [Ring; 2] = [Ring::Log, Ring::Capture];
+
+/// Which slot of that state a recording is.
+const fn ring_index(ring: Ring) -> usize {
+    match ring {
+        Ring::Log => 0,
+        Ring::Capture => 1,
+    }
+}
 
 /// Bytes of plaintext this end composes for its own greeting.
 ///
@@ -184,6 +198,37 @@ struct Dialogue<'arena> {
     /// and never ships is the fault worth seeing. It stays bounded by being a
     /// state: the second record is owed once, whatever the wire does after.
     reported_shipping: bool,
+    /// One past the last ring byte this end has composed into a frame, per
+    /// recording. **The bound every acknowledgement is judged against**, and it
+    /// is judged here rather than where the cursors are kept because this is the
+    /// only place that knows: this domain composes every frame, so `position`
+    /// plus the bytes behind it is exactly what has left the appliance.
+    sent_to: [u64; RINGS.len()],
+    /// How far the server says it has durably taken each recording, as this end
+    /// will let itself believe.
+    ///
+    /// Seeded by the greeting, which is a **resume point** and deliberately not
+    /// bounded by [`Self::sent_to`]: a session that has sent nothing has sent
+    /// nothing to be acknowledged, and the number the server opens with is where
+    /// it wants the appliance to start rather than a claim about this session.
+    /// Every later acknowledgement is clamped to what has been sent and may only
+    /// move forward.
+    held: [u64; RINGS.len()],
+    /// Whether the greeting's resume point and the first acknowledgement past it
+    /// have each been put on the console.
+    ///
+    /// **Two states rather than a record per acknowledgement.** A server chooses
+    /// how often it acknowledges, so a record apiece would be a console line at
+    /// a peer's chosen rate. What an operator needs is the pair of facts a
+    /// session has: where it was told to start, and whether anything it shipped
+    /// has since been taken.
+    reported_resume: bool,
+    reported_acked: bool,
+    /// An acknowledgement past what this end has sent, kept for the console and
+    /// said **once** per session, for the reason above: a peer sending a
+    /// thousand impossible claims buys one line.
+    clamped: Option<(u64, u64)>,
+    reported_clamp: bool,
 }
 
 /// The channel as the relay drives it: the identity a session is opened with,
@@ -248,6 +293,15 @@ impl ManagementChannel {
     /// The instant a chain is judged against on the next open.
     pub const fn at(&mut self, now: u64) {
         self.now = now;
+    }
+
+    /// How far the server has taken each recording in the session running now,
+    /// as this end judged the claim. Nothing, between sessions.
+    #[must_use]
+    pub fn acknowledged(&self) -> Acknowledged {
+        self.session
+            .as_ref()
+            .map_or(Acknowledged::NONE, Dialogue::acknowledged)
     }
 
     /// Whether the greeting has been agreed in the session running now.
@@ -317,6 +371,12 @@ impl ManagementChannel {
                     reported_ending: false,
                     reported_framing: false,
                     reported_shipping: false,
+                    sent_to: [0; RINGS.len()],
+                    held: [0; RINGS.len()],
+                    reported_resume: false,
+                    reported_acked: false,
+                    clamped: None,
+                    reported_clamp: false,
                 });
             }
             Err(outcome) => {
@@ -527,7 +587,58 @@ impl Dialogue<'_> {
             return Some("channel-shipment-not-taken");
         }
         self.sent = self.sent.saturating_add(1);
+        // Moved only once the record layer has taken the whole frame, which is
+        // what makes this "what has been sent" rather than "what was offered":
+        // a bound that counted a frame the session refused would let a server
+        // acknowledge bytes that never left.
+        if let Some(slot) = self.sent_to.get_mut(ring_index(ring)) {
+            *slot = (*slot).max(position.saturating_add(bytes.len() as u64));
+        }
         None
+    }
+
+    /// Take an acknowledgement, bounded by what this end has actually sent.
+    ///
+    /// **The clamp is a safety property and not tidiness.** These numbers become
+    /// a reader cursor in a recording's superblock, and a ring refuses a reader
+    /// cursor ahead of its writer — refusing the whole checkpoint with it. So an
+    /// acknowledgement believed past what was written would not corrupt a
+    /// recording; it would stop the appliance making any recording durable at
+    /// all, at a management server's choosing. It is cut off here, at the one
+    /// place that knows the bound, and the fact that a peer reached for it is
+    /// said on the console rather than swallowed.
+    ///
+    /// Forward only, for the same reason it is forward only everywhere else: a
+    /// server that could walk this back could walk the appliance's own record of
+    /// what has been delivered back with it.
+    fn acknowledge(&mut self, log: u64, capture: u64) {
+        for (at, claimed) in [log, capture].into_iter().enumerate() {
+            let bound = self.sent_to.get(at).copied().unwrap_or(0);
+            if claimed > bound && self.clamped.is_none() {
+                self.clamped = Some((claimed, bound));
+            }
+            if let Some(slot) = self.held.get_mut(at) {
+                *slot = (*slot).max(claimed.min(bound));
+            }
+        }
+    }
+
+    /// How far the server has taken each recording, as this end judged it.
+    fn acknowledged(&self) -> Acknowledged {
+        Acknowledged {
+            log: self.held.first().copied().unwrap_or(0),
+            capture: self.held.get(1).copied().unwrap_or(0),
+        }
+    }
+
+    /// Where the two recordings stand between the two ends: taken, and sent.
+    fn delivery(&self) -> DomainDetail {
+        DomainDetail::ChannelAcked {
+            log_acked: self.held.first().copied().unwrap_or(0),
+            log_sent: self.sent_to.first().copied().unwrap_or(0),
+            capture_acked: self.held.get(1).copied().unwrap_or(0),
+            capture_sent: self.sent_to.get(1).copied().unwrap_or(0),
+        }
     }
 
     /// Read everything the record layer decrypted as frames.
@@ -563,8 +674,19 @@ impl Dialogue<'_> {
                         return;
                     }
                     Decoded::Frame(frame) => {
-                        if let Frame::Hello(Hello::Server { .. }) = frame {
-                            self.agreed = true;
+                        match frame {
+                            Frame::Hello(Hello::Server { log, capture }) => {
+                                self.agreed = true;
+                                // Taken whole, and behind where this appliance
+                                // last shipped if that is what it says: the
+                                // greeting is where the end that will ingest the
+                                // bytes wants them from, and re-shipping a run
+                                // costs an ingest nothing because every frame
+                                // carries its own position.
+                                self.held = [log, capture];
+                            }
+                            Frame::Ack { log, capture } => self.acknowledge(log, capture),
+                            _ => {}
                         }
                         self.received = self.received.saturating_add(1);
                     }
@@ -616,6 +738,47 @@ impl Dialogue<'_> {
             self.reported_shipping = true;
             if let Some(slot) = taken.get_mut(at) {
                 *slot = Some(self.framing());
+                at = at.saturating_add(1);
+            }
+        }
+        // Where the greeting said to start, said once the greeting has been
+        // read. It is the record that makes a resumed channel legible: without
+        // it, an appliance told to start at a position it has already passed and
+        // one told to start where it left off are the same two lines.
+        if self.agreed && !self.reported_resume {
+            self.reported_resume = true;
+            if let Some(slot) = taken.get_mut(at) {
+                *slot = Some(self.delivery());
+                at = at.saturating_add(1);
+            }
+        }
+        // And once anything shipped on this session has been taken. Two states
+        // and not a line per acknowledgement: a server chooses how often it
+        // acknowledges, and a record per one would be a console rate a peer sets.
+        if self.reported_resume
+            && !self.reported_acked
+            && self
+                .held
+                .iter()
+                .zip(&self.sent_to)
+                .any(|(held, sent)| *sent > 0 && *held >= *sent)
+        {
+            self.reported_acked = true;
+            if let Some(slot) = taken.get_mut(at) {
+                *slot = Some(self.delivery());
+                at = at.saturating_add(1);
+            }
+        }
+        if !self.reported_clamp
+            && let Some((claimed, bound)) = self.clamped
+        {
+            self.reported_clamp = true;
+            if let Some(slot) = taken.get_mut(at) {
+                *slot = Some(DomainDetail::Refusal(Refusal {
+                    cause: "channel-ack-past-sent",
+                    detail: RefusalDetail::Two(claimed, bound),
+                    signalled: false,
+                }));
             }
         }
         taken

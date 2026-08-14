@@ -780,6 +780,12 @@ const fn chosen_via(via: Via) -> NextHopVia {
 /// standing behind a cursor that is not moving, with a session up that could
 /// carry them. The position and the backlog are what an operator needs to see
 /// whether it is growing.
+///
+/// A **clamped resume point** is neither: it is a management server naming a
+/// position past the end of a recording this appliance has, which is a server
+/// holding some other node's cursor or one that outlived the medium here. The
+/// session goes on from the durable end, and the two numbers are what say how
+/// far apart the two ends' ideas of this recording are.
 const fn refusal_for(
     recording: DownloadSink,
     causes: (&'static str, &'static str),
@@ -820,6 +826,18 @@ fn shipping_record(shipped: Shipped) -> DomainDetail {
             recording,
             ("upstream-log-ring-stalled", "upstream-capture-ring-stalled"),
             RefusalDetail::Two(place.position, place.pending),
+        )),
+        Shipped::ResumeClamped {
+            recording,
+            claimed,
+            durable,
+        } => DomainDetail::Refusal(refusal_for(
+            recording,
+            (
+                "upstream-log-resume-past-durable",
+                "upstream-capture-resume-past-durable",
+            ),
+            RefusalDetail::Two(claimed, durable),
         )),
     }
 }

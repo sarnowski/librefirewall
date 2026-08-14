@@ -70,7 +70,7 @@
 use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ConnectionId, onboard::Ended};
 use lfw_log::{OnboardEnd, RefusalDetail};
-pub use wire::Half;
+pub use wire::{Acknowledged, Half};
 use wire::{
     DownloadSink, MAX_RELAY_PAYLOAD, PendingRelay, RelayDemand, RelayEnding, RelayFault,
     RelayOperation, RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester,
@@ -348,6 +348,7 @@ enum Claimed {
         kept: usize,
         closed: bool,
         agreed: bool,
+        acked: Acknowledged,
     },
     Refused(RelayRefusal),
     Faulted(RelayFault),
@@ -521,11 +522,13 @@ impl<'chan> Relay<'chan> {
                     closed,
                     agreed,
                     answered: _,
+                    acked,
                 } => Claimed::Answered {
                     offered: records.len(),
                     kept: stream.push(records),
                     closed,
                     agreed,
+                    acked,
                 },
                 RelayPoll::Refused(reason) => Claimed::Refused(reason),
                 RelayPoll::Faulted(fault) => Claimed::Faulted(fault),
@@ -555,6 +558,7 @@ impl<'chan> Relay<'chan> {
                 kept,
                 closed,
                 agreed,
+                acked,
             } => {
                 self.relayed = self.relayed.saturating_add(1);
                 self.sent = self.sent.saturating_add(kept as u64);
@@ -567,6 +571,12 @@ impl<'chan> Relay<'chan> {
                 // schedule is owed its reset for it.
                 let first = agreed && !self.agreed;
                 self.agreed |= agreed;
+                // The resume point **before** the acknowledgement, and only on
+                // the pass that first agreed.
+                if first {
+                    upstream.resume_from(acked);
+                }
+                upstream.acknowledged(acked);
                 if kept < offered {
                     self.far = Far::Closed;
                     // The room there was is exactly what was kept, `Relayed::push`
@@ -943,14 +953,25 @@ pub trait Upstream {
     /// Which recording, the absolute ring position, and the bytes themselves.
     fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])>;
 
+    /// Where the far end says it will be sent from, taken **once** per session
+    /// off the greeting that opened it. A resume point and not an
+    /// acknowledgement: it may name a position behind where this appliance last
+    /// shipped — a server asking again for what it never made durable, harmless
+    /// because every frame carries its own position — so nothing bounds it here.
+    fn resume_from(&mut self, acked: Acknowledged);
+
+    /// How far the far end says it has durably taken each recording, as a level
+    /// read off every answer. Bounded by what this appliance sent, never
+    /// **backward**.
+    fn acknowledged(&mut self, acked: Acknowledged);
+
     /// The far end answered the shipment those bytes were on, so the reader may
     /// move past them.
     ///
     /// Called on the **answer** and never on the issue, which keeps a hole out
     /// of the shipped stream: an item refused, faulted or never answered leaves
-    /// the cursor where it was and the next session ships that position again. A
-    /// frame can cross twice and never be skipped, and the position makes the
-    /// repetition harmless.
+    /// the cursor where it was and the next session ships that position again.
+    /// A frame can cross twice and never be skipped.
     fn shipped(&mut self);
 }
 
@@ -1029,6 +1050,13 @@ pub trait Terminator {
     /// that has no greeting to agree, which is what the onboarding server is.
     fn agreed(&self) -> bool {
         false
+    }
+
+    /// How far the peer says it has durably taken each recording, as **this**
+    /// end judged the claim. Asked rather than remembered here for
+    /// [`Self::agreed`]'s reason: only the end composing every frame knows it.
+    fn acknowledged(&self) -> Acknowledged {
+        Acknowledged::NONE
     }
 
     /// The session is over, however it ended.
@@ -1356,6 +1384,10 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
     /// The bytes answered with are counted as the channel published them rather
     /// than as they were offered: what the account states is what crossed.
     fn publish(&mut self, demand: RelayDemand, sent: usize, closed: bool, agreed: bool) {
+        // Stated on every answer, on the agreed word's terms: read as a level,
+        // so a coalesced wakeup cannot lose it.
+        let acked = self.terminator.acknowledged();
+        self.responder.acknowledge(acked);
         let Self {
             responder, answer, ..
         } = self;

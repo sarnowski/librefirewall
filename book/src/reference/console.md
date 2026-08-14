@@ -753,6 +753,31 @@ node: an operator holding a silent appliance still has only the external act.
 
   **No byte of a recording has a representation here.** Four positions are system state; what stands
   at them is a customer's traffic and reaches no console line.
+- `channel-log-acked=<n> channel-log-sent=<n> channel-capture-acked=<n> channel-capture-sent=<n>` —
+  **how far the management server says it has durably taken each recording, against how far this
+  appliance has sent it.** All four are byte positions in each ring's own append space — the same
+  coordinate the record above uses and the same one the ring superblocks' reader cursors are kept
+  in — so the gap between an `-acked=` and the `-sent=` beside it is what is in flight, and the
+  `-acked=` alone is what a reboot resumes from.
+
+  Written twice per session and no more: once when the two ends greet, where the two `-acked=`
+  numbers are the **resume point** the server named and the two `-sent=` numbers are still zero; and
+  once the first time anything this session shipped comes back acknowledged. A record per
+  acknowledgement would be a console line at a rate the server picks, which is exactly what this
+  appliance does not let a peer have.
+
+  The first of the two is the record that makes a reconnect legible. A session whose `-acked=` opens
+  where the last one left off is a server that kept everything; one that opens behind it is a server
+  asking for a run again, which costs nothing because every frame carries its own position; and one
+  that opens at zero against a node that has been shipping for hours is a management plane that has
+  lost this appliance, which is a thing to go and look at. The second says the round trip closed —
+  an appliance that greets, ships, and never sees an `-acked=` move is delivering into a server that
+  is not committing, and the recordings will be overwritten ahead of it.
+
+  These numbers are the server's claim and are **not believed past what this appliance sent**; the
+  clamp and the token it raises are in the refusal-cause tables below. **No byte of a recording has
+  a representation here** either — four positions are system state, and what stands at them is a
+  customer's traffic.
 - `cause=<token> signalled=<true|false>[ detail=…]` — the refusal. **`cause=` may be absent**: a
   domain may refuse without naming a token, and an empty token takes its whole key with it rather
   than writing `cause=` with nothing after it, which is the one shape a reader looking keys up
@@ -781,8 +806,8 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 25 the `management` domain raises, 46
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 160 the `crypto` domain
+`nic-driver` domain raises, 30 the `clock` domain raises, 27 the `management` domain raises, 46
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 161 the `crypto` domain
 raises, and 155 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
@@ -916,6 +941,7 @@ anything.
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
 | a recording that outran the channel's cursor, which carried on from where the recording now begins (`detail=` is the position that was lost and the position it resumed at) | `upstream-log-ring-resynchronised`, `upstream-capture-ring-resynchronised` |
 | a recording with durable bytes behind a cursor that is not moving, on a session that could carry them (`detail=` is the position and the bytes behind it) | `upstream-log-ring-stalled`, `upstream-capture-ring-stalled` |
+| a session that opened naming a resume point past the durable end of a recording, which the reader started from instead (`detail=` is the position the server named and the durable end it was cut to) | `upstream-log-resume-past-durable`, `upstream-capture-resume-past-durable` |
 
 **The `-resynchronised` tokens say history has gone past this appliance.** The recording had
 overwritten the position the channel's cursor stood at, so the reader carried on from the oldest byte
@@ -933,6 +959,16 @@ them. The appliance is recording and not shipping, and the recordings will be ov
 the server. Said once per stall and again only after the cursor has moved, so a console does not fill
 with it. `detail=` carries the position and the backlog, and the shipping record above is where to
 watch whether the backlog is growing.
+
+**The `-resume-past-durable` tokens are the third pair and the only one about the far end.** A
+session opens with the management server naming, per recording, the position it wants this appliance
+to ship from — and that number is the server's, so it can name a position past the end of a recording
+this node has. A server holding another appliance's cursor is one way; a node whose medium was
+replaced under a management plane that remembers the old one is another. The reader starts from the
+durable end instead, so the session carries what there is, and `detail=` is the two positions: what
+was named, and what this appliance actually has. Said once per session — this is where a session
+starts and not something that recurs within one — and a node that says it on every dial has two ends
+that will not converge without somebody looking.
 
 Each pair is two tokens rather than one carrying which ring because the two recordings are different
 losses: the log ring is this appliance's connection and policy history, and the capture ring is the
@@ -1023,6 +1059,7 @@ of a vector's contents.
 | taking delivery of an onboarding package, before a rule of it is read (`detail=` is the arena an upload needs and the arena that was free, on the first; the second carries none) | `upload-window-unavailable`, `upload-unprepared` |
 | the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
 | a shipment of ring bytes this end would not compose into a frame (none carries a `detail=`) | `channel-shipment-too-long`, `channel-shipment-before-greeting`, `channel-shipment-not-taken` |
+| an acknowledgement claiming more of a recording than this end has sent (`detail=` is the position claimed and the position sent) | `channel-ack-past-sent` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
@@ -1043,6 +1080,22 @@ on its way out than this design allows, so a whole frame would not fit behind wh
 ends the session rather than dropping the shipment, and the reason is that the cursor moves on the
 answer: a shipment dropped quietly would be a gap in the recording the management server has no way
 to notice. A re-dial ships the same bytes again.
+
+**`channel-ack-past-sent` is the server, and it is the one refusal on this channel whose being
+ignored would take the appliance down.** A management server acknowledges, per recording, how far it
+has durably ingested — and those positions become reader cursors in the recordings' own superblocks
+on the medium. A ring refuses a reader cursor ahead of its writer, and a checkpoint carrying a
+refused state is a checkpoint that is not written: an acknowledgement believed past what was actually
+sent would not corrupt a recording, it would stop this appliance making *any* of it durable, for as
+long as the server kept claiming it. So the claim is cut to what the frames this session composed
+actually carried, which is known in the one domain that composes them, and the reach is said out
+loud. `detail=` is the position claimed and the position sent. Said **once per session** whatever a
+server does afterwards, so a peer sending a thousand impossible acknowledgements buys one line.
+
+The session is not ended for it. An over-reaching acknowledgement is a server that has lost track of
+this appliance, not one breaking the protocol's framing, and ending the session would turn a
+disagreement about a number into an outage the server chooses the timing of. It is clamped, counted
+against the session it happened on, and shipping goes on.
 
 **The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
 rule of the channel's own protocol that the far end broke, and the context the code has for each —

@@ -857,6 +857,23 @@ pub enum DomainDetail<C = &'static str> {
         capture_position: u64,
         capture_pending: u64,
     },
+    /// How far the **management server** says it has durably taken each
+    /// recording, against how far this appliance has sent it. Both are positions
+    /// in that ring's own append space — the coordinate the reader cursors in
+    /// the ring superblocks are kept in — so the gap between the two is what is
+    /// in flight, and the acked number alone is what a reboot resumes from.
+    ///
+    /// Its own record rather than fields beside the shipping one: that one moves
+    /// at this appliance's rate and this one at the far end's. **Two states and
+    /// not a line per acknowledgement** — where a session was told to start, and
+    /// the first time anything it shipped came back. **No byte of a recording
+    /// reaches it.**
+    ChannelAcked {
+        log_acked: u64,
+        log_sent: u64,
+        capture_acked: u64,
+        capture_sent: u64,
+    },
 }
 
 /// Why a domain refused to start, and what that left the hardware in.

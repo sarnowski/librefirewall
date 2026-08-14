@@ -45,6 +45,7 @@ use wire::{
 };
 
 use crate::{endpoint::EndpointStage, relay::SHIPPED_RING_BYTES, relay::Upstream};
+use wire::Acknowledged;
 
 // The two window lengths this module sits between, tied together where both are
 // visible: the transport's sliding window is what a reply must fit into, so a
@@ -208,11 +209,12 @@ const SHIPPING_STALL_WINDOW: Duration = Duration::from_millis(10_000);
 
 /// Reports the reader has for the console and the domain has not taken.
 ///
-/// Four, and total by construction: one pass claims at most one answer, so it
+/// Six, and total by construction: one pass claims at most one answer, so it
 /// raises at most one resynchronisation, and beside that it raises at most one
-/// line about where the channel stands and one stall per recording. The domain
-/// drains the queue on every pass, so nothing accumulates in it.
-const SHIPPING_REPORTS: usize = 4;
+/// line about where the channel stands, one stall per recording, and — on the
+/// single pass that agrees a greeting — one clamped resume point per recording.
+/// The domain drains the queue on every pass, so nothing accumulates in it.
+const SHIPPING_REPORTS: usize = 6;
 
 /// One recording's place in the channel, as a report carries it.
 ///
@@ -252,6 +254,14 @@ pub enum Shipped {
     Stalled {
         recording: DownloadSink,
         place: Place,
+    },
+    /// A session opened naming a resume point past the durable end of the
+    /// recording, and the reader started from that end instead. Not a
+    /// resynchronisation: that is history lost, this is bytes nothing wrote.
+    ResumeClamped {
+        recording: DownloadSink,
+        claimed: u64,
+        durable: u64,
     },
 }
 
@@ -353,6 +363,14 @@ struct RingCursor {
     /// Whether a stall has already been reported, so it is said once and
     /// re-armed only by the cursor moving.
     stalled: bool,
+    /// How far the management server says it has durably taken this recording.
+    ///
+    /// **Never moved backward**: this becomes a reader cursor on the medium, so
+    /// a peer that could walk it back could make a reboot re-ship history the
+    /// server already holds. Distinct from [`Self::position`], which is where
+    /// the *reader* stands — the two disagreeing is the ordinary state of a
+    /// channel with bytes in flight.
+    acked: u64,
 }
 
 impl RingCursor {
@@ -366,6 +384,7 @@ impl RingCursor {
             seen: 0,
             moving_since: None,
             stalled: false,
+            acked: 0,
         }
     }
 
@@ -536,6 +555,23 @@ impl<'chan> Downloads<'chan> {
             };
             self.report(Shipped::Stalled { recording, place });
         }
+    }
+
+    /// What this reader has taken delivery of, as the recorder is told it.
+    /// Composed from the per-recording cursors rather than kept beside them, so
+    /// each number has one home.
+    fn acknowledgement(&self) -> Acknowledged {
+        let mut acked = Acknowledged::NONE;
+        for (at, recording) in RINGS.iter().enumerate() {
+            let Some(ring) = self.rings.get(at) else {
+                continue;
+            };
+            match recording {
+                DownloadSink::Log => acked.log = ring.acked,
+                DownloadSink::Capture => acked.capture = ring.acked,
+            }
+        }
+        acked
     }
 
     /// Both recordings' places, in [`RINGS`] order.
@@ -923,6 +959,75 @@ fn due(now: Option<Monotonic>, last: Option<Monotonic>) -> bool {
 }
 
 impl Upstream for Downloads<'_> {
+    /// Place both readers where the session that just opened says to read from.
+    ///
+    /// **The whole of honouring a resume point.** Where a reader stood is where
+    /// the *last* session got to; where this one starts is what the server that
+    /// will ingest the bytes needs, and the two differ whenever a session ended
+    /// with frames in flight. Moving backwards costs nothing, every frame
+    /// carrying its own position.
+    ///
+    /// The one bound is the recording's own durable end, applied only where the
+    /// recorder has said where that is. A resume point past it names bytes
+    /// nothing wrote, and a reader placed there would ask forever for a position
+    /// answered as past the end. Clamped and said out loud rather than refused,
+    /// the session still being worth carrying.
+    fn resume_from(&mut self, acked: Acknowledged) {
+        let mut clamped = [None; RINGS.len()];
+        for (at, recording) in RINGS.iter().enumerate() {
+            let claimed = acked.of(*recording);
+            let Some(ring) = self.rings.get_mut(at) else {
+                continue;
+            };
+            // Unanswered is *unknown* and not *nothing*, on `note_durable`'s
+            // terms: clamping against an unstated durable end would place every
+            // reader at zero, which is what the resume point replaces.
+            if ring.answered && claimed > ring.durable {
+                if let Some(slot) = clamped.get_mut(at) {
+                    *slot = Some((claimed, ring.durable));
+                }
+                ring.position = ring.durable;
+            } else {
+                ring.position = claimed;
+            }
+            // Moved by something other than a shipment, so the stall window
+            // starts afresh rather than counting against a new session.
+            ring.seen = ring.position;
+            ring.moving_since = None;
+            ring.stalled = false;
+        }
+        for (at, report) in clamped.into_iter().enumerate() {
+            let (Some((claimed, durable)), Some(recording)) = (report, RINGS.get(at).copied())
+            else {
+                continue;
+            };
+            self.report(Shipped::ResumeClamped {
+                recording,
+                claimed,
+                durable,
+            });
+        }
+    }
+
+    /// Take how far the far end says it has durably taken each recording, and
+    /// state it to the recorder so a reboot resumes from it.
+    ///
+    /// **Forward only.** The claim was bounded by what this appliance sent at
+    /// the end that composes the frames; what is left here is that no session
+    /// undoes what an earlier one established — a server greeting with a smaller
+    /// number wants those bytes again, which `resume_from` gives it, and is not
+    /// saying the older ones were never delivered. The pair rides the next
+    /// request to the recorder, whatever that request is for.
+    fn acknowledged(&mut self, acked: Acknowledged) {
+        for (at, recording) in RINGS.iter().enumerate() {
+            let claimed = acked.of(*recording);
+            if let Some(ring) = self.rings.get_mut(at) {
+                ring.acked = ring.acked.max(claimed);
+            }
+        }
+        self.requester.acknowledge(self.acknowledgement());
+    }
+
     fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])> {
         let Shipment {
             recording,

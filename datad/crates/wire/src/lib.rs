@@ -145,9 +145,9 @@ pub use log_ring::{
 };
 pub use owner::{ApplianceOwnership, OWNED_TOKEN, OWNERSHIP_REGION_SIZE};
 pub use relay::{
-    Half, MAX_RELAY_PAYLOAD, PendingRelay, RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE,
-    RelayBusy, RelayDemand, RelayEnding, RelayFault, RelayOperation, RelayPoll, RelayRefusal,
-    RelayReply, RelayRequest, RelayRequester, RelayResponder, RelayStatus,
+    Acknowledged, Half, MAX_RELAY_PAYLOAD, PendingRelay, RELAY_REPLY_REGION_SIZE,
+    RELAY_REQUEST_REGION_SIZE, RelayBusy, RelayDemand, RelayEnding, RelayFault, RelayOperation,
+    RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester, RelayResponder, RelayStatus,
 };
 pub use signing::{
     DEVICE_ID_LEN, DeviceIdentity, MAX_CERTIFICATE_LEN, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,

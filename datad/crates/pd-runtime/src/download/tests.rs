@@ -1012,3 +1012,147 @@ fn a_recording_nobody_has_asked_about_is_not_reported_as_caught_up() {
         })
     );
 }
+
+/// The reports a pass raised, drained as the domain drains them.
+fn reports(downloads: &mut Downloads<'_>) -> Vec<Shipped> {
+    let mut taken = Vec::new();
+    while let Some(shipped) = downloads.take_shipped() {
+        taken.push(shipped);
+    }
+    taken
+}
+
+#[test]
+fn a_session_reads_each_recording_from_where_its_greeting_says_to() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.resume_from(Acknowledged {
+        log: 8_192,
+        capture: 4_096,
+    });
+    downloads.poll(at(0), &mut stream, true);
+    assert_eq!(
+        recorder.deliver(&[7_u8; 64], 65_536),
+        (DownloadReader::Ring, DownloadSink::Log, 8_192),
+        "the reader asked from the beginning of the ring rather than from the resume point"
+    );
+    downloads.poll(at(1), &mut stream, true);
+    downloads.shipped();
+    downloads.poll(at(2), &mut stream, true);
+    assert_eq!(
+        recorder.deliver(&[7_u8; 64], 65_536),
+        (DownloadReader::Ring, DownloadSink::Capture, 4_096),
+        "the other recording's own resume point was not honoured"
+    );
+}
+
+/// A resume point behind where this appliance already shipped is honoured, not
+/// refused: the server is asking for a run again, and every frame carries its
+/// own position, so the repetition is harmless.
+#[test]
+fn a_resume_point_behind_the_cursor_moves_the_reader_back_to_it() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.poll(at(0), &mut stream, true);
+    recorder.deliver(&[3_u8; 128], 65_536);
+    downloads.poll(at(1), &mut stream, true);
+    downloads.shipped();
+
+    downloads.resume_from(Acknowledged::NONE);
+    downloads.poll(at(2), &mut stream, true);
+    let (_, _, offset, _) = recorder.taken().expect("a ring read");
+    assert_eq!(offset, 0, "the reader did not go back to the resume point");
+}
+
+#[test]
+fn a_resume_point_past_the_durable_end_is_cut_to_it_and_said_out_loud() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    // One answer apiece, so both recordings' durable ends are known: before
+    // that an unstated end is *unknown* rather than *nothing*, and clamping
+    // against it would place every reader at zero.
+    downloads.poll(at(0), &mut stream, true);
+    recorder.deliver(&[], 4_096);
+    downloads.poll(at(1), &mut stream, true);
+    downloads.poll(at(2_000_000_000), &mut stream, true);
+    recorder.deliver(&[], 2_048);
+    // A pass claims and then asks, so this one leaves a request outstanding for
+    // whichever ring is out of hold-off. Answered and claimed here, so what the
+    // resume point below is judged by is a reader with nothing in flight.
+    downloads.poll(at(2_000_000_001), &mut stream, true);
+    recorder.refuse(DownloadRefusal::NotReady, 4_096, 0);
+    downloads.poll(at(2_000_000_002), &mut stream, true);
+    assert!(recorder.quiet(), "the reader is asking during its hold-off");
+    let _ = reports(&mut downloads);
+
+    downloads.resume_from(Acknowledged {
+        log: 1_000_000,
+        capture: 0,
+    });
+    let raised = reports(&mut downloads);
+    assert_eq!(
+        raised,
+        vec![Shipped::ResumeClamped {
+            recording: DownloadSink::Log,
+            claimed: 1_000_000,
+            durable: 4_096,
+        }],
+        "a resume point past the durable end was taken whole, or was cut silently"
+    );
+
+    // Whichever ring the round-robin reaches first, the clamped one must be
+    // asked for at the durable end and not at what the server named.
+    let mut asked_log_at = None;
+    for step in 0..4 {
+        downloads.poll(at(4_000_000_000 + step * 2_000_000_000), &mut stream, true);
+        let Some((_, sink, offset, _)) = recorder.taken() else {
+            continue;
+        };
+        if sink == DownloadSink::Log {
+            asked_log_at = Some(offset);
+            break;
+        }
+    }
+    assert_eq!(asked_log_at, Some(4_096));
+}
+
+/// The acknowledged position is not the reader's: it is what the far end holds,
+/// it only ever grows, and it rides every later request to the recorder.
+#[test]
+fn what_the_far_end_holds_only_ever_grows_and_reaches_the_recorder() {
+    let channel = Channel::new();
+    let mut recorder = Recorder::new(&channel);
+    let mut downloads = channel.downloads();
+    let mut stream = FakeStream::default();
+
+    downloads.acknowledged(Acknowledged {
+        log: 2_048,
+        capture: 512,
+    });
+    downloads.acknowledged(Acknowledged {
+        log: 1_024,
+        capture: 4_096,
+    });
+    downloads.poll(at(0), &mut stream, true);
+    let demand = recorder.responder.take().expect("a request is outstanding");
+    assert_eq!(
+        demand.acknowledged(),
+        Acknowledged {
+            log: 2_048,
+            capture: 4_096,
+        },
+        "a later, smaller claim walked an acknowledged position backwards"
+    );
+    recorder
+        .responder
+        .refuse(demand, DownloadRefusal::NotReady, 0, 0);
+}

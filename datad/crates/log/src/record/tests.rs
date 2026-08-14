@@ -504,6 +504,12 @@ fn every_domain_detail_shape_survives_the_crossing() {
             capture_position: 1_048_576,
             capture_pending: 4_096,
         },
+        DomainDetail::ChannelAcked {
+            log_acked: 32_768,
+            log_sent: 65_536,
+            capture_acked: 524_288,
+            capture_sent: 1_048_576,
+        },
         // And the request surface's three, on the same terms: no two fields of
         // one shape are equal, so a field read out of the wrong operand word
         // fails here.
@@ -776,7 +782,7 @@ fn a_minted_event_becomes_its_bounded_form_field_for_field() {
 /// refusal waiting to happen for the records that make up most of a transcript.
 #[test]
 fn a_shape_with_no_cause_crosses_the_seam_unconditionally() {
-    let events: [Event; 15] = [
+    let events: [Event; 16] = [
         Event::Domain {
             domain: Domain::Console,
             state: DomainState::Ready,
@@ -861,6 +867,16 @@ fn a_shape_with_no_cause_crosses_the_seam_unconditionally() {
                 log_pending: 0,
                 capture_position: 9_216,
                 capture_pending: 512,
+            },
+        },
+        Event::Domain {
+            domain: Domain::Crypto,
+            state: DomainState::Ready,
+            detail: DomainDetail::ChannelAcked {
+                log_acked: 512,
+                log_sent: 1_024,
+                capture_acked: 8_192,
+                capture_sent: 9_216,
             },
         },
         Event::Domain {
@@ -1203,6 +1219,14 @@ fn any_detail() -> impl Strategy<Value = DomainDetail<Cause>> {
                     capture_position,
                     capture_pending,
                 }
+            },
+        ),
+        any::<(u64, u64, u64, u64)>().prop_map(
+            |(log_acked, log_sent, capture_acked, capture_sent)| DomainDetail::ChannelAcked {
+                log_acked,
+                log_sent,
+                capture_acked,
+                capture_sent,
             },
         ),
         any::<([u16; crate::MAX_OFFERED_POINTS], u16)>()

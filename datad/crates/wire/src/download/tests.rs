@@ -61,7 +61,7 @@ fn forge_reader(channel: &Channel, reader: u32) {
 #[test]
 fn the_regions_the_system_description_reserves_are_the_recorded_ones() {
     assert_eq!(DOWNLOAD_WINDOW_LEN, 32_768);
-    assert_eq!(size_of::<DownloadRequest>(), 24);
+    assert_eq!(size_of::<DownloadRequest>(), 40);
     assert_eq!(DOWNLOAD_REQUEST_REGION_SIZE, 0x1000);
     assert!(DOWNLOAD_REQUEST_REGION_SIZE >= size_of::<DownloadRequest>());
     assert!(DOWNLOAD_REQUEST_REGION_SIZE.is_multiple_of(MAPPING_ALIGN));

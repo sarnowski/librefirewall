@@ -86,7 +86,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::MAPPING_ALIGN;
+use crate::{MAPPING_ALIGN, relay::Acknowledged};
 
 /// Bytes of the snapshot one reply carries.
 ///
@@ -318,6 +318,18 @@ pub struct DownloadRequest {
     /// Which reader is asking, which is what says whether [`Self::offset`] is a
     /// snapshot offset or an absolute ring position.
     reader: AtomicU32,
+    /// How far the management server says it has durably taken each recording,
+    /// as the domain that composes the frames judged the claim — the two words
+    /// of a [`crate::Acknowledged`].
+    ///
+    /// Carried on the request rather than a channel of its own, it travelling to
+    /// exactly the domain that answers these already, and written on **every**
+    /// one so a demand reads this item's words. **Still a claim**, bounded again
+    /// by the recorder against its own writer: a cursor ahead of the writer is
+    /// one the ring refuses, and a refused checkpoint is an appliance that stops
+    /// making recordings durable at all.
+    acked_log: AtomicU64,
+    acked_capture: AtomicU64,
 }
 
 impl DownloadRequest {
@@ -334,6 +346,8 @@ impl DownloadRequest {
             offset: AtomicU64::new(0),
             len: AtomicU32::new(0),
             reader: AtomicU32::new(0),
+            acked_log: AtomicU64::new(0),
+            acked_capture: AtomicU64::new(0),
         }
     }
 
@@ -353,6 +367,7 @@ impl DownloadRequest {
             reply: PeerReply::new(reply),
             sequence: 0,
             faults: 0,
+            acked: Acknowledged::NONE,
         }
     }
 }
@@ -506,6 +521,15 @@ mod peer {
         pub(super) fn reader(&self) -> u32 {
             self.0.reader.load(Ordering::Relaxed)
         }
+
+        /// Read after the sequence: the requester's `Release` on it publishes
+        /// these two.
+        pub(super) fn acked(&self) -> super::Acknowledged {
+            super::Acknowledged {
+                log: self.0.acked_log.load(Ordering::Relaxed),
+                capture: self.0.acked_capture.load(Ordering::Relaxed),
+            }
+        }
     }
 }
 
@@ -607,6 +631,9 @@ pub struct DownloadRequester<'chan> {
     /// let an old reply match a new request.
     sequence: u32,
     faults: u32,
+    /// What every request states as the far end's acknowledgement. Held here
+    /// rather than passed per request, so no asking path can forget it.
+    acked: Acknowledged,
 }
 
 impl DownloadRequester<'_> {
@@ -654,7 +681,13 @@ impl DownloadRequester<'_> {
         self.request.sink.store(sink.to_bits(), Ordering::Relaxed);
         self.request.offset.store(offset, Ordering::Relaxed);
         self.request.len.store(requested, Ordering::Relaxed);
-        // Release, and last: the four words above must be visible to the
+        self.request
+            .acked_log
+            .store(self.acked.log, Ordering::Relaxed);
+        self.request
+            .acked_capture
+            .store(self.acked.capture, Ordering::Relaxed);
+        // Release, and last: the six words above must be visible to the
         // recorder before the sequence that makes them a request is.
         self.request
             .sequence
@@ -664,6 +697,13 @@ impl DownloadRequester<'_> {
             sequence: self.sequence,
             requested,
         }
+    }
+
+    /// State what every later request carries as the far end's acknowledgement.
+    /// Set beside the asking rather than passed to it: the pair belongs to the
+    /// channel's session and a request is the vehicle, not the subject.
+    pub const fn acknowledge(&mut self, acked: Acknowledged) {
+        self.acked = acked;
     }
 
     /// Look once for the answer to `pending`, copying any window into `into`.
@@ -758,6 +798,7 @@ pub struct DownloadDemand {
     reader: Option<DownloadReader>,
     offset: u64,
     len: u32,
+    acked: Acknowledged,
 }
 
 impl DownloadDemand {
@@ -765,6 +806,15 @@ impl DownloadDemand {
     #[must_use]
     pub const fn sequence(&self) -> u32 {
         self.sequence
+    }
+
+    /// How far the management server says it has durably taken each recording,
+    /// as the domain that composes the channel's frames judged the claim.
+    /// **Still to be clamped**: bounded already by what this appliance sent, and
+    /// not by what a recording's writer has reached.
+    #[must_use]
+    pub const fn acknowledged(&self) -> Acknowledged {
+        self.acked
     }
 
     /// Which sink was asked for, or `None` where the word named none this
@@ -844,6 +894,7 @@ impl DownloadResponder<'_> {
             reader: DownloadReader::from_bits(self.request.reader()),
             offset: self.request.offset(),
             len,
+            acked: self.request.acked(),
         })
     }
 
@@ -944,13 +995,17 @@ const _: () = {
     assert!(DownloadReader::Snapshot.to_bits() == 0);
     assert!(DownloadReader::from_bits(2).is_none());
 
-    assert!(size_of::<DownloadRequest>() == 24);
+    assert!(size_of::<DownloadRequest>() == 40);
     assert!(align_of::<DownloadRequest>() == 8);
     assert!(offset_of!(DownloadRequest, sequence) == 0);
     assert!(offset_of!(DownloadRequest, sink) == 4);
     assert!(offset_of!(DownloadRequest, offset) == 8);
     assert!(offset_of!(DownloadRequest, len) == 16);
     assert!(offset_of!(DownloadRequest, reader) == 20);
+    assert!(offset_of!(DownloadRequest, acked_log) == 24);
+    assert!(offset_of!(DownloadRequest, acked_capture) == 32);
+    assert!(offset_of!(DownloadRequest, acked_log).is_multiple_of(align_of::<u64>()));
+    assert!(offset_of!(DownloadRequest, acked_capture).is_multiple_of(align_of::<u64>()));
     // Naturally aligned, which is what makes each store and load a single
     // access rather than two a reader could tear across.
     assert!(offset_of!(DownloadRequest, offset).is_multiple_of(align_of::<u64>()));

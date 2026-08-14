@@ -168,7 +168,8 @@ const DETAIL_CHANNEL_FRAMES: u8 = 52;
 const DETAIL_RECORDING_RESUMED: u8 = 53;
 const DETAIL_RECORDING_FRESH: u8 = 54;
 const DETAIL_CHANNEL_SHIPPING: u8 = 55;
-const DETAIL_COUNT: u8 = 56;
+const DETAIL_CHANNEL_ACKED: u8 = 56;
+const DETAIL_COUNT: u8 = 57;
 
 /// How many ways a handshake on the management channel may end, and how many
 /// ways a delivered anchor may refuse the certificate a server presented.
@@ -658,9 +659,11 @@ fn keep_only_named_fields(record: &LogRecord) -> LogRecord {
                 | DETAIL_CHANNEL_ALERT
                 | DETAIL_CHANNEL_BACKLOGGED
                 | DETAIL_CHANNEL_FRAMES
-                // And where its reader stands in the two recordings, which is
-                // four positions out of the same array.
+                // And where its reader stands in the two recordings, and how far
+                // the server says it has taken them, which are four positions
+                // out of the same array apiece.
                 | DETAIL_CHANNEL_SHIPPING
+                | DETAIL_CHANNEL_ACKED
                 // And the recording superblock's two, on the same terms: each
                 // reads its words out of that array and none of them reaches a
                 // word outside it.
@@ -838,7 +841,14 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // And where the channel's reader stands in the two recordings: four
         // byte positions in a ring's own append space, every bit pattern of
         // each a number the reading domain could really have held.
-        | DETAIL_CHANNEL_SHIPPING => None,
+        | DETAIL_CHANNEL_SHIPPING
+        // And how far the server says it has taken each recording against how
+        // far this end sent it: four positions in the same space, unranged for
+        // the same reason and one more of its own. That an acknowledgement is
+        // not past what was sent is judged where the frames are composed, which
+        // is the only place that knows — a rule here would refuse the very
+        // record that says a server reached too far.
+        | DETAIL_CHANNEL_ACKED => None,
         // The details whose fourth operand word is a flag rather than a number
         // and which range nothing ahead of it: every other word each carries is
         // unranged, so that flag is the whole of what any of them can be refused
@@ -2044,6 +2054,20 @@ mod tests {
                     // the widest a `u64` goes in the last so a rule that crept
                     // a range onto it is refused here.
                     operands: [65_536, 512, 1_048_576, u64::MAX],
+                    ..domain_record()
+                }),
+            ),
+            (
+                "valid_domain_channel_acked",
+                region_from_record(&LogRecord {
+                    detail: DETAIL_CHANNEL_ACKED,
+                    // How far the server has taken each recording against how
+                    // far this end sent it: four unranged positions, no two
+                    // alike so one read out of the wrong word is visible, with
+                    // each acked word behind its sent word — the shape a real
+                    // session holds — and the widest a `u64` goes in the last so
+                    // a rule that crept a range onto it is refused here.
+                    operands: [4_096, 12_288, 262_144, u64::MAX],
                     ..domain_record()
                 }),
             ),

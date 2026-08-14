@@ -235,6 +235,10 @@ impl Upstream for Idle {
         None
     }
 
+    fn resume_from(&mut self, _acked: Acknowledged) {}
+
+    fn acknowledged(&mut self, _acked: Acknowledged) {}
+
     fn shipped(&mut self) {
         unreachable!("a reader with nothing waiting is never told a shipment went")
     }
@@ -251,6 +255,11 @@ struct Held {
     position: u64,
     bytes: Vec<u8>,
     shipped: usize,
+    /// Where a session's greeting placed this reader, and the last level it was
+    /// told — kept apart, because the two are different questions and a reader
+    /// that folded them could not show that the relay asks both.
+    resumed: Vec<Acknowledged>,
+    acked: Vec<Acknowledged>,
 }
 
 impl Held {
@@ -260,6 +269,8 @@ impl Held {
             position,
             bytes,
             shipped: 0,
+            resumed: Vec::new(),
+            acked: Vec::new(),
         }
     }
 }
@@ -267,6 +278,14 @@ impl Held {
 impl Upstream for Held {
     fn waiting(&self) -> Option<(DownloadSink, u64, &[u8])> {
         (!self.bytes.is_empty()).then_some((self.recording, self.position, self.bytes.as_slice()))
+    }
+
+    fn resume_from(&mut self, acked: Acknowledged) {
+        self.resumed.push(acked);
+    }
+
+    fn acknowledged(&mut self, acked: Acknowledged) {
+        self.acked.push(acked);
     }
 
     fn shipped(&mut self) {

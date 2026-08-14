@@ -126,6 +126,34 @@ use core::{
 
 use crate::{DownloadSink, LOG_ONBOARD_END_COUNT, MAPPING_ALIGN};
 
+/// How far a management server says it has durably taken each recording, in
+/// that ring's own append space.
+///
+/// One value rather than two words, the two never being read apart.
+/// **A claim and not a fact.** Every number came off the wire, so whatever acts
+/// on it clamps it — the end that composes the frames by what it has sent, the
+/// end that writes a reader cursor by what the writer has reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Acknowledged {
+    pub log: u64,
+    pub capture: u64,
+}
+
+impl Acknowledged {
+    /// Nothing acknowledged: what a session that has heard nothing holds, and
+    /// what a refusal publishes.
+    pub const NONE: Self = Self { log: 0, capture: 0 };
+
+    /// This claim's word for `recording`.
+    #[must_use]
+    pub const fn of(self, recording: DownloadSink) -> u64 {
+        match recording {
+            DownloadSink::Log => self.log,
+            DownloadSink::Capture => self.capture,
+        }
+    }
+}
+
 /// Bytes of opaque record data one item may carry, in either direction.
 ///
 /// 16 648: a TLS record is a five-byte header in front of at most 2^14 bytes of
@@ -498,6 +526,18 @@ pub struct RelayReply {
     /// network end reads it as a level rather than an edge, so an answer whose
     /// wakeup was coalesced with another cannot lose the fact.
     agreed: AtomicU32,
+    /// How far the peer behind this end says it has durably taken each
+    /// recording — [`Acknowledged`]'s two words.
+    ///
+    /// Words beside the payload rather than bytes inside it, on
+    /// [`Self::agreed`]'s reasoning: an answer can carry a session's records
+    /// *and* move these. They are the terminating end's judgement and never the
+    /// peer's arithmetic — that end composes every frame, so what it has sent is
+    /// the bound it cuts a claim to before one ever reaches here.
+    ///
+    /// **A level, stated on every answer**, for [`Self::agreed`]'s reason.
+    acked_log: AtomicU64,
+    acked_capture: AtomicU64,
     payload: [AtomicU8; MAX_RELAY_PAYLOAD],
 }
 
@@ -514,6 +554,8 @@ impl RelayReply {
             answered: AtomicU64::new(0),
             closed: AtomicU32::new(0),
             agreed: AtomicU32::new(0),
+            acked_log: AtomicU64::new(0),
+            acked_capture: AtomicU64::new(0),
             payload: [const { AtomicU8::new(0) }; MAX_RELAY_PAYLOAD],
         }
     }
@@ -529,6 +571,7 @@ impl RelayReply {
             request: PeerRequest::new(request),
             served: 0,
             answered: 0,
+            acked: Acknowledged::NONE,
         }
     }
 }
@@ -585,6 +628,15 @@ mod peer {
 
         pub(super) fn answered(&self) -> u64 {
             self.0.answered.load(Ordering::Relaxed)
+        }
+
+        /// Read after the sequence: the responder's `Release` on it publishes
+        /// these two.
+        pub(super) fn acked(&self) -> super::Acknowledged {
+            super::Acknowledged {
+                log: self.0.acked_log.load(Ordering::Relaxed),
+                capture: self.0.acked_capture.load(Ordering::Relaxed),
+            }
         }
 
         /// Bounded by `into`, which the caller obtained from the reply's own
@@ -724,6 +776,9 @@ pub enum RelayPoll<'buf> {
         /// Items this responder has answered, so a caller can report the relay
         /// working without a record byte reaching a surface.
         answered: u64,
+        /// How far the peer says it has durably taken each recording, as this
+        /// end judged the claim. A level, read off every answer.
+        acked: Acknowledged,
     },
     /// The terminating end answered and produced nothing, saying why. Every
     /// refusal ends the connection.
@@ -898,6 +953,7 @@ impl RelayRequester<'_> {
             closed,
             agreed,
             answered: self.reply.answered(),
+            acked: self.reply.acked(),
         }
     }
 
@@ -1016,6 +1072,11 @@ pub struct RelayResponder<'chan> {
     /// this would have the terminating end process one run of bytes twice.
     served: u32,
     answered: u64,
+    /// What the next answer publishes as the far end's acknowledgement. Held
+    /// here rather than taken per answer, for the reason
+    /// [`RelayRequest::position`] is written on every item: a level restated by
+    /// every path cannot be left standing at an older session's number.
+    acked: Acknowledged,
 }
 
 impl RelayResponder<'_> {
@@ -1096,9 +1157,20 @@ impl RelayResponder<'_> {
             .unwrap_or(RelayOperation::Open(Half::Onboarding));
         self.answered = self.answered.saturating_add(1);
         self.reply.answered.store(self.answered, Ordering::Relaxed);
-        // Nothing is agreed on a refusal: a refusal is this end saying it never
-        // had a session to speak a protocol over.
+        // Nothing is agreed on a refusal, and nothing is acknowledged either: a
+        // refusal is this end saying it never had a session, so the cursors of
+        // one are not its to restate.
+        self.acked = Acknowledged::NONE;
         self.publish(demand, operation, reason.to_status(), 0, true, false);
+    }
+
+    /// State what the next answer publishes as the far end's acknowledgement.
+    ///
+    /// Set beside answering rather than passed to it, because it is a level and
+    /// not an event: it belongs to the session, and a refusal is the one thing
+    /// that overrides it — see [`Self::refuse`].
+    pub const fn acknowledge(&mut self, acked: Acknowledged) {
+        self.acked = acked;
     }
 
     /// Items this responder has answered, refusals included.
@@ -1132,8 +1204,14 @@ impl RelayResponder<'_> {
         self.reply
             .agreed
             .store(u32::from(agreed), Ordering::Relaxed);
-        // Release, and last: the bytes and the five words above must be visible to
-        // the network end before the sequence that claims them as this item's
+        self.reply
+            .acked_log
+            .store(self.acked.log, Ordering::Relaxed);
+        self.reply
+            .acked_capture
+            .store(self.acked.capture, Ordering::Relaxed);
+        // Release, and last: the bytes and the seven words above must be visible
+        // to the network end before the sequence that claims them as this item's
         // answer is.
         self.reply
             .sequence
@@ -1204,8 +1282,12 @@ const _: () = {
     assert!(offset_of!(RelayReply, answered) == 16);
     assert!(offset_of!(RelayReply, closed) == 24);
     assert!(offset_of!(RelayReply, agreed) == 28);
-    assert!(offset_of!(RelayReply, payload) == 32);
+    assert!(offset_of!(RelayReply, acked_log) == 32);
+    assert!(offset_of!(RelayReply, acked_capture) == 40);
+    assert!(offset_of!(RelayReply, payload) == 48);
     assert!(align_of::<RelayReply>() == 8);
+    assert!(offset_of!(RelayReply, acked_log).is_multiple_of(align_of::<u64>()));
+    assert!(offset_of!(RelayReply, acked_capture).is_multiple_of(align_of::<u64>()));
     // Naturally aligned, which is what makes the tally a single access rather
     // than two a reader could tear across.
     assert!(offset_of!(RelayReply, answered).is_multiple_of(align_of::<u64>()));
