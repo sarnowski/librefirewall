@@ -112,6 +112,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
         ("pds/crypto/src/delegate.rs", &["delegated-key-refused"]),
         ("pds/crypto/src/upload.rs", &["upload-window-unavailable"]),
         ("pds/crypto/src/channel.rs", &["channel-version-mismatch"]),
+        ("crates/pd-runtime/src/range.rs", &["channel-range-empty"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         (
             "crates/package/src/refusal.rs",
@@ -156,6 +157,7 @@ fn sound_console() -> String {
                     "delegated-key-refused",
                     "upload-window-unavailable",
                     "channel-version-mismatch",
+                    "channel-range-empty",
                     "install-endpoint-loopback",
                 ][..],
             ),
@@ -191,6 +193,7 @@ fn sound_console() -> String {
                     "delegated-key-refused",
                     "upload-window-unavailable",
                     "channel-version-mismatch",
+                    "channel-range-empty",
                 ][..],
             ),
             (
@@ -303,6 +306,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
                 "delegated-key-refused",
                 "upload-window-unavailable",
                 "channel-version-mismatch",
+                "channel-range-empty",
                 "install-endpoint-loopback",
             ],
         ),

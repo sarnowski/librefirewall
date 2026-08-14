@@ -150,7 +150,7 @@ use pd_runtime::{
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
     ClockCalibration, DownloadSink, InstallStaging, LogConsume, LogRecords, ManagementEndpoint,
-    RelayRefusal, RelayReply, RelayRequest, SignReply, SignRequest,
+    RangeOutcome, RangeWant, RelayRefusal, RelayReply, RelayRequest, SignReply, SignRequest,
 };
 
 use arena::{ARENA_BYTES, Arena, ArenaRegion};
@@ -1728,6 +1728,31 @@ impl Terminator for Management {
             },
             answer,
         )
+    }
+
+    /// Compose one frame of a range answer, routed to the channel unconditionally
+    /// on [`Self::ship`]'s terms: a range answer on an onboarding session is a
+    /// neighbour answering the wrong protocol, and the channel's own answer to one
+    /// with no request behind it is already the right one.
+    fn range(
+        &mut self,
+        outcome: RangeOutcome,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        self.channel.answer_range(outcome, position, bytes, answer)
+    }
+
+    /// The extent the channel is waiting for, gated on the channel being the half
+    /// running now — the acknowledgement's gate, for its reason: the onboarding
+    /// half asks for no extent, and one left standing from an ended channel session
+    /// would have the reader read the medium for a request nobody is waiting on.
+    fn wanted(&self) -> Option<RangeWant> {
+        match self.carrying {
+            Some(Carrying::Channel) => self.channel.wanted(),
+            _ => None,
+        }
     }
 
     fn agreed(&self) -> bool {

@@ -41,9 +41,11 @@ use lfw_clock::{Duration, Monotonic};
 use lfw_ip_endpoint::{ContentType, http::WINDOW_LEN};
 use wire::{
     DOWNLOAD_WINDOW_LEN, DownloadFault, DownloadPoll, DownloadReader, DownloadRefusal,
-    DownloadReply, DownloadRequest, DownloadRequester, DownloadSink, PendingDownload,
+    DownloadReply, DownloadRequest, DownloadRequester, DownloadSink, PendingDownload, RangeOutcome,
+    RangeWant,
 };
 
+use crate::range::RANGE_ANSWER_BYTES;
 use crate::{endpoint::EndpointStage, relay::SHIPPED_RING_BYTES, relay::Upstream};
 use wire::Acknowledged;
 
@@ -209,12 +211,16 @@ const SHIPPING_STALL_WINDOW: Duration = Duration::from_millis(10_000);
 
 /// Reports the reader has for the console and the domain has not taken.
 ///
-/// Six, and total by construction: one pass claims at most one answer, so it
-/// raises at most one resynchronisation, and beside that it raises at most one
+/// Seven, and total by construction: one pass claims at most one answer, so it
+/// raises at most one resynchronisation **or** one range-read report — the two
+/// come off the same claim and never both — and beside that it raises at most one
 /// line about where the channel stands, one stall per recording, and — on the
 /// single pass that agrees a greeting — one clamped resume point per recording.
-/// The domain drains the queue on every pass, so nothing accumulates in it.
-const SHIPPING_REPORTS: usize = 6;
+/// The seventh slot is the range report's, counted separately rather than shared
+/// with the resynchronisation's so the sum stays a sum of the shapes a pass can
+/// have rather than of the ones it happens to. The domain drains the queue on
+/// every pass, so nothing accumulates in it.
+const SHIPPING_REPORTS: usize = 7;
 
 /// One recording's place in the channel, as a report carries it.
 ///
@@ -229,12 +235,17 @@ pub struct Place {
     pub pending: u64,
 }
 
-/// What the reader has to say about the recordings it ships.
+/// What the reader has to say about the recordings it ships and the extents it
+/// reads.
 ///
-/// Three variants because they are three different things for an operator to do:
-/// a channel working, which is what makes a healthy appliance legible at all;
-/// history this appliance can no longer ship, and so a gap in what the server
-/// will hold; and a node that has records to send and is not sending them.
+/// One variant per thing an operator does something different about: a channel
+/// working; history this appliance can no longer ship, and so a gap in what the
+/// server will hold; a node that has records to send and is not sending them; and
+/// the three ways a read for a range answer does not produce the extent asked for.
+///
+/// The last three exist because the wire cannot carry the cause: a range answer
+/// has three statuses and the recorder has six refusals, so the mapping is lossy
+/// by construction and the console is where the cause that was lost is put.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shipped {
     /// Where both recordings stand. Both in one report rather than one each,
@@ -263,6 +274,41 @@ pub enum Shipped {
         claimed: u64,
         durable: u64,
     },
+    /// The recorder refused a read for a range answer, saying why, at this
+    /// position. Carried whole rather than mapped: which recording it was is in
+    /// the answer's own ring byte, while the cause is only here.
+    RangeRefused {
+        reason: DownloadRefusal,
+        offset: u64,
+    },
+    /// The recorder answered with a reply this reader could not believe. Its own
+    /// line: an operator reading a fault as a refusal would go looking at the
+    /// medium instead of at the domain in front of it.
+    RangeFaulted { offset: u64 },
+    /// The recorder did not answer a read for a range answer inside
+    /// [`REPLY_TIMEOUT`]. Distinct from a refusal for the same reason: a recorder
+    /// that said nothing and one that said no are different faults.
+    RangeUnanswered { offset: u64 },
+}
+
+/// The range-answer status a recorder's refusal amounts to.
+///
+/// **Lossy on purpose, and the loss is recorded elsewhere.** The wire has an
+/// overrun and a medium refusal and nothing else, so the four that are neither
+/// take the honest catch-all rather than a status invented here — each reaching
+/// the console under its own name on the line beside this mapping.
+const fn range_outcome(reason: DownloadRefusal) -> RangeOutcome {
+    match reason {
+        // The ring rolled past the extent. The one refusal the wire has a word of
+        // its own for, and the one an operator acts on differently: those bytes
+        // are gone rather than momentarily unavailable.
+        DownloadRefusal::Overrun => RangeOutcome::Overwritten,
+        DownloadRefusal::DeviceError
+        | DownloadRefusal::NotReady
+        | DownloadRefusal::OutOfRange
+        | DownloadRefusal::NoSuchSink
+        | DownloadRefusal::NoSuchReader => RangeOutcome::MediumRefused,
+    }
 }
 
 /// A request out to the recorder, and what its answer is for.
@@ -279,11 +325,43 @@ struct Outstanding {
     /// carries the length the response commits to, so it is the only one that
     /// may begin the stream.
     opening: bool,
+    /// What this read is for. Both readers of a ring ask in the same coordinate,
+    /// so the coordinate cannot say which of them asked — and answering a range
+    /// request into the shipment buffer would put an operator's extent on the wire
+    /// under a shipping cursor.
+    purpose: Fetching,
     /// When this request is given up on, or `None` on a node whose clock has not
     /// been published yet — a state no client can reach, the endpoint refusing
     /// every TCP segment until a calibration has arrived, and carried rather than
     /// asserted away.
     deadline: Option<Monotonic>,
+}
+
+/// Which of the reader's three jobs one outstanding read belongs to.
+///
+/// A value rather than a flag beside the coordinate, because the coordinate is
+/// already taken: an operator's download reads a snapshot, and both the shipping
+/// cursor and a range answer read the ring's own append space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fetching {
+    /// An operator's `GET`, in snapshot coordinates.
+    Snapshot,
+    /// The shipping cursor, whose answer moves that cursor.
+    Ship,
+    /// One frame of a range answer, whose answer moves no cursor at all.
+    Range,
+}
+
+/// One frame of a range answer, waiting for the relay's next free item.
+///
+/// The shipment's shape for the other direction, with the outcome in place of the
+/// recording: the ring a range answer names is the asking end's, so this side
+/// never states one.
+#[derive(Clone, Copy)]
+struct RangeFrame {
+    outcome: RangeOutcome,
+    position: u64,
+    len: usize,
 }
 
 /// The download half of the management endpoint.
@@ -316,10 +394,42 @@ pub struct Downloads<'chan> {
     reported_at: Option<Monotonic>,
     /// What the domain has not taken yet.
     reports: [Option<Shipped>; SHIPPING_REPORTS],
-    /// Which ring the next ring request is for, so neither starves the other.
+    /// The extent a range answer still owes, as the composing domain last stated
+    /// it. **Told and never remembered across it**: that domain holds the answer's
+    /// state and shrinks this as frames go, so what stands here is always the
+    /// remainder rather than a copy this reader keeps in step.
+    range: Option<RangeWant>,
+    /// The extent bytes read for a range answer and not yet sent. Its own buffer
+    /// for the reason the shipment has one: the other two readers take the shared
+    /// window whenever they want it.
+    answer: [u8; RANGE_ANSWER_BYTES],
+    /// How much of it is a frame, and how that read went.
+    held_range: Option<RangeFrame>,
+    /// Which medium turn is next, so no one of the three starves the others.
     next: usize,
     counters: DownloadCounters,
 }
+
+/// Turns the medium is shared out in: one per ring, and one for a range answer.
+///
+/// **This is where shipping and range answers are made fair to each other.** The
+/// relay puts a shipment in hand ahead of an answer frame in hand, which settles
+/// only which of two composed frames goes first; what decides how much of the
+/// medium each gets is this rotation. Two of every three reads are a ring's, so an
+/// answer advances by a frame every third read — neither a peer starving the
+/// channel's own purpose, nor the traffic starving an operator's request.
+const MEDIUM_TURNS: usize = RINGS.len() + 1;
+
+/// The turn a range answer takes, after the rings.
+const RANGE_TURN: usize = RINGS.len();
+
+const _: () = {
+    assert!(MEDIUM_TURNS == 3);
+    assert!(RANGE_TURN < MEDIUM_TURNS);
+    // One answer frame is read in one request, so the window the channel offers
+    // must hold a whole one.
+    assert!(RANGE_ANSWER_BYTES <= DOWNLOAD_WINDOW_LEN);
+};
 
 /// One recording's place in the channel, as the reader keeps it.
 ///
@@ -419,6 +529,9 @@ impl<'chan> Downloads<'chan> {
             rings: [RingCursor::new(), RingCursor::new()],
             reported_at: None,
             reports: [None; SHIPPING_REPORTS],
+            range: None,
+            answer: [0; RANGE_ANSWER_BYTES],
+            held_range: None,
             next: 0,
             counters: DownloadCounters {
                 started: 0,
@@ -458,6 +571,15 @@ impl<'chan> Downloads<'chan> {
     /// greeting has been agreed, and a reader that guessed would read the medium
     /// on behalf of a channel that is not there.
     pub fn poll(&mut self, now: Option<Monotonic>, stage: &mut impl Stream, shipping: bool) {
+        if !shipping {
+            // No session to carry an answer, so nothing is owed one. Cleared here
+            // rather than waited for: a want is retired by the next relay answer,
+            // and a session that has gone will not produce one — which would
+            // leave this reader spending medium turns on an extent nobody is
+            // waiting for.
+            self.range = None;
+            self.held_range = None;
+        }
         self.claim(now, stage);
         self.ask(now, stage, shipping);
         self.judge(now, shipping);
@@ -598,14 +720,22 @@ impl<'chan> Downloads<'chan> {
             recording,
             offset,
             opening,
+            purpose,
             deadline,
         }) = self.outstanding.take()
         else {
             return;
         };
-        if matches!(reader, DownloadReader::Ring) {
-            self.claim_ring(now, pending, recording, offset, deadline);
-            return;
+        match purpose {
+            Fetching::Ship => {
+                self.claim_ring(now, pending, recording, offset, deadline);
+                return;
+            }
+            Fetching::Range => {
+                self.claim_range(now, pending, recording, offset, deadline);
+                return;
+            }
+            Fetching::Snapshot => {}
         }
         match self.requester.poll(pending, &mut self.window) {
             DownloadPoll::Outstanding(pending) => {
@@ -625,6 +755,7 @@ impl<'chan> Downloads<'chan> {
                     recording,
                     offset,
                     opening,
+                    purpose,
                     deadline,
                 });
             }
@@ -703,6 +834,7 @@ impl<'chan> Downloads<'chan> {
                     recording,
                     offset,
                     opening: false,
+                    purpose: Fetching::Ship,
                     deadline,
                 });
             }
@@ -822,10 +954,11 @@ impl<'chan> Downloads<'chan> {
         }
         let Some((offset, len)) = stage.stream_wanted() else {
             // Nothing an operator is waiting for, so the channel may have the
-            // window. This is the whole of the fairness between the two readers:
+            // window. This is the whole of the fairness between an operator
+            // physically downloading a recording and everything the channel does:
             // a download in progress is asked for above and returns, and the
-            // ring is only ever reached on a pass where none is.
-            self.ask_ring(now, shipping);
+            // medium's own rotation is only ever reached on a pass where none is.
+            self.ask_medium(now, shipping);
             return;
         };
         let Some(sink) = self.serving else {
@@ -864,22 +997,36 @@ impl<'chan> Downloads<'chan> {
             recording: sink,
             offset,
             opening,
+            purpose: Fetching::Snapshot,
             deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
         });
     }
 
-    /// Ask one ring for the bytes at its cursor.
+    /// Share the medium out between the two rings and one range answer, one read
+    /// per pass and each participant taken in turn.
     ///
-    /// One recording per pass and the two taken in turn, so a ring the traffic
-    /// keeps busy cannot hold the window against the other. A ring that is held
-    /// off or already holding a shipment is skipped: there is one shipment
-    /// buffer, and reading a second over it would drop the first.
-    fn ask_ring(&mut self, now: Option<Monotonic>, shipping: bool) {
-        if !shipping || self.held.is_some() {
+    /// **The rotation is the fairness.** A ring the traffic keeps busy cannot hold
+    /// the window against the other ring, and neither can hold it against an
+    /// answer an operator is waiting for; equally, a peer asking for extent after
+    /// extent takes one read in three and never the channel's own purpose. A
+    /// participant with nothing to do is stepped over rather than costing its
+    /// turn, so an idle range answer does not slow shipping down at all.
+    fn ask_medium(&mut self, now: Option<Monotonic>, shipping: bool) {
+        if !shipping {
             return;
         }
-        for step in 0..RINGS.len() {
-            let at = self.next.saturating_add(step) % RINGS.len();
+        for step in 0..MEDIUM_TURNS {
+            let at = self.next.saturating_add(step) % MEDIUM_TURNS;
+            if at == RANGE_TURN {
+                if self.ask_range(now) {
+                    self.next = at.saturating_add(1) % MEDIUM_TURNS;
+                    return;
+                }
+                continue;
+            }
+            if self.held.is_some() {
+                continue;
+            }
             let Some(recording) = RINGS.get(at) else {
                 continue;
             };
@@ -902,11 +1049,124 @@ impl<'chan> Downloads<'chan> {
                 recording: *recording,
                 offset,
                 opening: false,
+                purpose: Fetching::Ship,
                 deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
             });
-            self.next = at.saturating_add(1) % RINGS.len();
+            self.next = at.saturating_add(1) % MEDIUM_TURNS;
             return;
         }
+    }
+
+    /// Ask for the next frame's worth of the extent a range answer owes.
+    ///
+    /// Answers whether a read was issued. Nothing is asked while a frame is held —
+    /// there is one answer buffer — and the length is cut to what one frame
+    /// carries, a constant of this crate and not the number on the wire.
+    fn ask_range(&mut self, now: Option<Monotonic>) -> bool {
+        if self.held_range.is_some() {
+            return false;
+        }
+        let Some(want) = self.range else {
+            return false;
+        };
+        // Both bounds in one step, and both this crate's: one frame's room, and
+        // what is actually still owed. The peer's own length reached the composing
+        // domain's bound before it ever became a want.
+        let len = usize::try_from(want.length)
+            .unwrap_or(RANGE_ANSWER_BYTES)
+            .min(RANGE_ANSWER_BYTES);
+        if len == 0 {
+            return false;
+        }
+        let pending = self
+            .requester
+            .request(DownloadReader::Ring, want.recording, want.start, len);
+        self.outstanding = Some(Outstanding {
+            pending,
+            reader: DownloadReader::Ring,
+            recording: want.recording,
+            offset: want.start,
+            opening: false,
+            purpose: Fetching::Range,
+            deadline: now.map(|now| now.saturating_add(REPLY_TIMEOUT)),
+        });
+        true
+    }
+
+    /// Claim the answer to a range read and hold the one frame it produced.
+    ///
+    /// **Every path produces a frame**, which is what keeps a requester from
+    /// waiting forever. None of them touches a shipping cursor or a ring's durable
+    /// end: a range read is an operator's question and must not move where the
+    /// channel stands.
+    fn claim_range(
+        &mut self,
+        now: Option<Monotonic>,
+        pending: PendingDownload,
+        recording: DownloadSink,
+        offset: u64,
+        deadline: Option<Monotonic>,
+    ) {
+        // Held only to re-park the item under the same identity it was issued
+        // with; nothing about a range answer's outcome depends on it, the ring
+        // being the asking end's.
+        let _ = recording;
+        match self.requester.poll(pending, &mut self.window) {
+            DownloadPoll::Outstanding(pending) => {
+                if expired(now, deadline) {
+                    // Given up on rather than re-parked, which frees this
+                    // module's one slot. The answer ends saying the medium would
+                    // not serve it, which is what a recorder that never replied
+                    // amounts to from here.
+                    self.hold_range(RangeOutcome::MediumRefused, offset, 0);
+                    self.report(Shipped::RangeUnanswered { offset });
+                    return;
+                }
+                self.outstanding = Some(Outstanding {
+                    pending,
+                    reader: DownloadReader::Ring,
+                    recording,
+                    offset,
+                    opening: false,
+                    purpose: Fetching::Range,
+                    deadline,
+                });
+            }
+            DownloadPoll::Delivered { bytes, .. } => {
+                // Copied out of the shared window on the shipment's terms: the
+                // other two readers take it whenever they want it.
+                let mut taken = 0_usize;
+                for (slot, byte) in self.answer.iter_mut().zip(bytes) {
+                    *slot = *byte;
+                    taken = taken.saturating_add(1);
+                }
+                // An empty delivery is handed on as a data frame of no bytes, and
+                // the composing domain's own rule ends the answer on it. One place
+                // decides what a read that advanced nothing means.
+                self.hold_range(RangeOutcome::Data, offset, taken);
+            }
+            DownloadPoll::Refused { reason, .. } => {
+                self.hold_range(range_outcome(reason), offset, 0);
+                // The wire has three statuses and the recorder has six refusals,
+                // so the mapping loses the cause — which is put on the console
+                // here, where a node with no shell is diagnosed.
+                self.report(Shipped::RangeRefused { reason, offset });
+            }
+            DownloadPoll::Faulted(fault) => {
+                let _: DownloadFault = fault;
+                self.hold_range(RangeOutcome::MediumRefused, offset, 0);
+                self.report(Shipped::RangeFaulted { offset });
+            }
+        }
+    }
+
+    /// Hold one answer frame for the relay's next free item.
+    fn hold_range(&mut self, outcome: RangeOutcome, position: u64, len: usize) {
+        self.held_range = Some(RangeFrame {
+            outcome,
+            position,
+            len,
+        });
     }
 
     fn abandon(&mut self, stage: &mut impl Stream) {
@@ -1053,6 +1313,38 @@ impl Upstream for Downloads<'_> {
             // reaches here, and taking the shipment's own is what keeps them so.
             ring.position = position.saturating_add(len as u64);
         }
+    }
+
+    /// Take what extent the composing domain says it still owes.
+    ///
+    /// Assigned rather than merged, and that is the whole of how an answer ends:
+    /// the domain states `None` once it is complete, so this reader stops asking
+    /// without holding a rule about when to.
+    fn wants(&mut self, wanted: Option<RangeWant>) {
+        self.range = wanted;
+    }
+
+    fn range_waiting(&self) -> Option<(RangeOutcome, u64, &[u8])> {
+        let RangeFrame {
+            outcome,
+            position,
+            len,
+        } = self.held_range?;
+        // An outcome that ends the answer carries nothing whatever was read, so
+        // the length is taken from the outcome rather than from the read.
+        let bytes = if outcome.ends_the_answer() {
+            &[][..]
+        } else {
+            self.answer.get(..len)?
+        };
+        Some((outcome, position, bytes))
+    }
+
+    fn range_answered(&mut self) {
+        // No cursor moves: where the answer stands next is the composing domain's,
+        // and it states it as the next want. This reader keeps nothing about an
+        // answer between frames, which is what makes the two accounts one.
+        self.held_range = None;
     }
 }
 

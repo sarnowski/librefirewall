@@ -224,6 +224,10 @@ struct Spoken {
     opened_on: Option<Half>,
     /// Every shipment the protocol was asked to frame, as it was told it.
     shipped: Vec<(DownloadSink, u64, Vec<u8>)>,
+    /// Every range-answer frame it was asked to frame, on the same terms.
+    ranged: Vec<(RangeOutcome, u64, Vec<u8>)>,
+    /// What the protocol says it is waiting for, which the responder publishes.
+    wants: Option<RangeWant>,
 }
 
 /// A reader with nothing to ship, which is every case whose subject is not the
@@ -241,6 +245,16 @@ impl Upstream for Idle {
 
     fn shipped(&mut self) {
         unreachable!("a reader with nothing waiting is never told a shipment went")
+    }
+
+    fn wants(&mut self, _wanted: Option<RangeWant>) {}
+
+    fn range_waiting(&self) -> Option<(RangeOutcome, u64, &[u8])> {
+        None
+    }
+
+    fn range_answered(&mut self) {
+        unreachable!("a reader with no answer waiting is never told a frame went")
     }
 }
 
@@ -260,6 +274,17 @@ struct Held {
     /// that folded them could not show that the relay asks both.
     resumed: Vec<Acknowledged>,
     acked: Vec<Acknowledged>,
+    /// One frame of a range answer, and a tally of how often the relay said it
+    /// had gone — the shipment's two fields for the other direction.
+    answer: Option<(RangeOutcome, u64, Vec<u8>)>,
+    range_answered: usize,
+    /// Every want the relay handed down, in order, so a case can show that a
+    /// level stated on an answer reaches the reader.
+    wanted: Vec<Option<RangeWant>>,
+    /// Whether an answered shipment empties this reader, which is what a real one
+    /// does. Off by default, the cases about *when* the relay says a shipment went
+    /// needing a reader that keeps offering one.
+    drains: bool,
 }
 
 impl Held {
@@ -271,7 +296,23 @@ impl Held {
             shipped: 0,
             resumed: Vec::new(),
             acked: Vec::new(),
+            answer: None,
+            range_answered: 0,
+            wanted: Vec::new(),
+            drains: false,
         }
+    }
+
+    /// Empty this reader when a shipment is answered, as a real one does.
+    fn draining(mut self) -> Self {
+        self.drains = true;
+        self
+    }
+
+    /// Hold one frame of a range answer for the relay to issue.
+    fn answering(mut self, outcome: RangeOutcome, position: u64, bytes: Vec<u8>) -> Self {
+        self.answer = Some((outcome, position, bytes));
+        self
     }
 }
 
@@ -290,6 +331,23 @@ impl Upstream for Held {
 
     fn shipped(&mut self) {
         self.shipped += 1;
+        if self.drains {
+            self.bytes.clear();
+        }
+    }
+
+    fn wants(&mut self, wanted: Option<RangeWant>) {
+        self.wanted.push(wanted);
+    }
+
+    fn range_waiting(&self) -> Option<(RangeOutcome, u64, &[u8])> {
+        self.answer
+            .as_ref()
+            .map(|(outcome, position, bytes)| (*outcome, *position, bytes.as_slice()))
+    }
+
+    fn range_answered(&mut self) {
+        self.range_answered += 1;
     }
 }
 
@@ -309,6 +367,12 @@ impl Protocol {
 
     fn overstate(&self, sent: usize) {
         self.0.borrow_mut().overstate = Some(sent);
+    }
+
+    /// State what extent this protocol is waiting for, which the responder then
+    /// publishes on every answer.
+    fn wanting(&self, wanted: Option<RangeWant>) {
+        self.0.borrow_mut().wants = wanted;
     }
 }
 
@@ -339,6 +403,29 @@ impl Terminator for Protocol {
             finished: spoken.finish_on == Some(spoken.turns),
             agreed: spoken.agreed,
         }
+    }
+
+    fn range(
+        &mut self,
+        outcome: RangeOutcome,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        let mut spoken = self.0.borrow_mut();
+        spoken.turns += 1;
+        spoken.ranged.push((outcome, position, bytes.to_vec()));
+        let len = bytes.len().min(answer.len());
+        answer[..len].copy_from_slice(&bytes[..len]);
+        Answered {
+            sent: spoken.overstate.unwrap_or(len),
+            finished: spoken.finish_on == Some(spoken.turns),
+            agreed: spoken.agreed,
+        }
+    }
+
+    fn wanted(&self) -> Option<RangeWant> {
+        self.0.borrow().wants
     }
 
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
@@ -1581,4 +1668,246 @@ fn a_shipment_reaches_the_protocol_with_its_recording_and_position() {
         RelayPoll::Answered { records, .. } => assert_eq!(records, bytes.as_slice()),
         other => panic!("a shipment is answered: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recording range answers: the extent the terminating end asks for, and the
+// frames that answer it.
+// ---------------------------------------------------------------------------
+
+/// An extent, used wherever the numbers themselves do not matter.
+const WANT: RangeWant = RangeWant {
+    recording: DownloadSink::Capture,
+    start: 0x2000,
+    length: 8192,
+};
+
+/// Open a channel session on the terminating end and hand back both halves.
+fn opened_terminating(
+    channel: &Channel,
+    protocol: Protocol,
+) -> (Terminating<'_, Protocol>, RelayRequester<'_>) {
+    let mut far = Terminating::attach(&channel.request, &channel.reply, protocol);
+    let mut requester = channel.request.requester(&channel.reply);
+    let opening = requester
+        .request(RelayOperation::Open(Half::Channel), &[])
+        .expect("the window is free");
+    let open = far.take().expect("the open");
+    far.answer(open);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    let _ = requester.poll(opening, &mut into);
+    (far, requester)
+}
+
+#[test]
+fn the_extent_a_protocol_wants_is_published_on_every_answer_it_gives() {
+    let channel = Channel::zero();
+    let protocol = Protocol::default();
+    protocol.wanting(Some(WANT));
+    let (mut far, mut requester) = opened_terminating(&channel, protocol.clone());
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+
+    for _ in 0..3 {
+        let pending = requester
+            .request(RelayOperation::Poll, &[])
+            .expect("the window is free");
+        let demand = far.take().expect("the poll");
+        far.answer(demand);
+        match requester.poll(pending, &mut into) {
+            RelayPoll::Answered { wanted, .. } => assert_eq!(
+                wanted,
+                Some(WANT),
+                "the want is asked of the protocol on every answer, so a want \
+                 made while a session is busy is not one it never got to make"
+            ),
+            other => panic!("expected an answer: {other:?}"),
+        }
+    }
+    // And it stops the moment the protocol stops wanting it.
+    protocol.wanting(None);
+    let pending = requester
+        .request(RelayOperation::Poll, &[])
+        .expect("the window is free");
+    let demand = far.take().expect("the poll");
+    far.answer(demand);
+    match requester.poll(pending, &mut into) {
+        RelayPoll::Answered { wanted, .. } => assert_eq!(wanted, None),
+        other => panic!("expected an answer: {other:?}"),
+    }
+}
+
+#[test]
+fn a_range_frame_reaches_the_protocol_with_its_outcome_position_and_bytes() {
+    let channel = Channel::zero();
+    let protocol = Protocol::default();
+    let (mut far, mut requester) = opened_terminating(&channel, protocol.clone());
+    let bytes = vec![0xC3_u8; 96];
+    let pending = requester
+        .range(RangeOutcome::Data, 0x5000, &bytes)
+        .expect("the window is free");
+    let demand = far.take().expect("the range frame");
+    let pass = far.answer(demand);
+    assert!(pass.refused.is_none());
+    assert_eq!(
+        protocol.spoken().ranged.as_slice(),
+        &[(RangeOutcome::Data, 0x5000, bytes.clone())],
+        "the semantic fields cross whole and the framing is the far end's"
+    );
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    match requester.poll(pending, &mut into) {
+        RelayPoll::Answered { records, .. } => assert_eq!(records, bytes.as_slice()),
+        other => panic!("a range frame is answered: {other:?}"),
+    }
+}
+
+#[test]
+fn a_range_frame_past_what_one_carries_is_refused_rather_than_shortened() {
+    let channel = Channel::zero();
+    let protocol = Protocol::default();
+    let (mut far, mut requester) = opened_terminating(&channel, protocol.clone());
+    // Written through the raw door, a neighbour being able to write the region
+    // whatever the issuing door would have dropped.
+    let long = vec![0x7E_u8; RANGE_ANSWER_BYTES + 1];
+    let pending = requester
+        .request(RelayOperation::Range(RangeOutcome::Data), &long)
+        .expect("the window is free");
+    let demand = far.take().expect("the range frame");
+    let pass = far.answer(demand);
+    assert!(
+        matches!(
+            pass.refused,
+            Some((RelayRefusal::PayloadTooLong, RefusalDetail::One(_)))
+        ),
+        "a run longer than one frame carries would leave the remainder inside \
+         the record layer: {:?}",
+        pass.refused
+    );
+    assert!(
+        protocol.spoken().ranged.is_empty(),
+        "and never reaches the protocol"
+    );
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        RelayPoll::Refused(RelayRefusal::PayloadTooLong)
+    );
+}
+
+#[test]
+fn an_ended_range_outcome_carrying_bytes_is_refused_rather_than_composed() {
+    for outcome in [RangeOutcome::Overwritten, RangeOutcome::MediumRefused] {
+        let channel = Channel::zero();
+        let protocol = Protocol::default();
+        let (mut far, mut requester) = opened_terminating(&channel, protocol.clone());
+        // The issuing door drops the bytes, so this is the region written past it.
+        let pending = requester
+            .request(
+                RelayOperation::Range(outcome),
+                b"bytes that must not travel",
+            )
+            .expect("the window is free");
+        let demand = far.take().expect("the range frame");
+        let pass = far.answer(demand);
+        assert!(
+            pass.refused.is_some(),
+            "a frame contradicting itself is refused rather than handed to a \
+             protocol that would refuse to compose it"
+        );
+        assert!(protocol.spoken().ranged.is_empty());
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        assert_eq!(
+            requester.poll(pending, &mut into),
+            RelayPoll::Refused(RelayRefusal::PayloadTooLong)
+        );
+    }
+}
+
+#[test]
+fn an_ended_range_outcome_reaches_the_protocol_carrying_nothing() {
+    for outcome in [RangeOutcome::Overwritten, RangeOutcome::MediumRefused] {
+        let channel = Channel::zero();
+        let protocol = Protocol::default();
+        let (mut far, mut requester) = opened_terminating(&channel, protocol.clone());
+        let pending = requester
+            .range(outcome, 0x3000, b"dropped at the door")
+            .expect("the window is free");
+        let demand = far.take().expect("the range frame");
+        assert_eq!(demand.stated_len(), 0);
+        let pass = far.answer(demand);
+        assert!(pass.refused.is_none());
+        assert_eq!(
+            protocol.spoken().ranged.as_slice(),
+            &[(outcome, 0x3000, Vec::new())],
+            "the outcome and the position cross, and no byte does"
+        );
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        let _ = requester.poll(pending, &mut into);
+    }
+}
+
+#[test]
+fn a_shipment_in_hand_goes_before_a_range_frame_in_hand() {
+    let channel = Channel::zero();
+    let mut stream = Stream::dialled();
+    // Both a shipment and one frame of a range answer are waiting.
+    let mut upstream = Held::new(DownloadSink::Log, 4096, vec![0x11; 32])
+        .draining()
+        .answering(RangeOutcome::Data, 0x2000, vec![0x22; 16]);
+    let (mut relay, mut far) = agreed_channel(&channel, &mut stream);
+
+    relay.poll(at(3), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Ship(DownloadSink::Log),
+        "shipping is what the channel exists for, so a shipment in hand wins"
+    );
+    relay.poll(at(4), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Range(RangeOutcome::Data),
+        "and the answer frame goes on the pass after it"
+    );
+}
+
+#[test]
+fn a_range_frame_nobody_answered_leaves_the_answer_where_it_was() {
+    let channel = Channel::zero();
+    let mut stream = Stream::dialled();
+    let mut upstream = Held::new(DownloadSink::Log, 0, Vec::new()).answering(
+        RangeOutcome::Data,
+        0x100,
+        vec![4; 8],
+    );
+    let (mut relay, mut far) = agreed_channel(&channel, &mut stream);
+
+    relay.poll(at(3), &mut stream, &mut upstream);
+    let demand = far.take().expect("the range frame");
+    drop(demand);
+    let past = ANSWER_TIMEOUT.as_nanos();
+    relay.poll(at(3 + past), &mut stream, &mut upstream);
+    assert_eq!(
+        upstream.range_answered, 0,
+        "an unanswered frame is one the answer offers again, never a hole"
+    );
+}
+
+#[test]
+fn no_range_frame_goes_before_a_greeting_or_on_the_onboarding_half() {
+    let channel = Channel::zero();
+    let mut relay = channel.network();
+    let mut far = channel.terminating();
+    let mut stream = Stream::running();
+    let mut upstream =
+        Held::new(DownloadSink::Log, 0, Vec::new()).answering(RangeOutcome::Data, 0, vec![3; 8]);
+    relay.poll(at(0), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Open(Half::Onboarding)
+    );
+    relay.poll(at(1), &mut stream, &mut upstream);
+    assert_eq!(
+        serve(&mut far, &[], false),
+        RelayOperation::Poll,
+        "the onboarding half answers no extent, so a held frame is never issued"
+    );
 }

@@ -907,6 +907,34 @@ and wall-clock times. An independent parse of the two files established:
   one segment or a byte extent — the [management design](../design/management.md) serves recording
   range reads over the channel, and the download it replaces cannot even express one. A body over
   2 GiB is refused outright rather than served wrong.
+- **A range read over the channel is served, and is bounded by this appliance and not by the peer.**
+  The extent's three numbers are the management server's, so each is judged against a constant of
+  this appliance's before a byte of medium is read: one mebibyte per request — a recording segment,
+  and what one frame of this protocol carries — at most 1024 answer frames, and **one answer in
+  flight per session**, which is the bound on how many places at once a peer can have this appliance
+  reading its own medium. An extent past a bound is refused outright rather than clamped and the
+  session ends, a clamped extent being an answer to a question nobody asked and indistinguishable
+  from a complete one. Every path out of an answer either advances the extent or ends it with a
+  status: a read that produced nothing while bytes were still owed cannot be asked for again, and a
+  spent frame budget **drops the chunk in hand** rather than sending a data frame with nothing after
+  it, which a requester could not tell from a gap.
+- **The seam it needed runs the other way along an existing relay.** The domain that composes the
+  channel's frames holds no channel to the recorder — the domain that owns the network drives that —
+  so the extent still owed is published as three words of the relay reply's side-band and read as a
+  level on every answer, exactly as the acknowledgement cursors are, and the bytes come back as a
+  relay operation of its own. It is a **want and not a command**: nothing about it obliges a read,
+  which is what keeps an extent a peer asked for from outranking the shipping the channel exists for.
+  Neither region grew — the reply region already had the room — so **no capability moved** and the
+  system description is unchanged.
+- **Shipping and range answers are prioritised in two places, and both are stated.** A shipment in
+  hand goes before an answer frame in hand, because the at-least-once catch-up of the rings is what
+  the channel is for; and the medium itself is shared out between the two rings and one answer in
+  turn, so two of every three reads are a ring's and an answer still advances by a frame every third
+  read. An operator physically downloading a recording over the HTTP surface outranks all three,
+  which is the fairness that was already there. **Missing:** no booted node has been asked for an
+  extent, so the whole path is held together by unit and property cover on both domains rather than
+  by a scenario, and the management server can decode a range answer but offers an operator no way to
+  ask for one.
 - **Nothing is measured.** There is no Criterion bench on the tap or the recording path, nothing has
   been measured against the 10 Gbit/s target with recording on or off, and the segment size, the
   staging split and the two drain budgets are plausible numbers rather than measured ones. The tap

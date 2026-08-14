@@ -169,6 +169,15 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     // byte. Named where the decision is, so scanning the domain's main file
     // alone would leave both tokens uncompared.
     ("pds/crypto/src/upload.rs", Vocabulary::Causes(&["crypto"])),
+    // A recording range read's own bounds and the ways an answer ends. They are
+    // the cryptography domain's tokens — that domain decodes the request, holds
+    // the answer and puts every one of these on its console — but they live in a
+    // library crate so the bounds are host-testable, which is why the file is
+    // named here rather than found under the domain.
+    (
+        "crates/pd-runtime/src/range.rs",
+        Vocabulary::Causes(&["crypto"]),
+    ),
     // The delegation's own refusals, raised by the cryptography domain and named
     // where the variants are: `DelegationError::cause` is the one place that knows
     // what each way of failing to reach the key holder means, so scanning the

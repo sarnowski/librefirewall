@@ -288,6 +288,89 @@ pub enum RelayOperation {
     /// close: the network end still chooses the bytes, so it can ship the wrong
     /// content under a right-looking position.
     Ship(DownloadSink),
+    /// Here is how reading the extent the terminating end asked for went, and —
+    /// where it went well — the bytes, from the position beside them.
+    ///
+    /// The answering half of [`RangeWant`], which travels the other way on the
+    /// reply. The recording is deliberately **not** in this word: the end that
+    /// asked knows which one it asked for, so taking the recording from here
+    /// would let the network end answer a question that was never put — and a
+    /// range answer naming the wrong ring is an extent of one recording ingested
+    /// as another.
+    Range(RangeOutcome),
+}
+
+/// How reading an extent off the medium went, as the network end reports it.
+///
+/// Three values because the recorder already answers three things and they are
+/// three different facts for whoever asked: bytes, an extent the ring has rolled
+/// past, and a medium that refused. The two failures carry no bytes — a reader
+/// that cannot serve an extent says so rather than serving a short one.
+///
+/// This crate's own vocabulary rather than the framing's, for the reason
+/// [`DownloadSink`] is: the domains that share this region link neither the
+/// framing crate nor the endpoint's, and the one domain that composes a frame
+/// maps this onto the wire's status exactly as it maps a recording onto a ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeOutcome {
+    /// The request carries the extent's bytes, from the position beside them.
+    Data,
+    /// The ring rolled past the extent, so it no longer exists to be read.
+    Overwritten,
+    /// The medium refused the read.
+    MediumRefused,
+}
+
+impl RangeOutcome {
+    /// Outcomes a range answer has. Exposed so the relay's operation vocabulary,
+    /// which ends where this one does, derives that rather than restating it.
+    pub const COUNT: usize = 3;
+
+    #[must_use]
+    pub const fn to_bits(self) -> u32 {
+        match self {
+            Self::Data => 0,
+            Self::Overwritten => 1,
+            Self::MediumRefused => 2,
+        }
+    }
+
+    /// `None` for every other bit pattern, on [`DownloadSink::from_bits`]'s
+    /// terms.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Data),
+            1 => Some(Self::Overwritten),
+            2 => Some(Self::MediumRefused),
+            _ => None,
+        }
+    }
+
+    /// Whether this outcome ends the answer, and so may carry no bytes.
+    #[must_use]
+    pub const fn ends_the_answer(self) -> bool {
+        !matches!(self, Self::Data)
+    }
+}
+
+/// An extent of one recording the terminating end is waiting for.
+///
+/// A value rather than three words read separately, because the three are one
+/// fact: a start without the recording names no byte, and either without the
+/// length names no extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeWant {
+    pub recording: DownloadSink,
+    /// An absolute position in the ring's own append space — the coordinate a
+    /// [`DownloadReader::Ring`] offset is in, and the one the framing's positions
+    /// are in. Never a snapshot offset, which names a different byte after every
+    /// restart.
+    pub start: u64,
+    /// Bytes of it still owed. Bounded by the terminating end before it is ever
+    /// stated here, so a number this side reads is one a first-party constant has
+    /// already cut down.
+    pub length: u64,
 }
 
 impl RelayOperation {
@@ -298,6 +381,10 @@ impl RelayOperation {
     /// endings included.
     const SHIP_BASE: u32 = Self::CLOSE_BASE + RelayEnding::COUNT as u32;
 
+    /// The words before a range answer's own encoding: everything above, the two
+    /// recordings included.
+    const RANGE_BASE: u32 = Self::SHIP_BASE + DownloadSink::COUNT as u32;
+
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
@@ -307,6 +394,7 @@ impl RelayOperation {
             Self::Poll => 3,
             Self::Close(ending) => Self::CLOSE_BASE + ending.to_bits(),
             Self::Ship(recording) => Self::SHIP_BASE + recording.to_bits(),
+            Self::Range(outcome) => Self::RANGE_BASE + outcome.to_bits(),
         }
     }
 
@@ -329,7 +417,10 @@ impl RelayOperation {
                 Some(ending) => Some(Self::Close(ending)),
                 None => match DownloadSink::from_bits(bits.wrapping_sub(Self::SHIP_BASE)) {
                     Some(recording) => Some(Self::Ship(recording)),
-                    None => None,
+                    None => match RangeOutcome::from_bits(bits.wrapping_sub(Self::RANGE_BASE)) {
+                        Some(outcome) => Some(Self::Range(outcome)),
+                        None => None,
+                    },
                 },
             },
         }
@@ -538,7 +629,73 @@ pub struct RelayReply {
     /// **A level, stated on every answer**, for [`Self::agreed`]'s reason.
     acked_log: AtomicU64,
     acked_capture: AtomicU64,
+    /// Which recording the terminating end is waiting for an extent of, as
+    /// [`RangeWanting`] numbers it, or [`RangeWanting::NOTHING`] where it wants
+    /// none.
+    ///
+    /// The **only** direction on this channel the terminating end initiates, and
+    /// it is a level on the reply rather than an item of its own for the reason
+    /// [`Self::agreed`] is a word: an answer can carry a session's records *and*
+    /// leave an extent owed, so a demand able to arrive only between items would
+    /// be a demand a busy session never got to make. A second channel pointing
+    /// the other way would be a second window, a second sequence and a second
+    /// region — authority granted to two domains to say the same thing twice.
+    ///
+    /// It is a **want and not a command**: the network end reads it, bounds it
+    /// against its own constants, and answers with [`RelayOperation::Range`] when
+    /// it has something to say. Nothing here obliges it to read anything, which is
+    /// what keeps an extent from outranking the shipping this channel exists for.
+    wanted: AtomicU32,
+    /// Alignment only, so the two words below are naturally aligned. Nothing is
+    /// placed here and nothing reads it.
+    _pad: AtomicU32,
+    /// Where that extent begins and how much of it is still owed, meaningful only
+    /// where [`Self::wanted`] names a recording. Beside any other word they name
+    /// nothing.
+    wanted_start: AtomicU64,
+    wanted_length: AtomicU64,
     payload: [AtomicU8; MAX_RELAY_PAYLOAD],
+}
+
+/// How [`RelayReply::wanted`] encodes an [`Option<DownloadSink>`].
+///
+/// Its own name rather than an untyped word, because zero is *nothing wanted*
+/// and the recordings therefore cannot be their own bit values: a channel with a
+/// zeroed reply region wants nothing, which is what makes the idle state the
+/// valid one the kernel already handed both domains.
+pub struct RangeWanting;
+
+impl RangeWanting {
+    /// No extent is owed.
+    pub const NOTHING: u32 = 0;
+
+    /// The words a recording occupies, so the vocabulary ends where the
+    /// recordings do rather than where a reading of the match says.
+    const FIRST: u32 = 1;
+
+    #[must_use]
+    pub const fn to_bits(recording: Option<DownloadSink>) -> u32 {
+        match recording {
+            None => Self::NOTHING,
+            Some(recording) => Self::FIRST + recording.to_bits(),
+        }
+    }
+
+    /// `None` for every bit pattern outside the vocabulary, which the network end
+    /// raises as [`RelayFault::WantUnknown`] rather than reading as *nothing
+    /// wanted*: a word it could not decode is a responder it cannot believe, and
+    /// treating it as an idle channel would silently drop every extent an
+    /// operator ever asked for.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Option<DownloadSink>> {
+        if bits == Self::NOTHING {
+            return Some(None);
+        }
+        match DownloadSink::from_bits(bits.wrapping_sub(Self::FIRST)) {
+            Some(recording) => Some(Some(recording)),
+            None => None,
+        }
+    }
 }
 
 impl RelayReply {
@@ -556,6 +713,10 @@ impl RelayReply {
             agreed: AtomicU32::new(0),
             acked_log: AtomicU64::new(0),
             acked_capture: AtomicU64::new(0),
+            wanted: AtomicU32::new(RangeWanting::NOTHING),
+            _pad: AtomicU32::new(0),
+            wanted_start: AtomicU64::new(0),
+            wanted_length: AtomicU64::new(0),
             payload: [const { AtomicU8::new(0) }; MAX_RELAY_PAYLOAD],
         }
     }
@@ -572,6 +733,7 @@ impl RelayReply {
             served: 0,
             answered: 0,
             acked: Acknowledged::NONE,
+            wanted: None,
         }
     }
 }
@@ -637,6 +799,19 @@ mod peer {
                 log: self.0.acked_log.load(Ordering::Relaxed),
                 capture: self.0.acked_capture.load(Ordering::Relaxed),
             }
+        }
+
+        pub(super) fn wanted(&self) -> u32 {
+            self.0.wanted.load(Ordering::Relaxed)
+        }
+
+        /// The extent's two numbers, read on the same release as the word that
+        /// gives them meaning.
+        pub(super) fn wanted_extent(&self) -> (u64, u64) {
+            (
+                self.0.wanted_start.load(Ordering::Relaxed),
+                self.0.wanted_length.load(Ordering::Relaxed),
+            )
         }
 
         /// Bounded by `into`, which the caller obtained from the reply's own
@@ -752,6 +927,11 @@ pub enum RelayFault {
     /// read as not it would leave an appliance whose channel is up backing off as
     /// though it were down.
     AgreedUnknown { agreed: u32 },
+    /// The wanted word names no recording and is not *nothing wanted*. Its own
+    /// fault rather than a want read as absent: an extent silently dropped is an
+    /// operator's request that answers nothing and says nothing, which is the one
+    /// outcome a request-response surface must not have.
+    WantUnknown { wanted: u32 },
 }
 
 /// What [`RelayRequester::poll`] found.
@@ -779,6 +959,10 @@ pub enum RelayPoll<'buf> {
         /// How far the peer says it has durably taken each recording, as this
         /// end judged the claim. A level, read off every answer.
         acked: Acknowledged,
+        /// The extent the terminating end is waiting for, or `None` where it
+        /// waits for none. A level, read off every answer for [`Self::acked`]'s
+        /// reason.
+        wanted: Option<RangeWant>,
     },
     /// The terminating end answered and produced nothing, saying why. Every
     /// refusal ends the connection.
@@ -839,6 +1023,31 @@ impl RelayRequester<'_> {
         bytes: &[u8],
     ) -> Result<PendingRelay, RelayBusy> {
         self.issue(RelayOperation::Ship(recording), position, bytes)
+    }
+
+    /// Answer the wanted extent: how the read went, where the bytes begin, and
+    /// the bytes.
+    ///
+    /// A door of its own for [`Self::ship`]'s reason, and one rule of its own on
+    /// top of it: an outcome that ends the answer carries **no bytes**, so they
+    /// are dropped here rather than put in the region. A refusal accompanied by
+    /// content is a frame that contradicts itself, and the end that composes one
+    /// refuses it — this keeps such a thing from being composed at all.
+    ///
+    /// # Errors
+    /// [`RelayBusy`], on [`Self::request`]'s terms.
+    pub fn range(
+        &mut self,
+        outcome: RangeOutcome,
+        position: u64,
+        bytes: &[u8],
+    ) -> Result<PendingRelay, RelayBusy> {
+        let bytes = if outcome.ends_the_answer() {
+            &[][..]
+        } else {
+            bytes
+        };
+        self.issue(RelayOperation::Range(outcome), position, bytes)
     }
 
     fn issue(
@@ -947,6 +1156,18 @@ impl RelayRequester<'_> {
             1 => true,
             other => return self.fault(RelayFault::AgreedUnknown { agreed: other }),
         };
+        let raw_wanted = self.reply.wanted();
+        let Some(recording) = RangeWanting::from_bits(raw_wanted) else {
+            return self.fault(RelayFault::WantUnknown { wanted: raw_wanted });
+        };
+        let wanted = recording.map(|recording| {
+            let (start, length) = self.reply.wanted_extent();
+            RangeWant {
+                recording,
+                start,
+                length,
+            }
+        });
         self.reply.copy_payload(target);
         RelayPoll::Answered {
             records: target,
@@ -954,6 +1175,7 @@ impl RelayRequester<'_> {
             agreed,
             answered: self.reply.answered(),
             acked: self.reply.acked(),
+            wanted,
         }
     }
 
@@ -1039,6 +1261,18 @@ impl RelayDemand {
         }
     }
 
+    /// The position a [`RelayOperation::Range`] names its bytes as beginning at,
+    /// and `None` for every other operation — on [`Self::shipping`]'s terms, so
+    /// no position can be read off an operation that stated none. The outcome is
+    /// not repeated here: it is in the operation the caller already matched on.
+    #[must_use]
+    pub const fn ranging(&self) -> Option<u64> {
+        match self.operation {
+            Some(RelayOperation::Range(_)) => Some(self.position),
+            _ => None,
+        }
+    }
+
     /// The payload length the requester stated, **unclamped**: a length past
     /// [`MAX_RELAY_PAYLOAD`] is a request to refuse and not one to shorten, so it
     /// arrives as what was claimed.
@@ -1077,6 +1311,9 @@ pub struct RelayResponder<'chan> {
     /// [`RelayRequest::position`] is written on every item: a level restated by
     /// every path cannot be left standing at an older session's number.
     acked: Acknowledged,
+    /// The extent the next answer publishes as owed, on [`Self::acked`]'s terms
+    /// and for its reason.
+    wanted: Option<RangeWant>,
 }
 
 impl RelayResponder<'_> {
@@ -1159,8 +1396,9 @@ impl RelayResponder<'_> {
         self.reply.answered.store(self.answered, Ordering::Relaxed);
         // Nothing is agreed on a refusal, and nothing is acknowledged either: a
         // refusal is this end saying it never had a session, so the cursors of
-        // one are not its to restate.
+        // one are not its to restate — and neither is an extent it was owed.
         self.acked = Acknowledged::NONE;
+        self.wanted = None;
         self.publish(demand, operation, reason.to_status(), 0, true, false);
     }
 
@@ -1171,6 +1409,16 @@ impl RelayResponder<'_> {
     /// that overrides it — see [`Self::refuse`].
     pub const fn acknowledge(&mut self, acked: Acknowledged) {
         self.acked = acked;
+    }
+
+    /// State what extent the next answer publishes as owed, `None` for none.
+    ///
+    /// Set beside answering for [`Self::acknowledge`]'s reason, and overridden by
+    /// a refusal for the same one: a refusal is this end saying it never had a
+    /// session, and an extent asked for over a session that never was is an
+    /// extent nobody is waiting for.
+    pub const fn want(&mut self, wanted: Option<RangeWant>) {
+        self.wanted = wanted;
     }
 
     /// Items this responder has answered, refusals included.
@@ -1210,7 +1458,19 @@ impl RelayResponder<'_> {
         self.reply
             .acked_capture
             .store(self.acked.capture, Ordering::Relaxed);
-        // Release, and last: the bytes and the seven words above must be visible
+        self.reply.wanted.store(
+            RangeWanting::to_bits(self.wanted.map(|wanted| wanted.recording)),
+            Ordering::Relaxed,
+        );
+        // Stored whatever the word above says, so the two numbers a demand reads
+        // are this answer's rather than ones left behind by an older one — the
+        // reason a ship's position is written on every item.
+        let (start, length) = self
+            .wanted
+            .map_or((0, 0), |wanted| (wanted.start, wanted.length));
+        self.reply.wanted_start.store(start, Ordering::Relaxed);
+        self.reply.wanted_length.store(length, Ordering::Relaxed);
+        // Release, and last: the bytes and the ten words above must be visible
         // to the network end before the sequence that claims them as this item's
         // answer is.
         self.reply
@@ -1261,9 +1521,32 @@ const _: () = {
         RelayOperation::from_bits(RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32 - 1)
             .is_some()
     );
+    // A range answer's words sit immediately after the two recordings, so the
+    // whole vocabulary has no gap and ends exactly where the outcomes do.
+    assert!(RelayOperation::RANGE_BASE == 10);
+    assert!(RelayOperation::from_bits(RelayOperation::RANGE_BASE).is_some());
     assert!(
-        RelayOperation::from_bits(RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32).is_none()
+        RelayOperation::from_bits(RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32 - 1)
+            .is_some()
     );
+    assert!(
+        RelayOperation::from_bits(RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32)
+            .is_none()
+    );
+    assert!(RangeOutcome::from_bits(RangeOutcome::COUNT as u32).is_none());
+    // Zero is *nothing wanted*, which is what makes a zeroed reply region an idle
+    // channel rather than one owing an extent of the first recording.
+    assert!(RangeWanting::to_bits(None) == RangeWanting::NOTHING);
+    assert!(RangeWanting::NOTHING == 0);
+    assert!(matches!(
+        RangeWanting::from_bits(RangeWanting::NOTHING),
+        Some(None)
+    ));
+    assert!(RangeWanting::from_bits(RangeWanting::FIRST + DownloadSink::COUNT as u32).is_none());
+    // Only the success carries bytes, which is the rule the answering door keeps.
+    assert!(!RangeOutcome::Data.ends_the_answer());
+    assert!(RangeOutcome::Overwritten.ends_the_answer());
+    assert!(RangeOutcome::MediumRefused.ends_the_answer());
 
     assert!(offset_of!(RelayRequest, sequence) == 0);
     assert!(offset_of!(RelayRequest, operation) == 4);
@@ -1284,10 +1567,16 @@ const _: () = {
     assert!(offset_of!(RelayReply, agreed) == 28);
     assert!(offset_of!(RelayReply, acked_log) == 32);
     assert!(offset_of!(RelayReply, acked_capture) == 40);
-    assert!(offset_of!(RelayReply, payload) == 48);
+    assert!(offset_of!(RelayReply, wanted) == 48);
+    assert!(offset_of!(RelayReply, _pad) == 52);
+    assert!(offset_of!(RelayReply, wanted_start) == 56);
+    assert!(offset_of!(RelayReply, wanted_length) == 64);
+    assert!(offset_of!(RelayReply, payload) == 72);
     assert!(align_of::<RelayReply>() == 8);
     assert!(offset_of!(RelayReply, acked_log).is_multiple_of(align_of::<u64>()));
     assert!(offset_of!(RelayReply, acked_capture).is_multiple_of(align_of::<u64>()));
+    assert!(offset_of!(RelayReply, wanted_start).is_multiple_of(align_of::<u64>()));
+    assert!(offset_of!(RelayReply, wanted_length).is_multiple_of(align_of::<u64>()));
     // Naturally aligned, which is what makes the tally a single access rather
     // than two a reader could tear across.
     assert!(offset_of!(RelayReply, answered).is_multiple_of(align_of::<u64>()));

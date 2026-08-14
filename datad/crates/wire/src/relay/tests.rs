@@ -78,8 +78,13 @@ fn records_cross_in_both_directions_under_one_sequence() {
             agreed: _,
             answered,
             acked: _,
+            wanted,
         } => {
             assert_eq!(records, &b"\x16\x03\x03back"[..]);
+            assert_eq!(
+                wanted, None,
+                "a responder that stated no extent is a channel owing none"
+            );
             assert!(!closed);
             assert_eq!(answered, 1);
         }
@@ -302,7 +307,7 @@ fn an_operation_word_the_far_end_does_not_know_is_refused_rather_than_ignored() 
     // operation moves it instead of quietly making this case a valid word.
     store_request_operation(
         request,
-        RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
+        RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32,
     );
     let demand = responder.take().expect("outstanding");
     assert_eq!(demand.operation(), None);
@@ -381,9 +386,9 @@ fn a_status_or_operation_word_outside_its_vocabulary_is_a_fault() {
         ),
         (
             RelayStatus::Ok.to_bits(),
-            RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
+            RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32,
             RelayFault::OperationUnknown {
-                operation: RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32,
+                operation: RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32,
             },
         ),
     ] {
@@ -772,11 +777,241 @@ proptest! {
         match RelayOperation::from_bits(bits) {
             Some(operation) => {
                 prop_assert_eq!(operation.to_bits(), bits);
-                prop_assert!(bits < RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32);
+                prop_assert!(bits < RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32);
             }
             None => prop_assert!(
-                bits >= RelayOperation::SHIP_BASE + DownloadSink::COUNT as u32
+                bits >= RelayOperation::RANGE_BASE + RangeOutcome::COUNT as u32
             ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recording range reads: the one direction the terminating end initiates, and
+// the answer that comes back the other way.
+// ---------------------------------------------------------------------------
+
+/// An extent of the capture ring, used wherever the numbers themselves do not
+/// matter.
+const WANT: RangeWant = RangeWant {
+    recording: DownloadSink::Capture,
+    start: 0x1234_5678,
+    length: 4096,
+};
+
+#[test]
+fn every_range_outcome_round_trips_through_its_operation_word() {
+    for outcome in [
+        RangeOutcome::Data,
+        RangeOutcome::Overwritten,
+        RangeOutcome::MediumRefused,
+    ] {
+        let operation = RelayOperation::Range(outcome);
+        assert_eq!(
+            RelayOperation::from_bits(operation.to_bits()),
+            Some(operation)
+        );
+        assert_eq!(RangeOutcome::from_bits(outcome.to_bits()), Some(outcome));
+    }
+}
+
+#[test]
+fn a_range_word_past_the_outcomes_names_no_operation() {
+    let past = RelayOperation::Range(RangeOutcome::MediumRefused).to_bits() + 1;
+    assert_eq!(
+        RelayOperation::from_bits(past),
+        None,
+        "the vocabulary ends where the outcomes do, so a word past it is input \
+         to reject rather than one to coerce"
+    );
+}
+
+#[test]
+fn a_want_round_trips_and_zero_is_nothing_wanted() {
+    assert_eq!(
+        RangeWanting::from_bits(RangeWanting::to_bits(None)),
+        Some(None)
+    );
+    for recording in [DownloadSink::Log, DownloadSink::Capture] {
+        let bits = RangeWanting::to_bits(Some(recording));
+        assert_ne!(
+            bits,
+            RangeWanting::NOTHING,
+            "a recording must not share the word that means no extent is owed"
+        );
+        assert_eq!(RangeWanting::from_bits(bits), Some(Some(recording)));
+    }
+}
+
+#[test]
+fn a_stated_want_reaches_the_network_end_on_every_answer() {
+    let mut channel = Channel::new();
+    channel.responder.want(Some(WANT));
+    for _ in 0..3 {
+        let pending = ask(&mut channel, RelayOperation::Poll, &[]);
+        let demand = channel.responder.take().expect("outstanding");
+        channel.responder.answered(demand, &[], false, true);
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        match channel.requester.poll(pending, &mut into) {
+            RelayPoll::Answered { wanted, .. } => assert_eq!(
+                wanted,
+                Some(WANT),
+                "the want is a level and is stated on every answer, so a wakeup \
+                 that coalesced with another cannot lose it"
+            ),
+            other => panic!("expected an answer: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_refusal_states_no_want_however_one_was_left_standing() {
+    let mut channel = Channel::new();
+    channel.responder.want(Some(WANT));
+    let pending = ask(&mut channel, RelayOperation::Poll, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.refuse(demand, RelayRefusal::NoConnection);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    assert!(matches!(
+        channel.requester.poll(pending, &mut into),
+        RelayPoll::Refused(RelayRefusal::NoConnection)
+    ));
+    // And the next answer does not resurrect it: a refusal is this end saying it
+    // never had a session, so an extent asked for over one is nobody's.
+    let pending = ask(&mut channel, RelayOperation::Poll, &[]);
+    let demand = channel.responder.take().expect("outstanding");
+    channel.responder.answered(demand, &[], false, false);
+    match channel.requester.poll(pending, &mut into) {
+        RelayPoll::Answered { wanted, .. } => assert_eq!(wanted, None),
+        other => panic!("expected an answer: {other:?}"),
+    }
+}
+
+#[test]
+fn a_want_word_naming_no_recording_is_a_fault_and_never_read_as_idle() {
+    let request: &'static RelayRequest = Box::leak(Box::new(RelayRequest::zero()));
+    let reply: &'static RelayReply = Box::leak(Box::new(RelayReply::zero()));
+    let mut requester = request.requester(reply);
+    let mut responder = reply.responder(request);
+    let pending = requester
+        .request(RelayOperation::Poll, &[])
+        .expect("the window is free");
+    let demand = responder.take().expect("outstanding");
+    responder.answered(demand, &[], false, false);
+    // A responder writing the region directly, which is what a byzantine
+    // neighbour does.
+    reply
+        .wanted
+        .store(0xDEAD_BEEF, core::sync::atomic::Ordering::Relaxed);
+    let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+    assert_eq!(
+        requester.poll(pending, &mut into),
+        RelayPoll::Faulted(RelayFault::WantUnknown {
+            wanted: 0xDEAD_BEEF
+        }),
+        "an extent silently dropped is an operator's request that answers nothing \
+         and says nothing"
+    );
+    assert_eq!(requester.faults(), 1);
+}
+
+#[test]
+fn a_range_answer_carries_its_position_and_only_a_range_answer_does() {
+    let mut channel = Channel::new();
+    let pending = channel
+        .requester
+        .range(RangeOutcome::Data, 0xABCD, b"extent")
+        .expect("the window is free");
+    assert_eq!(
+        pending.operation(),
+        RelayOperation::Range(RangeOutcome::Data)
+    );
+    let demand = channel.responder.take().expect("outstanding");
+    assert_eq!(demand.ranging(), Some(0xABCD));
+    assert_eq!(
+        demand.shipping(),
+        None,
+        "a position is readable only off the operation that stated one"
+    );
+    let mut scratch = [0_u8; MAX_RELAY_PAYLOAD];
+    assert_eq!(
+        demand.payload(&channel.responder, &mut scratch),
+        Some(&b"extent"[..])
+    );
+    channel.responder.answered(demand, &[], false, true);
+}
+
+#[test]
+fn an_ended_range_answer_carries_no_bytes_however_many_were_offered() {
+    for outcome in [RangeOutcome::Overwritten, RangeOutcome::MediumRefused] {
+        let mut channel = Channel::new();
+        let _pending = channel
+            .requester
+            .range(outcome, 512, b"bytes that must not travel")
+            .expect("the window is free");
+        let demand = channel.responder.take().expect("outstanding");
+        assert_eq!(
+            demand.stated_len(),
+            0,
+            "a frame contradicting itself is refused at the door it is issued \
+             through, not composed and then refused"
+        );
+        assert_eq!(demand.ranging(), Some(512));
+        channel.responder.answered(demand, &[], false, true);
+    }
+}
+
+#[test]
+fn a_ship_position_is_not_readable_as_a_range_position() {
+    let mut channel = Channel::new();
+    let _pending = channel
+        .requester
+        .ship(DownloadSink::Log, 4096, b"ring")
+        .expect("the window is free");
+    let demand = channel.responder.take().expect("outstanding");
+    assert_eq!(demand.shipping(), Some((DownloadSink::Log, 4096)));
+    assert_eq!(demand.ranging(), None);
+    channel.responder.answered(demand, &[], false, true);
+}
+
+proptest! {
+    /// Whatever a peer writes into the wanted words, the network end either reads
+    /// an extent or raises the one fault for it — never a panic and never a
+    /// silent idle channel.
+    #[test]
+    fn any_wanted_word_is_decoded_or_faulted(
+        word in any::<u32>(),
+        start in any::<u64>(),
+        length in any::<u64>(),
+    ) {
+        let request: &'static RelayRequest = Box::leak(Box::new(RelayRequest::zero()));
+        let reply: &'static RelayReply = Box::leak(Box::new(RelayReply::zero()));
+        let mut requester = request.requester(reply);
+        let mut responder = reply.responder(request);
+        let pending = requester
+            .request(RelayOperation::Poll, &[])
+            .expect("the window is free");
+        let demand = responder.take().expect("outstanding");
+        responder.answered(demand, &[], false, false);
+        let order = core::sync::atomic::Ordering::Relaxed;
+        reply.wanted.store(word, order);
+        reply.wanted_start.store(start, order);
+        reply.wanted_length.store(length, order);
+        let mut into = [0_u8; MAX_RELAY_PAYLOAD];
+        match requester.poll(pending, &mut into) {
+            RelayPoll::Answered { wanted, .. } => match RangeWanting::from_bits(word) {
+                Some(None) => prop_assert_eq!(wanted, None),
+                Some(Some(recording)) => prop_assert_eq!(
+                    wanted,
+                    Some(RangeWant { recording, start, length })
+                ),
+                None => prop_assert!(false, "an undecodable word answered an extent"),
+            },
+            RelayPoll::Faulted(RelayFault::WantUnknown { wanted }) => {
+                prop_assert_eq!(wanted, word);
+                prop_assert!(RangeWanting::from_bits(word).is_none());
+            }
+            other => prop_assert!(false, "unexpected: {:?}", other),
         }
     }
 }

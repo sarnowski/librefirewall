@@ -72,12 +72,13 @@ use lfw_ip_endpoint::{ConnectionId, onboard::Ended};
 use lfw_log::{OnboardEnd, RefusalDetail};
 pub use wire::{Acknowledged, Half};
 use wire::{
-    DownloadSink, MAX_RELAY_PAYLOAD, PendingRelay, RelayDemand, RelayEnding, RelayFault,
-    RelayOperation, RelayPoll, RelayRefusal, RelayReply, RelayRequest, RelayRequester,
-    RelayResponder,
+    DownloadSink, MAX_RELAY_PAYLOAD, PendingRelay, RangeOutcome, RangeWant, RelayDemand,
+    RelayEnding, RelayFault, RelayOperation, RelayPoll, RelayRefusal, RelayReply, RelayRequest,
+    RelayRequester, RelayResponder,
 };
 
 use crate::endpoint::EndpointStage;
+use crate::range::RANGE_ANSWER_BYTES;
 
 /// The room the onboarding stream keeps for what arrives, and the payload one
 /// item may carry, held to each other where both are visible.
@@ -349,6 +350,7 @@ enum Claimed {
         closed: bool,
         agreed: bool,
         acked: Acknowledged,
+        wanted: Option<RangeWant>,
     },
     Refused(RelayRefusal),
     Faulted(RelayFault),
@@ -523,12 +525,14 @@ impl<'chan> Relay<'chan> {
                     agreed,
                     answered: _,
                     acked,
+                    wanted,
                 } => Claimed::Answered {
                     offered: records.len(),
                     kept: stream.push(records),
                     closed,
                     agreed,
                     acked,
+                    wanted,
                 },
                 RelayPoll::Refused(reason) => Claimed::Refused(reason),
                 RelayPoll::Faulted(fault) => Claimed::Faulted(fault),
@@ -559,6 +563,7 @@ impl<'chan> Relay<'chan> {
                 closed,
                 agreed,
                 acked,
+                wanted,
             } => {
                 self.relayed = self.relayed.saturating_add(1);
                 self.sent = self.sent.saturating_add(kept as u64);
@@ -577,6 +582,9 @@ impl<'chan> Relay<'chan> {
                     upstream.resume_from(acked);
                 }
                 upstream.acknowledged(acked);
+                // Before the paths below that end the session: a want stated on
+                // the answer carrying a session's last bytes is still a want.
+                upstream.wants(wanted);
                 if kept < offered {
                     self.far = Far::Closed;
                     // The room there was is exactly what was kept, `Relayed::push`
@@ -600,6 +608,9 @@ impl<'chan> Relay<'chan> {
                     // them. Here and nowhere earlier: an item that faulted or
                     // was never answered leaves the cursor where it was.
                     RelayOperation::Ship(_) => upstream.shipped(),
+                    // A shipment's rule, for its reason: a frame that never
+                    // reached the composing end is one the answer offers again.
+                    RelayOperation::Range(_) => upstream.range_answered(),
                     RelayOperation::Deliver | RelayOperation::Poll => {}
                 }
                 if closed {
@@ -729,6 +740,25 @@ impl<'chan> Relay<'chan> {
             && !bytes.is_empty()
         {
             let Ok(pending) = self.requester.ship(recording, position, bytes) else {
+                self.refuse_window(stream);
+                return (false, None);
+            };
+            self.park(now, pending);
+            self.polled = false;
+            return (true, None);
+        }
+        // **After the shipment, and that ordering is the answer to "who wins".**
+        // Shipping is what this channel exists for; a range answer is a remote peer
+        // asking this appliance to read its own medium. So a shipment in hand
+        // always goes first. It does not starve the answer, the reader arbitrating
+        // the medium between the two rings and one answer in turn — so what this
+        // ordering decides is only which of two frames in hand goes now.
+        if carried.half == Half::Channel
+            && self.agreed
+            && room
+            && let Some((outcome, position, bytes)) = upstream.range_waiting()
+        {
+            let Ok(pending) = self.requester.range(outcome, position, bytes) else {
                 self.refuse_window(stream);
                 return (false, None);
             };
@@ -896,7 +926,7 @@ pub const DEMANDS_PER_WAKEUP: usize = 2;
 /// an item is not issued until a whole answer could leave. So a full wire costs a
 /// session that can drain one a pass rather than the session, and
 /// [`RelayFailure::AnswerTooLong`] is what is left — typed, confined to one.
-const ANSWER_ROOM: usize = lfw_ip_endpoint::onboard::OUTBOUND_CAPACITY;
+pub(crate) const ANSWER_ROOM: usize = lfw_ip_endpoint::onboard::OUTBOUND_CAPACITY;
 
 const _: () = {
     assert!(ANSWER_ROOM <= MAX_RELAY_PAYLOAD);
@@ -973,6 +1003,23 @@ pub trait Upstream {
     /// the cursor where it was and the next session ships that position again.
     /// A frame can cross twice and never be skipped.
     fn shipped(&mut self);
+
+    /// The extent the protocol above is waiting for, or `None` for none.
+    ///
+    /// A **want** handed down rather than a command: nothing about it obliges a
+    /// read, which is what keeps an extent a peer asked for from outranking the
+    /// shipping this channel exists for.
+    fn wants(&mut self, wanted: Option<RangeWant>);
+
+    /// How reading that extent went, and the bytes where it went well. On
+    /// [`Self::waiting`]'s terms: this end reads none of them.
+    fn range_waiting(&self) -> Option<(RangeOutcome, u64, &[u8])>;
+
+    /// The far end answered the range frame those bytes were on. Called on the
+    /// **answer** and never on the issue, on [`Self::shipped`]'s terms: a hole in a
+    /// range answer is a run of a recording placed at a position it never came
+    /// from.
+    fn range_answered(&mut self);
 }
 
 /// What one turn of the protocol left for the wire.
@@ -1040,6 +1087,34 @@ pub trait Terminator {
         bytes: &[u8],
         answer: &mut [u8],
     ) -> Answered;
+
+    /// Compose one frame of the answer to the extent this protocol asked for, on
+    /// [`Self::ship`]'s terms — the semantic fields, and the framing is the
+    /// composing end's. A protocol that asks for no extent answers with a finished
+    /// session: a range answer nobody wanted is a neighbour answering a question
+    /// that was never put, and there is nothing for it to be but the end of the
+    /// session that carried it.
+    fn range(
+        &mut self,
+        outcome: RangeOutcome,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        let _ = (outcome, position, bytes, answer);
+        Answered {
+            sent: 0,
+            finished: true,
+            agreed: false,
+        }
+    }
+
+    /// The extent this protocol is waiting for, or `None` for none. Asked rather
+    /// than remembered here, on [`Self::acknowledged`]'s terms: only the end that
+    /// decoded the request knows how much of it is still owed.
+    fn wanted(&self) -> Option<RangeWant> {
+        None
+    }
 
     /// Whether the protocol has agreed a greeting with the peer in the session
     /// it holds now.
@@ -1241,6 +1316,7 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
             RelayOperation::Open(_) | RelayOperation::Poll => self.turn(demand, 0),
             RelayOperation::Deliver => self.deliver(demand),
             RelayOperation::Ship(recording) => self.ship(demand, recording),
+            RelayOperation::Range(outcome) => self.range(demand, outcome),
             RelayOperation::Close(ending) => {
                 // Answered as closed, which is what makes the network end stop
                 // rather than wait for a session this end no longer holds. The
@@ -1332,6 +1408,54 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
         self.settle(demand, answered)
     }
 
+    /// Take one frame of a range answer and give it to the protocol to frame.
+    ///
+    /// Bounded by [`crate::RANGE_ANSWER_BYTES`] on the shipment's terms and for
+    /// its reason, and refused rather than shortened for the same one. An outcome
+    /// that ends the answer carries no bytes: the network end drops them at the
+    /// door it issues through, so a stated length above zero on one is a
+    /// neighbour writing the region directly.
+    fn range(&mut self, demand: RelayDemand, outcome: RangeOutcome) -> TerminatingPass {
+        let stated = demand.stated_len();
+        if stated as usize > RANGE_ANSWER_BYTES || (outcome.ends_the_answer() && stated != 0) {
+            return self.refuse(
+                demand,
+                RelayRefusal::PayloadTooLong,
+                RefusalDetail::One(u64::from(stated)),
+            );
+        }
+        // The position a range answer states travels in the same word a
+        // shipment's does, that word being written on every item.
+        let position = match demand.ranging() {
+            Some(position) => position,
+            // Unreachable: this arm is reached off the very operation that
+            // carries one. Answered rather than asserted, on the shipment's
+            // terms — no fault is admissible on a path a peer paces.
+            None => {
+                return self.refuse(demand, RelayRefusal::NoSuchOperation, RefusalDetail::None);
+            }
+        };
+        let Self {
+            responder, records, ..
+        } = self;
+        let Some(taken) = demand.payload(responder, records).map(<[u8]>::len) else {
+            return self.refuse(
+                demand,
+                RelayRefusal::PayloadTooLong,
+                RefusalDetail::One(u64::from(stated)),
+            );
+        };
+        let Self {
+            terminator,
+            records,
+            answer,
+            ..
+        } = self;
+        let bytes = records.get(..taken).unwrap_or_default();
+        let answered = terminator.range(outcome, position, bytes, answer);
+        self.settle(demand, answered)
+    }
+
     /// Give the protocol the first `taken` bytes of what was copied out, and put
     /// its answer on the channel.
     ///
@@ -1388,6 +1512,11 @@ impl<'chan, T: Terminator> Terminating<'chan, T> {
         // so a coalesced wakeup cannot lose it.
         let acked = self.terminator.acknowledged();
         self.responder.acknowledge(acked);
+        // Stated on every answer for the acknowledgement's reason, and the one
+        // thing on this channel the terminating end initiates: an extent reaches
+        // the reader on whatever item comes next, needing none of its own.
+        let wanted = self.terminator.wanted();
+        self.responder.want(wanted);
         let Self {
             responder, answer, ..
         } = self;

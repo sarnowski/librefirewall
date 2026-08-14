@@ -61,12 +61,13 @@
 use alloc::sync::Arc;
 
 use lfw_channel::{
-    Decoded, Frame, FrameDecoder, Hello, MAX_FRAME_LEN, Ring, Side, VERSION, Violation, encode,
-    encoded_len,
+    Decoded, Frame, FrameDecoder, Hello, MAX_FRAME_LEN, RangeStatus, Ring, Side, VERSION,
+    Violation, encode, encoded_len,
 };
 use lfw_log::{DomainDetail, Refusal, RefusalDetail};
 use lfw_tls::{Bump, CHANNEL_OUTCOME_RECORDS, ChannelClient, CryptoProvider, Turn};
-use pd_runtime::{Acknowledged, Answered, SHIPPED_RING_BYTES};
+use pd_runtime::{Acknowledged, Answered, RANGE_ANSWER_BYTES, RangeRequest, SHIPPED_RING_BYTES};
+use wire::{DownloadSink, RangeOutcome, RangeWant};
 
 use crate::delegate::{HeldAnchor, HeldCertificate};
 
@@ -81,8 +82,9 @@ use crate::delegate::{HeldAnchor, HeldCertificate};
 /// is no third outcome whatever a server does on the wire, neither account has
 /// a third state, a refused shipment ends the session that carried it, and the
 /// clamp is latched so a server sending a thousand impossible acknowledgements
-/// buys one line and not a thousand.
-pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 7;
+/// buys one line and not a thousand, and a range read that cannot be served ends
+/// the session that asked.
+pub const CHANNEL_RECORDS: usize = CHANNEL_OUTCOME_RECORDS * 2 + 8;
 
 /// The recordings, in the order this file indexes its per-ring state by.
 const RINGS: [Ring; 2] = [Ring::Log, Ring::Capture];
@@ -110,12 +112,53 @@ const _: () = assert!(APPLIANCE_GREETING_LEN == 10);
 const UPSTREAM_FRAME_LEN: usize = lfw_channel::HEADER_LEN + RING_POSITION_LEN + SHIPPED_RING_BYTES;
 const RING_POSITION_LEN: usize = 8;
 
+/// Bytes of plaintext one frame of a range answer occupies: the header, the ring,
+/// the status and the position, then the extent's bytes.
+///
+/// Exactly [`UPSTREAM_FRAME_LEN`], the two bytes a range answer's prefix carries
+/// over a shipment's being exactly the two the extent is narrower by — which is
+/// what lets one array compose either frame.
+const RANGE_FRAME_LEN: usize = lfw_channel::HEADER_LEN + RANGE_PREFIX_LEN + RANGE_ANSWER_BYTES;
+const RANGE_PREFIX_LEN: usize = 1 + 1 + 8;
+
 const _: () = {
     // A maximal shipment composes into the array below, so the encoder has
     // nothing to refuse for want of room on any shipment this end accepts.
     assert!(UPSTREAM_FRAME_LEN <= lfw_channel::MAX_FRAME_LEN);
     assert!(SHIPPED_RING_BYTES <= lfw_channel::MAX_PAYLOAD_LEN - RING_POSITION_LEN);
+    // And so does a maximal answer frame, into the same one.
+    assert!(RANGE_FRAME_LEN == UPSTREAM_FRAME_LEN);
+    assert!(RANGE_ANSWER_BYTES <= lfw_channel::MAX_PAYLOAD_LEN - RANGE_PREFIX_LEN);
 };
+
+/// Which recording a ring selector names, and back.
+///
+/// Two functions rather than one type, because the two vocabularies belong to two
+/// crates that must not depend on each other: the framing's ring is the wire's and
+/// the recording is the relay's, and this domain is the one place both are
+/// visible.
+const fn recording_of(ring: Ring) -> DownloadSink {
+    match ring {
+        Ring::Log => DownloadSink::Log,
+        Ring::Capture => DownloadSink::Capture,
+    }
+}
+
+const fn ring_of(recording: DownloadSink) -> Ring {
+    match recording {
+        DownloadSink::Log => Ring::Log,
+        DownloadSink::Capture => Ring::Capture,
+    }
+}
+
+/// The status a range answer's outcome is stated as on the wire.
+const fn status_of(outcome: RangeOutcome) -> RangeStatus {
+    match outcome {
+        RangeOutcome::Data => RangeStatus::Data,
+        RangeOutcome::Overwritten => RangeStatus::Overwritten,
+        RangeOutcome::MediumRefused => RangeStatus::MediumRefused,
+    }
+}
 
 /// One recording's bytes to put on the wire, as the relay handed them over.
 ///
@@ -126,6 +169,18 @@ pub struct Shipment<'bytes> {
     pub ring: Ring,
     pub position: u64,
     pub bytes: &'bytes [u8],
+}
+
+/// What the reader made of one read for a range answer, as the relay handed it
+/// over.
+///
+/// The recording is deliberately absent: the ring an answer names is this end's,
+/// held with the request it decoded, so a neighbour naming one here could answer a
+/// question that was never put.
+struct RangeChunk<'bytes> {
+    outcome: RangeOutcome,
+    position: u64,
+    bytes: &'bytes [u8],
 }
 
 /// Everything this domain needs to open one channel session.
@@ -229,6 +284,28 @@ struct Dialogue<'arena> {
     /// thousand impossible claims buys one line.
     clamped: Option<(u64, u64)>,
     reported_clamp: bool,
+    /// The rule a range read broke, where the server broke one. It ends the
+    /// session, on a violation's terms: what the peer asked for is past a bound of
+    /// this appliance's, and the connection is over.
+    refused_range: Option<&'static str>,
+    /// Why the last range answer ended, where it ended for a reason other than
+    /// being served whole, and not yet said.
+    ///
+    /// Separate from a refusal because it does not end the session: the answer
+    /// ended and the connection did not. Taken once by the pass that produced it,
+    /// so it is bounded by the answers a peer asks for and not by the frames one
+    /// spends.
+    range_ended: Option<&'static str>,
+    /// The range read being answered, or `None` where none is.
+    ///
+    /// **One at a time, and that is a bound on the peer rather than a
+    /// simplification.** A server that could have several answers in flight could
+    /// have this appliance reading its own medium in as many places at once as it
+    /// cared to name, so a second request arriving while one is in progress ends
+    /// the session instead. The composing end holds the state because it is the
+    /// end that decoded the request: it knows which ring was asked for, so no
+    /// neighbour can answer a question that was never put.
+    range: Option<RangeRequest>,
 }
 
 /// The channel as the relay drives it: the identity a session is opened with,
@@ -304,6 +381,45 @@ impl ManagementChannel {
             .map_or(Acknowledged::NONE, Dialogue::acknowledged)
     }
 
+    /// The extent the session running now is waiting for, or `None` for none.
+    ///
+    /// Read off the request rather than kept beside it, so what the reader is told
+    /// is always the remainder: one fact, one home.
+    #[must_use]
+    pub fn wanted(&self) -> Option<RangeWant> {
+        self.session
+            .as_ref()?
+            .range
+            .as_ref()
+            .map(RangeRequest::wanted)
+    }
+
+    /// One turn that also composes one frame of a range answer out of what the
+    /// reader read.
+    ///
+    /// A frame this end will not compose **ends the session**, on the shipment's
+    /// terms and for its reason: the reader retires the frame on the answer, so
+    /// one that went nowhere quietly would be a hole in an extent nothing can
+    /// notice.
+    pub fn answer_range(
+        &mut self,
+        outcome: RangeOutcome,
+        position: u64,
+        bytes: &[u8],
+        answer: &mut [u8],
+    ) -> Answered {
+        self.turn(
+            &[],
+            None,
+            Some(RangeChunk {
+                outcome,
+                position,
+                bytes,
+            }),
+            answer,
+        )
+    }
+
     /// Whether the greeting has been agreed in the session running now.
     #[must_use]
     pub fn agreed(&self) -> bool {
@@ -377,6 +493,9 @@ impl ManagementChannel {
                     reported_acked: false,
                     clamped: None,
                     reported_clamp: false,
+                    refused_range: None,
+                    range_ended: None,
+                    range: None,
                 });
             }
             Err(outcome) => {
@@ -392,7 +511,7 @@ impl ManagementChannel {
     /// One turn: give the record layer what arrived, read what it decrypted as
     /// frames, and put back what this end owes.
     pub fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
-        self.turn(received, None, answer)
+        self.turn(received, None, None, answer)
     }
 
     /// One turn that also composes an upstream frame out of `shipment`.
@@ -402,13 +521,14 @@ impl ManagementChannel {
     /// domain that handed it over moves its ring cursor on the answer, so one
     /// that went nowhere quietly would be a hole nothing can notice.
     pub fn ship(&mut self, shipment: Shipment<'_>, answer: &mut [u8]) -> Answered {
-        self.turn(&[], Some(shipment), answer)
+        self.turn(&[], Some(shipment), None, answer)
     }
 
     fn turn(
         &mut self,
         received: &[u8],
         shipment: Option<Shipment<'_>>,
+        chunk: Option<RangeChunk<'_>>,
         answer: &mut [u8],
     ) -> Answered {
         let Self {
@@ -428,15 +548,26 @@ impl ManagementChannel {
         let first = dialogue.client.advance(received, answer);
         dialogue.read_frames();
         dialogue.greet();
-        let refused = shipment.and_then(|shipment| dialogue.compose(shipment, composed));
+        let refused = shipment
+            .and_then(|shipment| dialogue.compose(shipment, composed))
+            .or_else(|| chunk.and_then(|chunk| dialogue.compose_range(chunk, composed)));
         // A second turn, which is what encrypts anything the frame reading just
         // pushed and takes it toward the wire. The room is what the first turn
         // left. A single call would answer every greeting one delivery late,
         // because the library produces bytes only when it is asked.
         let second = drive_again(&mut dialogue.client, answer, first.sent);
         let agreed = dialogue.agreed;
+        let ended = dialogue.range_ended.take();
+        // Read out of the session and folded in with a refused frame below: both
+        // are this end refusing to go on, and a session ends once whichever of
+        // them happened.
+        let asked = dialogue.refused_range.take();
         let settled = dialogue.settled();
         self.stage(settled.into_iter().flatten());
+        if let Some(cause) = ended {
+            self.stage([DomainDetail::Refusal(refusal(cause))]);
+        }
+        let refused = refused.or(asked);
         if let Some(cause) = refused {
             self.stage([DomainDetail::Refusal(refusal(cause))]);
         }
@@ -597,6 +728,117 @@ impl Dialogue<'_> {
         None
     }
 
+    /// Take a range read the server asked for, answering the token of the rule it
+    /// broke where it broke one.
+    ///
+    /// **One answer in flight**, which is the bound on how many places at once a
+    /// peer can have this appliance reading its own medium. A request arriving
+    /// while one is in progress is that bound being broken, and every other cause
+    /// is one of the request's three numbers past a constant of this appliance's.
+    /// None of them is answered with a status: the statuses say how a read went,
+    /// and none of these is a read.
+    fn asked(&mut self, ring: Ring, start: u64, length: u64) -> Option<&'static str> {
+        if !self.agreed {
+            // A request in front of the greeting. The far end has not said who it
+            // is in this protocol's terms yet, and an appliance reading its medium
+            // for an unopened session is a read nobody asked for.
+            return Some("channel-range-before-greeting");
+        }
+        if self.range.is_some() {
+            return Some("channel-range-already-answering");
+        }
+        match RangeRequest::accept(recording_of(ring), start, length) {
+            Ok(request) => {
+                self.range = Some(request);
+                None
+            }
+            Err(refusal) => Some(refusal.token()),
+        }
+    }
+
+    /// Compose one frame of a range answer and hand it to the record layer,
+    /// answering the token of the rule that stopped it where one did.
+    ///
+    /// **The request decides, not the chunk.** The outcome and the bytes come from
+    /// a neighbour, so what they are allowed to say is what the request in hand
+    /// can be advanced by: the ring is the request's, the length is cut to what
+    /// the request still owes and to what one frame carries, and a position that
+    /// is not the one this end asked at is a neighbour answering a different
+    /// question and ends the session rather than being framed.
+    fn compose_range(
+        &mut self,
+        chunk: RangeChunk<'_>,
+        composed: &mut [u8; UPSTREAM_FRAME_LEN],
+    ) -> Option<&'static str> {
+        let RangeChunk {
+            outcome,
+            position,
+            bytes,
+        } = chunk;
+        let Some(request) = self.range.as_mut() else {
+            // A frame of an answer to a request this end is not holding. The
+            // neighbour is answering something nobody asked, and there is no
+            // request to advance by it.
+            return Some("channel-range-unasked");
+        };
+        if position != request.wanted().start {
+            // The reader read somewhere other than where the request stands. A
+            // frame composed from it would place a run of a recording at a
+            // position it never came from, which is the one error an ingest
+            // cannot detect.
+            return Some("channel-range-position-moved");
+        }
+        if bytes.len() > RANGE_ANSWER_BYTES {
+            return Some("channel-range-chunk-too-long");
+        }
+        if !self.agreed || !self.greeted || self.violation.is_some() {
+            return Some("channel-range-before-greeting");
+        }
+        if !self.client.drained() {
+            return Some("channel-range-not-taken");
+        }
+        let ring = ring_of(request.recording());
+        let taken = request.took(outcome, bytes.len());
+        // Cut to what the request allowed, which is at most what arrived: the
+        // request's own arithmetic is the bound, and a slice of the chunk shorter
+        // than the chunk is the whole of how a neighbour's length is refused
+        // without a panic.
+        let carried = bytes.get(..taken.len).unwrap_or_default();
+        let frame = Frame::UpRangeData {
+            ring,
+            status: status_of(taken.status),
+            position: taken.position,
+            bytes: carried,
+        };
+        let written = match encode(Side::Appliance, &frame, composed) {
+            Ok(written) => written,
+            // Unreachable while the array is sized by the bound checked above.
+            // Answered rather than asserted: this runs on a path a peer paces.
+            Err(_) => return Some("channel-range-chunk-too-long"),
+        };
+        debug_assert_eq!(written, encoded_len(&frame));
+        if self
+            .client
+            .push(composed.get(..written).unwrap_or_default())
+            != written
+        {
+            return Some("channel-range-not-taken");
+        }
+        self.sent = self.sent.saturating_add(1);
+        if taken.finished {
+            // Retired only once the record layer has taken the whole frame, so an
+            // answer that could not be put on the wire is still owed rather than
+            // quietly complete.
+            self.range = None;
+        }
+        // A token where the answer ended for a reason: the wire carried the only
+        // status that fits and the console carries the cause. It does not end the
+        // session — the answer ended, the connection did not — so it is staged
+        // beside the frame rather than returned as a refusal.
+        self.range_ended = taken.token;
+        None
+    }
+
     /// Take an acknowledgement, bounded by what this end has actually sent.
     ///
     /// **The clamp is a safety property and not tidiness.** These numbers become
@@ -686,6 +928,24 @@ impl Dialogue<'_> {
                                 self.held = [log, capture];
                             }
                             Frame::Ack { log, capture } => self.acknowledge(log, capture),
+                            Frame::DownRangeRead {
+                                ring,
+                                start,
+                                length,
+                            } => {
+                                if let Some(cause) = self.asked(ring, start, length) {
+                                    // A request this appliance will not serve. The
+                                    // session ends rather than the request being
+                                    // answered with a status that would misname
+                                    // it: every one of these is the peer past a
+                                    // bound of this appliance's, which is a
+                                    // protocol violation and not a read that went
+                                    // badly.
+                                    self.refused_range = Some(cause);
+                                    self.client.close();
+                                    return;
+                                }
+                            }
                             _ => {}
                         }
                         self.received = self.received.saturating_add(1);
