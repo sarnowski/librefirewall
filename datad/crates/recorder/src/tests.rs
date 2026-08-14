@@ -5,7 +5,7 @@
 
 use super::*;
 
-use lfw_capture_ring::SUPERBLOCK_COPY_BYTES;
+use lfw_capture_ring::{SUPERBLOCK_COPY_BYTES, decode_superblock};
 use wire::{TapClassification, TapEvent, TapFlow, TapFlowState, TapRule};
 
 const SEGMENT: usize = 8 * 1024;
@@ -1587,4 +1587,115 @@ fn a_block_staging_cannot_hold_is_re_offered_rather_than_dropped() {
     // Nothing was counted as dropped: the caller offers it again.
     assert_eq!(sink.counters().dropped_oversized, 0);
     assert_eq!(sink.counters().dropped_refused, 0);
+}
+
+/// The whole of the durable half: a position a management server acknowledged
+/// becomes a reader cursor, the cursor goes onto the medium inside the
+/// superblock, and the boot after it reads that cursor back and goes on
+/// republishing it under the same identifier.
+#[test]
+fn an_acknowledged_position_becomes_a_reader_cursor_the_next_boot_reads_back() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    for index in 0..4u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+
+    let durable = harness.sink.durable_position();
+    assert!(
+        durable > 0,
+        "the boot being resumed from made bytes durable"
+    );
+    assert!(
+        harness.sink.acknowledge_reader(durable),
+        "an acknowledgement of everything durable moved nothing"
+    );
+    let taken = harness.sink.reader().expect("a reader cursor");
+
+    // Through the medium and back, so what is asserted is the bytes a disk
+    // holds rather than a value this test carried in memory.
+    let state = harness.checkpoint();
+    let stored: Vec<_> = state.readers().iter().flatten().copied().collect();
+    assert_eq!(
+        stored,
+        vec![ReaderCursor {
+            id: CHANNEL_READER_ID,
+            cursor: taken,
+        }],
+        "the superblock carries exactly one reader slot, under the channel's identifier"
+    );
+
+    let mut staging = vec![0u8; STAGING];
+    let mut resumed = Sink::resume(config(2048, 4), &state, &mut staging).expect("a resumed sink");
+    assert_eq!(
+        resumed.reader(),
+        Some(taken),
+        "the boot after it did not read the cursor back"
+    );
+    let mut image = [0u8; SUPERBLOCK_BYTES];
+    let republished = resumed.superblock(&mut image).expect("a checkpoint");
+    let _: SuperblockWrite = republished;
+    assert_eq!(
+        decode_superblock(&image)
+            .expect("a superblock")
+            .readers()
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![ReaderCursor {
+            id: CHANNEL_READER_ID,
+            cursor: taken,
+        }],
+        "the resumed boot stopped republishing the cursor it inherited"
+    );
+}
+
+/// A ring refuses a reader cursor ahead of its writer and abandons the whole
+/// checkpoint on it, so a claim past what was written is a remote denial of
+/// durability. It is cut off at the sink, and a checkpoint still composes.
+#[test]
+fn an_acknowledgement_past_the_writer_is_cut_to_it_and_still_checkpoints() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    for index in 0..4u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+
+    let durable = harness.sink.durable_position();
+    assert!(harness.sink.acknowledge_reader(u64::MAX));
+    let cut = harness.sink.reader().expect("a reader cursor");
+    let state = harness.checkpoint();
+    let stored = state.readers()[0].expect("a reader slot");
+    assert_eq!(stored.cursor, cut);
+    assert!(
+        stored.cursor.sequence <= state.writer().sequence,
+        "a cursor past the writer reached a checkpoint, which the ring would refuse"
+    );
+    assert!(
+        matches!(harness.sink.find(durable), Locate::PastEnd),
+        "the recording itself was disturbed by a claim that only concerned a reader"
+    );
+}
+
+/// Forward only, whatever a later session claims.
+#[test]
+fn an_acknowledgement_behind_the_one_before_it_moves_nothing() {
+    let mut harness = Harness::new(2048, 4);
+    let bytes = frame(256, 6);
+    for index in 0..4u64 {
+        harness.record(&tap(index + 1, 0, bytes.len() as u32), &bytes);
+    }
+    harness.seal();
+
+    let durable = harness.sink.durable_position();
+    assert!(harness.sink.acknowledge_reader(durable));
+    let held = harness.sink.reader().expect("a reader cursor");
+    assert!(
+        !harness.sink.acknowledge_reader(0),
+        "a smaller claim moved the cursor, so nothing stops a peer walking it back"
+    );
+    assert_eq!(harness.sink.reader(), Some(held));
 }
