@@ -3759,20 +3759,50 @@ delivered anchor and matches the profile in every field.
   none of them is re-fetched: the channel has a range read for exactly that and nothing here calls
   it. Recovery is the appliance's next re-ship of the whole ring, which arrives on its own schedule
   rather than on this server's noticing.
-- **No configuration operations.** Generation 1 is the document the package carried, and there is
-  no staging, commit-confirm, rollback, or version beyond it — those are channel operations.
+- **An administrator can now change a running appliance's configuration**, over the channel and in
+  the steps the protocol takes. The appliance page carries the document — opened on the generation
+  the appliance is running rather than on an empty box, a configuration change being an edit of
+  what is there — and submitting it writes the version and its audit record before a byte leaves,
+  then asks that appliance's live session to send it. A registry keyed by the device identifier the
+  *handshake* established is what an operator's action reaches a session through, so a document
+  staged for one appliance cannot reach another, and an appliance that hung up between the render
+  and the submit is a named refusal rather than a document sent nowhere.
+
+  The session drives the rest with no second decision for anybody to take: it sends the document,
+  records the appliance's result line verbatim — it names the rule that refused one and the offset
+  that places it, and this server has no business paraphrasing a verdict it did not reach — and
+  commits straight away what the appliance took as its candidate, naming the generation the
+  *appliance* stated rather than the one this server proposed. **The commit ends the session, and
+  that is the protocol working**: the confirmation is sent from the greeting of the *next*
+  connection, out of the row the commit wrote, which is what makes it evidence that this server is
+  still reachable. A result line for a version this session is not staging is dropped and counted
+  like any other unanswerable frame — the appliance is semi-trusted, and a peer able to move a
+  version's state by asserting a verdict nobody asked for would be a peer that commits its own
+  configuration.
+
+  The five instants are the whole record and the lifecycle is **derived** from them, on the same
+  reasoning the inventory derives an appliance's status: a stored state is a value that can
+  disagree with the facts under it. There is deliberately no rollback instant — an unconfirmed
+  commit is undone by the appliance's own deadline, over no frame this server sends and with none
+  coming back — so a version that was committed and never confirmed says exactly that, which is
+  the honest answer. One transaction at a time per appliance, because the appliance holds one
+  candidate and a second staged document would displace the first while this server still showed
+  both.
 - **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an
   administrator-supplied certificate or ACME later. Until then a deployment terminates TLS in front
   of it or keeps it on a trusted network.
 - **No revocation, no CA rollover, no identity federation.** Device certificates are long-lived and
   nothing withdraws one yet; the authority cannot be replaced without visiting every appliance; and
   authentication is local accounts only, with one role.
-- **Nothing yet subscribes to the events that now exist.** A channel session announces itself on
-  PubSub — a connection and a disconnection on both a fleet topic and the appliance's own, and each
-  arrival of ring bytes on the appliance's own topic alone, carrying a count and never a byte of what
-  arrived. So there is a producer now; what is missing is the consumer. The inventory, the appliance
-  page, the authority page and the audit trail are still LiveViews that mount and render, and a status
-  on one is current as of the last load.
+- **One page now subscribes to the events that exist; the rest still do not.** A channel session
+  announces itself on PubSub — a connection and a disconnection on both a fleet topic and the
+  appliance's own, each arrival of ring bytes on the appliance's own topic alone, carrying a count
+  and never a byte of what arrived, and now each step a configuration transaction takes. The
+  appliance page is the consumer: it subscribes, and the verdict, the provisional commit and the
+  confirmation that lands on the *next* connection each appear on it without a reload, the row
+  being re-read rather than patched from the message so what is shown is the trail and not this
+  view's idea of it. The inventory, the authority page and the audit trail are still LiveViews that
+  mount and render, and a status on one is current as of the last load.
 
 ## Engineering foundations
 

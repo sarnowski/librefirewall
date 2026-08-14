@@ -16,7 +16,14 @@ defmodule Ctrld.Application do
         CtrldWeb.Telemetry,
         Ctrld.Repo,
         {DNSCluster, query: Application.get_env(:ctrld, :dns_cluster_query) || :ignore},
-        {Phoenix.PubSub, name: Ctrld.PubSub}
+        {Phoenix.PubSub, name: Ctrld.PubSub},
+        # The directory an operator's staging reaches a live session through. Up
+        # before the listener and unconditionally, for the reason the ingest's
+        # registry below is: a session registers as it opens, so the registry has
+        # to exist before anything can accept a connection — and in test, where no
+        # listener starts here, the suite starts its own and needs the registry
+        # just the same.
+        Ctrld.Channel.Sessions
       ] ++
         Ctrld.Channel.Ingest.Telemetry.children() ++
         bootstrap_child() ++

@@ -40,24 +40,60 @@ defmodule Ctrld.Channel.Handler do
   frame's worth of buffer — the decoder holds one frame and never two — with the
   listener's connection ceiling bounding how many such peers there can be at once.
 
-  A frame that is *legal* but that nothing here answers — a validate result or
-  range data, for which this server has sent no request, having no configuration
-  operations and no range reads — is counted and dropped rather than refused. An
-  appliance speaking a part of the protocol this build does not yet answer is one
-  running ahead of this server, and refusing it would make an upgrade of one end
-  an outage of the pair. That is the same decision the appliance takes about
-  frames this server has not yet learned to send, taken on the other end of the
-  same wire. The count is reported once, when the session ends.
+  A frame that is *legal* but that nothing here answers — range data, for which
+  this server has sent no request, having no range reads — is counted and dropped
+  rather than refused. An appliance speaking a part of the protocol this build
+  does not yet answer is one running ahead of this server, and refusing it would
+  make an upgrade of one end an outage of the pair. That is the same decision the
+  appliance takes about frames this server has not yet learned to send, taken on
+  the other end of the same wire. The count is reported once, when the session
+  ends.
+
+  ## The configuration transaction, over two connections
+
+  This session drives one, and it is the only thing here that this server starts
+  rather than answers. An administrator stages a document; the session sends
+  `down_config_stage`, the appliance answers `up_config_validate_result`, and a
+  document it took as its candidate is committed straight away with
+  `down_config_commit` — one round trip, because there is nothing for an operator
+  to decide between the verdict and the commit that they did not already decide by
+  staging.
+
+  **The commit ends the session, and that is the protocol working rather than
+  failing.** The appliance closes on a commit precisely so that a confirmation
+  cannot arrive on the connection that made it: a commit is provisional, an
+  appliance whose management plane has become unreachable must undo it, and a
+  confirmation over the same connection would prove nothing about reachability. So
+  the confirmation is sent from `greeted/2` on the *next* connection, out of the
+  row the commit wrote, and this session's ending is expected.
+
+  A validate result that arrives for a version this server is not staging is
+  counted and dropped like any other unanswerable frame. It has to be: the
+  appliance is semi-trusted, so an unsolicited result is a frame a peer chose to
+  send, and acting on one would let it move a version's state by asserting a
+  verdict nobody asked for.
   """
 
   use ThousandIsland.Handler
 
   alias Ctrld.Appliances
-  alias Ctrld.Appliances.Appliance
-  alias Ctrld.Channel.{Decoder, Frame, Identity, Ingest}
+  alias Ctrld.Appliances.{Appliance, ConfigurationVersion}
+  alias Ctrld.Channel.{Decoder, Frame, Identity, Ingest, Sessions}
   alias ThousandIsland.Socket
 
   require Logger
+
+  # How long the appliance is given to confirm a provisional commit, in seconds,
+  # and it is the number the commit frame carries rather than a deadline this
+  # server keeps: the appliance arms it off its own clock, because it is the end
+  # that has to act when it expires.
+  #
+  # Sixty seconds. The appliance closes the session on the commit and re-dials on
+  # a backoff that starts short, so a minute is several attempts' worth of room —
+  # and the whole point of the bound is that an appliance whose management plane
+  # has genuinely gone away undoes the change while somebody is still watching,
+  # rather than hours later.
+  @confirm_deadline_secs 60
 
   # How long an appliance has to answer the server's greeting with its own. The
   # session is authenticated by this point, so this is not the flood bound — that
@@ -75,9 +111,14 @@ defmodule Ctrld.Channel.Handler do
   instant the greeting is owed by, and it is an instant rather than a duration on
   purpose: a duration handed to the transport afresh on each arrival would be a
   bound a peer resets by sending a byte, so a peer dribbling one byte at a time
-  would never meet it. `ending` is how the session was decided to end where this
+  would never meet it.   `ending` is how the session was decided to end where this
   end decided it, so the one line a close writes names the real cause rather than
   the transport's view of it.
+
+  `staging` is the generation this session has sent a document for and not yet had
+  a verdict on, or `nil`. It is the whole of what makes an unsolicited validate
+  result harmless: a result is acted on only while this session is waiting for
+  one, so a peer asserting a verdict nobody asked for moves nothing.
   """
   @type state :: %{
           device_id: String.t() | nil,
@@ -87,6 +128,7 @@ defmodule Ctrld.Channel.Handler do
           greet_by: integer() | nil,
           received: non_neg_integer(),
           unanswered: non_neg_integer(),
+          staging: pos_integer() | nil,
           ending: term() | nil
         }
 
@@ -142,6 +184,26 @@ defmodule Ctrld.Channel.Handler do
 
   defp still_owed_a_greeting(other), do: other
 
+  # An operator's staging, arriving from a web request in another process. A
+  # message and not a call, so the request does not wait on the appliance; what it
+  # watches instead is the version's own state, which this session moves.
+  #
+  # A handler process is a `GenServer` whose state is the transport's
+  # `{socket, state}` pair, and the answer goes back through the transport's own
+  # continuation rather than being assembled here: that is what keeps the read
+  # timer, the socket options and the close path identical to the ones every
+  # arriving frame takes. A staging that could not be written closes the session,
+  # which the continuation turns into the same orderly shutdown a refusal does.
+  def handle_info({:stage_configuration, %ConfigurationVersion{} = version}, {socket, state}) do
+    continuation =
+      case stage(socket, state, version) do
+        {:ok, state} -> {:continue, state}
+        {:close, state} -> {:close, state}
+      end
+
+    ThousandIsland.Handler.handle_continuation(continuation, socket)
+  end
+
   @impl ThousandIsland.Handler
   def handle_close(_socket, state), do: ended(state, :peer_closed)
 
@@ -162,6 +224,12 @@ defmodule Ctrld.Channel.Handler do
     # window in which the appliance believes it has a session and the inventory
     # says it has none.
     {:ok, appliance} = Appliances.session_opened(appliance, DateTime.utc_now())
+    # And the registration goes with it, so an operator who sees the inventory
+    # call this appliance online has somewhere to send a document. A second
+    # session for one appliance does not displace the first — see
+    # `Ctrld.Channel.Sessions` — and carries on unregistered, which costs it
+    # nothing but the ability to be staged on.
+    _ = Sessions.register(device_id)
     timeout = greeting_timeout()
 
     state = %{
@@ -206,8 +274,9 @@ defmodule Ctrld.Channel.Handler do
   defp dispatch([], _socket, state), do: {:continue, state}
 
   defp dispatch([frame | rest], socket, state) do
-    case receive_frame(frame, state) do
+    case receive_frame(frame, socket, state) do
       {:ok, state} -> dispatch(rest, socket, state)
+      {:close, state} -> {:close, state}
       {:refuse, refusal} -> refuse(socket, state, refusal)
     end
   end
@@ -218,29 +287,165 @@ defmodule Ctrld.Channel.Handler do
   # rule: an appliance restarting a greeting mid-session is a shape the protocol
   # has nowhere to put, and accepting it would be accepting a peer's reset of a
   # conversation this end is keeping the state of.
-  defp receive_frame({:hello, :appliance}, %{greeted?: false} = state) do
+  defp receive_frame({:hello, :appliance}, socket, %{greeted?: false} = state) do
     Logger.info(
       "ctrld: channel greeting agreed with appliance #{state.device_id} " <>
         "on protocol version #{Frame.version()}"
     )
 
-    {:ok, %{state | greeted?: true}}
+    greeted(socket, %{state | greeted?: true})
   end
 
-  defp receive_frame({:hello, :appliance}, _state), do: {:refuse, :second_greeting}
+  defp receive_frame({:hello, :appliance}, _socket, _state), do: {:refuse, :second_greeting}
 
-  defp receive_frame({:up_records, position, bytes}, state) do
+  defp receive_frame({:up_records, position, bytes}, _socket, state) do
     {:ok, received(state, :log, position, bytes)}
   end
 
-  defp receive_frame({:up_capture, position, bytes}, state) do
+  defp receive_frame({:up_capture, position, bytes}, _socket, state) do
     {:ok, received(state, :capture, position, bytes)}
+  end
+
+  # The verdict on the document this session staged, and only while it is waiting
+  # for one: an unsolicited result is a frame a semi-trusted peer chose to send,
+  # so it falls through to the unanswerable tally below rather than moving a
+  # version's state.
+  defp receive_frame({:up_config_validate_result, line}, socket, %{staging: generation} = state)
+       when is_integer(generation) do
+    validated(socket, %{state | staging: nil}, generation, line)
   end
 
   # Legal, and unanswerable by this build. Counted rather than logged per frame,
   # so a peer cannot drive this server's records: the tally goes out once, when
   # the session ends.
-  defp receive_frame(_frame, state), do: {:ok, %{state | unanswered: state.unanswered + 1}}
+  defp receive_frame(_frame, _socket, state),
+    do: {:ok, %{state | unanswered: state.unanswered + 1}}
+
+  # What a fresh connection owes before anything else: the confirmation of a
+  # commit made on a previous one. Sent here rather than when the commit was made,
+  # because that is the protocol's whole point — the appliance ends the session on
+  # a commit so that the confirmation has to travel a connection the appliance
+  # established afterwards, which is what makes it evidence that this server is
+  # still reachable.
+  #
+  # A version with no confirmation owed is the ordinary case and says nothing.
+  defp greeted(socket, state) do
+    case Appliances.awaiting_confirmation(state.device_id) do
+      nil ->
+        {:ok, state}
+
+      %ConfigurationVersion{generation: generation} ->
+        confirm(socket, state, generation)
+    end
+  end
+
+  defp confirm(socket, state, generation) do
+    case send_frame(socket, {:down_commit_confirm, generation}) do
+      :ok ->
+        {:ok, _version} =
+          Appliances.configuration_confirmed(state.device_id, generation, DateTime.utc_now())
+
+        Logger.info(
+          "ctrld: confirmed generation #{generation} on appliance #{state.device_id} " <>
+            "over a fresh connection"
+        )
+
+        {:ok, state}
+
+      # A peer that hung up between the greeting and this frame. Its own ending,
+      # and the version stays awaiting a confirmation: the next connection owes
+      # the same one, which is exactly right — an appliance that never gets a
+      # confirmation rolls the commit back on its own deadline, and this server
+      # keeps trying until one of the two happens.
+      {:error, reason} ->
+        {:close, %{state | ending: {:confirmation_not_sent, reason}}}
+    end
+  end
+
+  # The appliance's verdict, recorded, and then the commit it earns. One round
+  # trip and no second decision for an operator to take: staging a document IS
+  # the decision, and a verdict that says the appliance took it as its candidate
+  # is the only thing that was in doubt.
+  defp validated(socket, state, generation, line) do
+    {:ok, version} =
+      Appliances.configuration_validated(state.device_id, generation, line, DateTime.utc_now())
+
+    if ConfigurationVersion.accepted?(line) do
+      commit(socket, state, staged_generation(version, generation))
+    else
+      Logger.info(
+        "ctrld: appliance #{state.device_id} refused the document staged as generation " <>
+          "#{generation}: #{line}"
+      )
+
+      {:ok, state}
+    end
+  end
+
+  # The generation the COMMIT names, taken from the appliance's own result line
+  # where it stated one. The appliance's datastore is the authority on the number
+  # a commit must carry — it refuses one that is not the number it would assign —
+  # so reading it back is what keeps a commit from being refused for having
+  # proposed a generation this server merely believed in.
+  defp staged_generation(%ConfigurationVersion{validation_result: line}, fallback)
+       when is_binary(line) do
+    ConfigurationVersion.stated_generation(line) || fallback
+  end
+
+  defp staged_generation(%ConfigurationVersion{}, fallback), do: fallback
+
+  # The document goes down the wire and the generation is remembered, which is
+  # what makes the verdict that comes back one this session asked for.
+  #
+  # A staging while another is outstanding is dropped rather than sent: the
+  # appliance holds one candidate, so two documents in flight would leave the
+  # second's verdict arriving against the first's generation. The context refuses a
+  # second staging before it gets here, so this is the belt to that braces — and it
+  # says so on the way past, because a document an operator staged and nothing sent
+  # is worth a line.
+  defp stage(socket, %{staging: outstanding} = state, version) when is_integer(outstanding) do
+    Logger.warning(
+      "ctrld: not staging generation #{version.generation} on appliance #{state.device_id}: " <>
+        "generation #{outstanding} is still awaiting the appliance's verdict"
+    )
+
+    _ = socket
+    {:ok, state}
+  end
+
+  defp stage(socket, state, %ConfigurationVersion{} = version) do
+    case send_frame(socket, {:down_config_stage, version.document}) do
+      :ok ->
+        Logger.info(
+          "ctrld: staged generation #{version.generation} on appliance #{state.device_id}, " <>
+            "#{byte_size(version.document)} document byte(s)"
+        )
+
+        {:ok, %{state | staging: version.generation}}
+
+      {:error, reason} ->
+        {:close, %{state | ending: {:stage_not_sent, reason}}}
+    end
+  end
+
+  defp commit(socket, state, generation) do
+    case send_frame(socket, {:down_config_commit, generation, @confirm_deadline_secs}) do
+      :ok ->
+        {:ok, _version} =
+          Appliances.configuration_committed(state.device_id, generation, DateTime.utc_now())
+
+        Logger.info(
+          "ctrld: committed generation #{generation} on appliance #{state.device_id} " <>
+            "provisionally, to be confirmed within #{@confirm_deadline_secs}s over a fresh " <>
+            "connection"
+        )
+
+        {:ok, state}
+
+      {:error, reason} ->
+        {:close, %{state | ending: {:commit_not_sent, reason}}}
+    end
+  end
 
   # The ring bytes cross the seam, and the arrival is announced. Both, in this
   # order, and neither is the other's business: the seam is what eventually reads
@@ -303,9 +508,12 @@ defmodule Ctrld.Channel.Handler do
       {:ok, bytes} ->
         Socket.send(socket, bytes)
 
-      # Unreachable from anything a peer sends: the only frame this build
-      # composes is the server greeting, and every field in it is a constant of
-      # `log_cursor/1` and `capture_cursor/1`. So a refusal here is a defect in
+      # Unreachable from anything a peer sends, and that claim now has to cover
+      # four frames rather than one. The greeting's fields are constants of
+      # `log_cursor/1` and `capture_cursor/1`; the commit's and the confirmation's
+      # are a generation out of this server's own row; and the staged document is
+      # held to `Ctrld.Configuration.maximum_bytes/0` before a version exists,
+      # which is the codec's own document bound. So a refusal here is a defect in
       # this module or in the codec, and it fails visibly rather than closing a
       # session as though the appliance had done something.
       {:error, refusal} ->
@@ -336,6 +544,7 @@ defmodule Ctrld.Channel.Handler do
       greet_by: nil,
       received: 0,
       unanswered: 0,
+      staging: nil,
       ending: nil
     }
   end
@@ -357,6 +566,15 @@ defmodule Ctrld.Channel.Handler do
 
   def describe({:greeting_not_sent, reason}),
     do: "this server's greeting was not sent: #{inspect(reason)}"
+
+  def describe({:stage_not_sent, reason}),
+    do: "a staged document was not sent: #{inspect(reason)}"
+
+  def describe({:commit_not_sent, reason}),
+    do: "a provisional commit was not sent: #{inspect(reason)}"
+
+  def describe({:confirmation_not_sent, reason}),
+    do: "a commit's confirmation was not sent: #{inspect(reason)}"
 
   def describe({:failed, reason}), do: "the connection failed: #{inspect(reason)}"
   def describe({:framing, refusal}), do: "the framing was broken: #{describe_refusal(refusal)}"

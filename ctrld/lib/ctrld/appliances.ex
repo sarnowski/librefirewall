@@ -14,13 +14,36 @@ defmodule Ctrld.Appliances do
   poll. Those two facts are the only ones a connection may write: an identity is
   the onboarding's to establish and never a session's, which is what
   `Ctrld.Appliances.Appliance.session_changeset/2` exists to enforce.
+
+  ## Changing an appliance's configuration
+
+  And it drives the configuration transaction, which is the one thing an
+  administrator does to an appliance that takes more than one step and more than
+  one connection. `stage_configuration/3` writes the version and asks the live
+  session to send it; the session reports the appliance's verdict back through
+  `configuration_validated/4`, commits through `configuration_committed/3`, and
+  confirms over the *next* connection through `configuration_confirmed/3`.
+
+  **Every step is one transaction with its own audit record**, on the onboarding's
+  reasoning exactly: a configuration that reached an appliance without a record of
+  who sent it is the fact an audit trail exists to hold. The three steps the
+  session drives carry no actor, because no administrator was there — the audit
+  record names the appliance's own channel as the actor, which is what actually
+  did it.
   """
 
   import Ecto.Query
 
   alias Ctrld.Appliances.{Appliance, ConfigurationVersion}
+  alias Ctrld.Channel.Sessions
   alias Ctrld.PKI.{Certificate, CSR}
   alias Ctrld.{Audit, ChannelEndpoint, Configuration, Package, PKI, Repo}
+
+  # The actor an audit record names for the three steps no administrator is
+  # present for. A name and not a user reference: the channel is not a user, and
+  # a record that borrowed the staging administrator's identity would say they
+  # confirmed a commit they may have been asleep for.
+  @channel_actor "the appliance's own channel"
 
   @doc "The inventory, newest first."
   @spec list_appliances() :: [Appliance.t()]
@@ -101,6 +124,15 @@ defmodule Ctrld.Appliances do
   never will be**: they are a customer's captured traffic, a recording is where
   that belongs, and a subscriber wanting content reads it from whatever ingests
   it.
+
+  And one more, for each step a configuration transaction takes:
+
+      {:appliance_configuration, device_id :: String.t(), generation :: pos_integer(),
+       state :: Ctrld.Appliances.ConfigurationVersion.state()}
+
+  Here for the same reason: a change is watched on the page of the appliance it
+  is being made to. It carries the derived state and not the appliance's result
+  line, so a subscriber renders a transition and reads the row for the verdict.
   """
   @spec topic(String.t()) :: String.t()
   def topic(device_id) when is_binary(device_id), do: "appliance:" <> device_id
@@ -305,6 +337,255 @@ defmodule Ctrld.Appliances do
     compose_bytes(appliance, version.document)
   end
 
+  @doc """
+  Stage `document` on `appliance` as its next generation.
+
+  The version row and its audit record commit together, and only then is the live
+  session asked to send the document down the channel. That order is deliberate:
+  a document that reached an appliance with no record of who sent it is the one
+  thing this trail exists to prevent, so the record is durable before a byte
+  leaves — and a session that hung up in between leaves a version in `:staging`,
+  which is an honest description of what happened rather than a lost change.
+
+  Refused where this server can refuse it. The document is held to
+  `Ctrld.Configuration` first, because a document this server can already tell is
+  wrong should not cost an appliance a round trip; the appliance's own validator
+  is still the authority, and its verdict is what the version records.
+  `{:error, :no_session}` is the refusal an operator gets for an appliance that is
+  not connected — there is no queue behind it, because a configuration held for an
+  appliance that reappears in a fortnight is a change nobody remembers asking for.
+  """
+  @spec stage_configuration(Appliance.t(), binary(), Ctrld.Accounts.User.t()) ::
+          {:ok, ConfigurationVersion.t()}
+          | {:error, :no_session | :in_flight | Configuration.reason() | Ecto.Changeset.t()}
+  def stage_configuration(%Appliance{} = appliance, document, actor) when is_binary(document) do
+    with :ok <- Configuration.validate(document),
+         :ok <- nothing_in_flight(appliance),
+         {:ok, version} <- insert_staged(appliance, document, actor) do
+      case Sessions.stage(appliance.device_id, version) do
+        :ok ->
+          announce_configuration(appliance.device_id, version)
+          {:ok, version}
+
+        # The row and its audit record stay: the change was authorised and
+        # recorded, and the appliance was gone. Reporting it as though nothing
+        # had happened would leave an operator a trail with a hole in it.
+        {:error, :no_session} ->
+          announce_configuration(appliance.device_id, version)
+          {:error, :no_session}
+      end
+    end
+  end
+
+  @doc """
+  Record the appliance's verdict on the document it was sent.
+
+  `line` is the appliance's own result line, stored verbatim: it names the rule
+  that refused a document and the offset that places it, and this server has no
+  business paraphrasing a verdict it did not reach.
+  """
+  @spec configuration_validated(String.t(), pos_integer(), String.t(), DateTime.t()) ::
+          {:ok, ConfigurationVersion.t()} | {:error, :no_such_version | Ecto.Changeset.t()}
+  def configuration_validated(device_id, generation, line, %DateTime{} = at)
+      when is_binary(device_id) and is_integer(generation) and is_binary(line) do
+    advance(device_id, generation, %{
+      validated_at: DateTime.truncate(at, :second),
+      validation_result: line
+    })
+  end
+
+  @doc """
+  Record that this server committed `generation` provisionally.
+
+  There is no acknowledgement to wait for and none to record: the appliance ends
+  the session on a commit, which is how the protocol makes the confirmation
+  arrive over a fresh connection. So what this writes is the send, and what
+  evidences the commit landing is the appliance coming back at all.
+  """
+  @spec configuration_committed(String.t(), pos_integer(), DateTime.t()) ::
+          {:ok, ConfigurationVersion.t()} | {:error, :no_such_version | Ecto.Changeset.t()}
+  def configuration_committed(device_id, generation, %DateTime{} = at)
+      when is_binary(device_id) and is_integer(generation) do
+    advance(device_id, generation, %{committed_at: DateTime.truncate(at, :second)})
+  end
+
+  @doc "Record that this server confirmed `generation` over a fresh connection."
+  @spec configuration_confirmed(String.t(), pos_integer(), DateTime.t()) ::
+          {:ok, ConfigurationVersion.t()} | {:error, :no_such_version | Ecto.Changeset.t()}
+  def configuration_confirmed(device_id, generation, %DateTime{} = at)
+      when is_binary(device_id) and is_integer(generation) do
+    advance(device_id, generation, %{confirmed_at: DateTime.truncate(at, :second)})
+  end
+
+  @doc """
+  The version this appliance owes a confirmation, where it owes one.
+
+  A commit with no confirmation, newest first. There is at most one — a stage is
+  refused while another version is in flight — and the query is written for the
+  general case anyway, because "at most one" is a rule of this module and not of
+  the table.
+  """
+  @spec awaiting_confirmation(String.t()) :: ConfigurationVersion.t() | nil
+  def awaiting_confirmation(device_id) when is_binary(device_id) do
+    Repo.one(
+      from(version in ConfigurationVersion,
+        join: appliance in assoc(version, :appliance),
+        where:
+          appliance.device_id == ^device_id and not is_nil(version.committed_at) and
+            is_nil(version.confirmed_at),
+        order_by: [desc: version.generation],
+        limit: 1
+      )
+    )
+  end
+
+  @doc """
+  The version an appliance's next generation number follows, as that number.
+
+  The appliance's datastore is the real authority on it — a commit names a
+  generation and the appliance refuses one that is not the number it would
+  assign — so this is the number this server *proposes*, and the result line is
+  where the appliance says what it actually is.
+  """
+  @spec next_generation(Appliance.t()) :: pos_integer()
+  def next_generation(%Appliance{} = appliance) do
+    highest =
+      Repo.one(
+        from(version in ConfigurationVersion,
+          where: version.appliance_id == ^appliance.id,
+          select: max(version.generation)
+        )
+      )
+
+    (highest || 0) + 1
+  end
+
+  # One configuration transaction at a time per appliance. A second stage while
+  # one is in flight is refused rather than queued: the appliance holds ONE
+  # candidate, so a second staged document would displace the first on the
+  # appliance while this server still showed both, and a commit would then name a
+  # generation whose document is not the one an operator is looking at.
+  defp nothing_in_flight(%Appliance{} = appliance) do
+    in_flight =
+      Repo.exists?(
+        from(version in ConfigurationVersion,
+          where:
+            version.appliance_id == ^appliance.id and not is_nil(version.staged_at) and
+              is_nil(version.confirmed_at) and
+              (is_nil(version.validated_at) or not is_nil(version.committed_at))
+        )
+      )
+
+    if in_flight, do: {:error, :in_flight}, else: :ok
+  end
+
+  defp insert_staged(%Appliance{} = appliance, document, actor) do
+    now = DateTime.truncate(DateTime.utc_now(), :second)
+    generation = next_generation(appliance)
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.insert(
+      :version,
+      ConfigurationVersion.changeset(%ConfigurationVersion{}, %{
+        appliance_id: appliance.id,
+        generation: generation,
+        document: document,
+        document_sha256: ConfigurationVersion.digest(document),
+        author_id: actor.id,
+        staged_at: now
+      })
+    )
+    |> Ecto.Multi.insert(
+      :audit,
+      Audit.record(%{
+        actor_id: actor.id,
+        actor_email: actor.email,
+        action: "configuration.staged",
+        subject_type: "appliance",
+        subject_id: appliance.device_id,
+        detail: %{
+          "generation" => generation,
+          "document_sha256" => ConfigurationVersion.digest(document)
+        }
+      })
+    )
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{version: version}} -> {:ok, version}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  # One step of the transaction, with the audit record that names it, in one
+  # database transaction. The action is derived from the attribute that moved, so
+  # a step cannot be recorded under another step's name.
+  defp advance(device_id, generation, attributes) do
+    case version_of(device_id, generation) do
+      nil ->
+        {:error, :no_such_version}
+
+      version ->
+        Ecto.Multi.new()
+        |> Ecto.Multi.update(:version, ConfigurationVersion.changeset(version, attributes))
+        |> Ecto.Multi.insert(
+          :audit,
+          Audit.record(%{
+            actor_email: @channel_actor,
+            action: step_action(attributes),
+            subject_type: "appliance",
+            subject_id: device_id,
+            detail: step_detail(generation, attributes)
+          })
+        )
+        |> Repo.transaction()
+        |> case do
+          {:ok, %{version: updated}} ->
+            announce_configuration(device_id, updated)
+            {:ok, updated}
+
+          {:error, _step, reason, _changes} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  defp step_action(%{validated_at: _at, validation_result: line}) do
+    if ConfigurationVersion.accepted?(line),
+      do: "configuration.staged_on_appliance",
+      else: "configuration.refused_by_appliance"
+  end
+
+  defp step_action(%{committed_at: _at}), do: "configuration.committed"
+  defp step_action(%{confirmed_at: _at}), do: "configuration.confirmed"
+
+  defp step_detail(generation, %{validation_result: line}),
+    do: %{"generation" => generation, "result" => line}
+
+  defp step_detail(generation, _attributes), do: %{"generation" => generation}
+
+  defp version_of(device_id, generation) do
+    Repo.one(
+      from(version in ConfigurationVersion,
+        join: appliance in assoc(version, :appliance),
+        where: appliance.device_id == ^device_id and version.generation == ^generation
+      )
+    )
+  end
+
+  # A configuration step is announced on the appliance's own topic and not on the
+  # fleet's, on `telemetry_received/4`'s reasoning: a view of the whole inventory
+  # has no column for it and would be woken to render nothing.
+  defp announce_configuration(device_id, %ConfigurationVersion{} = version) do
+    Phoenix.PubSub.broadcast(
+      Ctrld.PubSub,
+      topic(device_id),
+      {:appliance_configuration, device_id, version.generation,
+       ConfigurationVersion.state(version)}
+    )
+
+    :ok
+  end
+
   defp compose(appliance, document) do
     case compose_bytes(Repo.preload(appliance, :certificate_authority), document) do
       {:ok, bytes} -> {:ok, %{appliance: appliance, package: bytes}}
@@ -352,11 +633,21 @@ defmodule Ctrld.Appliances do
     if taken, do: {:error, :already_onboarded}, else: :ok
   end
 
-  @doc "A refusal in the words the administrator onboarding needs."
-  @spec describe(:already_onboarded | :no_authority) :: String.t()
+  @doc "A refusal in the words the administrator onboarding or staging needs."
+  @spec describe(:already_onboarded | :no_authority | :no_session | :in_flight) :: String.t()
   def describe(:already_onboarded),
     do: "an appliance with this device identifier or key is already onboarded"
 
   def describe(:no_authority),
     do: "this server holds no certificate authority, so it can issue nothing"
+
+  def describe(:no_session),
+    do:
+      "the appliance has no channel session open, so there is nothing to stage a document on; " <>
+        "the version is recorded and can be staged again once it dials in"
+
+  def describe(:in_flight),
+    do:
+      "a configuration change for this appliance is still in flight; an appliance holds one " <>
+        "candidate, so the one in progress has to finish before another is staged"
 end
