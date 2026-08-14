@@ -1156,3 +1156,340 @@ fn what_the_far_end_holds_only_ever_grows_and_reaches_the_recorder() {
         .responder
         .refuse(demand, DownloadRefusal::NotReady, 0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Recording range reads: the extent the composing domain asks for, the frames
+// this reader produces, and the medium shared out between them and the rings.
+// ---------------------------------------------------------------------------
+
+/// An extent of the capture ring.
+fn want(start: u64, length: u64) -> RangeWant {
+    RangeWant {
+        recording: DownloadSink::Capture,
+        start,
+        length,
+    }
+}
+
+/// Answer whatever is outstanding as a demand for a range answer, and hand back
+/// what it asked for.
+fn range_asked(channel: &Channel) -> Option<(DownloadSink, DownloadReader, u64, usize)> {
+    let mut responder = channel.responder();
+    let demand = responder.take()?;
+    let seen = (
+        demand.sink()?,
+        demand.reader()?,
+        demand.offset(),
+        demand.len(),
+    );
+    responder.refuse(demand, DownloadRefusal::NotReady, 0, 0);
+    Some(seen)
+}
+
+/// Step the reader until the read it has outstanding is the one for `start`,
+/// refusing whatever else it asks for on the way.
+///
+/// The medium is shared out in turn and the rotation starts on the first ring, so
+/// a case about a range answer has to reach the answer's turn rather than assume
+/// the first pass is it. Bounded by the rotation, which is what makes this a
+/// helper and not a spin: if the read is not reached in that many passes the
+/// reader is not asking for it at all, and the case says so.
+fn advance_to_range(
+    channel: &Channel,
+    downloads: &mut Downloads<'_>,
+    stage: &mut FakeStream,
+    start: u64,
+    from: u64,
+) -> u64 {
+    let mut nanos = from;
+    for _ in 0..=MEDIUM_TURNS {
+        downloads.poll(at(nanos), stage, true);
+        nanos += 1;
+        // Peeked through a throwaway responder, which each of these fixtures is:
+        // one starts at sequence zero, so leaving a demand unanswered leaves the
+        // request outstanding in the region for the caller to answer.
+        let peeked = {
+            let mut responder = channel.responder();
+            responder
+                .take()
+                .map(|demand| (demand.offset(), demand.reader()))
+        };
+        let Some((offset, reader)) = peeked else {
+            continue;
+        };
+        if offset == start && matches!(reader, Some(DownloadReader::Ring)) {
+            return nanos;
+        }
+        {
+            let mut responder = channel.responder();
+            if let Some(demand) = responder.take() {
+                responder.refuse(demand, DownloadRefusal::NotReady, 0, 0);
+            }
+        }
+        downloads.poll(at(nanos), stage, true);
+        nanos += 1;
+        while downloads.take_shipped().is_some() {}
+    }
+    panic!("the reader never asked for the extent at {start}");
+}
+
+#[test]
+fn an_extent_is_read_in_the_rings_own_coordinate_and_never_past_one_frame() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    // Larger than one frame carries, so the request must be cut by this crate's
+    // own bound rather than by the number it was handed.
+    downloads.wants(Some(want(0x4000, (RANGE_ANSWER_BYTES as u64) * 4)));
+    advance_to_range(&channel, &mut downloads, &mut stage, 0x4000, 0);
+    assert_eq!(
+        range_asked(&channel),
+        Some((
+            DownloadSink::Capture,
+            DownloadReader::Ring,
+            0x4000,
+            RANGE_ANSWER_BYTES
+        )),
+        "an extent is asked for in the ring's own append space — the coordinate \
+         the framing's positions are in — and never more than one frame carries"
+    );
+}
+
+#[test]
+fn an_extent_shorter_than_a_frame_is_asked_for_at_its_own_length() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(64, 100)));
+    advance_to_range(&channel, &mut downloads, &mut stage, 64, 0);
+    assert_eq!(
+        range_asked(&channel).map(|asked| (asked.2, asked.3)),
+        Some((64, 100))
+    );
+}
+
+#[test]
+fn nothing_is_read_for_an_extent_while_no_channel_can_carry_the_answer() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0, 4096)));
+    downloads.poll(at(0), &mut stage, false);
+    assert!(
+        range_asked(&channel).is_none(),
+        "a want with no session to answer over is an extent nobody is waiting for"
+    );
+    assert!(
+        downloads.range_waiting().is_none(),
+        "and a frame held from an ended session does not survive into the next"
+    );
+}
+
+#[test]
+fn a_read_that_brought_bytes_becomes_one_data_frame_at_the_position_asked_for() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x8000, 4096)));
+    let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x8000, 0);
+    answer(&channel, &[0xAB; 512], 1 << 20);
+    downloads.poll(at(now), &mut stage, true);
+    let (outcome, position, bytes) = downloads.range_waiting().expect("one frame");
+    assert_eq!(outcome, RangeOutcome::Data);
+    assert_eq!(position, 0x8000);
+    assert_eq!(bytes, &[0xAB_u8; 512][..]);
+    // Retired on the answer, and no cursor moves with it.
+    downloads.range_answered();
+    assert!(downloads.range_waiting().is_none());
+}
+
+#[test]
+fn an_overrun_becomes_an_overwritten_frame_carrying_nothing() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x100, 4096)));
+    let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x100, 0);
+    {
+        let mut responder = channel.responder();
+        let demand = responder.take().expect("a request is out");
+        responder.refuse(demand, DownloadRefusal::Overrun, 1 << 20, 0x9000);
+    }
+    downloads.poll(at(now), &mut stage, true);
+    let (outcome, position, bytes) = downloads.range_waiting().expect("one frame");
+    assert_eq!(
+        outcome,
+        RangeOutcome::Overwritten,
+        "the ring rolled past the extent, which is the one refusal the wire has a \
+         word of its own for"
+    );
+    assert_eq!(position, 0x100);
+    assert!(bytes.is_empty(), "an ended answer carries no bytes");
+}
+
+#[test]
+fn every_other_refusal_becomes_a_medium_refusal_and_names_its_cause_on_the_console() {
+    for (reason, expected) in [
+        (DownloadRefusal::DeviceError, RangeOutcome::MediumRefused),
+        (DownloadRefusal::NotReady, RangeOutcome::MediumRefused),
+        (DownloadRefusal::OutOfRange, RangeOutcome::MediumRefused),
+        (DownloadRefusal::NoSuchSink, RangeOutcome::MediumRefused),
+        (DownloadRefusal::NoSuchReader, RangeOutcome::MediumRefused),
+    ] {
+        let channel = Channel::new();
+        let mut downloads = channel.downloads();
+        let mut stage = FakeStream::default();
+        downloads.wants(Some(want(0x200, 4096)));
+        let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x200, 0);
+        {
+            let mut responder = channel.responder();
+            let demand = responder.take().expect("a request is out");
+            responder.refuse(demand, reason, 0, 0);
+        }
+        downloads.poll(at(now), &mut stage, true);
+        let (outcome, position, bytes) = downloads.range_waiting().expect("one frame");
+        assert_eq!(outcome, expected, "{reason:?}");
+        assert_eq!(position, 0x200);
+        assert!(bytes.is_empty());
+        // The cause the mapping threw away reaches the console.
+        let mut reported = Vec::new();
+        while let Some(shipped) = downloads.take_shipped() {
+            reported.push(shipped);
+        }
+        assert!(
+            reported.contains(&Shipped::RangeRefused {
+                reason,
+                offset: 0x200
+            }),
+            "the wire cannot carry {reason:?}, so the console must: {reported:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_read_becomes_a_data_frame_of_no_bytes_for_the_composer_to_end() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x300, 4096)));
+    let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x300, 0);
+    answer(&channel, &[], 1 << 20);
+    downloads.poll(at(now), &mut stage, true);
+    let (outcome, position, bytes) = downloads.range_waiting().expect("one frame");
+    assert_eq!(
+        outcome,
+        RangeOutcome::Data,
+        "one place decides what a read that advanced nothing means, and it is the \
+         domain holding the request"
+    );
+    assert_eq!(position, 0x300);
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn a_recorder_that_never_answered_a_range_read_ends_the_answer_and_says_so() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x400, 4096)));
+    let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x400, 0);
+    // Nothing answers, and the deadline passes.
+    downloads.poll(at(now + REPLY_TIMEOUT.as_nanos() + 1), &mut stage, true);
+    let (outcome, position, bytes) = downloads.range_waiting().expect("one frame");
+    assert_eq!(outcome, RangeOutcome::MediumRefused);
+    assert_eq!(position, 0x400);
+    assert!(bytes.is_empty());
+    let mut reported = Vec::new();
+    while let Some(shipped) = downloads.take_shipped() {
+        reported.push(shipped);
+    }
+    assert!(
+        reported.contains(&Shipped::RangeUnanswered { offset: 0x400 }),
+        "a recorder that said nothing and one that said no are different faults: \
+         {reported:?}"
+    );
+}
+
+#[test]
+fn a_second_read_is_not_made_while_a_frame_is_still_held() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x500, (RANGE_ANSWER_BYTES as u64) * 2)));
+    let now = advance_to_range(&channel, &mut downloads, &mut stage, 0x500, 0);
+    answer(&channel, &[1; 64], 1 << 20);
+    downloads.poll(at(now), &mut stage, true);
+    assert!(downloads.range_waiting().is_some());
+    // Every remaining turn of the rotation, so the claim is that no pass reads a
+    // second extent rather than that the next one happened not to.
+    for step in 0..MEDIUM_TURNS as u64 {
+        downloads.poll(at(now + 1 + step), &mut stage, true);
+        assert!(
+            range_asked(&channel).is_none_or(|asked| asked.2 != 0x500 + RANGE_ANSWER_BYTES as u64),
+            "there is one answer buffer, and reading a second over it would drop \
+             the first"
+        );
+    }
+}
+
+#[test]
+fn the_medium_is_shared_out_between_both_rings_and_one_range_answer() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x600, (RANGE_ANSWER_BYTES as u64) * 8)));
+    let mut readers = Vec::new();
+    // Three passes, each answered so nothing is held, is one full rotation.
+    for step in 0..3_u64 {
+        downloads.poll(at(step * 2), &mut stage, true);
+        {
+            let mut responder = channel.responder();
+            let demand = responder.take().expect("a request is out");
+            let seen = (
+                demand.sink().expect("a sink"),
+                demand.reader().expect("a reader"),
+                demand.offset(),
+            );
+            readers.push(seen);
+            // Refused, so no cursor moves and nothing is held: what this case is
+            // about is which participant was asked, not what came back.
+            responder.refuse(demand, DownloadRefusal::NotReady, 0, 0);
+        }
+        downloads.poll(at(step * 2 + 1), &mut stage, true);
+        // Drain whatever the refusal reported so the queue does not fill.
+        while downloads.take_shipped().is_some() {}
+        downloads.range_answered();
+    }
+    let ring_reads = readers
+        .iter()
+        .filter(|(_, reader, offset)| matches!(reader, DownloadReader::Ring) && *offset != 0x600)
+        .count();
+    let range_reads = readers
+        .iter()
+        .filter(|(_, _, offset)| *offset == 0x600)
+        .count();
+    assert_eq!(
+        (ring_reads, range_reads),
+        (2, 1),
+        "two of every three reads are a ring's and one is the answer's, so \
+         neither a peer starves the channel's own purpose nor the traffic \
+         starves an operator's request: {readers:?}"
+    );
+}
+
+#[test]
+fn an_operator_download_takes_the_medium_ahead_of_both_the_rings_and_an_answer() {
+    let channel = Channel::new();
+    let mut downloads = channel.downloads();
+    let mut stage = FakeStream::default();
+    downloads.wants(Some(want(0x700, 4096)));
+    stage.pending = Some(LOG_TARGET);
+    downloads.poll(at(0), &mut stage, true);
+    // The very first pass, so the rotation never gets a turn at all.
+    assert_eq!(
+        range_asked(&channel).map(|asked| asked.1),
+        Some(DownloadReader::Snapshot),
+        "an operator physically downloading a recording is asked for first, and \
+         the medium's own rotation is reached only on a pass where none is"
+    );
+}

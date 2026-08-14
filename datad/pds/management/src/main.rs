@@ -196,8 +196,9 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    DownloadReply, DownloadRequest, DownloadSink, LogConsume, LogRecords, ManagementDestination,
-    ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest, StatsRelay,
+    DownloadRefusal, DownloadReply, DownloadRequest, DownloadSink, LogConsume, LogRecords,
+    ManagementDestination, ManagementEndpoint, RelayFault, RelayRefusal, RelayReply, RelayRequest,
+    StatsRelay,
 };
 
 /// How many dataplane ports the build has, and so the bound a committed image's
@@ -280,6 +281,13 @@ fn relay_refusal(failure: RelayFailure) -> Refusal {
         RelayFailure::Faulted(RelayFault::AgreedUnknown { agreed }) => (
             "relay-agreed-unknown",
             RefusalDetail::One(u64::from(agreed)),
+        ),
+        // Its own token for the reason above it has one: an extent read as not
+        // wanted is an operator's request that answers nothing and says nothing,
+        // which is the one outcome a request-response surface must not have.
+        RelayFailure::Faulted(RelayFault::WantUnknown { wanted }) => (
+            "relay-wanted-unknown",
+            RefusalDetail::One(u64::from(wanted)),
         ),
         // The bound that was spent, in milliseconds, because the token alone
         // says a far end went quiet and not how long this end waited.
@@ -839,6 +847,33 @@ fn shipping_record(shipped: Shipped) -> DomainDetail {
             ),
             RefusalDetail::Two(claimed, durable),
         )),
+        // One token per cause and none per recording, unlike the four above.
+        // Which recording an extent was of is on the wire in the answer's own
+        // ring byte and in the request the operator made; the cause the mapping
+        // onto three wire statuses throws away is only here, so that is what the
+        // token spends itself on.
+        Shipped::RangeRefused { reason, offset } => DomainDetail::Refusal(Refusal {
+            cause: match reason {
+                DownloadRefusal::NotReady => "upstream-range-not-ready",
+                DownloadRefusal::OutOfRange => "upstream-range-out-of-range",
+                DownloadRefusal::Overrun => "upstream-range-overwritten",
+                DownloadRefusal::DeviceError => "upstream-range-medium-error",
+                DownloadRefusal::NoSuchSink => "upstream-range-no-such-recording",
+                DownloadRefusal::NoSuchReader => "upstream-range-no-such-reader",
+            },
+            detail: RefusalDetail::One(offset),
+            signalled: false,
+        }),
+        Shipped::RangeFaulted { offset } => DomainDetail::Refusal(Refusal {
+            cause: "upstream-range-faulted",
+            detail: RefusalDetail::One(offset),
+            signalled: false,
+        }),
+        Shipped::RangeUnanswered { offset } => DomainDetail::Refusal(Refusal {
+            cause: "upstream-range-unanswered",
+            detail: RefusalDetail::One(offset),
+            signalled: false,
+        }),
     }
 }
 

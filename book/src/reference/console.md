@@ -806,16 +806,15 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 27 the `management` domain raises, 47
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 172 the `crypto` domain
+`nic-driver` domain raises, 30 the `clock` domain raises, 36 the `management` domain raises, 47
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 185 the `crypto` domain
 raises, and 175 the `store` domain raises. A token outside all eight is a defect, not an extension.
-
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **One of those eight tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
-raise, so its table names both and its tokens are counted in each domain's total — 87 of the 172
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 185
 and 87 of the 175. Listing it twice would make a reader learn one vocabulary twice; attributing it
 to one domain would leave the other's records looking unnamed.
 
@@ -876,7 +875,7 @@ metrics surface.
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
-**`management`.** Twenty-one tokens, and the five groups differ in what they mean for the domain.
+**`management`.** Thirty-six tokens, and the groups differ in what they mean for the domain.
 
 The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
 its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
@@ -912,9 +911,10 @@ says which session ended and what it had carried, and with the `onboard-accepted
 which says what the port itself has done and refused. The `relay-refused-*` four are the terminating
 domain's own judgement, quoted rather than folded — an operator reads `relay-refused-no-connection`
 as this port having asked about a session that was never opened and `relay-refused-session-failed`
-as the other domain having given up on the protocol, and those are different places to go. The six
+as the other domain having given up on the protocol, and those are different places to go. The seven
 after them are answers this port **could not believe**, which accuse the terminating domain of not
-keeping to the channel. The last three are this appliance's own bounds: a far end that said nothing
+keeping to the channel — `relay-wanted-unknown` among them, an extent word this port could not
+decode, which it faults on rather than reading as a channel owing no extent. The last three are this appliance's own bounds: a far end that said nothing
 inside the answer timeout, a window this end found taken, and an answer that outgrew the room this
 port keeps for one.
 
@@ -928,7 +928,26 @@ Every one of the thirteen ends the connection an administrator was holding, and 
 touches anything else: the metric surface, the recordings, the configuration surface and the
 dataplane are unaffected, because the port they are on carries none of those.
 
-`signalled=` is always `false` on all twenty-one: no device was told to stop, because none was told
+The last eight are a **read of the medium made for a recording range read** that did not produce the
+extent the management server asked for. They ride on **`state=ready`** and end nothing but the answer:
+the channel stays up, the recordings keep shipping, and the server receives a frame stating that the
+extent could not be served. They exist because the wire cannot carry the cause — a range answer has
+three statuses and the recorder has six refusals — so `detail=` is the ring position the read was made
+at and the token is the cause the mapping threw away. Which recording it was is not in the token, and
+does not need to be: it is in the answer's own ring byte and in the request the operator made.
+
+`upstream-range-overwritten` is the only one an operator reads as ordinary: the ring has rolled past
+the extent, so those bytes are simply gone and the server is told so. `upstream-range-not-ready` is a
+recorder that has not finished coming up, and `upstream-range-out-of-range` an extent past the end of
+the recording — both a request that came too early or reached too far. `upstream-range-medium-error`
+is the medium itself refusing, which is the one to read beside the recorder domain's own tokens.
+`upstream-range-no-such-recording` and `upstream-range-no-such-reader` are **this appliance's own
+defect** — this port forms the request, so a recording or a coordinate the recorder does not have is a
+request this domain composed wrongly and should never appear. `upstream-range-faulted` is a reply this
+port could not believe and `upstream-range-unanswered` a recorder that said nothing inside the reply
+timeout: a byzantine neighbour and a silent one, which are different places to look.
+
+`signalled=` is always `false` on all thirty-six: no device was told to stop, because none was told
 anything.
 
 | group | tokens |
@@ -938,11 +957,12 @@ anything.
 | the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
 | nowhere to dial (a `ready` record, no `detail=`; the port serves everything else and opens no channel) | `dial-endpoint-unpublished` |
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
-| an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown` |
+| an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown`, `relay-wanted-unknown` |
 | this appliance's own bounds on that path (`detail=` is the answer timeout in milliseconds, nothing, and the bytes refused against the room there is) | `relay-unanswered`, `relay-window-busy`, `relay-answer-too-long` |
 | a recording that outran the channel's cursor, which carried on from where the recording now begins (`detail=` is the position that was lost and the position it resumed at) | `upstream-log-ring-resynchronised`, `upstream-capture-ring-resynchronised` |
 | a recording with durable bytes behind a cursor that is not moving, on a session that could carry them (`detail=` is the position and the bytes behind it) | `upstream-log-ring-stalled`, `upstream-capture-ring-stalled` |
 | a session that opened naming a resume point past the durable end of a recording, which the reader started from instead (`detail=` is the position the server named and the durable end it was cut to) | `upstream-log-resume-past-durable`, `upstream-capture-resume-past-durable` |
+| a read made for a recording range read that did not produce the extent (`detail=` is the ring position the read was made at) | `upstream-range-not-ready`, `upstream-range-out-of-range`, `upstream-range-overwritten`, `upstream-range-medium-error`, `upstream-range-no-such-recording`, `upstream-range-no-such-reader`, `upstream-range-faulted`, `upstream-range-unanswered` |
 
 **The `-resynchronised` tokens say history has gone past this appliance.** The recording had
 overwritten the position the channel's cursor stood at, so the reader carried on from the oldest byte
@@ -1064,6 +1084,9 @@ of a vector's contents.
 | taking delivery of an onboarding package, before a rule of it is read (`detail=` is the arena an upload needs and the arena that was free, on the first; the second carries none) | `upload-window-unavailable`, `upload-unprepared` |
 | the management channel this appliance dials, before a session can be opened on it (none carries a `detail=`) | `channel-identity-absent`, `channel-buffer-unavailable` |
 | a shipment of ring bytes this end would not compose into a frame (none carries a `detail=`) | `channel-shipment-too-long`, `channel-shipment-before-greeting`, `channel-shipment-not-taken` |
+| a recording range read this appliance will not serve, which ends the session that asked (none carries a `detail=`) | `channel-range-too-long`, `channel-range-empty`, `channel-range-end-past-space`, `channel-range-already-answering`, `channel-range-before-greeting` |
+| a range answer that ended for a reason other than being served whole (none carries a `detail=`) | `channel-range-overwritten`, `channel-range-medium-refused`, `channel-range-no-progress`, `channel-range-frames-exhausted` |
+| a frame of a range answer this end would not compose, which ends the session (none carries a `detail=`) | `channel-range-unasked`, `channel-range-position-moved`, `channel-range-chunk-too-long`, `channel-range-not-taken` |
 | an acknowledgement claiming more of a recording than this end has sent (`detail=` is the position claimed and the position sent) | `channel-ack-past-sent` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
 | a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-not-durable`, `channel-config-nothing-staged` |
@@ -1086,6 +1109,41 @@ on its way out than this design allows, so a whole frame would not fit behind wh
 ends the session rather than dropping the shipment, and the reason is that the cursor moves on the
 answer: a shipment dropped quietly would be a gap in the recording the management server has no way
 to notice. A re-dial ships the same bytes again.
+
+**The thirteen `channel-range-*` tokens are the recording range reads, and they fall into three
+groups that mean three different things.**
+
+The first five are **a request this appliance will not serve, and each ends the session that asked**.
+A range read is a remote peer asking this appliance to read its own medium, so every bound on it is a
+constant of this appliance's and a request past one is a protocol violation rather than a read that
+went badly — which is why none of them is answered with a status. `channel-range-too-long` is an
+extent longer than one request may ask for, and it is refused outright rather than cut down: a clamped
+extent would answer a question nobody asked, and the answer would be indistinguishable from a complete
+one. `channel-range-empty` is a request for no bytes at all, and `channel-range-end-past-space` an
+extent whose end does not fit a ring position — a server's arithmetic rather than a place on any
+medium. `channel-range-already-answering` is a second request arriving while one is still being
+answered: **one answer at a time is the bound on how many places at once a peer can have this
+appliance reading**, and a server that reaches past it is one this appliance stops talking to.
+`channel-range-before-greeting` is a request in front of the greeting.
+
+The next four say **an answer ended for a reason other than being served whole**, and none of them
+ends the session — the answer ended, the connection did not. `channel-range-overwritten` is the ring
+having rolled past the extent, which the server is told in the status too. The other three are all
+`medium-refused` on the wire, that being the only status which fits, and the token is the cause that
+would otherwise be lost: `channel-range-medium-refused` is the medium itself, `channel-range-no-progress`
+a read that produced nothing while bytes were still owed — which cannot be asked for again, a request
+re-asked with no progress being a loop a peer could pace — and `channel-range-frames-exhausted` the
+per-answer frame budget spent with the extent unserved. That last one **drops the chunk in hand rather
+than sending it**: a data frame with nothing after it is a short answer the requester could not tell
+from a gap, so this end states that it could not serve the extent instead.
+
+The last four are **this appliance's own halves disagreeing**, on the shipment tokens' terms, and each
+ends the session. `channel-range-unasked` is a frame of an answer to a request this end is not
+holding; `channel-range-position-moved` is the reader having read somewhere other than where the
+answer stands, which would place a run of a recording at a position it never came from — the one error
+an ingest cannot detect; `channel-range-chunk-too-long` is a chunk longer than one frame carries; and
+`channel-range-not-taken` is a session already holding more on its way out than a whole frame would fit
+behind.
 
 **`channel-ack-past-sent` is the server, and it is the one refusal on this channel whose being
 ignored would take the appliance down.** A management server acknowledges, per recording, how far it

@@ -242,6 +242,32 @@ for data; a `1` (the extent has been overwritten — overrun) or `2` (the medium
 carries no bytes and ends the answer, stating rather than truncating, exactly as the recording
 design requires of every reader.
 
+**The end of an answer is stated and never inferred from a gap.** A run of data frames ends either
+with the frame that completes the extent — the positions and lengths account for every byte the
+request asked for — or with a status frame saying the appliance could not serve it. There is no third
+ending, so a server waiting on an answer never has to decide how long to wait before concluding one
+finished.
+
+**A range read is a peer asking the appliance to read its own medium, so the appliance bounds it.**
+Three bounds, each a constant of the appliance rather than a number on the wire, and each the same on
+every appliance this project ships:
+
+* **At most 1 MiB of one ring per request** — a recording segment, and what one frame carries. A
+  request for more is refused outright rather than cut down to the bound: a clamped extent would be
+  answered as though it were the extent asked for.
+* **At most 1024 answer frames per request.** Reaching it ends the answer with status `2`.
+* **One answer in flight per session.** A DOWN_RANGE_READ arriving while an answer is in progress is a
+  protocol violation.
+
+**Upstream shipping outranks a range answer.** The rings' at-least-once catch-up is what the channel
+exists for, so a server that issues range reads back to back cannot slow it down: the appliance
+serves an answer out of the capacity shipping is not using, and an answer therefore progresses at the
+appliance's own pace rather than at the rate the server asks. A server that needs an extent quickly
+gets it quickly on an idle channel and no faster than shipping allows on a busy one.
+
+A request that breaks one of those rules, or that asks for an extent of zero bytes or one whose end
+does not fit a ring position, closes the connection as any other violation does.
+
 ## Reconnection
 
 The appliance re-dials on any close, with **bounded exponential backoff: one second initially,
@@ -254,7 +280,8 @@ committed configuration however long the channel is down.
 
 A protocol violation closes the connection, and nothing else happens: a nonzero reserved byte, an
 unknown frame type, a length over the bound, a frame in the wrong direction, a first frame that is
-not HELLO, a version mismatch, a malformed payload. The violation is counted and the connection is
+not HELLO, a version mismatch, a malformed payload, a range read past one of the appliance's bounds,
+and a range read arriving while an answer is still in flight. The violation is counted and the connection is
 closed — **never a panic**, on either end; the peer is external input like any other. The next dial
 starts the backoff schedule fresh only if the previous session reached a successful HELLO exchange;
 otherwise the schedule continues, so a server that closes every handshake cannot be made to invite a

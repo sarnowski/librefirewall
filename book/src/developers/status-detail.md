@@ -907,6 +907,34 @@ and wall-clock times. An independent parse of the two files established:
   one segment or a byte extent — the [management design](../design/management.md) serves recording
   range reads over the channel, and the download it replaces cannot even express one. A body over
   2 GiB is refused outright rather than served wrong.
+- **A range read over the channel is served, and is bounded by this appliance and not by the peer.**
+  The extent's three numbers are the management server's, so each is judged against a constant of
+  this appliance's before a byte of medium is read: one mebibyte per request — a recording segment,
+  and what one frame of this protocol carries — at most 1024 answer frames, and **one answer in
+  flight per session**, which is the bound on how many places at once a peer can have this appliance
+  reading its own medium. An extent past a bound is refused outright rather than clamped and the
+  session ends, a clamped extent being an answer to a question nobody asked and indistinguishable
+  from a complete one. Every path out of an answer either advances the extent or ends it with a
+  status: a read that produced nothing while bytes were still owed cannot be asked for again, and a
+  spent frame budget **drops the chunk in hand** rather than sending a data frame with nothing after
+  it, which a requester could not tell from a gap.
+- **The seam it needed runs the other way along an existing relay.** The domain that composes the
+  channel's frames holds no channel to the recorder — the domain that owns the network drives that —
+  so the extent still owed is published as three words of the relay reply's side-band and read as a
+  level on every answer, exactly as the acknowledgement cursors are, and the bytes come back as a
+  relay operation of its own. It is a **want and not a command**: nothing about it obliges a read,
+  which is what keeps an extent a peer asked for from outranking the shipping the channel exists for.
+  Neither region grew — the reply region already had the room — so **no capability moved** and the
+  system description is unchanged.
+- **Shipping and range answers are prioritised in two places, and both are stated.** A shipment in
+  hand goes before an answer frame in hand, because the at-least-once catch-up of the rings is what
+  the channel is for; and the medium itself is shared out between the two rings and one answer in
+  turn, so two of every three reads are a ring's and an answer still advances by a frame every third
+  read. An operator physically downloading a recording over the HTTP surface outranks all three,
+  which is the fairness that was already there. **Missing:** no booted node has been asked for an
+  extent, so the whole path is held together by unit and property cover on both domains rather than
+  by a scenario, and the management server can decode a range answer but offers an operator no way to
+  ask for one.
 - **Nothing is measured.** There is no Criterion bench on the tap or the recording path, nothing has
   been measured against the 10 Gbit/s target with recording on or off, and the segment size, the
   staging split and the two drain budgets are plausible numbers rather than measured ones. The tap
@@ -3121,19 +3149,21 @@ coverage. What the target cannot reach is stated where it lives: four encoder re
 *this end* composed wrongly, so no peer's stream produces one, and they are held in the crate's own
 suite instead.
 
-**The cryptography domain runs it over the channel's record layer, and the greeting and the two
-upstream recording frames are implemented above it.** The client and the decoder are one value because they are one session: the
+**The cryptography domain runs it over the channel's record layer, and the greeting, the two
+upstream recording frames, the recording range read and the three configuration operations are
+implemented above it.** The client and the decoder are one value because they are one session: the
 reassembly buffer is handed on from session to session, and a decoder that outlived its client would
 be reading the next server's bytes against the last one's greeting state. This end sends its greeting
 the moment the record layer will carry one; the server's greeting is what latches
 `channel-agreed=true`, and that latch is the single fact the redial schedule may start afresh on. **A
-frame that is not the greeting is counted and dropped**, deliberately not treated as a violation: a
-server that speaks the rest of the protocol to an appliance which has not shipped its half is a
-server running ahead of this build, and refusing it would turn an upgrade of one end into an outage of
-the pair. What bounds that generosity is the decoder, which holds one frame's worth and never two. A
-violation, by contrast, closes the connection and nothing else happens — there is no
-resynchronisation, because where the next header starts is exactly what has been lost — and the
-appliance re-dials under its own schedule.
+frame this build does not act on is counted and dropped**, deliberately not treated as a violation: a
+server that speaks a part of the protocol an appliance has not shipped yet is a server running ahead
+of this build, and refusing it would turn an upgrade of one end into an outage of the pair. No frame
+a server may send is in that case today — every one of the six is acted on — so what the tolerance
+buys is the next frame the protocol grows. What bounds that generosity is the decoder, which holds
+one frame's worth and never two. A violation, by contrast, closes the connection and nothing else
+happens — there is no resynchronisation, because where the next header starts is exactly what has
+been lost — and the appliance re-dials under its own schedule.
 
 **The upstream frames are composed here, out of semantic fields the domain that owns the network
 hands over.** That domain reads the recorder's window and has no vocabulary for a frame, so what
@@ -3147,19 +3177,20 @@ than being dropped, because the cursor at the other end moves on the answer: one
 quietly would be a gap in the recording nothing could notice, where ending the session costs a
 redial and re-ships the same position.
 
-**Seventeen console tokens on this domain and no metric.** Twelve are rules of the framing a
-management server broke, one per `Violation` variant and carrying no number, the context each has
-being a peer's own bytes; two are this appliance's own state — a node whose store published
-somewhere to dial and whose key holder produced no anchor, which is the two halves of an ownership
-disagreeing, and the reassembly buffer having never been allocated, which is this domain's own
-defect and should never appear; and three are shipments this end refused to compose, each ending
-the session that carried it. **No metric counts a violation yet**, and no scenario drives one:
-the counting the contract asks of a violation belongs with the domain that has a metric to count
-into, and the four boots that judge the channel point a real `openssl s_server` or a deliberate
-silence at the appliance — a peer that breaks the framing is not one `s_server` can be made to play.
-What is still missing above the greeting and the upstream frames is the rest of the session: the
-acknowledgement cursor, which is decoded and dropped rather than advancing anything, the flush
-cadence, and the commit-confirm over a fresh connection.
+**Twenty-four console tokens on the channel this domain carries, and no metric.** Twelve are rules
+of the framing a management server broke, one per `Violation` variant and carrying no number, the
+context each has being a peer's own bytes; two are this appliance's own state — a node whose store
+published somewhere to dial and whose key holder produced no anchor, which is the two halves of an
+ownership disagreeing, and the reassembly buffer having never been allocated, which is this domain's
+own defect and should never appear; three are shipments this end refused to compose, each ending the
+session that carried it; one is an acknowledgement past what this end has sent, said once per session
+however often a server repeats the claim; and six are the range read — a request this appliance will
+not serve, and a frame of an answer that does not match the request in hand. **No metric counts a
+violation yet**, and no scenario drives one: the counting the contract asks of a violation belongs
+with the domain that has a metric to count into, and the six boots that judge the channel point a
+real `openssl s_server`, a deliberate silence, or a carried medium at the appliance — a peer that
+breaks the framing is not one `s_server` can be made to play. What is still missing above the frames
+themselves is the flush cadence.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two

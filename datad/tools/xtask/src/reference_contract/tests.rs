@@ -116,6 +116,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
             "pds/crypto/src/configuration.rs",
             &["channel-config-unanswered"],
         ),
+        ("crates/pd-runtime/src/range.rs", &["channel-range-empty"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         (
             "crates/package/src/refusal.rs",
@@ -165,6 +166,7 @@ fn sound_console() -> String {
                     "upload-window-unavailable",
                     "channel-version-mismatch",
                     "channel-config-unanswered",
+                    "channel-range-empty",
                     "install-endpoint-loopback",
                 ][..],
             ),
@@ -202,6 +204,7 @@ fn sound_console() -> String {
                     "upload-window-unavailable",
                     "channel-version-mismatch",
                     "channel-config-unanswered",
+                    "channel-range-empty",
                 ][..],
             ),
             (
@@ -319,6 +322,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
                 "upload-window-unavailable",
                 "channel-version-mismatch",
                 "channel-config-unanswered",
+                "channel-range-empty",
                 "install-endpoint-loopback",
             ],
         ),

@@ -424,8 +424,7 @@ pub struct SubmissionCounters {
     pub applied: u64,
     pub refused: u64,
     pub unchanged: u64,
-    /// The three the management channel's two-step path produces and the one-step
-    /// path cannot.
+    /// The three the channel's two-step path produces and the one-step cannot.
     pub staged: u64,
     pub confirmed: u64,
     pub reverted: u64,
