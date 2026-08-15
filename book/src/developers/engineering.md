@@ -325,13 +325,12 @@ the recording and look at the packets. Every QEMU scenario leaves its downloads 
 `make test-system` run the evidence is already on disk. Use the surfaces while developing, not only
 at the end.
 
-The three surfaces in that table are also cross-checkable, and that is where they earn the
-most: the
-recorder's own record counts, the packet blocks in each recording, and the frames the harness put
-on the wire all describe one traffic stream from three independent vantage points, so a fault that
-hides inside any one of them shows up as a disagreement between two. `xtask::surface_contract`
-holds them to exactly that; when you add a surface, add its agreement with the others rather than a
-second isolated smoke check.
+The surfaces in that table are also cross-checkable, and that is where they earn the most: the
+packet blocks in each recording, the policy the image was built from, and the frames the harness put
+on the wire all describe one traffic stream from independent vantage points, so a fault that hides
+inside any one of them shows up as a disagreement between two. `xtask::surface_contract` holds them
+to exactly that; when you add a surface, add its agreement with the others rather than a second
+isolated smoke check.
 
 Two working rules follow:
 

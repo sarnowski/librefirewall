@@ -110,7 +110,6 @@ fn judged(snapshots: &[Snapshot]) -> Result<Agreement, String> {
     judge(
         "the connection history",
         snapshots,
-        &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
         &demanded(),
     )
@@ -187,7 +186,6 @@ fn a_reading_of_another_slot_count_is_refused() {
     let error = judge(
         "the connection history",
         &[reading(3, |_| 0)],
-        &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
         &demanded(),
     )
@@ -258,7 +256,6 @@ fn a_resumed_extent_is_not_held_to_rising_counters() {
     let agreement = judge(
         "the connection history",
         &[raised, sound()],
-        &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
         &Demanded {
             resumed_medium: true,
@@ -393,7 +390,6 @@ fn an_owned_boot_whose_reading_accounts_for_nothing_is_a_finding() {
     let error = judge(
         "the connection history",
         &[held],
-        &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
         &no_wire,
     )
@@ -418,7 +414,6 @@ fn an_unowned_boot_refuses_under_one_reason_and_no_other() {
         judge(
             "the connection history",
             &[held],
-            &[],
             lfw_metrics::CATALOGUE_FINGERPRINT,
             &unowned(0),
         )
@@ -507,117 +502,11 @@ fn a_timer_that_never_fired_and_one_that_fired_faster_than_it_was_armed() {
 }
 
 #[test]
-fn a_counter_no_larger_than_the_scrape_agrees_and_one_larger_does_not() {
-    let held = sound();
-    for scraped in [RECORDER_SECTORS, RECORDER_SECTORS + 1, u64::MAX] {
-        assert!(
-            judge(
-                "the connection history",
-                std::slice::from_ref(&held),
-                &[Agreed {
-                    summed: false,
-                    series: capacity(),
-                    scraped,
-                    constant: false,
-                }],
-                lfw_metrics::CATALOGUE_FINGERPRINT,
-                &demanded(),
-            )
-            .is_ok(),
-            "a reading of {RECORDER_SECTORS} against a scrape of {scraped}"
-        );
-    }
-
-    let error = judge(
-        "the connection history",
-        std::slice::from_ref(&held),
-        &[Agreed {
-            summed: false,
-            series: capacity(),
-            scraped: RECORDER_SECTORS - 1,
-            constant: false,
-        }],
-        lfw_metrics::CATALOGUE_FINGERPRINT,
-        &demanded(),
-    )
-    .expect_err("a recording claiming more than the appliance counted");
-    assert!(error.contains("never happened"), "{error}");
-}
-
-/// The scrape's own half of the off-by-one catch, which stands while there are
-/// two renderings of one set of shards to compare.
-#[test]
-fn a_constant_must_be_equal_in_both_directions() {
-    let held = sound();
-    assert!(
-        judge(
-            "the connection history",
-            std::slice::from_ref(&held),
-            &[Agreed {
-                summed: false,
-                series: capacity(),
-                scraped: RECORDER_SECTORS,
-                constant: true,
-            }],
-            lfw_metrics::CATALOGUE_FINGERPRINT,
-            &demanded(),
-        )
-        .is_ok()
-    );
-    for scraped in [RECORDER_SECTORS - 1, RECORDER_SECTORS + 1] {
-        assert!(
-            judge(
-                "the connection history",
-                std::slice::from_ref(&held),
-                &[Agreed {
-                    summed: false,
-                    series: capacity(),
-                    scraped,
-                    constant: true,
-                }],
-                lfw_metrics::CATALOGUE_FINGERPRINT,
-                &demanded(),
-            )
-            .is_err(),
-            "a constant of {RECORDER_SECTORS} was accepted against a scrape of {scraped}"
-        );
-    }
-}
-
-#[test]
-fn the_evidence_names_every_slot_it_compared() {
-    let at = slot_of(&capacity()).expect("declared");
-    let agreement = judge(
-        "the connection history",
-        &[sound()],
-        &[Agreed {
-            summed: false,
-            series: capacity(),
-            scraped: RECORDER_SECTORS,
-            constant: true,
-        }],
-        lfw_metrics::CATALOGUE_FINGERPRINT,
-        &demanded(),
-    )
-    .expect("agreed");
-    let evidence = agreement.evidence();
-    assert!(evidence.contains(&format!("slot {at}")), "{evidence}");
-    assert!(
-        evidence.contains("librefirewall_block_capacity_sectors"),
-        "{evidence}"
-    );
-    assert!(
-        evidence.contains(&format!("reads {RECORDER_SECTORS}")),
-        "{evidence}"
-    );
-}
-
-#[test]
 fn a_family_that_spans_pipelines_is_summed_rather_than_read_at_one_slot() {
     // The fault a per-slot read would pass: one pipeline counting twice and the
     // other never leaves either slot plausible and only the total wrong. The
-    // exposition sums the family over its pipelines, so the reading must be the
-    // same quantity or the two are not comparable at all.
+    // wire count a family is held to is the whole appliance's, so the reading it
+    // is compared against has to be the whole family's too.
     // The family is labelled by pipeline *and* reason, so one reason alone
     // still spans every pipeline — which is the case a slot lookup cannot even
     // name, its match being on the whole label set.

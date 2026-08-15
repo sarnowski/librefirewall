@@ -750,51 +750,65 @@ LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
 **What the gate proves.** Every scenario whose management port is reachable — 20 of the 37 system
-scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
-scenario drives, `curl`s `/metrics`, and reads **both recording extents straight off the disk image
-after shutdown**, holding the exposition, the two recordings and the wire to **each other**
-(`datad/tools/xtask/src/surface_contract.rs`). The recordings are the medium's own bytes, bounded by each
-extent's superblock durable cursor, so what every other account is compared against is the one
-account nothing inside the guest composed for a reader: every record
+scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic
+every other scenario drives, `curl`s `/metrics`, and reads **both recording extents straight off the
+disk image after shutdown**, holding the two recordings, the policy the image was built from and the
+wire to **each other** (`datad/tools/xtask/src/surface_contract.rs`). The recordings are the
+medium's own bytes, bounded by each extent's superblock durable cursor, so what every other account
+is compared against is the one account nothing inside the guest composed for a reader: every record
 of the connection history *of a frame* pairs into the capture by `epb_packetid` and none of it names
-no event, the one record that is about no frame is held instead to claiming none of the four things a
-frame has, neither recording exceeds the record count the recorder publishes for that sink, every
-injected probe appears in the capture byte-identically, and no block carries bytes the harness never
-injected. On top
-of that the decision each record carries is judged as bytes: every record carries the PEN-tagged
-annotation at the layout version this build writes; the verdict it states agrees with what the harness
-independently watched that probe do on the wire; a rule it names is one the exposition credits with a
-hit under the id the document gave it; a refusal it names is one the exposition counted at least as
-often; a close names a state a conversation does not leave and an earlier record opens the same
-conversation; and the lifecycle or policy event each probe had to cause is in the history, on the
-packet that caused it. A fault that hides inside any one surface shows up as a disagreement between
-two. The harness walks the medium's bytes block by block *by the lengths the file states* — the
-discipline a reader actually depends on — and holds the capture to carrying at least as many packet
-blocks as frames the harness put across the appliance, the history to at least as many as the events
-its probes owe, and neither to a captured length past its sink's snap length. Afterwards it reads the two extents straight off the disk image and requires
-each to carry a decodable superblock and a walkable recording. Two paths to one artifact, neither of
-them the appliance's own account of itself.
+no event, the one record that is about no frame is held instead to claiming none of the four things
+a frame has, every injected probe appears in the capture byte-identically, and no block carries
+bytes the harness never injected. On top of that the decision each record carries is judged as
+bytes: every record carries the PEN-tagged annotation at the layout version this build writes; the
+verdict it states agrees with what the harness independently watched that probe do on the wire; a
+refusal it names is one this build's tap ABI has a word for; a close names a state a conversation
+does not leave and an earlier record opens the same conversation; and the lifecycle or policy event
+each probe had to cause is in the history, on the packet that caused it. A fault that hides inside
+any one surface shows up as a disagreement between two. The harness walks the medium's bytes block
+by block *by the lengths the file states* — the discipline a reader actually depends on — and holds
+the capture to carrying at least as many packet blocks as frames the harness put across the
+appliance, the history to at least as many as the events its probes owe, and neither to a captured
+length past its sink's snap length. Afterwards it reads the two extents straight off the disk image
+and requires each to carry a decodable superblock and a walkable recording. Two paths to one
+artifact, neither of them the appliance's own account of itself.
 
-**A rule annotation is held to the policy as well as to the counter.** The rule-hit join above is one
-of the appliance's own totals against another, and there is a fault it cannot see at all: a denial
-credited to the rule that *accepts* raises that rule's hit count and the denial counter together, so
-the two agree and the join passes over it. Beside that join the gate therefore holds each record's
-own verdict to the document the image was built from and to the probe set the harness chose — a
-position past the rules the policy in force declares, a denial attributing itself to no rule or a
-fallthrough attributing itself to one, the accepting rule on a refused record or the dropping rule on
-a forwarded one, and any rule at all on a boot of an appliance nobody owns are each a finding on the
-first record that shows it, reached without consulting a counter. The filter's two refusals must also
-appear in the capture exactly where this boot's probes provoked them, and the absence is the stronger
-half: a refusal on a boot that injected nothing capable of provoking one is a frame nobody put on the
-wire or a stage refusing in another stage's name, which no counter reports because every counter
-involved is merely non-zero and consistent. The attribution law stands down on a boot that ran two
-policies, the submitted document keeping both rule ids and exchanging their actions so that each rule
-legitimately accrues records under both verdicts. All of it is stated over the records *this* boot
-appended, so a medium an earlier boot wrote answers for its own decisions and not for these. This is
-the account of a rule's work that does not depend on the exposition: the per-rule hit family cannot
-become a metric reading, its labels being the running document's text rather than a closed
-catalogue, so the counter join is the half of the pair with an expiry date on it and this is the half
-without one.
+**A rule annotation is held to the policy, and to nothing else.** It used to be held to a counter
+as well — a rule's position in the record joined to `librefirewall_rule_hits_total` under the id the
+document gave it — and that join was one of the appliance's own totals against another, with a fault
+it could not see at all: a denial credited to the rule that *accepts* raises that rule's hit count
+and the denial counter together, so the two agree and the join passes over it. What the gate holds
+instead is each record's own verdict, against the document the image was built from and the probe set
+the harness chose — a position past the rules the policy in force declares, a denial attributing
+itself to no rule or a fallthrough attributing itself to one, the accepting rule on a refused record
+or the dropping rule on a forwarded one, and any rule at all on a boot of an appliance nobody owns
+are each a finding on the first record that shows it, reached without consulting a counter. The
+filter's two refusals must also appear in the capture exactly where this boot's probes provoked them,
+and the absence is the stronger half: a refusal on a boot that injected nothing capable of provoking
+one is a frame nobody put on the wire or a stage refusing in another stage's name, which no counter
+reports because every counter involved is merely non-zero and consistent. The attribution law stands
+down on a boot that ran two policies, the submitted document keeping both rule ids and exchanging
+their actions so that each rule legitimately accrues records under both verdicts. All of it is stated
+over the records *this* boot appended, so a medium an earlier boot wrote answers for its own
+decisions and not for these. Nothing was lost with the join, and it could not have been kept in any
+case: the per-rule hit family cannot become a metric reading, its labels being the running document's
+text rather than a closed catalogue.
+
+**What the gate no longer proves about a recording, and why nothing replaces it.** Two counter
+comparisons went with the exposition. A recording used to be held to
+`librefirewall_recording_records_total` for its sink and to
+`librefirewall_forwarded_frames_total`/`librefirewall_route_drops_total` for the decisions its records
+state — each an inequality in one direction, a recording being allowed to hold fewer than the
+appliance counted and never more. **There is no sound replacement, and stating one would fail honest
+runs.** The obvious candidate is the metric reading the recording itself carries, and it does not
+work: the relay the readings cross is push-based, the recorder framing whatever the management domain
+last settled and at most one reading per pass, so a block's counters are older than the block by an
+unbounded amount — a real boot produces a reading reporting no encoded record with records already
+standing ahead of it. What still holds is the one relation whose other side is not a counter at all:
+a resumed extent may not offer fewer records than the harness read off that medium *before* the boot,
+which is the same bytes at two instants and is exact. The vocabulary bound survived the refusal
+comparison it sat inside — a reason outside this build's tap ABI is wrong whatever any counter says —
+and the record contents are judged against the medium's own bytes throughout.
 
 **What the demonstration showed.** Separately from the gate, and by hand, the published release disk
 was booted under OVMF with a 64 MiB virtio-blk data device attached at 00:05.0, and 14 routable

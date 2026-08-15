@@ -1,23 +1,23 @@
 //! What a booted appliance's metric readings must be.
 //!
 //! The recorder writes the whole metric surface into the connection history as a
-//! PEN-tagged Custom Block, and that block is on its way to being the only way a
-//! counter leaves this node. So the weight of this contract has moved: it used to
-//! rest on the reading agreeing with the `GET /metrics` exposition the same boot
-//! answered, and it now rests on three things the appliance did not compose — the
-//! frames the harness itself put on the wire, the geometry of the disk images the
-//! harness itself created, and the ownership word the harness wrote onto the
-//! medium the appliance booted from. The agreement with the exposition is still
-//! held below, for as long as there is an exposition to hold it to.
+//! PEN-tagged Custom Block, and that block is how a counter leaves this node.
+//! The whole weight of this contract rests on three things the appliance did not
+//! compose — the frames the harness itself put on the wire, the geometry of the
+//! disk images the harness itself created, and the ownership word the harness
+//! wrote onto the medium the appliance booted from.
 //!
 //! # Why an outside anchor rather than a second rendering
 //!
-//! The scrape and the reading are two renderings of one set of shards, so they
-//! agree with each other about anything that went wrong upstream of both: a slot
-//! a domain published at the wrong offset reads the same on either surface, and
-//! the pair is silent. What the agreement does catch is a defect inside one
-//! renderer, which is worth having and is why it stays while it can. What it
-//! cannot catch is exactly what the three anchors below can.
+//! A reading used to be held to the `GET /metrics` exposition the same boot
+//! answered, and that agreement is gone rather than replaced. It was worth
+//! having and it was never the load-bearing half: the scrape and the reading are
+//! two renderings of one set of shards, so they agree with each other about
+//! anything that went wrong upstream of both — a slot a domain published at the
+//! wrong offset reads the same on either surface, and the pair is silent. What
+//! it did catch was a defect inside one renderer. What it could not catch is
+//! exactly what the three anchors below can, and those are stated against
+//! something the appliance never chose.
 //!
 //! # The three anchors, and why each is outside the appliance
 //!
@@ -70,7 +70,6 @@
 //! constant may carry no number but its device's. Two back-to-back scrapes could
 //! state the first of those over milliseconds; a file states it over a whole run.
 
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use lfw_metrics::{SHARDS, Series};
@@ -81,11 +80,11 @@ use crate::recording_contract::Snapshot;
 /// One slot's identity, as a caller names it: the shard's domain, the family,
 /// and the labels that pick the series out within it.
 ///
-/// Borrowed rather than `'static`, because the labels a caller names are not
-/// all fixed at compile time: a drop reason comes out of this build's
-/// vocabulary and a rule id out of the document under test, and a contract that
-/// could only name a literal would be one that stopped short of exactly the
-/// series a configuration decides.
+/// Borrowed rather than `'static`, because a name a caller wants to reach a
+/// slot by need not be fixed at compile time: a drop reason comes out of this
+/// build's vocabulary and a rule id out of the document under test, and a
+/// lookup that could only name a literal would stop short of exactly the series
+/// a configuration decides.
 #[derive(Debug)]
 pub struct SeriesAt<'a> {
     pub domain: &'a str,
@@ -94,8 +93,7 @@ pub struct SeriesAt<'a> {
 }
 
 /// Every series of one family, wherever the catalogue puts it and whatever else
-/// labels it — the reading's counterpart to an exposition summed over its
-/// pipelines.
+/// labels it.
 ///
 /// Several families carry one series per pipeline, and what a recording is held
 /// to is the total across them: a per-pipeline slot compared alone would pass an
@@ -277,26 +275,6 @@ pub struct Demanded<'a> {
     pub drop_reasons: &'a [&'a str],
 }
 
-/// One agreement the reading and the still-standing scrape must satisfy.
-///
-/// The weaker half of this contract and the one with a date on it: it holds two
-/// renderings of one set of shards to each other, which is worth having while
-/// there are two and says nothing once there is one. Everything above it is
-/// stated against something outside the appliance and outlives the exposition.
-#[derive(Debug)]
-pub struct Agreed<'a> {
-    pub series: SeriesAt<'a>,
-    /// Whether the reading is the sum of every series of the family the labels
-    /// select, rather than one slot. `true` for a family the exposition itself
-    /// sums over its pipelines, so the two sides are the same quantity.
-    pub summed: bool,
-    /// What the scrape reported for it.
-    pub scraped: u64,
-    /// Whether the two must be equal, or whether the reading may only be no
-    /// larger — see the module header.
-    pub constant: bool,
-}
-
 /// What the comparison established, for a run log to carry.
 #[derive(Debug)]
 pub struct Agreement {
@@ -307,8 +285,8 @@ impl Agreement {
     #[must_use]
     pub fn evidence(&self) -> String {
         let mut out = String::from(
-            "  the metric readings the connection history carries, held to the wire, the disk, \
-             this boot's own bench and the same boot's scrape:",
+            "  the metric readings the connection history carries, held to the wire, the disk \
+             and this boot's own bench:",
         );
         for line in &self.lines {
             out.push('\n');
@@ -319,16 +297,14 @@ impl Agreement {
 }
 
 /// Hold every reading a recording carries to what this boot can be shown to have
-/// done, and then to the boot's own scrape.
+/// done.
 ///
 /// # Errors
 /// A recording with no reading at all, a reading whose fingerprint or slot count
-/// is not this build's, any relation in the module header that does not hold, or
-/// any named series where the reading and the scrape disagree.
+/// is not this build's, or any relation in the module header that does not hold.
 pub fn judge(
     target: &str,
     snapshots: &[Snapshot],
-    agreed: &[Agreed],
     fingerprint: u32,
     demanded: &Demanded,
 ) -> Result<Agreement, String> {
@@ -394,68 +370,6 @@ pub fn judge(
     lines.push(judge_signatures(target, last)?);
     lines.push(judge_traffic(target, last, demanded)?);
     lines.push(judge_ticks(target, snapshots, demanded.booted_for)?);
-
-    for want in agreed {
-        let (at, held) = if want.summed {
-            let total =
-                total_of(last, want.series.family, want.series.labels).ok_or_else(|| {
-                    format!(
-                        "{target}'s last reading carries no slot of {} under {:?} at all, so the \
-                     catalogue has moved the family this contract names",
-                        want.series.family, want.series.labels
-                    )
-                })?;
-            (None, total)
-        } else {
-            let at = slot_of(&want.series)?;
-            let held = last.slot(at).ok_or_else(|| {
-                format!(
-                    "{target}'s last reading has no slot {at}, which is where {} sits",
-                    want.series.family
-                )
-            })?;
-            (Some(at), held)
-        };
-        let ok = if want.constant {
-            held == want.scraped
-        } else {
-            held <= want.scraped
-        };
-        if !ok {
-            let relation = if want.constant { "equal" } else { "at most" };
-            return Err(format!(
-                "{target}'s last reading puts {} of the {} domain at {held}, and the same \
-                 boot's scrape reports {}; the recording must be {relation} the scrape — a \
-                 recording claiming more than the appliance counted describes work that never \
-                 happened",
-                want.series.family, want.series.domain, want.scraped
-            ));
-        }
-        let mut line = String::new();
-        let _ = write!(
-            line,
-            "    {}: {}{{domain=\"{}\"{}}} reads {held} in the recording and {} in the \
-             scrape ({})",
-            match at {
-                Some(at) => format!("slot {at}"),
-                None => format!("every slot of the family under {:?}", want.series.labels),
-            },
-            want.series.family,
-            want.series.domain,
-            want.series
-                .labels
-                .iter()
-                .map(|(name, value)| format!(",{name}=\"{value}\""))
-                .collect::<String>(),
-            want.scraped,
-            if want.constant {
-                "a constant, so equal"
-            } else {
-                "a counter, so no larger"
-            }
-        );
-        lines.push(line);
-    }
     Ok(Agreement { lines })
 }
 

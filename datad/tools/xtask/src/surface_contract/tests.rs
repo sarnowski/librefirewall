@@ -146,36 +146,12 @@ fn reason_code(name: &str) -> u8 {
     u8::try_from(at + 1).expect("the vocabulary fits a byte")
 }
 
-/// The exposition a sound run answers: enough forwarding and enough hits for
-/// every record the recordings hold.
-fn published() -> Published {
-    Published {
-        forwarded_frames: 100,
-        drop_reasons: DROP_REASONS
-            .iter()
-            .map(|reason| ((*reason).to_owned(), Some(100)))
-            .collect(),
-        // The same document [`DECLARED`] states, in the same order: the counter
-        // join reads a hit total per id off this and the per-record attribution
-        // reads the positions off that, so a fixture whose two accounts described
-        // different documents would make either law fire for the other's reason.
-        rules: DECLARED
-            .iter()
-            .map(|id| DeclaredRule {
-                id: (*id).to_owned(),
-                hits: Some(4),
-            })
-            .collect(),
-    }
-}
-
 /// The rule ids the synthetic document declares, in the order the filter decides
 /// them — which is the position a record names.
 ///
-/// The accepting rule first, because [`published`] names position 0
-/// `probe-forward` and [`opening`] credits it: the counter join and the
-/// per-record attribution have to be reading one document, or a case that
-/// perturbs a rule would be perturbing two different ones.
+/// The accepting rule first, because [`opening`] credits position 0: the
+/// document and the annotations under test have to describe one policy, or a
+/// case that perturbs a rule would be perturbing a different one.
 const DECLARED: [&str; 2] = ["probe-forward", "probe-blocked"];
 
 /// The position [`opening`] credits, which is the accepting rule's.
@@ -228,22 +204,20 @@ fn witness() -> PolicyWitness {
 /// station that retransmitted once would produce.
 const SOUND: &[(u64, usize)] = &[(0, 0), (1, 1), (2, 0), (3, 1)];
 
-fn log_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
+fn log_surface(parsed: &Parsed) -> Surface<'_> {
     Surface {
         recording: LOG_RECORDING,
         snap_len: LOG_SNAP,
         parsed,
-        published_records: published,
         carried: None,
     }
 }
 
-fn capture_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
+fn capture_surface(parsed: &Parsed) -> Surface<'_> {
     Surface {
         recording: CAPTURE_RECORDING,
         snap_len: CAPTURE_SNAP,
         parsed,
-        published_records: published,
         carried: None,
     }
 }
@@ -271,12 +245,10 @@ fn two_recordings_of_the_same_traffic_agree() {
     let capture = recording(CAPTURE_SNAP, SOUND);
     let probes = injected();
     let agreement = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("a sound pair");
     assert_eq!(agreement.paired, 4);
@@ -302,12 +274,10 @@ fn a_connection_history_shorter_than_the_capture_is_the_selection() {
     let capture = recording(CAPTURE_SNAP, SOUND);
     let probes = injected();
     let agreement = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("a selection is not a lost observation");
     assert_eq!(agreement.paired, 2);
@@ -323,12 +293,10 @@ fn a_connection_history_longer_than_the_capture_is_a_finding() {
     let capture = recording(CAPTURE_SNAP, &SOUND[..3]);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a selection cannot be larger than what it selects from");
     assert!(error.contains("holds 4 record(s)"), "{error}");
@@ -344,12 +312,10 @@ fn an_unpaired_packet_id_is_a_finding_even_at_an_equal_count() {
     let capture = recording(CAPTURE_SNAP, &[(0, 0), (1, 1), (2, 0), (99, 1)]);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("an identity in the history and not the capture is fabrication");
     assert!(error.contains("does not pair"), "{error}");
@@ -380,12 +346,10 @@ fn a_history_record_naming_no_event_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a record for its own sake is the packet log this is not");
     assert!(
@@ -423,12 +387,10 @@ fn an_event_the_probes_oblige_and_the_history_lacks_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("the opening the probe had to cause is not in the history");
     assert!(
@@ -456,88 +418,14 @@ fn a_verdict_disagreeing_with_the_wire_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("the harness watched that probe come back on the far port");
     assert!(error.contains("under verdict 1"), "{error}");
     assert!(error.contains("come back on the far port"), "{error}");
-}
-
-/// A record naming a rule the appliance credits with no hit: two accounts of one
-/// match, disagreeing.
-#[test]
-fn a_rule_the_exposition_credits_with_no_hit_is_a_finding() {
-    let log = recording(LOG_SNAP, SOUND);
-    let capture = recording(CAPTURE_SNAP, SOUND);
-    let probes = injected();
-    let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
-        &wire(&probes),
-        &Published {
-            rules: vec![DeclaredRule {
-                id: "probe-forward".to_owned(),
-                hits: Some(0),
-            }],
-            ..published()
-        },
-        &policy(),
-        true,
-    )
-    .expect_err("a record crediting a rule that never ran");
-    assert!(error.contains("credits it with no hit"), "{error}");
-    assert!(error.contains("probe-forward"), "{error}");
-}
-
-/// A record refused for a reason the exposition never counted: a recording
-/// describing refusals the appliance never made.
-#[test]
-fn a_refusal_the_exposition_never_counted_is_a_finding() {
-    let log = recording(LOG_SNAP, SOUND);
-    let mut capture = recording(CAPTURE_SNAP, SOUND);
-    for packet in &mut capture.packets {
-        packet.annotation = Some(Annotation {
-            verdict: VERDICT_DROPPED,
-            drop_reason: reason_code("flow_mid_stream"),
-            event: EVENT_FLOW_REFUSED,
-            classification: 0,
-            flow_state: 0,
-            flow_slot: 0,
-            flow_generation: 0,
-            rule: 0,
-            ..opening(0, 0)
-        });
-        packet.verdict = Some(vec![VERDICT_KIND, VERDICT_DROPPED]);
-    }
-    let probes: Vec<Injected> = injected()
-        .into_iter()
-        .map(|injected| Injected {
-            verdict: VERDICT_DROPPED,
-            event: None,
-            ..injected
-        })
-        .collect();
-    let mut drop_reasons = published().drop_reasons;
-    drop_reasons.insert("flow_mid_stream".to_owned(), Some(1));
-    let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
-        &wire(&probes),
-        &Published {
-            drop_reasons,
-            ..published()
-        },
-        &policy(),
-        true,
-    )
-    .expect_err("four records of a refusal the appliance counted once");
-    assert!(error.contains("refused as \"flow_mid_stream\""), "{error}");
-    assert!(error.contains("the appliance counted 1"), "{error}");
 }
 
 /// A close with no open of the same identity ahead of it: a history describing
@@ -563,12 +451,10 @@ fn a_close_with_no_matching_open_is_a_finding() {
     ));
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a close naming a conversation nothing opened");
     assert!(error.contains("no earlier record opens it"), "{error}");
@@ -596,12 +482,10 @@ fn a_close_that_does_not_say_how_is_a_finding() {
     ));
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a close must name a state a conversation does not leave");
     assert!(error.contains("does not say how"), "{error}");
@@ -638,12 +522,10 @@ fn an_advance_classified_new_or_naming_a_rule_is_a_finding() {
         log.packets.push(record(LOG_SNAP, 1, 0, annotation));
         let probes = injected();
         let error = judge(
-            &log_surface(&log, 4),
-            &capture_surface(&capture, 4),
+            &log_surface(&log),
+            &capture_surface(&capture),
             &wire(&probes),
-            &published(),
             &policy(),
-            true,
         )
         .expect_err("an advance the filter is claimed to have decided");
         assert!(error.contains(clause), "{error}");
@@ -661,12 +543,10 @@ fn a_record_carrying_no_annotation_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a record without the decision is not evidence of one");
     assert!(
@@ -686,12 +566,10 @@ fn a_standard_verdict_option_disagreeing_with_the_annotation_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("two statements of one decision, disagreeing");
     assert!(error.contains("disagree about one decision"), "{error}");
@@ -715,12 +593,10 @@ fn a_packet_the_harness_never_injected_is_a_finding() {
     log.packets.push(capture.packets[4].clone());
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 5),
-        &capture_surface(&capture, 5),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a block matching no injected frame is fabrication");
     assert!(
@@ -749,12 +625,10 @@ fn a_packet_block_that_retained_no_byte_is_a_finding() {
     log.packets.push(capture.packets[4].clone());
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 5),
-        &capture_surface(&capture, 5),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("an empty capture is no prefix of anything");
     assert!(
@@ -790,12 +664,10 @@ fn a_log_capture_past_the_snap_length_is_a_finding() {
     ]
     .concat();
     let error = judge(
-        &log_surface(&log, 5),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a log block keeping 200 bytes at a snap length of 128 is unclamped");
     assert!(error.contains("keeps 200 captured byte(s)"), "{error}");
@@ -844,12 +716,10 @@ fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way()
     let log = block(LOG_SNAP as usize);
     let capture = block(CAPTURE_SNAP as usize);
     let agreement = judge(
-        &log_surface(&log, 1),
-        &capture_surface(&capture, 1),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("each sink keeping its own snap length of one frame is the contract");
     assert_eq!(agreement.probes_matched, 1);
@@ -868,18 +738,15 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
     let error = judge(
         &Surface {
             recording: LOG_RECORDING,
-            // The sink this download came from keeps 128, and the file it
-            // answered declares 2048 — which is the duplicate showing.
+            // The sink this extent belongs to keeps 128, and the file on it
+            // declares 2048 — which is the duplicate showing.
             snap_len: LOG_SNAP,
             parsed: &log,
-            published_records: 4,
             carried: None,
         },
-        &capture_surface(&capture, 4),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("one ring under two names is one recording");
     assert!(
@@ -888,32 +755,11 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
     );
 }
 
-/// A recorder answering more than it says it encoded. The only direction of the
-/// metric comparison that is a finding, and the reason it is stated as an
-/// inequality.
-#[test]
-fn a_recording_holding_more_than_the_recorder_published_is_a_finding() {
-    let log = recording(LOG_SNAP, SOUND);
-    let capture = recording(CAPTURE_SNAP, SOUND);
-    let probes = injected();
-    let error = judge(
-        &log_surface(&log, 2),
-        &capture_surface(&capture, 4),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        true,
-    )
-    .expect_err("four blocks against two encoded records is fabrication");
-    assert!(error.contains("answers 4 packet block(s)"), "{error}");
-    assert!(error.contains("as 2"), "{error}");
-}
-
-/// **A recording outlives the node and a counter does not.** A boot that resumed
-/// one answers earlier boots' records under the same download, and the exact
-/// statement is over the difference — so the same four blocks against two
-/// encoded records that fire above are a sound run here, because two of them
-/// were already on the medium.
+/// **A recording outlives the node and this boot's witness does not.** A boot
+/// that resumed one answers earlier boots' records out of the same extent, so
+/// what the medium already held is separated out and every law stated against
+/// this boot is stated over the rest — which the run log then states both ways
+/// round, because a reader of a later failure needs to see which number moved.
 #[test]
 fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
     let log = recording(LOG_SNAP, SOUND);
@@ -922,12 +768,10 @@ fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
     let carried_capture = recording(CAPTURE_SNAP, &SOUND[..2]);
     let probes = injected();
     let agreement = judge(
-        &resumed(log_surface(&log, 2), &carried_log),
-        &resumed(capture_surface(&capture, 2), &carried_capture),
+        &resumed(log_surface(&log), &carried_log),
+        &resumed(capture_surface(&capture), &carried_capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("two of the four blocks were on the medium before this boot");
     assert_eq!(agreement.counted[1].packets, 4);
@@ -941,33 +785,10 @@ fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
     );
 }
 
-/// And the difference is still held: a boot that added more than it published
-/// fires exactly as it does on a fresh medium, with both numbers in the verdict
-/// so a reader sees which one moved.
-#[test]
-fn a_resumed_recording_holding_more_than_this_boot_published_is_a_finding() {
-    let log = recording(LOG_SNAP, SOUND);
-    let capture = recording(CAPTURE_SNAP, SOUND);
-    let carried = recording(CAPTURE_SNAP, &SOUND[..1]);
-    let probes = injected();
-    let error = judge(
-        &log_surface(&log, 4),
-        &resumed(capture_surface(&capture, 2), &carried),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        true,
-    )
-    .expect_err("three blocks of this boot's own against two encoded records is fabrication");
-    assert!(
-        error.contains("answers 3 (4 in the file, 1 of them the medium's before this boot)"),
-        "{error}"
-    );
-}
-
-/// The other direction on a carried medium, which is a finding of its own and
-/// has no counterpart on a fresh one: a download offering fewer records than the
-/// medium already held is a restart that cost a deployment its evidence.
+/// And the one relation between a file and a number that a carried medium
+/// carries at all: an extent offering fewer records than the medium already held
+/// is a restart that cost a deployment its evidence. The number is the harness's
+/// own read of the disk image, so it survives having no exposition to ask.
 #[test]
 fn a_resumed_recording_offering_fewer_records_than_the_medium_held_is_a_finding() {
     let log = recording(LOG_SNAP, SOUND);
@@ -975,157 +796,16 @@ fn a_resumed_recording_offering_fewer_records_than_the_medium_held_is_a_finding(
     let carried = recording(CAPTURE_SNAP, SOUND);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &resumed(capture_surface(&capture, 4), &carried),
+        &log_surface(&log),
+        &resumed(capture_surface(&capture), &carried),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a resumed recording may not lose what the medium already held");
     assert!(
         error.contains("the medium already held 4 going into this boot"),
         "{error}"
     );
-}
-
-/// The decisions the exposition counts are held to this boot's own records too,
-/// and by the same subtraction: the appliance's forwarding counter restarts with
-/// the node and the file does not.
-#[test]
-fn a_resumed_recording_is_held_to_the_decisions_this_boot_counted() {
-    let log = recording(LOG_SNAP, SOUND);
-    let capture = recording(CAPTURE_SNAP, SOUND);
-    let carried_log = recording(LOG_SNAP, &SOUND[..2]);
-    let carried_capture = recording(CAPTURE_SNAP, &SOUND[..2]);
-    let probes = injected();
-    // Every record in the fixture states a forwarded frame, so this boot's own
-    // two are exactly what the appliance counted.
-    let mut counted = published();
-    counted.forwarded_frames = 2;
-    judge(
-        &resumed(log_surface(&log, 2), &carried_log),
-        &resumed(capture_surface(&capture, 2), &carried_capture),
-        &wire(&probes),
-        &counted,
-        &policy(),
-        true,
-    )
-    .expect("two forwarded records of this boot's own against two forwarded frames");
-
-    let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
-        &wire(&probes),
-        &counted,
-        &policy(),
-        true,
-    )
-    .expect_err("on a fresh medium all four records are this boot's and two were counted");
-    assert!(
-        error.contains("holds 4 record(s) stating a forwarded frame"),
-        "{error}"
-    );
-}
-
-/// The other side of the same inequality: a recording holding fewer than the
-/// counter says is legitimate — the metric is read before the download and
-/// counts records encoded, not records flushed.
-#[test]
-fn a_recording_holding_fewer_than_the_recorder_published_is_accepted() {
-    let log = recording(LOG_SNAP, SOUND);
-    let capture = recording(CAPTURE_SNAP, SOUND);
-    let probes = injected();
-    judge(
-        &log_surface(&log, 9),
-        &capture_surface(&capture, 9),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        true,
-    )
-    .expect("a staging buffer between the scrape and the download is not a finding");
-}
-
-/// A recorder that published nothing at all, so the comparison would be two
-/// numbers about nothing.
-#[test]
-fn a_sink_publishing_no_record_proves_nothing() {
-    let log = recording(LOG_SNAP, &[]);
-    let capture = recording(CAPTURE_SNAP, &[]);
-    let probes = injected();
-    let error = judge(
-        &log_surface(&log, 0),
-        &capture_surface(&capture, 0),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        true,
-    )
-    .expect_err("zero against zero is not agreement");
-    assert!(error.contains("no encoded record at all"), "{error}");
-}
-
-/// **A boot that carried nothing publishes no history, and only the history.** An
-/// appliance no management plane has taken forwards nothing, so it opens no
-/// conversation — but it decides every frame it is offered, so its capture is as
-/// full as any other boot's. The allowance is exactly that narrow: an empty
-/// capture on the same boot is still a recorder that never reached the medium.
-#[test]
-fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
-    let log = recording(LOG_SNAP, &[]);
-    // Every record a refusal, which is what an unowned appliance's capture holds:
-    // it decided every frame it was offered and carried none of them.
-    let mut capture = recording(CAPTURE_SNAP, SOUND);
-    for packet in &mut capture.packets {
-        // The verdict and its reason, and nothing else: the interface each record
-        // names is the port the frame arrived on and is unchanged by what was
-        // decided about it.
-        packet.annotation = packet.annotation.map(|annotation| Annotation {
-            verdict: VERDICT_DROPPED,
-            drop_reason: reason_code("unowned"),
-            event: 0,
-            classification: 0,
-            flow_state: 0,
-            flow_slot: 0,
-            flow_generation: 0,
-            rule: 0,
-            ..annotation
-        });
-        packet.verdict = Some(vec![VERDICT_KIND, VERDICT_DROPPED]);
-    }
-    let probes: Vec<Injected> = injected()
-        .into_iter()
-        .map(|injected| Injected {
-            verdict: VERDICT_DROPPED,
-            event: None,
-            ..injected
-        })
-        .collect();
-    judge(
-        &log_surface(&log, 0),
-        &capture_surface(&capture, 4),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        false,
-    )
-    .expect("an appliance that carried nothing opened no conversation");
-
-    // The same boot with an empty capture: every frame was decided, so a recorder
-    // that encoded none of those decisions never reached the medium.
-    let empty = recording(CAPTURE_SNAP, &[]);
-    let error = judge(
-        &log_surface(&log, 0),
-        &capture_surface(&empty, 0),
-        &wire(&probes),
-        &published(),
-        &policy(),
-        false,
-    )
-    .expect_err("a refusal is a decision and owes a record");
-    assert!(error.contains("no encoded record at all"), "{error}");
-    assert!(error.contains(CAPTURE_RECORDING), "{error}");
 }
 
 /// A probe the appliance decided on and no recording holds — the tap losing an
@@ -1137,12 +817,10 @@ fn a_probe_missing_from_both_recordings_is_a_finding() {
     let capture = recording(CAPTURE_SNAP, &[(0, 0), (1, 0)]);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 2),
-        &capture_surface(&capture, 2),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("the second probe was injected and nothing recorded it");
     assert!(error.contains("probe routed-1-to-0"), "{error}");
@@ -1160,12 +838,10 @@ fn a_packet_naming_an_interface_the_document_does_not_configure_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("interface 7 on a two-port bench resolves to nothing");
     assert!(error.contains("naming an interface outside"), "{error}");
@@ -1181,12 +857,10 @@ fn a_prologue_short_of_the_documents_ports_is_a_finding() {
     log.interfaces.truncate(1);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("one interface block for a two-port document is a short prologue");
     assert!(error.contains("declares 1 interface block(s)"), "{error}");
@@ -1211,12 +885,10 @@ fn a_recording_spanning_two_sections_declares_a_prologue_in_each() {
     }
     let probes = injected();
     judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("a second segment's prologue is a second interface table, not a stray one");
 }
@@ -1232,12 +904,10 @@ fn a_packet_with_no_identity_cannot_be_paired_and_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a block with no identity pairs with nothing");
     assert!(error.contains("no epb_packetid"), "{error}");
@@ -1265,12 +935,10 @@ fn every_disagreement_is_reported_not_only_the_first() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a pair broken several ways");
     assert!(error.contains("do not agree in 4 respect(s)"), "{error}");
@@ -1333,14 +1001,7 @@ fn a_denial_credited_to_the_accepting_rule_is_a_finding_no_counter_can_make() {
         EVENT_POLICY_DENIED,
         ACCEPTING.saturating_add(1),
     ));
-    let surface = capture_surface(&capture, 5);
-    // The exposition's two accounts of that same denial, agreeing: the accepting
-    // rule is credited with hits and the reason is counted. Nothing here is
-    // wrong, which is the point.
-    assert!(
-        rule_differences(&surface, &published()).is_empty(),
-        "the counter join has no way to see a misattributed denial"
-    );
+    let surface = capture_surface(&capture);
     let found = policy_differences(
         &surface,
         &Policy {
@@ -1360,15 +1021,13 @@ fn a_denial_credited_to_the_accepting_rule_is_a_finding_no_counter_can_make() {
     // rather than only from a direct call.
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
+        &log_surface(&log),
         &surface,
         &wire(&probes),
-        &published(),
         &Policy {
             declared: &DECLARED_IDS,
             witness: probed_the_denying_rule(),
         },
-        true,
     )
     .expect_err("a denial credited to the rule that accepts");
     assert!(
@@ -1390,12 +1049,10 @@ fn a_forwarded_frame_credited_to_the_dropping_rule_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect_err("a frame the appliance carried, credited to the rule that drops");
     assert!(
@@ -1420,10 +1077,9 @@ fn a_reconfigured_boot_lets_one_rule_carry_both_verdicts() {
     }
     let probes = injected();
     judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &Policy {
             declared: &DECLARED_IDS,
             witness: PolicyWitness {
@@ -1431,7 +1087,6 @@ fn a_reconfigured_boot_lets_one_rule_carry_both_verdicts() {
                 ..witness()
             },
         },
-        true,
     )
     .expect("across a commit a rule's action moves, so its records carry both verdicts");
 }
@@ -1451,15 +1106,13 @@ fn a_rule_position_past_the_policy_in_force_is_a_finding() {
     ));
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 5),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &Policy {
             declared: &DECLARED_IDS,
             witness: probed_the_denying_rule(),
         },
-        true,
     )
     .expect_err("a rule nobody wrote");
     assert!(
@@ -1490,10 +1143,9 @@ fn a_refusal_attributed_against_its_own_reason_is_a_finding() {
         let capture = capture_with(refusal(reason, event, rule));
         let probes = injected();
         let error = judge(
-            &log_surface(&log, 4),
-            &capture_surface(&capture, 5),
+            &log_surface(&log),
+            &capture_surface(&capture),
             &wire(&probes),
-            &published(),
             &Policy {
                 declared: &DECLARED_IDS,
                 witness: PolicyWitness {
@@ -1502,7 +1154,6 @@ fn a_refusal_attributed_against_its_own_reason_is_a_finding() {
                     ..witness()
                 },
             },
-            true,
         )
         .expect_err("a refusal whose reason and whose attribution describe different outcomes");
         assert!(error.contains(clause), "{error}");
@@ -1512,17 +1163,13 @@ fn a_refusal_attributed_against_its_own_reason_is_a_finding() {
 /// An appliance nobody owns settles every frame in front of admission, so no
 /// record of that boot names a rule.
 ///
-/// The counter join cannot state this at all: it would pass the record whenever
-/// the exposition credited the same rule, which is two surfaces agreeing about
-/// work that could not have happened.
+/// No count could state this at all: a hit total that credits the rule and a
+/// record that names it agree with each other about work that could not have
+/// happened, whichever way round they are read.
 #[test]
 fn a_rule_named_on_an_unowned_boot_is_a_finding() {
     let capture = recording(CAPTURE_SNAP, SOUND);
-    let surface = capture_surface(&capture, 4);
-    assert!(
-        rule_differences(&surface, &published()).is_empty(),
-        "the counter join credits the rule and sees nothing"
-    );
+    let surface = capture_surface(&capture);
     let found = policy_differences(
         &surface,
         &Policy {
@@ -1553,14 +1200,12 @@ fn a_refusal_no_probe_provoked_is_a_finding() {
     ));
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 5),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         // The default witness: this boot injected nothing the dropping rule
         // could refuse.
         &policy(),
-        true,
     )
     .expect_err("a refusal nobody put on the wire");
     assert!(
@@ -1577,10 +1222,9 @@ fn a_refusal_the_probes_provoked_and_the_capture_lacks_is_a_finding() {
     let capture = recording(CAPTURE_SNAP, SOUND);
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &Policy {
             declared: &DECLARED_IDS,
             witness: PolicyWitness {
@@ -1588,7 +1232,6 @@ fn a_refusal_the_probes_provoked_and_the_capture_lacks_is_a_finding() {
                 ..witness()
             },
         },
-        true,
     )
     .expect_err("a probe the default deny had to refuse, and no record of it");
     assert!(error.contains("the default deny did not happen"), "{error}");
@@ -1615,12 +1258,10 @@ fn a_carried_mediums_records_are_not_held_to_this_boots_policy() {
     let capture = misattributed();
     let probes = injected();
     judge(
-        &resumed(log_surface(&log, 4), &carried_log),
-        &resumed(capture_surface(&capture, 5), &carried_capture),
+        &resumed(log_surface(&log), &carried_log),
+        &resumed(capture_surface(&capture), &carried_capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("a witness describes the boot that carries it and no earlier one");
 }
@@ -1647,15 +1288,13 @@ fn a_drop_reason_outside_the_vocabulary_is_a_finding() {
     }
     let probes = injected();
     let error = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 5),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &Policy {
             declared: &DECLARED_IDS,
             witness: probed_the_denying_rule(),
         },
-        true,
     )
     .expect_err("a refusal this build has no word for");
     assert!(
@@ -1671,7 +1310,7 @@ fn a_witness_rule_the_document_does_not_declare_is_a_finding() {
     let capture = recording(CAPTURE_SNAP, SOUND);
     let elsewhere = vec![String::from("some-other-rule")];
     let found = policy_differences(
-        &capture_surface(&capture, 4),
+        &capture_surface(&capture),
         &Policy {
             declared: &elsewhere,
             witness: witness(),
@@ -1700,12 +1339,10 @@ fn the_evidence_states_which_rule_each_record_credited() {
     let capture = recording(CAPTURE_SNAP, SOUND);
     let probes = injected();
     let agreement = judge(
-        &log_surface(&log, 4),
-        &capture_surface(&capture, 4),
+        &log_surface(&log),
+        &capture_surface(&capture),
         &wire(&probes),
-        &published(),
         &policy(),
-        true,
     )
     .expect("a sound pair");
     assert_eq!(
@@ -1732,7 +1369,7 @@ fn the_evidence_states_which_rule_each_record_credited() {
 fn an_unowned_boot_still_holds_a_refusal_to_its_own_reason() {
     let capture = capture_with(refusal("policy_denied", EVENT_POLICY_DENIED, 0));
     let found = policy_differences(
-        &capture_surface(&capture, 5),
+        &capture_surface(&capture),
         &Policy {
             declared: &DECLARED_IDS,
             witness: PolicyWitness {

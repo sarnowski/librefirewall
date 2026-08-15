@@ -23,8 +23,9 @@
 //! the appliance must refuse reach nobody — driven by
 //! [`crate::forward_harness`]. Some additionally judge the `LFW-CFG` console
 //! channel through [`crate::config_transcript`], and every one whose management
-//! port a real client can reach ([`ManagementRole::Client`]) pulls every surface
-//! the endpoint serves and holds the three of them to each other
+//! port a real client can reach ([`ManagementRole::Client`]) scrapes the
+//! endpoint and reads both recordings off the medium, holding the two
+//! recordings, the policy the image was built from and the wire to each other
 //! ([`crate::surface_contract`]). The exception is the forced-emulation boot,
 //! whose subject is the accelerator rather than a contract, and which therefore
 //! judges the cryptography domain alone ([`Console::JudgedOnCryptographyAlone`]).
@@ -40,7 +41,7 @@
 //! interface in that document claims.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -2883,13 +2884,13 @@ fn run_scenario(
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             }
-            let judged = judge_recordings(root, name, &booted, &topology, &log, owner)
+            let judged = judge_recordings(root, name, &booted, &topology, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             println!("{judged}");
             append_evidence(
                 &log,
-                "the two recordings this boot was judged by, and their agreement with the \
-                 exposition and the wire",
+                "the two recordings this boot was judged by, and their agreement with the policy \
+                 and the wire",
                 &judged,
             )
             .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -3439,8 +3440,8 @@ pub(crate) fn boot_and_forward(
 }
 
 /// Judge both recordings this boot left on the medium — each on its own terms,
-/// then the two of them against each other, against the exposition the same boot
-/// answered, and against the bytes the harness put on the wire.
+/// then the two of them against each other, against the policy the image was
+/// built from, and against the bytes the harness put on the wire.
 ///
 /// The order is the order the findings are worth reading in. An extent that is
 /// not a pcapng file at all is reported as that and not as a pairing failure;
@@ -3461,7 +3462,6 @@ fn judge_recordings(
     booted: &Booted,
     topology: &Topology,
     log: &Path,
-    owner: Ownership,
 ) -> Result<String, String> {
     // The events the probes oblige the connection history to hold, which is what
     // bounds it from below. Not the frame count: the log holds a record where the
@@ -3526,171 +3526,21 @@ fn judge_recordings(
         parsed.push(found);
     }
 
-    // The second scrape, which is the one `metrics_contract` judges and the one
-    // whose counters have advanced past the first connection.
-    let exposition = booted.scrapes.last().ok_or(
-        "the recordings were read off the medium and no scrape was taken, so the recorder's own \
-         published counts are not available to compare them against",
-    )?;
     let [log_parsed, capture_parsed] = parsed.as_slice() else {
         return Err(format!(
             "{} recordings parsed and the contract is stated over two",
             parsed.len()
         ));
     };
-    // What the appliance's own exposition says about the decisions the recordings
-    // describe. Read here rather than inside the judgement so that
-    // `surface_contract::judge` stays a pure function of parsed inputs.
-    let mut drop_reasons = BTreeMap::new();
-    for reason in surface_contract::DROP_REASONS {
-        drop_reasons.insert(
-            reason.to_owned(),
-            metrics_contract::drop_reason_total(&exposition.body, reason)?,
-        );
-    }
-    // The document's rules in the order the filter decides them, read once and
-    // handed to both accounts of their work: the counter join below, which reads
-    // a hit total per id off the scrape, and the per-record attribution, which
-    // reads nothing off it. Two accounts of one list, so a boot on which they
-    // disagree is one where the numbers and the records describe different work.
+    // The document's rules in the order the filter decides them, which is the
+    // position a record names — the whole of what a rule annotation is held to,
+    // and the harness's own reading of the document the image was built from
+    // rather than anything the appliance published about it.
     let declared_rules: Vec<String> = topology
         .rule_ids()
         .iter()
         .map(|id| id.as_str().to_owned())
         .collect();
-    let mut rules = Vec::new();
-    for id in &declared_rules {
-        rules.push(surface_contract::DeclaredRule {
-            id: id.clone(),
-            hits: metrics_contract::rule_hits(&exposition.body, id)?,
-        });
-    }
-    let published = surface_contract::Published {
-        forwarded_frames: metrics_contract::forwarded_frames_total(&exposition.body)?,
-        drop_reasons,
-        rules,
-    };
-    // And the fourth vantage point on those same counters: the metric readings
-    // the connection history itself carries. The recorder framed them out of a
-    // page the management domain published, and the scrape above was rendered
-    // out of the shards that page was read from — two renderings of one set of
-    // numbers, so a defect in either shows up here as a disagreement.
-    // The two families the surface contract reads off the scrape and sums over
-    // the pipelines that carry them. They are named here so the reading is held
-    // to the scrape for the *same* numbers that judgement uses: a slot that
-    // agreed for the recorder's own counters and not for these would leave the
-    // reading unable to stand in for the exposition it is about to outlive.
-    // The label slices the loop below hands out, owned here so they outlive the
-    // agreements that borrow them.
-    let reason_labels: Vec<[(&str, &str); 1]> = surface_contract::DROP_REASONS
-        .iter()
-        .map(|reason| [("reason", *reason)])
-        .collect();
-    let mut agreed = vec![snapshot_contract::Agreed {
-        summed: true,
-        series: snapshot_contract::SeriesAt {
-            domain: "forwarder",
-            family: "librefirewall_forwarded_frames_total",
-            labels: &[],
-        },
-        scraped: metrics_contract::forwarded_frames_total(&exposition.body)?,
-        constant: false,
-    }];
-    for (reason, labels) in surface_contract::DROP_REASONS.iter().zip(&reason_labels) {
-        // A reason the exposition carries no series under is one the reading is
-        // not owed either; what is asserted is that where the scrape has a
-        // number the reading has the same one.
-        if let Some(scraped) = metrics_contract::drop_reason_total(&exposition.body, reason)? {
-            agreed.push(snapshot_contract::Agreed {
-                summed: true,
-                series: snapshot_contract::SeriesAt {
-                    domain: "forwarder",
-                    family: "librefirewall_route_drops_total",
-                    labels,
-                },
-                scraped,
-                constant: false,
-            });
-        }
-    }
-    agreed.extend([
-        // The one that must be exactly equal: a device's capacity does not
-        // move between the two readings, so this is what proves the slots
-        // are read at the right offsets rather than merely being plausible.
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "recorder",
-                family: "librefirewall_block_capacity_sectors",
-                labels: &[],
-            },
-            scraped: metrics_contract::capacity_sectors(&exposition.body, "recorder")?,
-            constant: true,
-        },
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "store",
-                family: "librefirewall_block_capacity_sectors",
-                labels: &[],
-            },
-            scraped: metrics_contract::capacity_sectors(&exposition.body, "store")?,
-            constant: true,
-        },
-        // And the counters, each of which the recording may only be behind:
-        // one out of the domain that wrote the reading, one out of the
-        // domain that published it, and one out of a domain that touches
-        // neither — so a mapping that happened to work for the writer's own
-        // shard is not enough to pass.
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "recorder",
-                family: "librefirewall_recording_records_total",
-                labels: &[("sink", "log")],
-            },
-            scraped: metrics_contract::sink_records(&exposition.body, "log")?,
-            constant: false,
-        },
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "recorder",
-                family: "librefirewall_recording_records_total",
-                labels: &[("sink", "capture")],
-            },
-            scraped: metrics_contract::sink_records(&exposition.body, "capture")?,
-            constant: false,
-        },
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "forwarder",
-                family: "librefirewall_tap_observations_total",
-                labels: &[],
-            },
-            scraped: metrics_contract::one_value(
-                &exposition.body,
-                "librefirewall_tap_observations_total",
-                &[("domain", "forwarder")],
-            )?,
-            constant: false,
-        },
-        snapshot_contract::Agreed {
-            summed: false,
-            series: snapshot_contract::SeriesAt {
-                domain: "management",
-                family: "librefirewall_http_requests_total",
-                labels: &[],
-            },
-            scraped: metrics_contract::one_value(
-                &exposition.body,
-                "librefirewall_http_requests_total",
-                &[("domain", "management")],
-            )?,
-            constant: false,
-        },
-    ]);
     // What each extent held before the boot, in `Deck::extents`' order, which is
     // the connection history and then the capture — the same order the two
     // downloads and the two expectations above are in. A boot that made its own
@@ -3710,13 +3560,10 @@ fn judge_recordings(
     let snapshots = snapshot_contract::judge(
         recording_contract::LOG_RECORDING,
         &log_parsed.snapshots,
-        &agreed,
         lfw_metrics::CATALOGUE_FINGERPRINT,
-        // And what the readings are held to that the appliance had no part in
-        // composing: the frames this harness counted on the wire, the sizes it
-        // gave the two devices, and the vocabulary this build encodes. These
-        // outlive the exposition beside them, which is the point of stating them
-        // while both surfaces are still here to be compared.
+        // And what the readings are held to, all of which the appliance had no
+        // part in composing: the frames this harness counted on the wire, the
+        // sizes it gave the two devices, and the vocabulary this build encodes.
         &snapshot_contract::Demanded {
             booted_for: booted.started_at.elapsed(),
             forwarded_frames: booted.dataplane_frames,
@@ -3757,33 +3604,26 @@ fn judge_recordings(
             recording: recording_contract::LOG_RECORDING,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN,
             parsed: log_parsed,
-            published_records: metrics_contract::sink_records(&exposition.body, "log")?,
             carried: carried_log,
         },
         &surface_contract::Surface {
             recording: recording_contract::CAPTURE_RECORDING,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN,
             parsed: capture_parsed,
-            published_records: metrics_contract::sink_records(&exposition.body, "capture")?,
             carried: carried_capture,
         },
         &surface_contract::Wire {
             injected: &booted.injected,
             ports: topology.interfaces().len(),
         },
-        &published,
-        // And the account of the same rules that owes the exposition nothing:
-        // the document's own order, and what this boot's probe set arranged for
-        // the filter to decide. Both are the harness's, so every attribution
-        // stated against them survives the exposition beside them.
+        // The account of a rule's work, and the whole of it: the document's own
+        // order, and what this boot's probe set arranged for the filter to
+        // decide. Both are the harness's, so every attribution stated against
+        // them rests on nothing the appliance published about itself.
         &surface_contract::Policy {
             declared: &declared_rules,
             witness: booted.policy,
         },
-        // Whether this boot can have opened a conversation at all, taken from the
-        // medium the harness attached: an appliance nobody has onboarded carries
-        // nothing, so its history is legitimately empty and its capture is not.
-        matches!(owner, Ownership::Owned),
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
     evidence.push('\n');

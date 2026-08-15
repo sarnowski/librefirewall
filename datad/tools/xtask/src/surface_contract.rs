@@ -1,25 +1,24 @@
-//! Where the three surfaces have to agree: the two recordings, the exposition,
-//! and the frames the harness itself put on the wire.
+//! Where the surfaces have to agree: the two recordings, the policy the image
+//! was built from, and the frames the harness itself put on the wire.
 //!
-//! # Why this is not a fourth smoke check
+//! # Why this is not a third smoke check
 //!
-//! [`crate::metrics_contract`] judges the exposition and
-//! [`crate::recording_contract`] judges a recording, each on its own terms and
-//! each alone. Both can pass over a node that is quietly wrong, because the
-//! failures worth catching here are not properties of one surface but
-//! *disagreements between them*: a sink that silently drops a record still
-//! answers a well-formed pcapng file; a counter that double-counts still
-//! renders a valid exposition; a tap that loses an observation leaves both
-//! surfaces internally consistent. None of the three notices. What notices is
-//! holding them to each other and to the bytes the harness knows it injected,
-//! which no surface has any way to agree with by construction.
+//! [`crate::recording_contract`] judges a recording on its own terms and alone,
+//! and can pass over a node that is quietly wrong, because the failures worth
+//! catching here are not properties of one surface but *disagreements between
+//! them*: a sink that silently drops a record still answers a well-formed
+//! pcapng file; a tap that loses an observation leaves both recordings
+//! internally consistent. Neither notices. What notices is holding them to each
+//! other, to the document the image was built from, and to the bytes the
+//! harness knows it injected — none of which a recording has any way to agree
+//! with by construction.
 //!
 //! # Why a module of its own
 //!
-//! It is neither of the two it joins. Stated inside `recording_contract` it
-//! would make that module a reader of Prometheus exposition; stated inside
-//! `metrics_contract` it would make that one a reader of pcapng. Each stays
-//! about one surface, and the agreement between them is this.
+//! It is not the module it joins. Stated inside `recording_contract` it would
+//! make that module a reader of the harness's own wire and of the policy in
+//! force. That one stays about one file; the agreement between two files, a
+//! document and a probe set is this.
 //!
 //! # The judgement is a pure function
 //!
@@ -92,52 +91,22 @@ pub struct Injected {
     pub event: Option<u8>,
 }
 
-/// The rules the document declares, in the order that is their position on the
-/// dataplane, each with what `librefirewall_rule_hits_total` reports for it.
-///
-/// Position is what a recording carries and the id is what the counter is
-/// labelled with, so this is the join between them — and without it a rule named
-/// in a record is a number nothing corroborates.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeclaredRule {
-    pub id: String,
-    /// `None` where the exposition carries no series under that id, which is a
-    /// finding rather than a rule that has stayed at zero.
-    pub hits: Option<u64>,
-}
-
-/// What the appliance's own exposition says about the decisions the recordings
-/// describe.
-///
-/// Read out of the same boot's scrape and passed in rather than fetched here, so
-/// [`judge`] stays a pure function of parsed inputs.
-pub struct Published {
-    /// Frames the two pipelines put on an egress ring under a forwarding verdict.
-    pub forwarded_frames: u64,
-    /// `librefirewall_route_drops_total` per reason name, summed over the
-    /// pipelines. Absent where the family carries no series under that name.
-    pub drop_reasons: BTreeMap<String, Option<u64>>,
-    pub rules: Vec<DeclaredRule>,
-}
-
 /// The policy in force while this boot ran, and what its probe set obliges the
 /// filter to have decided.
 ///
-/// **This is what a rule annotation is held to without a per-rule counter.** The
-/// per-rule hit family has no place in a metric reading — its labels are the
-/// running document's text rather than a closed catalogue, so the block sits past
-/// the forwarder's named table and a snapshot cannot reach it — and the second
-/// account of a rule's work that [`Published::rules`] carries therefore goes away
-/// with the exposition. What does not go away is what the harness *arranged*: it
-/// chose which port each probe carried, so it knows which of the policy's two
-/// rules each probe was owed by, and it knows which probes fell past every rule.
-///
-/// Holding each record's own verdict to that is stronger than the counter
-/// comparison beside it, which can only say that two of the appliance's own
-/// totals agree: a denial credited to the *accepting* rule moves
-/// `librefirewall_rule_hits_total` and the denial counter together, so the pair
-/// still agrees and [`rule_differences`] passes — while [`policy_differences`]
-/// fails on the first misattributed record and consults no counter at all.
+/// **This is what a rule annotation is held to, and the whole of it.** The
+/// per-rule hit family that used to corroborate one — a position joined to
+/// `librefirewall_rule_hits_total` under the id an operator wrote — could only
+/// say that two of the appliance's own totals agreed, and it has no place in a
+/// metric reading either: its labels are the running document's text rather than
+/// a closed catalogue, so the block sits past the forwarder's named table and a
+/// snapshot cannot reach it. What the harness *arranged* is what remains, and it
+/// is the stronger statement: it chose which port each probe carried, so it
+/// knows which of the policy's two rules each probe was owed by, and it knows
+/// which probes fell past every rule. A denial credited to the *accepting* rule
+/// moved that rule's hits and the denial counter together, so the pair agreed
+/// and the join passed — while [`policy_differences`] fails on the first
+/// misattributed record.
 pub struct Policy<'a> {
     /// The rule ids the document declares, in the order the filter decides them
     /// — which is the position a record names.
@@ -168,19 +137,16 @@ pub struct Surface<'a> {
     /// rather than one served twice.
     pub snap_len: u32,
     pub parsed: &'a Parsed,
-    /// `librefirewall_recording_records_total` for this sink, read out of the
-    /// exposition the same boot answered.
-    pub published_records: u64,
     /// What this recording's extent already held when the boot started, read
     /// off the disk image before QEMU was spawned, or `None` on a medium this
     /// boot made itself.
     ///
-    /// **A recording outlives the node and a counter does not.** A boot that
-    /// resumed one serves earlier boots' records under the same download, so
-    /// every comparison below that holds the file to a published counter is
-    /// stated over the difference: what is here now, less what was here before.
-    /// That keeps each of them exact on a carried medium rather than standing
-    /// down on the one scenario where a recording has any history at all.
+    /// **A recording outlives the node and this boot's witness does not.** A
+    /// boot that resumed one answers earlier boots' records out of the same
+    /// extent, and those were written under a policy and an ownership this
+    /// boot's witness does not describe — so every law stated against the
+    /// witness is stated over the records past what was carried, and the
+    /// arithmetic that separates them is exact rather than approximate.
     pub carried: Option<&'a Parsed>,
 }
 
@@ -206,21 +172,6 @@ impl Surface<'_> {
     }
 }
 
-/// How a verdict states a count taken over **this boot's own** records: the
-/// plain number on a medium this boot made, and the arithmetic on one it
-/// inherited, because a reader of the failure needs to see which of the two
-/// numbers moved.
-fn counted(held: u64, inherited: u64) -> String {
-    if inherited == 0 {
-        format!("{held}")
-    } else {
-        format!(
-            "{} ({held} in the file, {inherited} of them the medium's before this boot)",
-            held.saturating_sub(inherited)
-        )
-    }
-}
-
 /// What the harness knows independently of anything the appliance said.
 pub struct Wire<'a> {
     pub injected: &'a [Injected],
@@ -234,10 +185,9 @@ pub struct Wire<'a> {
 pub struct Counted {
     pub target: &'static str,
     pub packets: usize,
-    /// How many of them were on the medium before this boot, which is what the
-    /// counter beside them is *not* an account of.
+    /// How many of them were on the medium before this boot, which is what no
+    /// law stated against this boot's witness is an account of.
     pub inherited: u64,
-    pub published_records: u64,
     pub interfaces: usize,
     pub declared_snap_len: u32,
     pub longest_capture: usize,
@@ -260,11 +210,10 @@ pub struct Agreement {
     /// Which rule each of this boot's capture records credited, with the id the
     /// document gave that position and how many records named it.
     ///
-    /// The attribution itself, in the run log. The counter comparison beside it
-    /// reports a rule's total and cannot say which records made it up, so a
-    /// reader asking whether the two accounts describe the same work has the
-    /// per-position tally here and the per-id total in the exposition — and a
-    /// misattribution moves one without the other.
+    /// The attribution itself, in the run log, and the only per-rule account
+    /// there is: a total says a rule matched some number of times and cannot say
+    /// which records made it up, while this says which position each record
+    /// credited — which is the quantity a misattribution moves.
     pub rule_positions: BTreeMap<u16, (String, usize)>,
 }
 
@@ -275,14 +224,14 @@ impl Agreement {
     #[must_use]
     pub fn evidence(&self) -> String {
         let mut lines = vec![String::from(
-            "  the three surfaces, held to each other and to the wire:",
+            "  the two recordings, held to each other, to the policy and to the wire:",
         )];
         for counted in &self.counted {
             let mut line = String::new();
             let _ = write!(
                 line,
-                "    {}: {} packet block(s){}; the recorder publishes {} record(s) for this sink; \
-                 {} interface block(s) declaring a snap length of {}; longest capture {}",
+                "    {}: {} packet block(s){}; {} interface block(s) declaring a snap length of \
+                 {}; longest capture {}",
                 counted.target,
                 counted.packets,
                 match counted.inherited {
@@ -293,7 +242,6 @@ impl Agreement {
                         (counted.packets as u64).saturating_sub(inherited)
                     ),
                 },
-                counted.published_records,
                 counted.interfaces,
                 counted.declared_snap_len,
                 counted.longest_capture,
@@ -327,7 +275,7 @@ impl Agreement {
     }
 }
 
-/// Hold the two recordings, the exposition and the wire to each other.
+/// Hold the two recordings, the policy and the wire to each other.
 ///
 /// Every disagreement found is reported, not only the first: a run that has to
 /// be repeated to see the second finding is a run that costs ten minutes to
@@ -340,20 +288,12 @@ pub fn judge(
     log: &Surface,
     capture: &Surface,
     wire: &Wire,
-    published: &Published,
     policy: &Policy,
-    conversations: bool,
 ) -> Result<Agreement, String> {
     let mut found = Vec::new();
     found.extend(selection_differences(log, capture));
     for surface in [log, capture] {
-        // The history is the one surface a correct boot may leave empty, and only
-        // where nothing was carried: its records are conversations, and an
-        // appliance no management plane has taken opens none. The capture is not
-        // empty on such a boot — a refusal is a decision — so the allowance is
-        // this narrow deliberately.
-        let may_be_empty = !conversations && std::ptr::eq(surface, log);
-        found.extend(published_differences(surface, may_be_empty));
+        found.extend(carried_differences(surface));
         found.extend(clamping_differences(surface));
         found.extend(interface_differences(surface, wire));
         found.extend(fabrication_differences(surface, wire));
@@ -364,12 +304,10 @@ pub fn judge(
         // the connection history and sound in the capture pairs cleanly and
         // would go unread if only one of them were held to the policy.
         found.extend(policy_differences(surface, policy));
-        found.extend(exposition_differences(surface, published));
     }
     found.extend(distinctness_differences(log, capture));
     found.extend(lifecycle_differences(log));
     found.extend(verdict_differences(capture, wire));
-    found.extend(rule_differences(capture, published));
     found.extend(outcome_differences(capture, policy));
     let probes_matched = match presence_differences(capture, wire) {
         Ok(matched) => matched,
@@ -387,7 +325,7 @@ pub fn judge(
     };
     if !found.is_empty() {
         return Err(format!(
-            "the recordings, the exposition and the wire do not agree in {} respect(s):\n{}",
+            "the recordings, the policy and the wire do not agree in {} respect(s):\n{}",
             found.len(),
             found
                 .iter()
@@ -446,7 +384,6 @@ fn count(surface: &Surface) -> Counted {
         target: surface.recording,
         packets: surface.parsed.packets.len(),
         inherited: surface.inherited_packets(),
-        published_records: surface.published_records,
         interfaces: surface.parsed.interfaces.len(),
         declared_snap_len: surface
             .parsed
@@ -900,50 +837,6 @@ fn carries(packet: &Packet, injected: &Injected) -> bool {
         && injected.frame.len() == packet.original_len as usize
 }
 
-/// A rule named in a record is a rule the exposition credits with a hit.
-///
-/// The join is the position: a recording carries the rule's place in the running
-/// generation and the counter is labelled with the id an operator wrote, so a
-/// position past the document's rules is a record naming a rule nobody declared,
-/// and a declared rule with no hit is a record crediting a rule that never ran.
-fn rule_differences(capture: &Surface, published: &Published) -> Vec<String> {
-    let mut found = Vec::new();
-    let named: BTreeSet<u16> = capture
-        .parsed
-        .packets
-        .iter()
-        .filter_map(|packet| packet.annotation)
-        .filter_map(|annotation| annotation.rule_position())
-        .collect();
-    for position in named {
-        match published.rules.get(position as usize) {
-            None => found.push(format!(
-                "{} holds a record naming the rule at position {position} and the document \
-                 declares {} rule(s), so the record names a rule no operator wrote",
-                capture.recording,
-                published.rules.len()
-            )),
-            Some(rule) => match rule.hits {
-                None => found.push(format!(
-                    "{} holds a record naming the rule at position {position}, which the document \
-                     calls {:?}, and librefirewall_rule_hits_total carries no series for it",
-                    capture.recording, rule.id
-                )),
-                Some(0) => found.push(format!(
-                    "{} holds a record naming rule {:?} and the appliance credits it with no hit, \
-                     so the two accounts of one match disagree",
-                    capture.recording, rule.id
-                )),
-                Some(_) => {}
-            },
-        }
-        if found.len() >= REPORTED {
-            break;
-        }
-    }
-    found
-}
-
 /// The filter's own two refusals, as the annotation encodes them — a position in
 /// [`DROP_REASONS`], one higher than the index.
 ///
@@ -966,18 +859,16 @@ const _: () = assert!(matches!(
 /// Every record's verdict, held to the rule its own annotation names and to what
 /// the harness arranged for this boot.
 ///
-/// **The account of a rule's work that outlives the exposition.**
-/// [`rule_differences`] joins a position to `librefirewall_rule_hits_total` and
-/// so says only that two of the appliance's own totals agree; these laws hold one
-/// record at a time to a document and a probe set chosen outside the appliance,
-/// and each fires on the first record that breaks it.
+/// **The whole account of a rule's work.** These laws hold one record at a time
+/// to a document and a probe set chosen outside the appliance, and each fires on
+/// the first record that breaks it — where a join between two of the appliance's
+/// own totals could only say that the appliance agreed with itself.
 ///
 /// The four laws, each catching a fault the others do not:
 ///
 /// * a position at or past the count the policy in force declares is a record
-///   crediting a rule nobody wrote — the same reach as the counter join's
-///   "position past the document's rules", stated against the harness's own count
-///   rather than against the series the exposition happened to render;
+///   crediting a rule nobody wrote, stated against the harness's own count of
+///   what the document declares;
 /// * `policy_denied` names a rule and `no_policy_match` names none. The same
 ///   statement over the *event* is [`annotation_laws`]', and stating it here over
 ///   the **refusal reason** is what binds the two: a record whose event and
@@ -1070,9 +961,9 @@ fn policy_differences(surface: &Surface, policy: &Policy) -> Vec<String> {
             }
         } else if !witness.reconfigured {
             // Where the two rules exchanged actions mid-boot, a rule's own
-            // records legitimately carry both verdicts and only their sum is
-            // attributable — which is the counter comparison's problem and not a
-            // statement about one record.
+            // records legitimately carry both verdicts, so nothing can be said
+            // about one record in isolation and this law stands down rather than
+            // firing on every record the commit's far side wrote.
             if position == accepting && annotation.verdict != VERDICT_FORWARDED {
                 found.push(at(&format!(
                     "the rule {accepted:?} accepts, and this record carries verdict {} rather \
@@ -1153,109 +1044,20 @@ fn outcome_differences(capture: &Surface, policy: &Policy) -> Vec<String> {
     found
 }
 
-/// Every decision a recording states is one the exposition counted too, and at
-/// least as often.
-///
-/// **An inequality, in one direction, and for [`published_differences`]'s
-/// reason.** The scrape is taken before the download and counts decisions the
-/// appliance *reached*, while a recording holds records it *flushed* out of a ring
-/// that may have wrapped — so a recording legitimately holds fewer. Nothing
-/// legitimate makes it hold more: that direction is a recording describing
-/// decisions the appliance never counted, which is what this catches.
-///
-/// Every count is taken over this boot's own records, the medium's earlier ones
-/// subtracted, for [`Surface::carried`]'s reason. The subtraction is exact
-/// rather than approximate: what the medium held is a *prefix* of what the
-/// download answers, so the records it accounts for are the same records.
-fn exposition_differences(surface: &Surface, published: &Published) -> Vec<String> {
-    let mut found = Vec::new();
-    let (held_forwarded, held_reasons) = decisions(surface.parsed);
-    let (was_forwarded, was_reasons) = surface
-        .carried
-        .map_or_else(|| (0, BTreeMap::new()), decisions);
-    if held_forwarded.saturating_sub(was_forwarded) > published.forwarded_frames {
-        found.push(format!(
-            "{} holds {} record(s) stating a forwarded frame and \
-             librefirewall_forwarded_frames_total sums to {}; a recording cannot describe \
-             forwarding the appliance never counted",
-            surface.recording,
-            counted(held_forwarded, was_forwarded),
-            published.forwarded_frames
-        ));
-    }
-    for (reason, held) in held_reasons {
-        let inherited = was_reasons.get(&reason).copied().unwrap_or(0);
-        // A reason this build's vocabulary does not carry has no name to look a
-        // counter up under, so there is nothing to compare here and
-        // `vocabulary_differences` is what reports it.
-        let Some(name) = DROP_REASONS.get(usize::from(reason).wrapping_sub(1)) else {
-            continue;
-        };
-        let records = held.saturating_sub(inherited);
-        if records == 0 {
-            continue;
-        }
-        match published.drop_reasons.get(*name) {
-            None | Some(None) => found.push(format!(
-                "{} holds {} record(s) refused as {name:?} and \
-                 librefirewall_route_drops_total carries no series under that reason",
-                surface.recording,
-                counted(held, inherited)
-            )),
-            Some(Some(appliance)) if *appliance < records => found.push(format!(
-                "{} holds {} record(s) refused as {name:?} and the appliance counted \
-                 {appliance}; a recording cannot describe refusals the appliance never made",
-                surface.recording,
-                counted(held, inherited)
-            )),
-            Some(Some(_)) => {}
-        }
-        if found.len() >= REPORTED {
-            break;
-        }
-    }
-    found
-}
-
-/// What one recording's records say the appliance decided: how many state a
-/// forwarded frame, and how many name each drop reason.
-///
-/// Taken over a [`Parsed`] rather than over a [`Surface`] so the same walk reads
-/// the download and the prefix the medium already held, which is what makes
-/// subtracting one from the other a comparison of like with like.
-fn decisions(parsed: &Parsed) -> (u64, BTreeMap<u8, u64>) {
-    let mut forwarded = 0u64;
-    let mut per_reason: BTreeMap<u8, u64> = BTreeMap::new();
-    for annotation in parsed.packets.iter().filter_map(|packet| packet.annotation) {
-        if annotation.verdict == VERDICT_FORWARDED {
-            forwarded = forwarded.saturating_add(1);
-        } else if !annotation.is_revocation() {
-            // A conversation the appliance ended refused no frame, so it is
-            // attributable to no drop reason and belongs in neither total: the
-            // series it *is* attributable to is `librefirewall_flow_lifecycle_total`,
-            // which the revocation contract reads.
-            let records = per_reason.entry(annotation.drop_reason).or_insert(0);
-            *records = records.saturating_add(1);
-        }
-    }
-    (forwarded, per_reason)
-}
-
 /// Every refusal a record states names a reason **this build's tap ABI
 /// encodes**.
 ///
-/// A per-record law and not a comparison against a counter, which is why it
-/// stands on its own rather than inside [`exposition_differences`]: it needs
-/// nothing the appliance published, so it says exactly as much once the
-/// exposition is gone as it does beside it. It is also the law that makes the
-/// name lookup beside that comparison total — a reason outside the vocabulary
-/// indexes no name, and reporting that as "no series under that reason" would
-/// blame the exposition for a recording that named a refusal this build has no
-/// word for.
+/// A per-record law and not a comparison against a counter: it needs nothing the
+/// appliance published, so it says exactly as much with one surface as it did
+/// beside two. It is what remains of the refusal comparison that used to sit
+/// here — a count per reason held to `librefirewall_route_drops_total` under the
+/// name the position indexes — and it is the half of that pair which was never
+/// about the exposition at all: a reason outside the vocabulary indexes no name,
+/// and a recording naming one is wrong whatever any counter says.
 ///
 /// Stated over **every** record in the file, a previous boot's included, for the
-/// reason the count comparisons are not: the vocabulary is a property of the
-/// build that wrote the bytes, and this build wrote every record on the medium.
+/// reason the policy laws are not: the vocabulary is a property of the build
+/// that wrote the bytes, and this build wrote every record on the medium.
 fn vocabulary_differences(surface: &Surface) -> Vec<String> {
     let mut found = Vec::new();
     let mut reported: BTreeSet<u8> = BTreeSet::new();
@@ -1362,30 +1164,28 @@ fn identities(surface: &Surface) -> BTreeMap<u64, usize> {
     counts
 }
 
-/// A recording may not hold more packet blocks than the recorder says it
-/// encoded for that sink.
+/// A resumed recording may not offer fewer packet blocks than the medium already
+/// held.
 ///
-/// **An inequality, and deliberately.** The two numbers are taken at different
-/// instants and mean subtly different things, and only one direction is a
-/// finding:
+/// **The one relation between a file and a number that survives having only the
+/// file.** The number here is not a counter the appliance published — it is what
+/// this harness read off the disk image before QEMU was spawned — so the two
+/// sides are the same bytes at two instants and the statement is exact. A
+/// recording resumed in place continues at the byte its predecessor stopped on,
+/// which makes what the medium held a *prefix* of what the extent now answers;
+/// an extent holding fewer records than that prefix is a restart that cost a
+/// deployment its evidence, which is the whole thing resuming in place exists to
+/// prevent.
 ///
-/// * the metric is read from a scrape taken *before* the download and counts
-///   records **encoded**, while the recording is read off the medium and holds
-///   records **flushed** — the recorder's staging buffer legitimately sits
-///   between the two;
-/// * a ring that wrapped has evicted records the counter still counts.
-///
-/// Both make the recording hold *fewer*, so an exact equality would be a
-/// statement that is quietly wrong whenever either happens. Nothing legitimate
-/// makes it hold *more* — that direction is a recorder answering blocks it
-/// never encoded, which is exactly what this catches.
-///
-/// On a medium a previous boot wrote, the counter is this boot's and the file is
-/// the medium's, so what is compared is the difference — and the other direction
-/// becomes a finding of its own: a download holding *fewer* records than the
-/// medium already held is a restart that cost a deployment its evidence, which
-/// is the whole thing resuming in place exists to prevent.
-fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
+/// **There is deliberately no bound in the other direction.** The one that used
+/// to stand here held the file to `librefirewall_recording_records_total` for
+/// its sink, and both halves of that pair went with the exposition. Nothing
+/// replaces them: a lower bound taken from a *reading* would be unsound, the
+/// relay being push-based — the recorder frames whatever the publisher last
+/// settled, at most once per pass — so a block's counters are older than the
+/// block by an unbounded amount, and a real boot answers a reading reporting no
+/// encoded record with records already standing ahead of it.
+fn carried_differences(surface: &Surface) -> Vec<String> {
     let mut found = Vec::new();
     let held = surface.parsed.packets.len() as u64;
     let inherited = surface.inherited_packets();
@@ -1393,24 +1193,7 @@ fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
         found.push(format!(
             "{} answers {held} packet block(s) and the medium already held {inherited} going into \
              this boot; a resumed recording continues at the byte its predecessor stopped on, so \
-             a download that offers fewer records than were already there has lost some",
-            surface.recording
-        ));
-    }
-    if held.saturating_sub(inherited) > surface.published_records {
-        found.push(format!(
-            "{} answers {} packet block(s) and the recorder publishes \
-             librefirewall_recording_records_total for this sink as {}; a recording cannot hold \
-             observations the recorder never encoded",
-            surface.recording,
-            counted(held, inherited),
-            surface.published_records,
-        ));
-    }
-    if surface.published_records == 0 && !may_be_empty {
-        found.push(format!(
-            "the recorder publishes no encoded record at all for {}, so the count the recording \
-             is compared against proves nothing about either",
+             an extent that offers fewer records than were already there has lost some",
             surface.recording
         ));
     }
