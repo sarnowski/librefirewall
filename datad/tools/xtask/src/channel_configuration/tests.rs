@@ -1,19 +1,19 @@
 use super::*;
 
-/// The answer grammar this module reads is `pd_runtime::configuration`'s, so the
+/// The result grammar this module reads is `pd_runtime::configuration`'s, so the
 /// two are held together here: a field renamed there and not here would leave a
-/// scenario reading `None` and reporting "names no generation" for an answer that
+/// scenario reading `None` and reporting "names no generation" for a line that
 /// named one.
 #[test]
-fn the_answer_grammar_is_read_field_by_field() {
-    let applied = "generation=2 outcome=applied changes=4";
-    assert_eq!(field(applied, "generation"), Some(2));
-    assert_eq!(token(applied, "outcome").as_deref(), Some("applied"));
-    assert_eq!(field(applied, "changes"), Some(4));
-    assert_eq!(token(applied, "rejected"), None);
+fn the_result_grammar_is_read_field_by_field() {
+    let staged = "generation=2 outcome=staged changes=0";
+    assert_eq!(field(staged, "generation"), Some(2));
+    assert_eq!(token(staged, "outcome").as_deref(), Some("staged"));
+    assert_eq!(field(staged, "changes"), Some(0));
+    assert_eq!(token(staged, "rejected"), None);
 
-    let refused = "generation=2 outcome=refused rejected=malformed offset=48";
-    assert_eq!(field(refused, "generation"), Some(2));
+    let refused = "generation=1 outcome=refused rejected=malformed offset=48";
+    assert_eq!(field(refused, "generation"), Some(1));
     assert_eq!(token(refused, "outcome").as_deref(), Some("refused"));
     assert_eq!(token(refused, "rejected").as_deref(), Some("malformed"));
     assert_eq!(field(refused, "offset"), Some(48));
@@ -21,9 +21,19 @@ fn the_answer_grammar_is_read_field_by_field() {
     // A field that is not there, and one whose value is not a number: both answer
     // `None` rather than a wrong number, which is what makes the verdict above
     // report the line rather than a plausible value read out of it.
-    assert_eq!(field("generation=x outcome=applied", "generation"), None);
-    assert_eq!(token("outcome=applied", "generation"), None);
+    assert_eq!(field("generation=x outcome=staged", "generation"), None);
+    assert_eq!(token("outcome=staged", "generation"), None);
     assert_eq!(token("", "generation"), None);
+}
+
+/// The two outcome tokens this transaction turns on are the console's own, so a
+/// vocabulary renamed under this module is a compile-time fact rather than a
+/// scenario that stops recognising an answer it is given.
+#[test]
+fn the_outcome_vocabulary_is_the_consoles_own() {
+    assert_eq!(lfw_log::GenerationOutcome::Staged.name(), "staged");
+    assert_eq!(REFUSED, "refused");
+    assert_eq!(APPLIED, "applied");
 }
 
 /// Every reason the console vocabulary carries is one this module accepts in a
@@ -39,6 +49,41 @@ fn the_reject_vocabulary_is_the_consoles_own() {
             .iter()
             .any(|reason| reason.name() == "not-a-reason")
     );
+}
+
+/// The two documents this transaction refuses are refused at the two different
+/// stages it tells apart, which is what makes the pair one statement rather than
+/// the same one twice.
+#[test]
+fn the_two_refused_documents_are_refused_at_the_two_different_stages() {
+    assert!(matches!(
+        config::load(MALFORMED),
+        Err(config::ConfigError::Document(_))
+    ));
+    assert!(matches!(
+        config::load(REFUSED_BY_RULE),
+        Err(config::ConfigError::Semantic(_))
+    ));
+    // And they name different reasons, so a verdict about one cannot be read as a
+    // verdict about the other.
+    let reader = match config::load(MALFORMED) {
+        Err(config::ConfigError::Document(fault)) => fault.reason(),
+        _ => unreachable!("held above"),
+    };
+    let rule = match config::load(REFUSED_BY_RULE) {
+        Err(config::ConfigError::Semantic(fault)) => fault.reason(),
+        _ => unreachable!("held above"),
+    };
+    assert_ne!(reader.name(), rule.name());
+}
+
+/// Every document a scenario pushes is one this appliance accepts, so a refusal
+/// seen on a booted node is the node's finding and never the harness's.
+#[test]
+fn every_pushed_document_is_one_this_appliance_accepts() {
+    for document in [SUBMITTED, NARROWED, RELATED] {
+        assert!(config::load(document).is_ok());
+    }
 }
 
 /// The generation a scenario waits for is the **forwarding** domain's, read out of
@@ -60,7 +105,7 @@ fn the_generation_read_is_the_one_the_dataplane_switched_to() {
     capture.push_str(&record("generation=1 outcome=applied changes=0"));
     assert_eq!(switched_generation(capture.as_bytes()), 1);
 
-    // The submission: the publisher has committed generation 2 and the forwarder
+    // The commit: the publisher has committed generation 2 and the forwarder
     // has not switched yet. This is the window the wait exists for, and reading
     // the publisher's record here is exactly the race.
     capture.push_str(&record("generation=2 outcome=applied changes=2"));
@@ -92,15 +137,14 @@ fn the_generation_read_is_the_one_the_dataplane_switched_to() {
 /// action alone — a swap that also moved an address would prove a reconfiguration
 /// happened and not that the *policy* is what changed the verdict.
 #[test]
-fn the_submitted_document_differs_from_the_shipped_one_in_the_actions_alone() {
+fn the_pushed_document_differs_from_the_shipped_one_in_the_actions_alone() {
     const SHIPPED: &str = include_str!("../../../../systems/qemu-x86_64/configuration.xml");
-    const SWAPPED: &str = include_str!("../../scenarios/reconfiguration-swap.xml");
 
     let shipped = config::load(SHIPPED.as_bytes()).expect("the shipped document");
-    let swapped = config::load(SWAPPED.as_bytes()).expect("the submitted document");
+    let swapped = config::load(SUBMITTED).expect("the pushed document");
     assert!(
         !shipped.has_same_content(&swapped),
-        "the submitted document is the running one, so nothing could reverse"
+        "the pushed document is the running one, so nothing could reverse"
     );
 
     // Same interfaces and neighbours, so no address, MAC or port moved.
@@ -127,16 +171,4 @@ fn the_submitted_document_differs_from_the_shipped_one_in_the_actions_alone() {
             before.id
         );
     }
-}
-
-/// A body cut for a verdict is cut and marked, so a reader can tell a truncated
-/// document from a short one.
-#[test]
-fn a_long_body_is_truncated_with_a_mark() {
-    let short = "<configuration/>";
-    assert_eq!(truncate(short), short);
-    let long = "x".repeat(400);
-    let cut = truncate(&long);
-    assert!(cut.ends_with('…'));
-    assert!(cut.len() < long.len());
 }

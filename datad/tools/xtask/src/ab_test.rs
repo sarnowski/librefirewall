@@ -381,6 +381,8 @@ fn run_scenario(
                     // about the image, which the scenario whose subject that is
                     // already makes.
                     channel: crate::channel_contract::ChannelContract::Untouched,
+                    // And so nothing to push a frame down either.
+                    server: None,
                     // This boot's own copy of the medium this run's onboarding
                     // boot left. A copy rather than that file itself, because
                     // these boots make no claim about the medium and write to it;

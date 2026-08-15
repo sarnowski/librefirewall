@@ -124,6 +124,24 @@ pub(crate) enum ChannelContract {
     /// admits a confirmation only over a connection opened after it — so this
     /// boot's connection closes where that one's stays up.
     CommitsAConfiguration,
+    /// [`Self::Established`]'s server, which reconfigures a node that is
+    /// **already carrying traffic**: it stands by until the appliance has
+    /// greeted, and only then pushes the transaction the boot's subject is —
+    /// two documents this appliance refuses, the document the scenario is
+    /// about, and the commit that puts it in force.
+    ///
+    /// Its own variant beside [`Self::CommitsAConfiguration`] because the two
+    /// differ in *when*, which is the whole of what these boots are for. That
+    /// one writes its frames before QEMU starts and is judged on the slot they
+    /// produced; this one has a dataplane whose verdicts under the old policy
+    /// are half the evidence, so the push cannot happen until those verdicts
+    /// have been reached — and the harness holds the pipe until the appliance
+    /// itself says a session is up.
+    ///
+    /// It owes no shipment and no frame tally, on [`Self::CommitsAConfiguration`]'s
+    /// terms exactly: a commit ends the session, so this boot's connection
+    /// closes where an established one's stays up.
+    ReconfiguresARunningNode,
     /// **Nothing is listening**, on [`Self::NoServer`]'s terms, and the boot's
     /// subject is what the appliance came back *running* rather than what it
     /// dials.
@@ -149,6 +167,7 @@ impl ChannelContract {
                 | Self::AnchorRejectsTheServer
                 | Self::RejectsTheAppliance
                 | Self::CommitsAConfiguration
+                | Self::ReconfiguresARunningNode
         )
     }
 
@@ -284,6 +303,14 @@ impl ChannelContract {
                     OwedRecord::store(&restored),
                 ]
             }
+            // The session and nothing beyond it. What the transaction itself
+            // produced is judged as it happens — every step of it is answered
+            // by a result frame this harness reads before it sends the next —
+            // so the console owes only the session those frames crossed on.
+            Self::ReconfiguresARunningNode => vec![
+                OwedRecord::dial("established"),
+                OwedRecord::channel(&established_session()),
+            ],
             // The version the medium gave back, and nothing else: what this
             // boot is about is the disk, and holding it to a dial outcome would
             // make a restored version depend on where the appliance was pointed.
@@ -481,30 +508,50 @@ const GREETING_LEN: usize = 26;
 /// answers the stage with a result frame, and the commit ends the session, so
 /// nothing follows.
 fn configuration_push(document: &[u8]) -> Result<Vec<u8>, String> {
-    let len = u32::try_from(document.len())
-        .map_err(|_| format!("a document of {} bytes is past a frame", document.len()))?;
     // The greeting **proper** and not the whole array: its four trailing bytes are
     // a deliberate partial second frame, and a real frame written after them would
     // be read as the continuation of that fragment rather than as itself. The
     // fragment is a boot of its own's subject; this boot's is what the server says
     // next, so it says it on a frame boundary.
     let mut stream = Vec::from(&SERVER_GREETING[..GREETING_LEN]);
-    // The stage frame: 0x05, and the document as its whole payload.
-    stream.extend_from_slice(&len.to_be_bytes());
-    stream.extend_from_slice(&[0x05, 0, 0, 0]);
-    stream.extend_from_slice(document);
-    // The commit frame: 0x07, a generation and the seconds a confirmation has.
-    // Ten bytes of payload, which is what the encoder puts there.
-    stream.extend_from_slice(&10_u32.to_be_bytes());
-    stream.extend_from_slice(&[0x07, 0, 0, 0]);
-    stream.extend_from_slice(&PUSHED_GENERATION.to_be_bytes());
-    // The longest this appliance will hold an unconfirmed commit for. The number
-    // is clamped by the appliance to its own bound whatever is asked, and no
-    // confirmation follows on this connection — a commit ends the session — so
-    // what it decides is only how long the boot has before the revert, and the
-    // boot is bounded by the record it waits for rather than by this.
-    stream.extend_from_slice(&600_u16.to_be_bytes());
+    stream.extend_from_slice(&stage_frame(document)?);
+    stream.extend_from_slice(&commit_frame());
     Ok(stream)
+}
+
+/// One stage frame: 0x05, and `document` as its whole payload.
+///
+/// # Errors
+/// A document longer than a frame's length prefix can name.
+pub(crate) fn stage_frame(document: &[u8]) -> Result<Vec<u8>, String> {
+    let len = u32::try_from(document.len())
+        .map_err(|_| format!("a document of {} bytes is past a frame", document.len()))?;
+    let mut frame = Vec::with_capacity(HEADER_LEN.saturating_add(document.len()));
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&[0x05, 0, 0, 0]);
+    frame.extend_from_slice(document);
+    Ok(frame)
+}
+
+/// The commit frame: 0x07, a generation and the seconds a confirmation has. Ten
+/// bytes of payload, which is what the encoder puts there.
+pub(crate) fn commit_frame() -> Vec<u8> {
+    /// The longest this appliance will hold an unconfirmed commit for. The
+    /// number is clamped by the appliance to its own bound whatever is asked,
+    /// and no confirmation follows on this connection — a commit ends the
+    /// session — so what it decides is only how long a boot has before the
+    /// revert. It is an order of magnitude past the budget any boot in this
+    /// gate takes, so the configuration a commit puts in force is still in
+    /// force when the guest stops, and every boot is bounded by the records it
+    /// waits for rather than by this.
+    const CONFIRM_SECONDS: u16 = 600;
+
+    let mut frame = Vec::with_capacity(18);
+    frame.extend_from_slice(&10_u32.to_be_bytes());
+    frame.extend_from_slice(&[0x07, 0, 0, 0]);
+    frame.extend_from_slice(&PUSHED_GENERATION.to_be_bytes());
+    frame.extend_from_slice(&CONFIRM_SECONDS.to_be_bytes());
+    frame
 }
 
 /// Start the management server this boot's contract asks for.
@@ -550,6 +597,11 @@ pub(crate) fn serve(
                 .map_err(|error| format!("read {}: {error}", crate::image::SUBMITTED_DOCUMENT))?;
             configuration_push(&document)?
         }
+        // The greeting **proper** and nothing after it: this boot's frames are
+        // written once the appliance has greeted, and they have to land on a
+        // frame boundary. The four-byte fragment every other boot's greeting
+        // carries would swallow the first of them.
+        ChannelContract::ReconfiguresARunningNode => Vec::from(&SERVER_GREETING[..GREETING_LEN]),
         _ => Vec::from(SERVER_GREETING),
     };
     fs::write(&greeting, &stream)
@@ -868,6 +920,32 @@ pub(crate) fn judge(
                 ipv4(DIAL_DESTINATION)
             ))
         }
+        ChannelContract::ReconfiguresARunningNode => {
+            let Some(server) = server else {
+                return Err(String::from(
+                    "this boot's contract reconfigures a running node over its channel and no \
+                     management server was started for it",
+                ));
+            };
+            let (transcript, verification) = server.finish()?;
+            expect_dial(log, "established")?;
+            expect_channel(log, &established_session())?;
+            expect_certificate(&verification, device)?;
+            expect_greeting(&transcript)?;
+            // What the transaction itself produced is not read here: every step
+            // of it was answered by a result frame the run loop held to its
+            // contract before it sent the next, and a second reading of the
+            // same transcript afterwards would state one fact twice. What this
+            // states is the session those frames crossed on — mutually
+            // authenticated, and agreed at both ends.
+            Ok(format!(
+                "  answered   channel               appliance->server  {}:{DIAL_PORT}  the \
+                 server validated CN={device} against the authority this run issued, both \
+                 greetings crossed at version 1, and it then reconfigured a node that was \
+                 already carrying traffic",
+                ipv4(DIAL_DESTINATION)
+            ))
+        }
         ChannelContract::RestoresACommittedConfiguration => {
             // Nothing was started: what this boot proves is about the disk the
             // boot before it wrote, and reaching a management plane to show it
@@ -917,6 +995,101 @@ pub(crate) fn judge(
 }
 
 impl Server {
+    /// Write `frames` down the pipe the boot is holding open, so the server
+    /// says something the appliance was not told at spawn.
+    ///
+    /// `openssl s_server` sends what it reads on standard input and this pipe
+    /// is never closed, which is what makes a mid-boot push possible at all:
+    /// the bytes reach the session the appliance is holding rather than a
+    /// redirect that hung up when the greeting had gone.
+    ///
+    /// # Errors
+    /// A server that has no pipe, and a write that failed.
+    pub(crate) fn push(&mut self, frames: &[u8]) -> Result<(), String> {
+        let Some(pipe) = self.child.stdin.as_mut() else {
+            return Err(String::from(
+                "the management server has no standard input to push a frame down, so nothing \
+                 this run says after the greeting can reach the appliance",
+            ));
+        };
+        pipe.write_all(frames)
+            .and_then(|()| pipe.flush())
+            .map_err(|error| format!("push a frame to the management server: {error}"))
+    }
+
+    /// What the server has written down so far, mid-boot.
+    ///
+    /// # Errors
+    /// A transcript that could not be read.
+    fn seen(&self) -> Result<Vec<u8>, String> {
+        fs::read(&self.transcript)
+            .map_err(|error| format!("read {}: {error}", self.transcript.display()))
+    }
+
+    /// How many times the **appliance's** greeting has reached this server,
+    /// which is one per session it has agreed.
+    ///
+    /// The server's own account and never the appliance's: what a push needs to
+    /// know is that there is a session at this end to write into, and a console
+    /// record is the far end saying so about a session that may since have
+    /// gone.
+    ///
+    /// # Errors
+    /// A transcript that could not be read.
+    pub(crate) fn sessions_greeted(&self) -> Result<usize, String> {
+        let seen = self.seen()?;
+        Ok(seen
+            .windows(APPLIANCE_GREETING.len())
+            .filter(|window| *window == APPLIANCE_GREETING)
+            .count())
+    }
+
+    /// Every result line the appliance has answered a staged document with, in
+    /// arrival order.
+    ///
+    /// The frames are found in the transcript rather than at an offset, on
+    /// [`expect_greeting`]'s terms: `openssl s_server` writes the application
+    /// data it received into the same stream as its own diagnostics. A payload
+    /// that is not one of this appliance's result lines is passed over rather
+    /// than reported, because a diagnostic that happened to carry the type byte
+    /// is not a frame — what makes one is the grammar the line is composed in.
+    ///
+    /// # Errors
+    /// A transcript that could not be read.
+    pub(crate) fn validate_results(&self) -> Result<Vec<String>, String> {
+        let seen = self.seen()?;
+        let mut lines = Vec::new();
+        let mut at = 0usize;
+        while let Some(found) = seen
+            .get(at..)
+            .and_then(|tail| tail.windows(HEADER_LEN).position(is_validate_result))
+        {
+            let start = at.saturating_add(found);
+            at = start.saturating_add(1);
+            let Some(header) = seen.get(start..start.saturating_add(HEADER_LEN)) else {
+                break;
+            };
+            let stated = match header
+                .get(..4)
+                .and_then(|four| <[u8; 4]>::try_from(four).ok())
+            {
+                Some(octets) => u32::from_be_bytes(octets) as usize,
+                None => continue,
+            };
+            let body = seen.get(
+                start.saturating_add(HEADER_LEN)
+                    ..start.saturating_add(HEADER_LEN).saturating_add(stated),
+            );
+            if let Some(body) = body
+                && let Ok(line) = core::str::from_utf8(body)
+                && line.starts_with(RESULT_LINE_OPENS_WITH)
+            {
+                lines.push(line.to_owned());
+            }
+        }
+        Ok(lines)
+    }
+
     /// Stop the server and read back what it wrote.
     fn finish(mut self) -> Result<(Vec<u8>, String), String> {
         let _ = self.child.kill();
@@ -1268,6 +1441,12 @@ fn is_up_records(window: &[u8]) -> bool {
     window.get(4) == Some(&UP_RECORDS_TYPE) && window.get(5..8) == Some(&[0, 0, 0][..])
 }
 
+/// The same, for the frame a staged document is answered with.
+fn is_validate_result(window: &[u8]) -> bool {
+    window.get(4) == Some(&UP_CONFIG_VALIDATE_RESULT_TYPE)
+        && window.get(5..8) == Some(&[0, 0, 0][..])
+}
+
 /// The records the domain that terminates the session wrote.
 fn crypto(log: &str) -> Vec<&str> {
     domain_records(log, Domain::Crypto)
@@ -1320,6 +1499,14 @@ const HEADER_LEN: usize = 8;
 /// The type bytes of a frame carrying log-ring and capture-ring bytes.
 const UP_RECORDS_TYPE: u8 = 0x02;
 const UP_CAPTURE_TYPE: u8 = 0x03;
+
+/// And of the frame a staged document is answered with, whose payload is one
+/// line of the console's own field vocabulary.
+const UP_CONFIG_VALIDATE_RESULT_TYPE: u8 = 0x06;
+
+/// What every one of those lines opens with, which is what tells a result frame
+/// from a diagnostic that happened to carry the type byte.
+const RESULT_LINE_OPENS_WITH: &str = "generation=";
 
 /// The ring position an upstream frame carries in front of its ring bytes.
 const RING_POSITION_LEN: usize = 8;

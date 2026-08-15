@@ -1275,9 +1275,7 @@ fn distinctness_differences(log: &Surface, capture: &Surface) -> Vec<String> {
 /// interface names itself — `interface_names` in `pds/recorder/src/main.rs` —
 /// and maps no configuration region to read them out of. Until it does, this
 /// assertion can hold the recording to the number of ports and to their indices
-/// and no further; the identity half of the same idea is
-/// `crate::config_submission_contract`'s read of the configuration surface, which
-/// does compare against the document field by field.
+/// and no further.
 fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     // A section's interface table restarts at zero, so the flat list holds one

@@ -174,11 +174,6 @@ pub(crate) struct Topology {
     /// drops the rules a port contract cannot be stated against, and a dropped
     /// rule would shift every position behind it.
     rule_ids: Vec<Identifier>,
-    /// The document itself, kept because a scenario that *changes* the running
-    /// configuration has to state its claims against what the node booted with:
-    /// the read it takes back is a rendering of the model in force, so comparing
-    /// the two needs the original bytes rather than the bench read out of them.
-    document: Vec<u8>,
 }
 
 impl Topology {
@@ -236,14 +231,7 @@ impl Topology {
                 }
             }
         };
-        let mut topology = Self::from_model(&model)?;
-        topology.document = document.to_vec();
-        Ok(topology)
-    }
-
-    /// The document this bench was read out of.
-    pub(crate) fn document(&self) -> &[u8] {
-        &self.document
+        Self::from_model(&model)
     }
 
     fn from_model(model: &Model) -> Result<Self, TopologyError> {
@@ -334,10 +322,6 @@ impl Topology {
                 management,
                 rules,
                 rule_ids,
-                // Filled by `from_document`, which is the only path a document
-                // reaches this from; `from_model` is a test's entry point and has
-                // no bytes to give.
-                document: Vec::new(),
             }),
             // Unreachable by the loop above, which pushes exactly `PORTS` of
             // each; the conversion is fallible and this is what that costs.

@@ -231,7 +231,7 @@ const CLIENT_ISN: u32 = 0x3b9a_ca07;
 /// several segments and more than one window, which is what makes this exchange
 /// a test of the *stream* rather than of one segment. What the document says is
 /// judged where it can be compared against the document the image was built from
-/// (`crate::config_submission_contract`); what is judged here is every field of
+/// (`crate::channel_configuration`); what is judged here is every field of
 /// every segment that carries it.
 const TCP_REQUEST: &[u8] = b"GET /config HTTP/1.1\r\nHost: librefirewall\r\n\r\n";
 
@@ -1726,9 +1726,9 @@ impl Traffic {
     /// still decides.
     const fn submitted(self) -> Option<&'static [u8]> {
         match self {
-            Self::Reconfiguration => Some(crate::config_submission_contract::SUBMITTED),
-            Self::Revocation => Some(crate::config_submission_contract::NARROWED),
-            Self::Related => Some(crate::config_submission_contract::RELATED),
+            Self::Reconfiguration => Some(crate::channel_configuration::SUBMITTED),
+            Self::Revocation => Some(crate::channel_configuration::NARROWED),
+            Self::Related => Some(crate::channel_configuration::RELATED),
             Self::Routed
             | Self::Policy
             | Self::Lifecycle
@@ -3163,6 +3163,15 @@ pub struct BootTest<'a> {
     /// session writes on the pass that decided it, which is later than anything
     /// the routed contract waits for.
     pub channel: crate::channel_contract::ChannelContract,
+    /// The management server this run started, on the boots that reconfigure a
+    /// node **mid-boot** over the channel it dialled.
+    ///
+    /// Borrowed rather than owned because the run does two things with it at two
+    /// times: this loop pushes frames down its pipe while the guest is up, and
+    /// the caller reads its transcript back once the guest has stopped. `None`
+    /// on every boot that started no server, and on every boot whose server was
+    /// handed all of its frames before QEMU began.
+    pub server: Option<&'a mut crate::channel_contract::Server>,
     /// Whether QEMU is executing the guest on hardware rather than emulating
     /// it. Carried through to [`Booted`] because one judge needs it and cannot
     /// re-derive it honestly: a cycle count taken under emulation measures the
@@ -5836,7 +5845,7 @@ fn judge_repeat(
 /// line and a `Content-Length`, and the body compared against the length it
 /// declared. Contents are deliberately not judged here — the document is judged
 /// where it can be compared against the one the image was built from
-/// (`crate::config_submission_contract`), and a body compared against a second
+/// (`crate::channel_configuration`), and a body compared against a second
 /// copy of the appliance's own writer would agree with itself.
 ///
 /// # Errors
@@ -6472,13 +6481,13 @@ pub struct Booted {
     /// What the configuration submission proved, on the two scenarios that make
     /// one. `None` everywhere else, and a scenario that should have made one and
     /// did not has already failed above.
-    pub applied: Option<crate::config_submission_contract::Applied>,
+    pub applied: Option<crate::channel_configuration::Reconfigured>,
     /// What the harness spent working off the re-decision that commit armed, on
     /// the one scenario that drives one. `None` everywhere else.
     ///
     /// What the pass *did* is not here: it is in this boot's metric readings, and
     /// [`crate::snapshot_contract`] states it once the medium can be read.
-    pub drove: Option<crate::config_submission_contract::Driven>,
+    pub drove: Option<crate::channel_configuration::Driven>,
     /// What every real client this boot ran against the onboarding port made of
     /// it, in the order it ran them. Empty on every boot whose subject is
     /// something else.
@@ -6538,7 +6547,7 @@ pub fn run_boot_test(
 fn run_boot(
     mut command: Command,
     backends: NicBackends,
-    test: BootTest,
+    mut test: BootTest,
     accept_timeout: Duration,
     total_timeout: Duration,
 ) -> Result<Booted, String> {
@@ -6610,8 +6619,8 @@ fn run_boot(
     // What the configuration submission proved, on the one scenario that makes one.
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
-    let mut applied: Option<crate::config_submission_contract::Applied> = None;
-    let mut drove: Option<crate::config_submission_contract::Driven> = None;
+    let mut applied: Option<crate::channel_configuration::Reconfigured> = None;
+    let mut drove: Option<crate::channel_configuration::Driven> = None;
     // What the onboarding station observed, on the three scenarios that open a
     // session. Outside the run block for the same reason, and read by the
     // contract that holds the console's account of that session to this one.
@@ -7222,11 +7231,11 @@ fn run_boot(
                             && wave == Wave::Shipped
                             && probes.iter().any(|probe| probe.wave == Wave::Submitted) =>
                     {
-                        let ManagementBacking::UserNetwork { host_port, .. } = backends.management
-                        else {
+                        let ManagementBacking::UserNetwork { .. } = backends.management else {
                             break 'run Err(String::from(
                                 "a reconfiguration scenario must be on the user-mode backing: the \
-                                 document is submitted with a real client",
+                                 appliance dials the management server out of that stack, and the \
+                                 document goes down the connection it opens",
                             ));
                         };
                         let Some(document) = test.traffic.submitted() else {
@@ -7235,15 +7244,22 @@ fn run_boot(
                                  is decided under",
                             ));
                         };
-                        match crate::config_submission_contract::apply(
-                            host_port,
-                            test.topology.document(),
+                        let Some(server) = test.server.as_mut() else {
+                            break 'run Err(String::from(
+                                "a reconfiguration scenario is reconfigured over the channel it \
+                                 dials, and this boot started no management server to push the \
+                                 document down",
+                            ));
+                        };
+                        match crate::channel_configuration::reconfigure(
+                            server,
                             document,
                             // The capture as it stands, drained afresh each time
-                            // the contract asks: the submission is answered by one
-                            // domain and taken up by another, and what says the
+                            // the transaction asks: the commit is answered by one
+                            // domain and taken up by another, what says the
                             // second has taken it up is a record it has not
-                            // written yet.
+                            // written yet, and draining is also what keeps the
+                            // guest's serial pipe moving while this is under way.
                             || {
                                 drain(&serial_receiver, &mut output);
                                 output.clone()
@@ -7274,14 +7290,12 @@ fn run_boot(
                                      pass through and this boot attached none",
                                 ));
                             };
-                            let outcome = crate::config_submission_contract::drive_re_decision(
-                                driven,
-                                || {
+                            let outcome =
+                                crate::channel_configuration::drive_re_decision(driven, || {
                                     if let Some(attached) = endpoints.first_mut() {
                                         attached.inject(&driver);
                                     }
-                                },
-                            );
+                                });
                             match outcome {
                                 Ok(proved) => drove = Some(proved),
                                 Err(verdict) => {
@@ -8245,6 +8259,8 @@ mod tests {
             // no record of one, so the contract that owes a console record is
             // the one this harness's own tests never take.
             channel: crate::channel_contract::ChannelContract::Untouched,
+            // And so there is none to push a frame down either.
+            server: None,
             contract: BootContract::Routed,
             // No client of this harness's own reaches for it: these boots run
             // no management server, so the workspace is named and never opened.

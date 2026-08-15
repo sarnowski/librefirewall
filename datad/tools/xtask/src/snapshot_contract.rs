@@ -462,7 +462,6 @@ const FORWARDER: &str = "forwarder";
 const CONFIG: &str = "config";
 
 const SUBMISSIONS: &str = "librefirewall_configuration_submissions_total";
-const READS: &str = "librefirewall_configuration_reads_total";
 const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
 const FLOW_LIFECYCLE: &str = "librefirewall_flow_lifecycle_total";
 const POLICY_SWEEP: &str = "librefirewall_policy_sweep_total";
@@ -498,20 +497,16 @@ fn judge_submission(
     for (family, outcome, least) in [
         (
             SUBMISSIONS,
-            Some(crate::config_submission_contract::APPLIED),
-            crate::config_submission_contract::OWED_APPLIED,
+            crate::channel_configuration::APPLIED,
+            crate::channel_configuration::OWED_APPLIED,
         ),
         (
             SUBMISSIONS,
-            Some(crate::config_submission_contract::REFUSED),
-            crate::config_submission_contract::OWED_REFUSED,
+            crate::channel_configuration::REFUSED,
+            crate::channel_configuration::OWED_REFUSED,
         ),
-        (READS, None, crate::config_submission_contract::OWED_READS),
     ] {
-        let labels: &[(&str, &str)] = match outcome {
-            Some(outcome) => &[("outcome", outcome)],
-            None => &[],
-        };
+        let labels: &[(&str, &str)] = &[("outcome", outcome)];
         let mut highest = None;
         for reading in snapshots {
             let held = value_of(
@@ -527,10 +522,9 @@ fn judge_submission(
         let reported = highest.unwrap_or(0);
         if reported < least {
             return Err(format!(
-                "no reading in {target} reports {family}{} above {reported} and at least {least} \
-                 is owed. The answers on the wire said one thing about this node's submissions \
-                 and the domain that decided them says another",
-                outcome.map_or(String::new(), |value| format!("{{outcome={value:?}}}"))
+                "no reading in {target} reports {family}{{outcome={outcome:?}}} above {reported} \
+                 and at least {least} is owed. The result frames on the channel said one thing \
+                 about this node's documents and the domain that decided them says another"
             ));
         }
     }

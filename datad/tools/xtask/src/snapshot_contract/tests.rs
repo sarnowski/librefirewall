@@ -138,29 +138,22 @@ fn driven() -> ReDecision {
     }
 }
 
-/// The deciding domain's counters as a boot that ran `apply` leaves them, written
-/// into whichever reading a test wants them in.
+/// The deciding domain's counters as a boot that ran `reconfigure` leaves them,
+/// written into whichever reading a test wants them in.
 fn decided(held: &mut Snapshot) {
     put(
         held,
         CONFIG,
         SUBMISSIONS,
-        &[("outcome", crate::config_submission_contract::APPLIED)],
-        crate::config_submission_contract::OWED_APPLIED,
+        &[("outcome", crate::channel_configuration::APPLIED)],
+        crate::channel_configuration::OWED_APPLIED,
     );
     put(
         held,
         CONFIG,
         SUBMISSIONS,
-        &[("outcome", crate::config_submission_contract::REFUSED)],
-        crate::config_submission_contract::OWED_REFUSED,
-    );
-    put(
-        held,
-        CONFIG,
-        READS,
-        &[],
-        crate::config_submission_contract::OWED_READS,
+        &[("outcome", crate::channel_configuration::REFUSED)],
+        crate::channel_configuration::OWED_REFUSED,
     );
 }
 
@@ -321,24 +314,15 @@ fn the_submission_counters_are_a_floor_over_the_file() {
 /// And a boot whose deciding domain never reported the documents it answered for.
 #[test]
 fn a_submission_no_reading_accounts_for_is_a_finding() {
+    let refused: &[(&str, &str)] = &[("outcome", crate::channel_configuration::REFUSED)];
+    let short_of = crate::channel_configuration::OWED_REFUSED - 1;
     let mut short = before_the_switch();
-    put(
-        &mut short,
-        CONFIG,
-        READS,
-        &[],
-        crate::config_submission_contract::OWED_READS - 1,
-    );
+    put(&mut short, CONFIG, SUBMISSIONS, refused, short_of);
     let mut after = after_the_pass();
-    put(
-        &mut after,
-        CONFIG,
-        READS,
-        &[],
-        crate::config_submission_contract::OWED_READS - 1,
-    );
-    let verdict = judged_submitting(&[short, after], None).expect_err("a read is unaccounted for");
-    assert!(verdict.contains(READS), "{verdict}");
+    put(&mut after, CONFIG, SUBMISSIONS, refused, short_of);
+    let verdict =
+        judged_submitting(&[short, after], None).expect_err("a refusal is unaccounted for");
+    assert!(verdict.contains(SUBMISSIONS), "{verdict}");
 }
 
 /// The console said the dataplane switched; a reading that never reports the

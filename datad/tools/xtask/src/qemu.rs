@@ -232,7 +232,7 @@ impl Acceleration {
 /// boot and are always chosen together — and because the accelerator only became
 /// a choice at all once a boot existed whose subject was the accelerator, which
 /// is exactly the kind of addition an argument list absorbs silently.
-struct Bench {
+struct Bench<'a> {
     accelerator: Accelerator,
     management: ManagementBacking,
     traffic: Traffic,
@@ -244,6 +244,10 @@ struct Bench {
     /// What the appliance owes on the console for the channel it dials out, and
     /// so what such a boot waits for before it ends.
     channel: ChannelContract,
+    /// The management server this run started, where the boot pushes frames down
+    /// it while the guest is up. Borrowed, because the caller reads its
+    /// transcript back once the guest has stopped.
+    server: Option<&'a mut channel_contract::Server>,
     /// Which store medium this boot attaches: a fresh one, the one an earlier
     /// boot of the same run minted an identity on — reset or not — or a copy of
     /// one an earlier boot was onboarded on.
@@ -264,12 +268,13 @@ struct Bench {
 /// attaches. A [`Bench`] without the accelerator, which a routed boot does not
 /// choose — the routed contract is a statement about the image, so every boot of
 /// it takes whatever the machine offers.
-pub(crate) struct ForwardBench {
+pub(crate) struct ForwardBench<'a> {
     pub(crate) management: ManagementBacking,
     pub(crate) traffic: Traffic,
     pub(crate) dial: DialContract,
     pub(crate) onboard: OnboardContract,
     pub(crate) channel: ChannelContract,
+    pub(crate) server: Option<&'a mut channel_contract::Server>,
     pub(crate) store: StoreMedium,
     pub(crate) data: DataMedium,
     pub(crate) owner: Ownership,
@@ -1485,7 +1490,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Reconfiguration,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
-        channel: ChannelContract::Untouched,
+        channel: ChannelContract::ReconfiguresARunningNode,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         data: DataMedium::Fresh,
@@ -1531,7 +1536,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Revocation,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
-        channel: ChannelContract::Untouched,
+        channel: ChannelContract::ReconfiguresARunningNode,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         data: DataMedium::Fresh,
@@ -1567,7 +1572,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         traffic: Traffic::Related,
         dial: DialContract::Answered,
         onboard: OnboardContract::Untouched,
-        channel: ChannelContract::Untouched,
+        channel: ChannelContract::ReconfiguresARunningNode,
         accelerator: Accelerator::WhateverTheMachineOffers,
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         data: DataMedium::Fresh,
@@ -2744,7 +2749,7 @@ fn run_scenario(
     // the appliance, so a server started once the boot had settled would already
     // have been dialled, reset, and be into the second wait of a schedule that
     // doubles.
-    let server = channel_contract::serve(
+    let mut server = channel_contract::serve(
         root,
         &root.join(crate::artifacts::BUILD_DEV_CA_DIR),
         scenario.channel,
@@ -2761,6 +2766,11 @@ fn run_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            // Borrowed for the boot and handed back: the run loop pushes this
+            // boot's frames down the server's pipe while the guest is up, and
+            // the verdict below reads the same server's transcript once it has
+            // stopped.
+            server: server.as_mut(),
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -2791,7 +2801,7 @@ fn run_scenario(
                 println!("{transcript}");
                 append_evidence(
                     &log,
-                    "the configuration this boot submitted, and what the node said about it",
+                    "the configuration this boot pushed, and what the node said about it",
                     &transcript,
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -2812,8 +2822,8 @@ fn run_scenario(
             .map_err(|error| format!("scenario {name}: {error}"))?;
             match &booted.applied {
                 Some(applied) => format!(
-                    "; both recordings judged together; generation {} submitted over HTTP and in \
-                     force on the dataplane{}",
+                    "; both recordings judged together; generation {} pushed over the channel and \
+                     in force on the dataplane{}",
                     applied.generation,
                     match judged.re_decision {
                         Some(decided) => format!(
@@ -3165,6 +3175,9 @@ fn run_cryptography_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            // Nothing to push down: these boots hand a server every frame it
+            // sends before QEMU starts, or start none at all.
+            server: None,
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -3222,6 +3235,8 @@ fn run_store_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            // Likewise nothing to push down.
+            server: None,
             store: scenario.store,
             data: scenario.data,
             owner,
@@ -3315,7 +3330,7 @@ pub(crate) fn boot_and_forward(
     disk: &Path,
     log_name: &str,
     topology: &Topology,
-    bench: ForwardBench,
+    bench: ForwardBench<'_>,
 ) -> Result<Booted, String> {
     let ForwardBench {
         management,
@@ -3323,6 +3338,7 @@ pub(crate) fn boot_and_forward(
         dial,
         onboard,
         channel,
+        server,
         store,
         data,
         owner,
@@ -3343,6 +3359,7 @@ pub(crate) fn boot_and_forward(
             dial,
             onboard,
             channel,
+            server,
             store,
             data,
             owner,
@@ -3656,6 +3673,7 @@ pub(crate) fn boot_and_fail_closed(
             // A node that refused its own document has been told nowhere to
             // dial, so there is no channel here to owe a record.
             channel: ChannelContract::Untouched,
+            server: None,
             store,
             data,
             owner,
@@ -3692,6 +3710,7 @@ pub(crate) fn boot_and_halt(
             onboard: OnboardContract::Untouched,
             // No slot boots, so nothing dials and nothing reports.
             channel: ChannelContract::Untouched,
+            server: None,
             // A fresh medium, so the appliance on it has no owner — which decides
             // nothing here: no slot boots, so no domain reads the word.
             store: StoreMedium::Fresh,
@@ -3711,7 +3730,7 @@ fn boot(
     log_name: &str,
     contract: BootContract,
     topology: &Topology,
-    bench: Bench,
+    bench: Bench<'_>,
 ) -> Result<Booted, String> {
     let Bench {
         accelerator,
@@ -3720,6 +3739,7 @@ fn boot(
         dial,
         onboard,
         channel,
+        server,
         store,
         data: data_medium,
         owner,
@@ -3822,6 +3842,7 @@ fn boot(
             dial,
             onboard,
             channel,
+            server,
             hardware_accelerated: acceleration.is_hardware(),
         },
     )?;
