@@ -39,12 +39,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::forward_harness::PolicyWitness;
 use crate::recording_contract::{
     ANNOTATION_VERSION, Annotation, CLASSIFICATION_ESTABLISHED, CLASSIFICATION_NEW,
     EVENT_FLOW_ADVANCED, EVENT_FLOW_CLOSED, EVENT_FLOW_OPENED, EVENT_FLOW_REVOKED,
-    EVENT_POLICY_DENIED, FLAGS_INBOUND, Packet, Parsed, STATE_CLOSED, STATE_TIME_WAIT,
-    VERDICT_DROPPED, VERDICT_FORWARDED, VERDICT_KIND, VERDICT_REVOKED, classification_name,
-    event_name,
+    EVENT_POLICY_DENIED, EVENT_POLICY_NO_MATCH, FLAGS_INBOUND, Packet, Parsed, STATE_CLOSED,
+    STATE_TIME_WAIT, VERDICT_DROPPED, VERDICT_FORWARDED, VERDICT_KIND, VERDICT_REVOKED,
+    classification_name, event_name,
 };
 
 /// One frame the harness put on a dataplane port, as the contract compares
@@ -119,6 +120,43 @@ pub struct Published {
     pub rules: Vec<DeclaredRule>,
 }
 
+/// The policy in force while this boot ran, and what its probe set obliges the
+/// filter to have decided.
+///
+/// **This is what a rule annotation is held to without a per-rule counter.** The
+/// per-rule hit family has no place in a metric reading — its labels are the
+/// running document's text rather than a closed catalogue, so the block sits past
+/// the forwarder's named table and a snapshot cannot reach it — and the second
+/// account of a rule's work that [`Published::rules`] carries therefore goes away
+/// with the exposition. What does not go away is what the harness *arranged*: it
+/// chose which port each probe carried, so it knows which of the policy's two
+/// rules each probe was owed by, and it knows which probes fell past every rule.
+///
+/// Holding each record's own verdict to that is stronger than the counter
+/// comparison beside it, which can only say that two of the appliance's own
+/// totals agree: a denial credited to the *accepting* rule moves
+/// `librefirewall_rule_hits_total` and the denial counter together, so the pair
+/// still agrees and [`rule_differences`] passes — while [`policy_differences`]
+/// fails on the first misattributed record and consults no counter at all.
+pub struct Policy<'a> {
+    /// The rule ids the document declares, in the order the filter decides them
+    /// — which is the position a record names.
+    pub declared: &'a [String],
+    /// What the probes oblige, out of the harness that chose them.
+    pub witness: PolicyWitness,
+}
+
+impl Policy<'_> {
+    /// Where a rule sits in the running document, or `None` for an id it does
+    /// not declare.
+    fn position_of(&self, id: &str) -> Option<u16> {
+        self.declared
+            .iter()
+            .position(|declared| declared == id)
+            .and_then(|at| u16::try_from(at).ok())
+    }
+}
+
 /// One recording as this contract sees it: which it is, what it declared, and
 /// what the appliance's own metrics say it put there.
 pub struct Surface<'a> {
@@ -150,6 +188,21 @@ impl Surface<'_> {
     fn inherited_packets(&self) -> u64 {
         self.carried
             .map_or(0, |carried| carried.packets.len() as u64)
+    }
+
+    /// The records **this boot** wrote, the medium's earlier ones skipped.
+    ///
+    /// What the medium held is a prefix of what the extent now answers — a boot
+    /// that resumed appended at the byte its predecessor stopped on — so the
+    /// records past it are exactly this boot's. Every statement made against
+    /// [`Policy::witness`] is stated over these and no others: the witness
+    /// describes the policy and the ownership *this* boot ran under, and a
+    /// previous boot may have run under neither.
+    fn own_packets(&self) -> impl Iterator<Item = &Packet> {
+        self.parsed
+            .packets
+            .iter()
+            .skip(self.carried.map_or(0, |carried| carried.packets.len()))
     }
 }
 
@@ -204,6 +257,15 @@ pub struct Agreement {
     pub events: BTreeMap<&'static str, usize>,
     /// Records of the connection history, every one of which the capture pairs.
     pub paired: usize,
+    /// Which rule each of this boot's capture records credited, with the id the
+    /// document gave that position and how many records named it.
+    ///
+    /// The attribution itself, in the run log. The counter comparison beside it
+    /// reports a rule's total and cannot say which records made it up, so a
+    /// reader asking whether the two accounts describe the same work has the
+    /// per-position tally here and the per-id total in the exposition — and a
+    /// misattribution moves one without the other.
+    pub rule_positions: BTreeMap<u16, (String, usize)>,
 }
 
 impl Agreement {
@@ -252,6 +314,15 @@ impl Agreement {
             let _ = write!(line, " {records}\u{d7} {event};");
         }
         lines.push(line);
+        let mut line =
+            String::from("    this boot's capture records credit the policy's rules by position:");
+        if self.rule_positions.is_empty() {
+            line.push_str(" none, no record of this boot naming a rule");
+        }
+        for (position, (id, records)) in &self.rule_positions {
+            let _ = write!(line, " {records}\u{d7} position {position} ({id});");
+        }
+        lines.push(line);
         lines.join("\n")
     }
 }
@@ -270,6 +341,7 @@ pub fn judge(
     capture: &Surface,
     wire: &Wire,
     published: &Published,
+    policy: &Policy,
     conversations: bool,
 ) -> Result<Agreement, String> {
     let mut found = Vec::new();
@@ -286,12 +358,19 @@ pub fn judge(
         found.extend(interface_differences(surface, wire));
         found.extend(fabrication_differences(surface, wire));
         found.extend(annotation_differences(surface));
+        found.extend(vocabulary_differences(surface));
+        // Over both files rather than over the capture alone: the two are paired
+        // by packet id and not by what each says, so a record misattributed in
+        // the connection history and sound in the capture pairs cleanly and
+        // would go unread if only one of them were held to the policy.
+        found.extend(policy_differences(surface, policy));
         found.extend(exposition_differences(surface, published));
     }
     found.extend(distinctness_differences(log, capture));
     found.extend(lifecycle_differences(log));
     found.extend(verdict_differences(capture, wire));
     found.extend(rule_differences(capture, published));
+    found.extend(outcome_differences(capture, policy));
     let probes_matched = match presence_differences(capture, wire) {
         Ok(matched) => matched,
         Err(differences) => {
@@ -323,7 +402,32 @@ pub fn judge(
         events_matched,
         events: events(log),
         paired: log.parsed.packets.len(),
+        rule_positions: rule_positions(capture, policy),
     })
+}
+
+/// Which rule each of this boot's capture records credited, named by the id the
+/// document gave that position.
+///
+/// A position the document does not declare is carried under an empty id rather
+/// than dropped: it is a finding [`policy_differences`] has already reported, and
+/// a summary that quietly omitted it would describe a boot that did not happen.
+fn rule_positions(capture: &Surface, policy: &Policy) -> BTreeMap<u16, (String, usize)> {
+    let mut counts: BTreeMap<u16, (String, usize)> = BTreeMap::new();
+    for position in capture
+        .own_packets()
+        .filter_map(|packet| packet.annotation)
+        .filter_map(|annotation| annotation.rule_position())
+    {
+        let id = policy
+            .declared
+            .get(usize::from(position))
+            .cloned()
+            .unwrap_or_default();
+        let entry = counts.entry(position).or_insert((id, 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    counts
 }
 
 /// Every event the connection history holds, with how many records carry it.
@@ -840,6 +944,215 @@ fn rule_differences(capture: &Surface, published: &Published) -> Vec<String> {
     found
 }
 
+/// The filter's own two refusals, as the annotation encodes them — a position in
+/// [`DROP_REASONS`], one higher than the index.
+///
+/// Written as numbers and held to the names rather than looked up at each use:
+/// the laws below are about *which* refusal a record states, and a lookup that
+/// silently found nothing would turn a renamed reason into a law that stopped
+/// applying rather than a build that stopped compiling.
+const POLICY_DENIED_REASON: u8 = 25;
+const NO_POLICY_MATCH_REASON: u8 = 26;
+
+const _: () = assert!(matches!(
+    DROP_REASONS[POLICY_DENIED_REASON as usize - 1].as_bytes(),
+    b"policy_denied"
+));
+const _: () = assert!(matches!(
+    DROP_REASONS[NO_POLICY_MATCH_REASON as usize - 1].as_bytes(),
+    b"no_policy_match"
+));
+
+/// Every record's verdict, held to the rule its own annotation names and to what
+/// the harness arranged for this boot.
+///
+/// **The account of a rule's work that outlives the exposition.**
+/// [`rule_differences`] joins a position to `librefirewall_rule_hits_total` and
+/// so says only that two of the appliance's own totals agree; these laws hold one
+/// record at a time to a document and a probe set chosen outside the appliance,
+/// and each fires on the first record that breaks it.
+///
+/// The four laws, each catching a fault the others do not:
+///
+/// * a position at or past the count the policy in force declares is a record
+///   crediting a rule nobody wrote — the same reach as the counter join's
+///   "position past the document's rules", stated against the harness's own count
+///   rather than against the series the exposition happened to render;
+/// * `policy_denied` names a rule and `no_policy_match` names none. The same
+///   statement over the *event* is [`annotation_laws`]', and stating it here over
+///   the **refusal reason** is what binds the two: a record whose event and
+///   reason describe different outcomes satisfies either law alone and neither
+///   pair;
+/// * under one policy the accepting rule appears only where the frame was
+///   forwarded and the dropping rule only where it was refused. This is the
+///   misattribution the counter join cannot see at all: a denial credited to the
+///   accepting rule raises that rule's hits and the denial counter together, so
+///   both totals still agree;
+/// * an appliance nobody owns runs no filter, so no record of one names any rule.
+///   The counter join would pass such a record whenever the exposition credited
+///   the same rule — two surfaces agreeing about work that could not have
+///   happened.
+///
+/// Only the third is ever conditional. It stands down where the boot ran **two**
+/// policies — the reconfiguration document keeps both ids and exchanges their
+/// actions, so across the commit each rule legitimately appears under both
+/// verdicts and the law is about a rule whose action does not move — and where the
+/// boot had no owner, the fourth being the stronger statement about the same
+/// records. The first two hold on every boot, an unowned one included: a refusal
+/// this build's vocabulary places outside the document, or one whose reason and
+/// whose attribution describe different outcomes, is wrong whoever owns the node.
+///
+/// Every law is stated over [`Surface::own_packets`] — a previous boot's records
+/// were written under a policy and an ownership this witness does not describe.
+fn policy_differences(surface: &Surface, policy: &Policy) -> Vec<String> {
+    let mut found = Vec::new();
+    let witness = &policy.witness;
+    let accepted = witness.policy.accepted.id.as_str();
+    let denied = witness.policy.denied.id.as_str();
+    let accepting = policy.position_of(accepted);
+    let dropping = policy.position_of(denied);
+    // The harness contradicting itself rather than the appliance misbehaving:
+    // the witness's two rules and the declared list are read out of one
+    // document, so an id with no position means the two were taken from
+    // different ones and every attribution below would be stated about the
+    // wrong rule.
+    for (which, id, position) in [
+        ("accepting", accepted, accepting),
+        ("dropping", denied, dropping),
+    ] {
+        if position.is_none() {
+            found.push(format!(
+                "the witness names {id:?} as this policy's {which} rule and the document declares \
+                 {:?}, so nothing says which position that rule occupies and no record can be \
+                 attributed to it",
+                policy.declared
+            ));
+        }
+    }
+    for packet in surface.own_packets() {
+        let Some(annotation) = packet.annotation else {
+            continue;
+        };
+        let at = |clause: &str| format!("{}: {}: {clause}", surface.recording, name(packet));
+        let position = annotation.rule_position();
+        if let Some(position) = position
+            && usize::from(position) >= witness.rules
+        {
+            found.push(at(&format!(
+                "the rule at position {position} and the policy in force declares {} rule(s), so \
+                 the record credits a rule no operator wrote",
+                witness.rules
+            )));
+        }
+        match (annotation.drop_reason, position) {
+            (POLICY_DENIED_REASON, None) => found.push(at(
+                "a frame refused as policy_denied and no rule named: a rule is what denied it, so \
+                 the record states a refusal it cannot attribute",
+            )),
+            (NO_POLICY_MATCH_REASON, Some(position)) => found.push(at(&format!(
+                "a frame refused as no_policy_match naming the rule at position {position}: \
+                 falling past every rule is the one refusal no rule made"
+            ))),
+            _ => {}
+        }
+        if witness.unowned {
+            // The whole of the attribution law on a boot with no owner, and it
+            // replaces the two below rather than joining them: naming *any* rule
+            // is already the finding, so stating which of the two it should have
+            // been would report one fault twice.
+            if let Some(position) = position {
+                found.push(at(&format!(
+                    "the rule at position {position} on a boot of an appliance nobody owns. \
+                     Ownership is settled in front of admission and the filter is never \
+                     consulted, so a record naming a rule is a stage deciding in another stage's \
+                     name"
+                )));
+            }
+        } else if !witness.reconfigured {
+            // Where the two rules exchanged actions mid-boot, a rule's own
+            // records legitimately carry both verdicts and only their sum is
+            // attributable — which is the counter comparison's problem and not a
+            // statement about one record.
+            if position == accepting && annotation.verdict != VERDICT_FORWARDED {
+                found.push(at(&format!(
+                    "the rule {accepted:?} accepts, and this record carries verdict {} rather \
+                     than a forwarded frame: the rule that admitted a conversation cannot be the \
+                     one that refused it",
+                    annotation.verdict
+                )));
+            }
+            if position == dropping && annotation.verdict == VERDICT_FORWARDED {
+                found.push(at(&format!(
+                    "the rule {denied:?} drops, and this record carries a forwarded frame: a \
+                     frame the appliance carried was admitted by some other rule than the one \
+                     credited here"
+                )));
+            }
+        }
+        if found.len() >= REPORTED {
+            break;
+        }
+    }
+    found
+}
+
+/// Each of the filter's two refusals appears in the capture exactly where this
+/// boot's probes provoked it.
+///
+/// **Both directions, and the absence is the stronger one.** That a refusal the
+/// harness aimed at happened is also said — anchored to the probe's own bytes —
+/// by [`event_differences`], but only of the connection history; here it is said
+/// of the capture, which is the surface that holds every observation of a frame
+/// and so the one an *absence* can be stated over at all. A boot whose probes
+/// reach neither refusal and whose capture holds one is either a frame nobody put
+/// on the wire or a stage refusing in another stage's name, and no count anywhere
+/// says so: the counters would simply be non-zero and agree with each other.
+///
+/// Stated over [`Surface::own_packets`] for [`policy_differences`]' reason, and
+/// here it is what makes the absence usable at all: a medium a previous boot
+/// wrote holds that boot's refusals, and a run that read them as this boot's
+/// would report the law broken on every scenario that resumes one.
+fn outcome_differences(capture: &Surface, policy: &Policy) -> Vec<String> {
+    let mut found = Vec::new();
+    let witness = &policy.witness;
+    for (event, reason, probed, what) in [
+        (
+            EVENT_POLICY_DENIED,
+            "policy_denied",
+            witness.probed_the_denying_rule,
+            "a rule that says drop",
+        ),
+        (
+            EVENT_POLICY_NO_MATCH,
+            "no_policy_match",
+            witness.probed_the_fallthrough,
+            "the default deny",
+        ),
+    ] {
+        let records = capture
+            .own_packets()
+            .filter_map(|packet| packet.annotation)
+            .filter(|annotation| annotation.event == event)
+            .count();
+        if probed && records == 0 {
+            found.push(format!(
+                "the boot injected a probe {reason:?} had to refuse and {} holds no record of \
+                 one, so {what} did not happen",
+                capture.recording
+            ));
+        }
+        if !probed && records != 0 {
+            found.push(format!(
+                "{} holds {records} record(s) refused as {reason:?} and this boot injected \
+                 nothing {what} could refuse — every probe it did inject is settled before the \
+                 filter is consulted or is permitted by a rule",
+                capture.recording
+            ));
+        }
+    }
+    found
+}
+
 /// Every decision a recording states is one the exposition counted too, and at
 /// least as often.
 ///
@@ -872,16 +1185,10 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
     }
     for (reason, held) in held_reasons {
         let inherited = was_reasons.get(&reason).copied().unwrap_or(0);
-        // A reason outside the vocabulary is a per-record law and not a
-        // comparison against a counter, so it is stated over every record in the
-        // file — a previous boot's included, this build having written those too.
+        // A reason this build's vocabulary does not carry has no name to look a
+        // counter up under, so there is nothing to compare here and
+        // `vocabulary_differences` is what reports it.
         let Some(name) = DROP_REASONS.get(usize::from(reason).wrapping_sub(1)) else {
-            found.push(format!(
-                "{} holds {held} record(s) naming drop reason {reason}, which is outside the \
-                 {} this build's vocabulary declares",
-                surface.recording,
-                DROP_REASONS.len()
-            ));
             continue;
         };
         let records = held.saturating_sub(inherited);
@@ -932,6 +1239,54 @@ fn decisions(parsed: &Parsed) -> (u64, BTreeMap<u8, u64>) {
         }
     }
     (forwarded, per_reason)
+}
+
+/// Every refusal a record states names a reason **this build's tap ABI
+/// encodes**.
+///
+/// A per-record law and not a comparison against a counter, which is why it
+/// stands on its own rather than inside [`exposition_differences`]: it needs
+/// nothing the appliance published, so it says exactly as much once the
+/// exposition is gone as it does beside it. It is also the law that makes the
+/// name lookup beside that comparison total — a reason outside the vocabulary
+/// indexes no name, and reporting that as "no series under that reason" would
+/// blame the exposition for a recording that named a refusal this build has no
+/// word for.
+///
+/// Stated over **every** record in the file, a previous boot's included, for the
+/// reason the count comparisons are not: the vocabulary is a property of the
+/// build that wrote the bytes, and this build wrote every record on the medium.
+fn vocabulary_differences(surface: &Surface) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut reported: BTreeSet<u8> = BTreeSet::new();
+    for packet in &surface.parsed.packets {
+        let Some(annotation) = packet.annotation else {
+            continue;
+        };
+        // A forwarded frame refused nothing and a revoked conversation refused no
+        // frame, so neither carries a reason to look up: that both read zero here
+        // is `annotation_laws`' statement, not this one's.
+        if annotation.verdict == VERDICT_FORWARDED || annotation.is_revocation() {
+            continue;
+        }
+        let known = usize::from(annotation.drop_reason)
+            .checked_sub(1)
+            .is_some_and(|at| at < DROP_REASONS.len());
+        if !known && reported.insert(annotation.drop_reason) {
+            found.push(format!(
+                "{}: {} names drop reason {}, which is outside the {} this build's vocabulary \
+                 declares",
+                surface.recording,
+                name(packet),
+                annotation.drop_reason,
+                DROP_REASONS.len()
+            ));
+        }
+        if found.len() >= REPORTED {
+            break;
+        }
+    }
+    found
 }
 
 /// The drop reasons this build's tap ABI encodes, in the order it encodes them —

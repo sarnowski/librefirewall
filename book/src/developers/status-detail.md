@@ -775,6 +775,27 @@ its probes owe, and neither to a captured length past its sink's snap length. Af
 each to carry a decodable superblock and a walkable recording. Two paths to one artifact, neither of
 them the appliance's own account of itself.
 
+**A rule annotation is held to the policy as well as to the counter.** The rule-hit join above is one
+of the appliance's own totals against another, and there is a fault it cannot see at all: a denial
+credited to the rule that *accepts* raises that rule's hit count and the denial counter together, so
+the two agree and the join passes over it. Beside that join the gate therefore holds each record's
+own verdict to the document the image was built from and to the probe set the harness chose — a
+position past the rules the policy in force declares, a denial attributing itself to no rule or a
+fallthrough attributing itself to one, the accepting rule on a refused record or the dropping rule on
+a forwarded one, and any rule at all on a boot of an appliance nobody owns are each a finding on the
+first record that shows it, reached without consulting a counter. The filter's two refusals must also
+appear in the capture exactly where this boot's probes provoked them, and the absence is the stronger
+half: a refusal on a boot that injected nothing capable of provoking one is a frame nobody put on the
+wire or a stage refusing in another stage's name, which no counter reports because every counter
+involved is merely non-zero and consistent. The attribution law stands down on a boot that ran two
+policies, the submitted document keeping both rule ids and exchanging their actions so that each rule
+legitimately accrues records under both verdicts. All of it is stated over the records *this* boot
+appended, so a medium an earlier boot wrote answers for its own decisions and not for these. This is
+the account of a rule's work that does not depend on the exposition: the per-rule hit family cannot
+become a metric reading, its labels being the running document's text rather than a closed
+catalogue, so the counter join is the half of the pair with an expiry date on it and this is the half
+without one.
+
 **What the demonstration showed.** Separately from the gate, and by hand, the published release disk
 was booted under OVMF with a 64 MiB virtio-blk data device attached at 00:05.0, and 14 routable
 IPv4/UDP frames of 84 to 1384 bytes were injected on dataplane-0 for the appliance to route to

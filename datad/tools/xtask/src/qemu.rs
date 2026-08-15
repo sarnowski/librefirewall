@@ -3548,11 +3548,21 @@ fn judge_recordings(
             metrics_contract::drop_reason_total(&exposition.body, reason)?,
         );
     }
+    // The document's rules in the order the filter decides them, read once and
+    // handed to both accounts of their work: the counter join below, which reads
+    // a hit total per id off the scrape, and the per-record attribution, which
+    // reads nothing off it. Two accounts of one list, so a boot on which they
+    // disagree is one where the numbers and the records describe different work.
+    let declared_rules: Vec<String> = topology
+        .rule_ids()
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
     let mut rules = Vec::new();
-    for id in topology.rule_ids() {
+    for id in &declared_rules {
         rules.push(surface_contract::DeclaredRule {
-            id: id.as_str().to_owned(),
-            hits: metrics_contract::rule_hits(&exposition.body, id.as_str())?,
+            id: id.clone(),
+            hits: metrics_contract::rule_hits(&exposition.body, id)?,
         });
     }
     let published = surface_contract::Published {
@@ -3762,6 +3772,14 @@ fn judge_recordings(
             ports: topology.interfaces().len(),
         },
         &published,
+        // And the account of the same rules that owes the exposition nothing:
+        // the document's own order, and what this boot's probe set arranged for
+        // the filter to decide. Both are the harness's, so every attribution
+        // stated against them survives the exposition beside them.
+        &surface_contract::Policy {
+            declared: &declared_rules,
+            witness: booted.policy,
+        },
         // Whether this boot can have opened a conversation at all, taken from the
         // medium the harness attached: an appliance nobody has onboarded carries
         // nothing, so its history is legitimately empty and its capture is not.

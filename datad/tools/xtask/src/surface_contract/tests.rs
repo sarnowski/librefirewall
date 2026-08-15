@@ -7,10 +7,15 @@
 //! perturbation below is a thing that would have to break in the appliance for
 //! the corresponding assertion to fire in QEMU.
 
+use std::sync::LazyLock;
+
+use config::Identifier;
+
 use super::*;
 use crate::recording_contract::{
     CLASSIFICATION_NEW, EVENT_FLOW_REFUSED, Interface, STATE_TIME_WAIT,
 };
+use crate::topology::{PortPolicy, PortRule};
 
 const LOG_RECORDING: &str = "the connection history";
 const CAPTURE_RECORDING: &str = "the capture";
@@ -150,10 +155,72 @@ fn published() -> Published {
             .iter()
             .map(|reason| ((*reason).to_owned(), Some(100)))
             .collect(),
-        rules: vec![DeclaredRule {
-            id: "probe-forward".to_owned(),
-            hits: Some(4),
-        }],
+        // The same document [`DECLARED`] states, in the same order: the counter
+        // join reads a hit total per id off this and the per-record attribution
+        // reads the positions off that, so a fixture whose two accounts described
+        // different documents would make either law fire for the other's reason.
+        rules: DECLARED
+            .iter()
+            .map(|id| DeclaredRule {
+                id: (*id).to_owned(),
+                hits: Some(4),
+            })
+            .collect(),
+    }
+}
+
+/// The rule ids the synthetic document declares, in the order the filter decides
+/// them — which is the position a record names.
+///
+/// The accepting rule first, because [`published`] names position 0
+/// `probe-forward` and [`opening`] credits it: the counter join and the
+/// per-record attribution have to be reading one document, or a case that
+/// perturbs a rule would be perturbing two different ones.
+const DECLARED: [&str; 2] = ["probe-forward", "probe-blocked"];
+
+/// The position [`opening`] credits, which is the accepting rule's.
+const ACCEPTING: u16 = 0;
+/// The position a refusal credits, which is the dropping rule's.
+const DROPPING: u16 = 1;
+
+/// [`DECLARED`] as the judgement takes it — owned strings, because a rule id in
+/// a running document is text an operator wrote rather than a literal.
+static DECLARED_IDS: LazyLock<Vec<String>> =
+    LazyLock::new(|| DECLARED.iter().map(|id| (*id).to_owned()).collect());
+
+/// The policy a sound run ran under: the synthetic document's two rules, and a
+/// probe set that reached neither of the filter's refusals.
+///
+/// The refusals are off because [`SOUND`] holds forwarded records only. A case
+/// that turns one on makes the zero half of the outcome law into the demand
+/// half, which is what puts both of its directions within reach from here.
+fn policy() -> Policy<'static> {
+    Policy {
+        declared: &DECLARED_IDS,
+        witness: witness(),
+    }
+}
+
+fn witness() -> PolicyWitness {
+    let rule = |at: u16, destination_port| PortRule {
+        id: Identifier::new(DECLARED[at as usize].as_bytes())
+            .expect("the fixture's rule ids are identifiers the schema admits"),
+        destination_port,
+    };
+    PolicyWitness {
+        policy: PortPolicy {
+            accepted: rule(ACCEPTING, 5000),
+            denied: rule(DROPPING, 5001),
+            unmatched: 5002,
+        },
+        probed_the_denying_rule: false,
+        probed_the_fallthrough: false,
+        probed_an_established_flow: false,
+        probed_mid_stream: false,
+        rules: DECLARED.len(),
+        reconfigured: false,
+        unowned: false,
+        flooded_tuples: 0,
     }
 }
 
@@ -208,6 +275,7 @@ fn two_recordings_of_the_same_traffic_agree() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("a sound pair");
@@ -238,6 +306,7 @@ fn a_connection_history_shorter_than_the_capture_is_the_selection() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("a selection is not a lost observation");
@@ -258,6 +327,7 @@ fn a_connection_history_longer_than_the_capture_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a selection cannot be larger than what it selects from");
@@ -278,6 +348,7 @@ fn an_unpaired_packet_id_is_a_finding_even_at_an_equal_count() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("an identity in the history and not the capture is fabrication");
@@ -313,6 +384,7 @@ fn a_history_record_naming_no_event_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a record for its own sake is the packet log this is not");
@@ -355,6 +427,7 @@ fn an_event_the_probes_oblige_and_the_history_lacks_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("the opening the probe had to cause is not in the history");
@@ -387,6 +460,7 @@ fn a_verdict_disagreeing_with_the_wire_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("the harness watched that probe come back on the far port");
@@ -412,6 +486,7 @@ fn a_rule_the_exposition_credits_with_no_hit_is_a_finding() {
             }],
             ..published()
         },
+        &policy(),
         true,
     )
     .expect_err("a record crediting a rule that never ran");
@@ -457,6 +532,7 @@ fn a_refusal_the_exposition_never_counted_is_a_finding() {
             drop_reasons,
             ..published()
         },
+        &policy(),
         true,
     )
     .expect_err("four records of a refusal the appliance counted once");
@@ -491,6 +567,7 @@ fn a_close_with_no_matching_open_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a close naming a conversation nothing opened");
@@ -523,6 +600,7 @@ fn a_close_that_does_not_say_how_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a close must name a state a conversation does not leave");
@@ -564,6 +642,7 @@ fn an_advance_classified_new_or_naming_a_rule_is_a_finding() {
             &capture_surface(&capture, 4),
             &wire(&probes),
             &published(),
+            &policy(),
             true,
         )
         .expect_err("an advance the filter is claimed to have decided");
@@ -586,6 +665,7 @@ fn a_record_carrying_no_annotation_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a record without the decision is not evidence of one");
@@ -610,6 +690,7 @@ fn a_standard_verdict_option_disagreeing_with_the_annotation_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("two statements of one decision, disagreeing");
@@ -638,6 +719,7 @@ fn a_packet_the_harness_never_injected_is_a_finding() {
         &capture_surface(&capture, 5),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a block matching no injected frame is fabrication");
@@ -671,6 +753,7 @@ fn a_packet_block_that_retained_no_byte_is_a_finding() {
         &capture_surface(&capture, 5),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("an empty capture is no prefix of anything");
@@ -711,6 +794,7 @@ fn a_log_capture_past_the_snap_length_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a log block keeping 200 bytes at a snap length of 128 is unclamped");
@@ -764,6 +848,7 @@ fn a_frame_past_the_log_snap_length_is_sound_when_each_sink_clamps_its_own_way()
         &capture_surface(&capture, 1),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("each sink keeping its own snap length of one frame is the contract");
@@ -793,6 +878,7 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("one ring under two names is one recording");
@@ -815,6 +901,7 @@ fn a_recording_holding_more_than_the_recorder_published_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("four blocks against two encoded records is fabrication");
@@ -839,6 +926,7 @@ fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
         &resumed(capture_surface(&capture, 2), &carried_capture),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("two of the four blocks were on the medium before this boot");
@@ -867,6 +955,7 @@ fn a_resumed_recording_holding_more_than_this_boot_published_is_a_finding() {
         &resumed(capture_surface(&capture, 2), &carried),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("three blocks of this boot's own against two encoded records is fabrication");
@@ -890,6 +979,7 @@ fn a_resumed_recording_offering_fewer_records_than_the_medium_held_is_a_finding(
         &resumed(capture_surface(&capture, 4), &carried),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a resumed recording may not lose what the medium already held");
@@ -918,6 +1008,7 @@ fn a_resumed_recording_is_held_to_the_decisions_this_boot_counted() {
         &resumed(capture_surface(&capture, 2), &carried_capture),
         &wire(&probes),
         &counted,
+        &policy(),
         true,
     )
     .expect("two forwarded records of this boot's own against two forwarded frames");
@@ -927,6 +1018,7 @@ fn a_resumed_recording_is_held_to_the_decisions_this_boot_counted() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &counted,
+        &policy(),
         true,
     )
     .expect_err("on a fresh medium all four records are this boot's and two were counted");
@@ -949,6 +1041,7 @@ fn a_recording_holding_fewer_than_the_recorder_published_is_accepted() {
         &capture_surface(&capture, 9),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("a staging buffer between the scrape and the download is not a finding");
@@ -966,6 +1059,7 @@ fn a_sink_publishing_no_record_proves_nothing() {
         &capture_surface(&capture, 0),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("zero against zero is not agreement");
@@ -1013,6 +1107,7 @@ fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         false,
     )
     .expect("an appliance that carried nothing opened no conversation");
@@ -1025,6 +1120,7 @@ fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
         &capture_surface(&empty, 0),
         &wire(&probes),
         &published(),
+        &policy(),
         false,
     )
     .expect_err("a refusal is a decision and owes a record");
@@ -1045,6 +1141,7 @@ fn a_probe_missing_from_both_recordings_is_a_finding() {
         &capture_surface(&capture, 2),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("the second probe was injected and nothing recorded it");
@@ -1067,6 +1164,7 @@ fn a_packet_naming_an_interface_the_document_does_not_configure_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("interface 7 on a two-port bench resolves to nothing");
@@ -1087,6 +1185,7 @@ fn a_prologue_short_of_the_documents_ports_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("one interface block for a two-port document is a short prologue");
@@ -1116,6 +1215,7 @@ fn a_recording_spanning_two_sections_declares_a_prologue_in_each() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect("a second segment's prologue is a second interface table, not a stray one");
@@ -1136,6 +1236,7 @@ fn a_packet_with_no_identity_cannot_be_paired_and_is_a_finding() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a block with no identity pairs with nothing");
@@ -1168,6 +1269,7 @@ fn every_disagreement_is_reported_not_only_the_first() {
         &capture_surface(&capture, 4),
         &wire(&probes),
         &published(),
+        &policy(),
         true,
     )
     .expect_err("a pair broken several ways");
@@ -1178,4 +1280,473 @@ fn every_disagreement_is_reported_not_only_the_first() {
     );
     assert!(error.contains("interface block(s)"), "{error}");
     assert!(error.contains("naming flow-opened"), "{error}");
+}
+
+/// A refusal the filter itself made, as a record states it.
+fn refusal(reason: &str, event: u8, rule: u16) -> Annotation {
+    Annotation {
+        verdict: VERDICT_DROPPED,
+        drop_reason: reason_code(reason),
+        event,
+        classification: 0,
+        flow_state: 0,
+        flow_slot: 0,
+        flow_generation: 0,
+        rule,
+        ..opening(0, 0)
+    }
+}
+
+/// The witness a boot that provoked the dropping rule carries.
+fn probed_the_denying_rule() -> PolicyWitness {
+    PolicyWitness {
+        probed_the_denying_rule: true,
+        ..witness()
+    }
+}
+
+/// A capture holding [`SOUND`] plus one record of the probe the tap is not held
+/// to, carrying `annotation`.
+///
+/// Probe 2 rather than either routed one, because the harness watched both of
+/// those come back on the far port: a refusal carrying their bytes would be
+/// caught by the wire comparison and the case would prove that instead.
+fn capture_with(annotation: Annotation) -> Parsed {
+    let mut capture = recording(CAPTURE_SNAP, SOUND);
+    capture.packets.push(record(CAPTURE_SNAP, 9, 2, annotation));
+    capture
+}
+
+/// **The misattribution the counter comparison cannot see.** A denial credited
+/// to the rule that *accepts* moves that rule's hit total and the denial counter
+/// together, so both of the appliance's accounts still agree — and the join
+/// between them passes while the record in front of it says the filter admitted
+/// and refused one frame by one rule.
+///
+/// Both halves are asserted here, on one fixture: the old law finding nothing is
+/// what makes the new one worth its cost.
+#[test]
+fn a_denial_credited_to_the_accepting_rule_is_a_finding_no_counter_can_make() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = capture_with(refusal(
+        "policy_denied",
+        EVENT_POLICY_DENIED,
+        ACCEPTING.saturating_add(1),
+    ));
+    let surface = capture_surface(&capture, 5);
+    // The exposition's two accounts of that same denial, agreeing: the accepting
+    // rule is credited with hits and the reason is counted. Nothing here is
+    // wrong, which is the point.
+    assert!(
+        rule_differences(&surface, &published()).is_empty(),
+        "the counter join has no way to see a misattributed denial"
+    );
+    let found = policy_differences(
+        &surface,
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: probed_the_denying_rule(),
+        },
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found.iter().any(
+            |difference| difference.contains("cannot be the one that refused it")
+                && difference.contains("probe-forward")
+        ),
+        "{found:?}"
+    );
+    // And through the whole judgement, so the law is reachable from a boot
+    // rather than only from a direct call.
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &surface,
+        &wire(&probes),
+        &published(),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: probed_the_denying_rule(),
+        },
+        true,
+    )
+    .expect_err("a denial credited to the rule that accepts");
+    assert!(
+        error.contains("cannot be the one that refused it"),
+        "{error}"
+    );
+}
+
+/// The mirror: the rule that *drops* on a frame the appliance carried.
+#[test]
+fn a_forwarded_frame_credited_to_the_dropping_rule_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let mut capture = recording(CAPTURE_SNAP, SOUND);
+    if let Some(packet) = capture.packets.first_mut() {
+        packet.annotation = Some(Annotation {
+            rule: DROPPING.saturating_add(1),
+            ..opening(0, 0)
+        });
+    }
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &published(),
+        &policy(),
+        true,
+    )
+    .expect_err("a frame the appliance carried, credited to the rule that drops");
+    assert!(
+        error.contains("admitted by some other rule than the one credited here"),
+        "{error}"
+    );
+    assert!(error.contains("probe-blocked"), "{error}");
+}
+
+/// A boot that ran two policies: the same two ids exchange their actions across
+/// the commit, so each legitimately appears under both verdicts and the
+/// attribution law stands down.
+#[test]
+fn a_reconfigured_boot_lets_one_rule_carry_both_verdicts() {
+    let log = recording(LOG_SNAP, SOUND);
+    let mut capture = recording(CAPTURE_SNAP, SOUND);
+    if let Some(packet) = capture.packets.first_mut() {
+        packet.annotation = Some(Annotation {
+            rule: DROPPING.saturating_add(1),
+            ..opening(0, 0)
+        });
+    }
+    let probes = injected();
+    judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &published(),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: PolicyWitness {
+                reconfigured: true,
+                ..witness()
+            },
+        },
+        true,
+    )
+    .expect("across a commit a rule's action moves, so its records carry both verdicts");
+}
+
+/// A record crediting a rule past the end of the policy in force: a rule no
+/// operator wrote.
+#[test]
+fn a_rule_position_past_the_policy_in_force_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = capture_with(refusal(
+        "policy_denied",
+        EVENT_POLICY_DENIED,
+        // One past the last rule the witness says the document declares.
+        u16::try_from(DECLARED.len())
+            .expect("two rules fit")
+            .saturating_add(1),
+    ));
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 5),
+        &wire(&probes),
+        &published(),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: probed_the_denying_rule(),
+        },
+        true,
+    )
+    .expect_err("a rule nobody wrote");
+    assert!(
+        error.contains("credits a rule no operator wrote"),
+        "{error}"
+    );
+}
+
+/// The two refusals the filter makes, each held to naming a rule or naming none:
+/// a denial is a rule's decision and a fallthrough is the absence of one.
+#[test]
+fn a_refusal_attributed_against_its_own_reason_is_a_finding() {
+    for (reason, event, rule, clause) in [
+        (
+            "policy_denied",
+            EVENT_POLICY_DENIED,
+            0,
+            "states a refusal it cannot attribute",
+        ),
+        (
+            "no_policy_match",
+            EVENT_POLICY_NO_MATCH,
+            DROPPING.saturating_add(1),
+            "the one refusal no rule made",
+        ),
+    ] {
+        let log = recording(LOG_SNAP, SOUND);
+        let capture = capture_with(refusal(reason, event, rule));
+        let probes = injected();
+        let error = judge(
+            &log_surface(&log, 4),
+            &capture_surface(&capture, 5),
+            &wire(&probes),
+            &published(),
+            &Policy {
+                declared: &DECLARED_IDS,
+                witness: PolicyWitness {
+                    probed_the_denying_rule: true,
+                    probed_the_fallthrough: true,
+                    ..witness()
+                },
+            },
+            true,
+        )
+        .expect_err("a refusal whose reason and whose attribution describe different outcomes");
+        assert!(error.contains(clause), "{error}");
+    }
+}
+
+/// An appliance nobody owns settles every frame in front of admission, so no
+/// record of that boot names a rule.
+///
+/// The counter join cannot state this at all: it would pass the record whenever
+/// the exposition credited the same rule, which is two surfaces agreeing about
+/// work that could not have happened.
+#[test]
+fn a_rule_named_on_an_unowned_boot_is_a_finding() {
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let surface = capture_surface(&capture, 4);
+    assert!(
+        rule_differences(&surface, &published()).is_empty(),
+        "the counter join credits the rule and sees nothing"
+    );
+    let found = policy_differences(
+        &surface,
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: PolicyWitness {
+                unowned: true,
+                ..witness()
+            },
+        },
+    );
+    assert!(
+        found
+            .iter()
+            .any(|difference| difference.contains("nobody owns")),
+        "{found:?}"
+    );
+}
+
+/// The zero case of the outcome law, which is its stronger half: a refusal in
+/// the capture that no probe of this boot could have provoked.
+#[test]
+fn a_refusal_no_probe_provoked_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = capture_with(refusal(
+        "policy_denied",
+        EVENT_POLICY_DENIED,
+        DROPPING.saturating_add(1),
+    ));
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 5),
+        &wire(&probes),
+        &published(),
+        // The default witness: this boot injected nothing the dropping rule
+        // could refuse.
+        &policy(),
+        true,
+    )
+    .expect_err("a refusal nobody put on the wire");
+    assert!(
+        error.contains("injected nothing a rule that says drop could refuse"),
+        "{error}"
+    );
+}
+
+/// And the demand half: a refusal the probes aimed at, and a capture that holds
+/// none.
+#[test]
+fn a_refusal_the_probes_provoked_and_the_capture_lacks_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &published(),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: PolicyWitness {
+                probed_the_fallthrough: true,
+                ..witness()
+            },
+        },
+        true,
+    )
+    .expect_err("a probe the default deny had to refuse, and no record of it");
+    assert!(error.contains("the default deny did not happen"), "{error}");
+}
+
+/// A previous boot's records are not this boot's to answer for: the medium it
+/// carried was written under a policy and an ownership this witness does not
+/// describe.
+#[test]
+fn a_carried_mediums_records_are_not_held_to_this_boots_policy() {
+    // The medium and the download built the same way, so what the earlier boot
+    // left is exactly the prefix this boot answers — and this boot appended
+    // nothing, leaving the misattribution below entirely the earlier boot's.
+    let misattributed = || {
+        capture_with(refusal(
+            "policy_denied",
+            EVENT_POLICY_DENIED,
+            ACCEPTING.saturating_add(1),
+        ))
+    };
+    let carried_log = recording(LOG_SNAP, SOUND);
+    let log = recording(LOG_SNAP, SOUND);
+    let carried_capture = misattributed();
+    let capture = misattributed();
+    let probes = injected();
+    judge(
+        &resumed(log_surface(&log, 4), &carried_log),
+        &resumed(capture_surface(&capture, 5), &carried_capture),
+        &wire(&probes),
+        &published(),
+        &policy(),
+        true,
+    )
+    .expect("a witness describes the boot that carries it and no earlier one");
+}
+
+/// A refusal naming a reason this build's tap ABI has no word for.
+///
+/// The law that survives the exposition out of the comparison it used to sit
+/// inside: it consults no counter, so it says exactly as much once there is one
+/// surface as it does while there are two.
+#[test]
+fn a_drop_reason_outside_the_vocabulary_is_a_finding() {
+    let log = recording(LOG_SNAP, SOUND);
+    let mut capture = capture_with(refusal(
+        "policy_denied",
+        EVENT_POLICY_DENIED,
+        DROPPING.saturating_add(1),
+    ));
+    if let Some(packet) = capture.packets.last_mut()
+        && let Some(annotation) = packet.annotation.as_mut()
+    {
+        annotation.drop_reason = u8::try_from(DROP_REASONS.len())
+            .expect("the vocabulary fits a byte")
+            .saturating_add(1);
+    }
+    let probes = injected();
+    let error = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 5),
+        &wire(&probes),
+        &published(),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: probed_the_denying_rule(),
+        },
+        true,
+    )
+    .expect_err("a refusal this build has no word for");
+    assert!(
+        error.contains("outside the 26 this build's vocabulary declares"),
+        "{error}"
+    );
+}
+
+/// The harness contradicting itself: a witness whose rules the document it was
+/// read beside does not declare, so no record can be attributed to either.
+#[test]
+fn a_witness_rule_the_document_does_not_declare_is_a_finding() {
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let elsewhere = vec![String::from("some-other-rule")];
+    let found = policy_differences(
+        &capture_surface(&capture, 4),
+        &Policy {
+            declared: &elsewhere,
+            witness: witness(),
+        },
+    );
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|difference| difference.contains("accepting rule")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|difference| difference.contains("dropping rule")),
+        "{found:?}"
+    );
+}
+
+/// The attribution itself, in the run log: which rule this boot's records
+/// credited, and how often.
+#[test]
+fn the_evidence_states_which_rule_each_record_credited() {
+    let log = recording(LOG_SNAP, SOUND);
+    let capture = recording(CAPTURE_SNAP, SOUND);
+    let probes = injected();
+    let agreement = judge(
+        &log_surface(&log, 4),
+        &capture_surface(&capture, 4),
+        &wire(&probes),
+        &published(),
+        &policy(),
+        true,
+    )
+    .expect("a sound pair");
+    assert_eq!(
+        agreement.rule_positions.get(&ACCEPTING),
+        Some(&(String::from("probe-forward"), 4))
+    );
+    let evidence = agreement.evidence();
+    assert!(
+        evidence.contains("4\u{d7} position 0 (probe-forward)"),
+        "{evidence}"
+    );
+}
+
+/// A refusal whose reason and whose attribution describe different outcomes is
+/// wrong whoever owns the node, so that law holds on an unowned boot too.
+///
+/// It has to be stated separately because the law that *replaces* the
+/// attribution law there cannot reach this record: the fault is a denial naming
+/// no rule, and a record naming no rule is exactly what an unowned boot's own law
+/// is satisfied by. The rest of the fixture is sound traffic, and every record of
+/// it trips that other law correctly — an unowned appliance consults no filter,
+/// so a forwarded frame crediting a rule is a finding whatever else is wrong.
+#[test]
+fn an_unowned_boot_still_holds_a_refusal_to_its_own_reason() {
+    let capture = capture_with(refusal("policy_denied", EVENT_POLICY_DENIED, 0));
+    let found = policy_differences(
+        &capture_surface(&capture, 5),
+        &Policy {
+            declared: &DECLARED_IDS,
+            witness: PolicyWitness {
+                unowned: true,
+                ..witness()
+            },
+        },
+    );
+    assert_eq!(
+        found
+            .iter()
+            .filter(|difference| difference.contains("states a refusal it cannot attribute"))
+            .count(),
+        1,
+        "{found:?}"
+    );
 }
