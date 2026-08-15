@@ -788,6 +788,7 @@ pub(crate) fn judge(
     serial: &[u8],
     device: &str,
     resumed: bool,
+    medium: &[crate::data_disk::Extent],
 ) -> Result<String, String> {
     let log = &String::from_utf8_lossy(serial);
     match contract {
@@ -824,6 +825,10 @@ pub(crate) fn judge(
             // number.
             expect_frames_beyond_the_greeting(log)?;
             expect_shipping_after_catching_up(log)?;
+            // And the half no reading of this transcript alone could establish:
+            // that the bytes the appliance handed a management server are the
+            // bytes on its own medium, at the positions it said they were at.
+            let corroborated = expect_the_medium_behind_the_shipments(&transcript, medium)?;
             Ok(format!(
                 "  answered   channel               appliance->server  {}:{DIAL_PORT}  \
                  TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768; the server validated \
@@ -831,7 +836,7 @@ pub(crate) fn judge(
                  version 1, and the appliance shipped {records} bytes of its log ring from \
                  position {from} as UP_RECORDS — where that recording begins on the medium this \
                  boot attached — then went on shipping across {shipped} frames at advancing \
-                 positions with traffic injected between them",
+                 positions with traffic injected between them\n{corroborated}",
                 ipv4(DIAL_DESTINATION)
             ))
         }
@@ -1217,42 +1222,6 @@ fn begins_a_recording(position: u64, resumed: bool) -> bool {
     position.is_multiple_of(SEGMENT_BYTES as u64)
 }
 
-/// Every upstream frame the server received, as `(type, position, ring bytes)`,
-/// in the order they arrived.
-///
-/// Read off the transcript the way [`expect_records`] reads the first one, and
-/// for the same reason: the frames are looked for inside a stream `openssl`
-/// interleaves with its own diagnostics, so each is found by its header rather
-/// than at an offset.
-fn upstream_frames(transcript: &[u8]) -> Vec<(u8, u64, usize)> {
-    let mut found = Vec::new();
-    let mut at = 0;
-    while let Some(next) = transcript
-        .get(at..)
-        .and_then(|tail| tail.windows(HEADER_LEN).position(is_upstream))
-    {
-        let start = at + next;
-        at = start + 1;
-        let Some(header) = transcript.get(start..start + HEADER_LEN) else {
-            break;
-        };
-        let stated = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let Some(body) = transcript.get(start + HEADER_LEN..start + HEADER_LEN + stated) else {
-            continue;
-        };
-        let (Some(position), Some(ring)) =
-            (body.get(..RING_POSITION_LEN), body.get(RING_POSITION_LEN..))
-        else {
-            continue;
-        };
-        let mut octets = [0_u8; RING_POSITION_LEN];
-        octets.copy_from_slice(position);
-        found.push((header[4], u64::from_be_bytes(octets), ring.len()));
-        at = start + HEADER_LEN + stated;
-    }
-    found
-}
-
 /// The appliance kept shipping: more than one upstream frame reached the server,
 /// and each ring's frames name strictly advancing positions.
 ///
@@ -1266,7 +1235,7 @@ fn upstream_frames(transcript: &[u8]) -> Vec<(u8, u64, usize)> {
 /// # Errors
 /// A boot that shipped once and stopped, and one whose positions stood still.
 fn expect_shipments_at_advancing_positions(transcript: &[u8]) -> Result<usize, String> {
-    let frames = upstream_frames(transcript);
+    let frames = crate::shipment_contract::walk(transcript).positions();
     if frames.len() < 2 {
         return Err(format!(
             "the appliance put {} upstream frame(s) on the session it was holding, and this boot \
@@ -1291,13 +1260,6 @@ fn expect_shipments_at_advancing_positions(transcript: &[u8]) -> Result<usize, S
         }
     }
     Ok(frames.len())
-}
-
-/// Whether these eight bytes are an upstream frame's header: either ring's type
-/// byte, and the three reserved bytes this protocol holds at zero.
-fn is_upstream(window: &[u8]) -> bool {
-    matches!(window.get(4), Some(&UP_RECORDS_TYPE | &UP_CAPTURE_TYPE))
-        && window.get(5..8) == Some(&[0, 0, 0][..])
 }
 
 /// Whether these eight bytes are an `UP_RECORDS` header: the type byte, and the
@@ -1381,6 +1343,50 @@ const SECTION_HEADER_PREFIX_LEN: usize = 12;
 /// it waits for.
 const _: () = assert!(SERVER_GREETING.len() == GREETING_LEN + 4);
 const _: () = assert!(SERVER_GREETING.len() - GREETING_LEN < HEADER_LEN);
+/// Hold the ring bytes the appliance shipped to the extents on its own disk.
+///
+/// **This is the pair that makes either reading evidence.** The transcript is
+/// the appliance's account of its recordings, composed by the domain whose
+/// conduct is in question; the extents are the same recordings read on the host
+/// side of the emulation by a process the guest cannot reach. A recorder that
+/// shipped a plausible stream and wrote nothing satisfies every management
+/// server, and a recorder that wrote a fine extent and shipped something else
+/// leaves one holding a fiction — neither surface notices alone, and the
+/// comparison is total rather than statistical because the framing contract
+/// makes the ring bytes the wire bytes.
+///
+/// # Errors
+/// A boot whose medium was not read back, and every disagreement
+/// [`crate::shipment_contract::judge`] states.
+fn expect_the_medium_behind_the_shipments(
+    transcript: &[u8],
+    medium: &[crate::data_disk::Extent],
+) -> Result<String, String> {
+    use crate::shipment_contract::{Extent, Ring, judge, walk};
+    // `Deck::extents`' order, which is the connection history and then the
+    // capture — the order the recorder declares them in and the order every
+    // other contract over the pair reads them in.
+    let [log, capture] = medium else {
+        return Err(format!(
+            "this boot shipped its recordings up a channel and {} recording extent(s) were read \
+             off its disk image, so there is nothing to hold the shipments to. The contract is \
+             stated over the two the recorder declares",
+            medium.len()
+        ));
+    };
+    let held = [(Ring::Log, log), (Ring::Capture, capture)].map(|(ring, extent)| Extent {
+        ring,
+        payload: &extent.payload,
+        durable: extent.durable,
+    });
+    // A floor rather than a count: how much of each ring reaches the wire before
+    // the boot ends is the appliance's own scheduling, and asserting a number
+    // would be this harness deciding it. What it refuses is the vacuous pass —
+    // an agreement reached because nothing was compared. A pcapng Section Header
+    // Block alone is 28 bytes, so a ring that shipped fewer shipped no recording.
+    Ok(judge(&walk(transcript), &held, 28)?.evidence())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

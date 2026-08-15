@@ -6455,6 +6455,16 @@ pub struct Booted {
     /// resumed recording answers earlier boots' records, and this is what tells
     /// them from the ones this boot's counters are an account of.
     pub carried_recordings: Vec<recording_contract::Parsed>,
+    /// Both recording extents as the **medium** holds them once the guest has
+    /// stopped, in [`lfw_recorder::deck::Deck::extents`]'s order.
+    ///
+    /// Filled by the caller after shutdown, for the same reason
+    /// `carried_recordings` is filled before the boot: this function never opens
+    /// the medium, and a reading taken while the guest is running is a reading
+    /// of a file still being written. It is the one account of a recording that
+    /// nothing inside the guest composed for a reader, which is what makes it
+    /// the thing every other account is held to.
+    pub on_the_medium: Vec<crate::data_disk::Extent>,
     /// Every frame this boot put on a dataplane port, with the probe that put
     /// it there and whether the appliance's tap must have observed it.
     ///
@@ -7971,6 +7981,7 @@ fn run_boot(
         policy,
         recordings,
         carried_recordings: Vec::new(),
+        on_the_medium: Vec::new(),
         handshakes,
         requests,
         installs,

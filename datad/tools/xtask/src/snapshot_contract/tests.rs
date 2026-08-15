@@ -13,6 +13,7 @@ fn reading(slots: usize, fill: impl Fn(usize) -> u64) -> Snapshot {
         fingerprint: lfw_metrics::CATALOGUE_FINGERPRINT,
         unix_nanos: 1,
         values: (0..slots).map(fill).collect(),
+        packets_before: 0,
     }
 }
 

@@ -398,6 +398,16 @@ pub struct Snapshot {
     /// where it had no clock.
     pub unix_nanos: u64,
     pub values: Vec<u64>,
+    /// How many packet blocks of this file stand ahead of the block carrying
+    /// this reading.
+    ///
+    /// A ring is append-ordered, so a record written before this block is one
+    /// the recorder had already encoded when it published these counters. That
+    /// is what makes a reading carried *inside* a recording comparable to the
+    /// records beside it: the counter and the records it accounts for are
+    /// ordered by the medium rather than by two clocks, so a reader needs no
+    /// race window to state the relation between them.
+    pub packets_before: usize,
 }
 
 impl Snapshot {
@@ -432,6 +442,8 @@ fn snapshot(data: &[u8]) -> Option<Snapshot> {
         fingerprint: word(header, 4)?,
         unix_nanos: u64::from_le_bytes(header.get(8..16)?.try_into().ok()?),
         values,
+        // Filled by the walk, which is the only place that knows the position.
+        packets_before: 0,
     })
 }
 
@@ -609,7 +621,10 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
             CUSTOM_BLOCK => {
                 if let Some(data) = block.get(12..block.len().saturating_sub(4)) {
                     match (snapshot(data), transcript(data)) {
-                        (Some(reading), _) => found.snapshots.push(reading),
+                        (Some(mut reading), _) => {
+                            reading.packets_before = found.packets.len();
+                            found.snapshots.push(reading);
+                        }
                         (_, Some(lines)) => {
                             found.transcript_batches += 1;
                             found.transcript.extend(lines);

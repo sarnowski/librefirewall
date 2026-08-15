@@ -100,6 +100,7 @@ mod qemu;
 mod recording_contract;
 mod reference_contract;
 mod reproducible;
+mod shipment_contract;
 mod signing;
 mod snapshot_contract;
 mod stamp_contract;

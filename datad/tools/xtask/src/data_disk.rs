@@ -91,6 +91,31 @@ struct Inherited {
     durable: Vec<u8>,
 }
 
+/// One recording extent as the medium holds it after a run, kept rather than
+/// only described.
+///
+/// The walk that judges an extent already reads every byte of it and parses the
+/// payload; a verdict that answered prose alone would leave the one reading no
+/// process inside the guest can influence unavailable to every other contract,
+/// which would then have to take the appliance's own account of the same file
+/// instead. So the reading is returned.
+#[derive(Debug)]
+pub(crate) struct Extent {
+    /// The extent's payload area, from payload byte zero — which is the
+    /// coordinate a channel shipment states its ring position in.
+    pub(crate) payload: Vec<u8>,
+    /// How far into that area the superblock says the recording is durable.
+    pub(crate) durable: usize,
+}
+
+/// What one run's medium was found to hold, and the sentence that says so.
+pub(crate) struct OnTheMedium {
+    pub(crate) evidence: String,
+    /// In [`Deck::extents`]'s order, which is the connection history and then
+    /// the capture.
+    pub(crate) extents: Vec<Extent>,
+}
+
 /// One run's data device: a raw image created fresh — or the one an earlier
 /// boot left — attached to QEMU, and read back afterwards.
 ///
@@ -350,12 +375,13 @@ impl DataDisk {
     /// extent whose payload segments hold no walkable pcapng, one the walk did
     /// not follow to exactly the byte the superblock's durable cursor names, or
     /// an extent that holds no packet block where this boot owed one.
-    pub(crate) fn judge_recordings(&self, conversations: bool) -> Result<String, String> {
+    pub(crate) fn judge_recordings(&self, conversations: bool) -> Result<OnTheMedium, String> {
         let mut file = OpenOptions::new()
             .read(true)
             .open(&self.path)
             .map_err(|error| format!("open {}: {error}", self.path.display()))?;
         let mut lines = Vec::new();
+        let mut read = Vec::new();
         for (start_sector, sectors) in Deck::extents() {
             let mut superblock = [0u8; SUPERBLOCK_BYTES];
             read_at(
@@ -480,11 +506,15 @@ impl DataDisk {
                 parsed.packets.len(),
                 parsed.consumed,
             ));
+            read.push(Extent { payload, durable });
         }
-        Ok(format!(
-            "both recording extents, read off the disk image after shutdown:\n{}",
-            lines.join("\n")
-        ))
+        Ok(OnTheMedium {
+            evidence: format!(
+                "both recording extents, read off the disk image after shutdown:\n{}",
+                lines.join("\n")
+            ),
+            extents: read,
+        })
     }
 
     /// What each extent already held **going into** this boot, parsed — in

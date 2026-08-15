@@ -2936,9 +2936,15 @@ fn run_scenario(
         // where its recordings begin: the harness's own fact about the image it
         // attached, not one read back off the appliance.
         let resumed = matches!(scenario.data, DataMedium::CarriedFrom(_));
-        let channel =
-            channel_contract::judge(scenario.channel, server, &booted.serial, &device, resumed)
-                .map_err(|error| format!("scenario {name}: {error}"))?;
+        let channel = channel_contract::judge(
+            scenario.channel,
+            server,
+            &booted.serial,
+            &device,
+            resumed,
+            &booted.on_the_medium,
+        )
+        .map_err(|error| format!("scenario {name}: {error}"))?;
         println!("{channel}");
         append_evidence(
             &log,
@@ -4028,12 +4034,13 @@ fn boot(
         let on_disk = data
             .judge_recordings(conversations)
             .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
-        println!("  data disk {run_label}: {on_disk}");
+        println!("  data disk {run_label}: {}", on_disk.evidence);
         append_evidence(
             &log,
             "the two recording extents, read off the disk image after shutdown",
-            &on_disk,
+            &on_disk.evidence,
         )?;
+        booted.on_the_medium = on_disk.extents;
     }
     Ok(booted)
 }
