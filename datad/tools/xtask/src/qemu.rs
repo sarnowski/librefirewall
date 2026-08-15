@@ -1527,8 +1527,10 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // rather than resetting, which is what says no domain restarted under it.
     //
     // A `Client` scenario necessarily: the document is submitted with a real
-    // client through QEMU's own user-mode stack, and the generation the
-    // dataplane switched to is a metric.
+    // client through QEMU's own user-mode stack. What the node says about that
+    // submission it says on channels of its own — the generation the dataplane
+    // switched to on the console, and the deciding domain's own counts in the
+    // metric reading its connection history carries — so neither is asked for.
     Scenario {
         name: "configuration-submission",
         document: image::CONFIGURATION_DOCUMENT,
@@ -1570,7 +1572,11 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // dataplane demonstrably still forwarding across the commit.
     //
     // A `Client` scenario necessarily: the document goes over HTTP with a real
-    // client, and three of the four statements are metrics.
+    // client. Three of the four statements are metric series, and all three are
+    // read out of the metric readings this boot's own connection history
+    // carries — split on the forwarding domain's generation, so "before the
+    // change" and "after the pass" are the appliance's instants and not the
+    // harness's.
     Scenario {
         name: "policy-revocation",
         document: image::CONFIGURATION_DOCUMENT,
@@ -2871,27 +2877,18 @@ fn run_scenario(
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;
             }
-            if let Some(revoked) = &booted.revoked {
-                // Beside the submission it followed, because the two are one
-                // statement: the document changed and these are the conversations
-                // it ended.
-                let transcript = revoked.render();
-                println!("{transcript}");
-                append_evidence(
-                    &log,
-                    "what that commit did to the conversations the node was already carrying",
-                    &transcript,
-                )
-                .map_err(|error| format!("scenario {name}: {error}"))?;
-            }
+            // What that commit did to the conversations the node was already
+            // carrying is *in* the recordings now, so it is stated with them
+            // rather than ahead of them: the numbers are the readings the medium
+            // holds, which nothing can be said about until the guest has stopped.
             let judged = judge_recordings(root, name, &booted, &topology, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
-            println!("{judged}");
+            println!("{}", judged.evidence);
             append_evidence(
                 &log,
                 "the two recordings this boot was judged by, and their agreement with the policy \
                  and the wire",
-                &judged,
+                &judged.evidence,
             )
             .map_err(|error| format!("scenario {name}: {error}"))?;
             match &booted.applied {
@@ -2900,10 +2897,10 @@ fn run_scenario(
                      over HTTP and in force on the dataplane{}",
                     booted.scrapes.len(),
                     applied.generation,
-                    match &booted.revoked {
-                        Some(revoked) => format!(
+                    match judged.re_decision {
+                        Some(decided) => format!(
                             ", which took back {} of the {} conversations it was carrying",
-                            revoked.revoked, revoked.assured_before
+                            decided.revoked, decided.assured_before
                         ),
                         None => String::new(),
                     }
@@ -3462,7 +3459,7 @@ fn judge_recordings(
     booted: &Booted,
     topology: &Topology,
     log: &Path,
-) -> Result<String, String> {
+) -> Result<Judged, String> {
     // The events the probes oblige the connection history to hold, which is what
     // bounds it from below. Not the frame count: the log holds a record where the
     // appliance reached a lifecycle or policy event and nowhere else, so holding
@@ -3570,6 +3567,19 @@ fn judge_recordings(
             resumed_medium: carried_log.is_some(),
             witness: booted.policy,
             drop_reasons: &surface_contract::DROP_REASONS,
+            // And, on a boot that handed the appliance a document, what its own
+            // counters owe about that — split on the generation the appliance
+            // assigned, which is the number it answered the submission with.
+            submitted: booted
+                .applied
+                .as_ref()
+                .map(|applied| snapshot_contract::Submitted {
+                    generation: applied.generation,
+                    re_decision: booted.drove.map(|driven| snapshot_contract::ReDecision {
+                        driver_domain: driven.driver_domain,
+                        wakeups: driven.wakeups,
+                    }),
+                }),
         },
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
@@ -3632,7 +3642,19 @@ fn judge_recordings(
     evidence.push_str(&snapshots.evidence());
     evidence.push('\n');
     evidence.push_str(&transcript.evidence());
-    Ok(evidence)
+    Ok(Judged {
+        evidence,
+        re_decision: snapshots.re_decision,
+    })
+}
+
+/// What judging both recordings established: the evidence a reader wants, and
+/// the one finding a scenario's own verdict line names.
+struct Judged {
+    evidence: String,
+    /// What the readings said the commit did to the conversations the appliance
+    /// was already carrying, on the one scenario that drives a re-decision.
+    re_decision: Option<snapshot_contract::ReDecided>,
 }
 
 /// Write one recording\'s durable bytes into the build tree, answering the line

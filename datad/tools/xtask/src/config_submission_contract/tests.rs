@@ -140,28 +140,3 @@ fn a_long_body_is_truncated_with_a_mark() {
     assert!(cut.ends_with('…'));
     assert!(cut.len() < long.len());
 }
-
-/// The deciding domain's own counts are read off its own shard and matched on the
-/// label the outcome carries: a reader that took the first family match would read
-/// another domain's series, and one that ignored the label would read `applied` for
-/// `refused`.
-#[test]
-fn the_submission_counts_are_read_per_outcome_and_per_domain() {
-    let exposition = concat!(
-        "# TYPE librefirewall_configuration_submissions_total counter\n",
-        "librefirewall_configuration_submissions_total{domain=\"config\",outcome=\"applied\"} 2\n",
-        "librefirewall_configuration_submissions_total{domain=\"config\",outcome=\"refused\"} 1\n",
-        "librefirewall_configuration_submissions_total{domain=\"config\",outcome=\"unchanged\"} 0\n",
-        "librefirewall_configuration_reads_total{domain=\"config\"} 2\n",
-    );
-    assert_eq!(counted(exposition, SUBMISSIONS, Some("applied")), Some(2));
-    assert_eq!(counted(exposition, SUBMISSIONS, Some("refused")), Some(1));
-    assert_eq!(counted(exposition, SUBMISSIONS, Some("unchanged")), Some(0));
-    assert_eq!(counted(exposition, READS, None), Some(2));
-    assert_eq!(counted(exposition, SUBMISSIONS, Some("nonesuch")), None);
-    assert_eq!(counted("", READS, None), None);
-
-    // A series published by another domain is not this one's, whatever the family.
-    let foreign = "librefirewall_configuration_reads_total{domain=\"management\"} 9\n";
-    assert_eq!(counted(foreign, READS, None), None);
-}

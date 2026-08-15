@@ -43,6 +43,18 @@
 //! polls, and reaching for one here meant asking the management domain about
 //! something the forwarding domain had already said.
 //!
+//! # What this module does not judge
+//!
+//! **The numbers.** What the deciding domain's own counters say about these
+//! submissions, and what the re-decision a commit arms did to the conversations
+//! already running, are judged against the metric readings this boot's connection
+//! history carries — [`crate::snapshot_contract`], which also carries why. This
+//! module drives: it makes the exchanges, holds each answer to its contract, waits
+//! for the dataplane, and manufactures the wakeups a quiet bench owes a pass. The
+//! appliance ships everything else on a channel of its own, and a harness that
+//! reached in to ask for it as well was asking a second surface to repeat what the
+//! first had already sent.
+//!
 //! # No adversary
 //!
 //! As [`crate::metrics_contract`]: this reads and writes the appliance's own
@@ -51,7 +63,7 @@
 //! recorded deviation from the design, not a property to rely on.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lfw_http::Status;
 
@@ -74,12 +86,29 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SWITCH_POLLS: usize = 240;
 const SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// What the deciding domain says it has decided, which is the independent half of
-/// every claim below: the HTTP answer is one domain's account of a submission and
-/// this is the same domain's account of it in a different place, joined on nothing
-/// but having happened.
-const SUBMISSIONS: &str = "librefirewall_configuration_submissions_total";
-const READS: &str = "librefirewall_configuration_reads_total";
+/// What the deciding domain owes on its own counters once [`apply`] has run,
+/// which is the independent half of every claim it makes: the HTTP answers are one
+/// domain's account of these submissions and the counters are the same domain's
+/// account of them in a different place, joined on nothing but having happened.
+///
+/// Two documents applied — the one this image booted and the one just submitted —
+/// two refused at the two stages, and three reads: before the change, after it,
+/// and after both refusals. Floors rather than equalities, because a boot is free
+/// to have done more; what they refuse is the two accounts disagreeing.
+///
+/// **Where they are judged is the connection history and not a scrape.** All three
+/// series have a slot in the metric reading the recorder frames into the log ring,
+/// so the claim is stated over the surface the appliance ships rather than over
+/// one an operator has to reach in and ask for — see `crate::snapshot_contract`,
+/// which also carries why a counter in a reading is read as a floor over the file.
+pub const OWED_APPLIED: u64 = 2;
+pub const OWED_REFUSED: u64 = 2;
+pub const OWED_READS: u64 = 3;
+
+/// The two outcomes those counters are read under, taken from the vocabulary the
+/// console and the metric labels share rather than written down twice.
+pub const APPLIED: &str = lfw_log::GenerationOutcome::Applied.name();
+pub const REFUSED: &str = lfw_log::GenerationOutcome::Refused.name();
 
 /// The document a **reconfiguration** scenario submits, compiled in rather than
 /// read at run time.
@@ -120,23 +149,6 @@ pub const REFUSED_BY_RULE: &[u8] = include_bytes!("../scenarios/duplicate-rule-i
 /// A document the **reader** refuses: unterminated, so the refusal is about a byte
 /// and an operator can act on it with no knowledge of this appliance's capacities.
 const MALFORMED: &[u8] = b"<configuration><interfaces><interface id=\"broken\"";
-
-/// The gauge the connection table publishes its occupancy under, one series per
-/// state.
-const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
-
-/// What ended a flow, one series per cause.
-const FLOW_LIFECYCLE: &str = "librefirewall_flow_lifecycle_total";
-
-/// The passes over the connection table a commit arms, one series per outcome.
-const POLICY_SWEEP: &str = "librefirewall_policy_sweep_total";
-
-/// 1 while a commit's pass is still owed.
-const POLICY_SWEEP_RUNNING: &str = "librefirewall_policy_sweep_running";
-
-/// What a port's driver says its device delivered, which is the independent
-/// account of the wakeups the harness manufactures for the pass below.
-const RECEIVE_FRAMES: &str = "librefirewall_receive_frames_total";
 
 /// What the submission surface answered, and what the node said about itself
 /// around it. Returned so the scenario can print it as evidence.
@@ -389,36 +401,12 @@ pub fn apply(
     // traffic whose verdict must reverse may not be injected before it has.
     let unmoved = await_dataplane(generation, console)?;
 
-    // And the deciding domain's own account of what it has done, which no answer on
-    // a connection could substitute for: two documents applied — the one this image
-    // carries and the one just submitted — one refused, and two reads served.
-    let exposition = crate::metrics_contract::fetch(host_port)
-        .map_err(|error| format!("scraping for the configuration domain's own counts: {error}"))?
-        .body;
-    for (family, outcome, least) in [
-        (SUBMISSIONS, Some("applied"), 2u64),
-        // Two refusals now, at the two stages, and the count is where the deciding
-        // domain says so independently of the two answers on the wire.
-        (SUBMISSIONS, Some("refused"), 2),
-        // Three reads: before the change, after it, and after both refusals.
-        (READS, None, 3),
-    ] {
-        let reported = counted(&exposition, family, outcome).ok_or_else(|| {
-            format!(
-                "{family}{} is not in the exposition, so the domain that decided this submission \
-                 publishes nothing about it",
-                outcome.map_or(String::new(), |value| format!("{{outcome={value:?}}}"))
-            )
-        })?;
-        if reported < least {
-            return Err(format!(
-                "{family}{} reports {reported} and at least {least} is owed: the answers on the \
-                 wire said one thing about this node's submissions and the domain that decided \
-                 them says another",
-                outcome.map_or(String::new(), |value| format!("{{outcome={value:?}}}"))
-            ));
-        }
-    }
+    // The deciding domain's own account of what it has done is owed too, and is
+    // judged where the appliance ships it: the metric reading inside this boot's
+    // connection history carries all three series, and `crate::snapshot_contract`
+    // holds them to [`OWED_APPLIED`], [`OWED_REFUSED`] and [`OWED_READS`] once the
+    // medium can be read. Nothing is asked of the node here that it does not
+    // already send.
 
     Ok(Applied {
         before,
@@ -431,83 +419,37 @@ pub fn apply(
     })
 }
 
-/// What the re-decision a commit armed did, as the node's own numbers report it.
+/// What the harness did to work the re-decision a commit armed off, so the
+/// readings that say what it *did* can be read beside it.
+///
+/// The numbers the re-decision is judged on are not here: they are in the metric
+/// readings this boot's connection history carries, and
+/// `crate::snapshot_contract` states them. What this carries is the harness's own
+/// half — how many wakeups it manufactured, and whose port they went to.
 #[derive(Clone, Copy, Debug)]
-pub struct Revoked {
-    /// Two-way UDP conversations the table held before the submission.
-    pub assured_before: u64,
-    /// And after the pass finished.
-    pub assured_after: u64,
-    /// Flows the pass took back.
-    pub revoked: u64,
-    /// Passes that reached the last bucket.
-    pub passes: u64,
-    /// Wakeups the harness had to manufacture to get there.
+pub struct Driven {
+    /// Wakeups the harness manufactured.
     pub wakeups: usize,
-    /// What the driven port's own driver had received when the harness first read
-    /// progress back. The harness counts what it *wrote*; this and the reading
-    /// below are the appliance's count of what arrived, so the two together say
-    /// whether the budget was spent on frames anybody saw.
-    pub received_first: u64,
-    /// And what it had received once the pass finished.
-    pub received_last: u64,
+    /// The shard of the driver whose port took them, so the appliance's own count
+    /// of what arrived can be reported beside this count of what was written.
+    pub driver_domain: &'static str,
 }
 
-impl Revoked {
-    /// The transcript a reader wants beside a scenario's verdict.
-    #[must_use]
-    pub fn render(&self) -> String {
-        format!(
-            "  the commit re-decided the connection table:\n\
-             \x20   two-way conversations before -> {}, after -> {}\n\
-             \x20   {} flow(s) taken back, {} pass(es) over the table completed\n\
-             \x20   {} wakeup(s) manufactured to work the pass off, a pass advancing per wakeup\n\
-             \x20   the driven port's own receive count over that: {} -> {}",
-            self.assured_before,
-            self.assured_after,
-            self.revoked,
-            self.passes,
-            self.wakeups,
-            self.received_first,
-            self.received_last,
-        )
-    }
-}
-
-/// How many two-way UDP conversations the table holds.
+/// Work the re-decision a commit armed off, by manufacturing the wakeups a quiet
+/// bench does not have, and answer what was spent doing it.
 ///
-/// The occupancy gauge's `udp_assured` series and no other: a conversation the
-/// harness has seen answered is in that state, and reading one state rather than
-/// summing them keeps the number independent of the transient flows a refused
-/// packet opens and the appliance withdraws in the same evaluation.
+/// `drive` is called to manufacture one wakeup. What the pass *did* is not read
+/// here: it is in this boot's metric readings, and `crate::snapshot_contract`
+/// states it once the medium can be read.
 ///
-/// # Errors
-/// The verdict, where the series is absent — a node publishing no occupancy is one
-/// nothing below can be stated against.
-pub fn assured_flows(host_port: u16) -> Result<u64, String> {
-    let exposition = crate::metrics_contract::fetch(host_port)
-        .map_err(|error| format!("scraping the connection table's occupancy: {error}"))?
-        .body;
-    labelled(&exposition, TABLE_ENTRIES, "state", "udp_assured")
-        .ok_or_else(|| format!("{TABLE_ENTRIES}{{state=\"udp_assured\"}} is not in the exposition"))
-}
-
-/// Work the re-decision a commit armed off to completion, and hold what it did to
-/// its contract.
-///
-/// `assured_before` is [`assured_flows`] taken before the submission, so the drop in
-/// occupancy is measured across the change rather than asserted against a literal.
-/// `drive` is called to manufacture one wakeup — see below on why the harness has
-/// to.
-///
-/// # Why this waits at all, and why it makes wakeups to do it
+/// # Why the harness makes wakeups at all
 ///
 /// The pass is bounded per wakeup, because a commit that walked a million-slot
 /// index in one go would stall forwarding for a visible interval. It therefore
 /// advances only when the forwarding domain is woken, and the forwarding domain is
-/// woken by frames arriving on a dataplane port — not by a scrape, which reaches
-/// the management domain alone. So a harness that only polled would wait forever on
-/// a node whose dataplane is quiet, which is exactly the node a scenario is.
+/// woken by frames arriving on a dataplane port. So a bench whose dataplane is
+/// quiet — which is exactly what a scenario is between its two waves — would leave
+/// a pass armed and never advanced.
 ///
 /// That is not a workaround for a defect: on a running appliance the flows that
 /// matter are the ones carrying traffic, and their own frames are the wakeups that
@@ -519,6 +461,18 @@ pub fn assured_flows(host_port: u16) -> Result<u64, String> {
 /// they open no flow, move no policy counter and reach neither recording — which
 /// keeps the occupancy, the lifecycle counts and the two recordings the scenario
 /// judges free of the harness's own pacing.
+///
+/// # Why the whole budget is spent, and why that is the simpler thing
+///
+/// The budget is the appliance's own arithmetic and it is spent unconditionally.
+/// Nothing here reads progress back, so there is nothing to poll, nothing to stop
+/// early on, and no surface to ask — the harness's job is to supply wakeups, and
+/// whether they were enough is a question the readings answer afterwards. A driver
+/// that also decided when to stop was reaching for a second surface to learn
+/// something the first one it drove had no opinion about.
+///
+/// It cannot hang: the count is fixed before the first frame goes out, and every
+/// iteration spends one of it.
 ///
 /// # Why the frames are spaced out, and why nothing is timed
 ///
@@ -538,17 +492,11 @@ pub fn assured_flows(host_port: u16) -> Result<u64, String> {
 /// that is not advancing is a finding at any speed, and a slow machine is not one.
 ///
 /// # Errors
-/// The verdict, naming what the node reported: a pass that never finished, a
-/// re-decision that took back nothing, or one that took back more than the single
-/// conversation the submitted document stops admitting.
-pub fn await_revocation(
-    host_port: u16,
-    assured_before: u64,
-    driven_port: usize,
-    mut drive: impl FnMut(),
-) -> Result<Revoked, String> {
-    /// How many wakeups the harness will manufacture before calling the pass
-    /// stalled.
+/// A port this build publishes no driver shard for, which would leave the
+/// appliance's own count of what arrived unreadable and the wakeups unaccounted
+/// for.
+pub fn drive_re_decision(driven_port: usize, mut drive: impl FnMut()) -> Result<Driven, String> {
+    /// How many wakeups the harness manufactures.
     ///
     /// The appliance's own arithmetic, and the reason nothing here is timed. A
     /// pass crosses `FLOW_CAPACITY / REVISIT_BUCKETS` windows of index, a commit
@@ -556,19 +504,13 @@ pub fn await_revocation(
     /// a wakeup works off at least one window however saturated it is — so two
     /// passes are owed at worst and cost at most twice that many wakeups. This is
     /// eight times that figure, and a quiet wakeup works off four windows rather
-    /// than one, so the margin over what a paced run actually spends is wider
-    /// still.
+    /// than one, so the margin over what the pass actually needs is wider still.
     const WAKEUPS: usize = 4_096;
-    /// How often the pass's own progress is read back. Every wakeup would spend
-    /// the whole budget on HTTP round trips — and this endpoint's connection table
-    /// holds eight, each left in `TIME_WAIT`, so scrapes in quick succession are
-    /// the expensive read here rather than the frames.
-    const POLL_EVERY: usize = 64;
     /// How long the harness waits between the wakeups it manufactures, so each
     /// lands on a domain that has finished with the one before it.
     const DRIVE_PACE: Duration = Duration::from_millis(5);
 
-    let Some(domain) = u8::try_from(driven_port)
+    let Some(driver_domain) = u8::try_from(driven_port)
         .ok()
         .and_then(lfw_metrics::port_domain)
     else {
@@ -578,133 +520,13 @@ pub fn await_revocation(
         ));
     };
 
-    let driving = Instant::now();
-    let mut wakeups = 0usize;
-    let mut received_first = None;
-    let mut received_last = 0u64;
-    while wakeups < WAKEUPS {
-        for _ in 0..POLL_EVERY {
-            drive();
-            wakeups += 1;
-            std::thread::sleep(DRIVE_PACE);
-        }
-        let exposition = crate::metrics_contract::fetch(host_port)
-            .map_err(|error| format!("scraping the re-decision's progress: {error}"))?
-            .body;
-        // The appliance's own count of what reached the driven port, beside the
-        // harness's count of what it wrote. Nothing is asserted against it: it is
-        // what tells a pass that is not advancing apart from frames that are not
-        // arriving, at the point where somebody reads the failure.
-        received_last = in_domain(&exposition, RECEIVE_FRAMES, domain).unwrap_or(received_last);
-        received_first.get_or_insert(received_last);
-        let passes =
-            labelled(&exposition, POLICY_SWEEP, "outcome", "completed").ok_or_else(|| {
-                format!(
-                    "{POLICY_SWEEP}{{outcome=\"completed\"}} is not in the exposition, so the \
-                     node publishes nothing about re-deciding its table at all"
-                )
-            })?;
-        if passes == 0 {
-            continue;
-        }
-        // **The gauge and not the counter is what closes the window**, and the two
-        // are deliberately different facts. A commit arriving while a pass is
-        // running does not abandon it: that pass runs on to the last bucket and a
-        // fresh pass over the whole table is queued behind it, so a `completed` may
-        // belong to a pass armed by an *earlier* generation — the one the node
-        // committed at boot — while the submitted document's own pass is still
-        // owed. Reading the counter alone would state the window closed one whole
-        // pass early, which is exactly the window a conversation the new policy
-        // forbids is still being forwarded in.
-        let running = plain(&exposition, POLICY_SWEEP_RUNNING)
-            .ok_or_else(|| format!("{POLICY_SWEEP_RUNNING} is not in the exposition"))?;
-        if running != 0 {
-            continue;
-        }
-        // Every number below is final: no pass is owed.
-        let revoked = labelled(&exposition, FLOW_LIFECYCLE, "event", "revoked").ok_or_else(|| {
-            format!(
-                "{FLOW_LIFECYCLE}{{event=\"revoked\"}} is not in the exposition, so nothing says \
-                 a commit ever ended a conversation"
-            )
-        })?;
-        if revoked != 1 {
-            return Err(format!(
-                "the commit took back {revoked} flow(s) and exactly one was owed: the submitted \
-                 document narrows one accept rule by one attribute, so of the two conversations \
-                 the bench opened it stops admitting one. {} would be a table flushed rather \
-                 than re-decided",
-                if revoked == 0 {
-                    "None"
-                } else {
-                    "More than one"
-                }
-            ));
-        }
-        let assured_after = labelled(&exposition, TABLE_ENTRIES, "state", "udp_assured")
-            .ok_or_else(|| {
-                format!("{TABLE_ENTRIES}{{state=\"udp_assured\"}} is not in the exposition")
-            })?;
-        if assured_after >= assured_before {
-            return Err(format!(
-                "the table held {assured_before} two-way conversation(s) before the commit and \
-                 {assured_after} after it, so the slot the revoked flow held did not come back"
-            ));
-        }
-        return Ok(Revoked {
-            assured_before,
-            assured_after,
-            revoked,
-            passes,
-            wakeups,
-            received_first: received_first.unwrap_or(received_last),
-            received_last,
-        });
+    for _ in 0..WAKEUPS {
+        drive();
+        std::thread::sleep(DRIVE_PACE);
     }
-    let first = received_first.unwrap_or(received_last);
-    Err(format!(
-        "the forwarding domain committed the submitted generation and no pass over its connection \
-         table finished after {wakeups} manufactured wakeup(s), spent in {:.1}s. A wakeup works \
-         off at least one bounded window and two passes are owed at worst, so this is a \
-         re-decision that is not progressing rather than one that is slow. Over those wakeups the \
-         driven port's own driver counted {first} received frame(s) rising to {received_last}: a \
-         count that barely moved is frames that never arrived, and one that tracked them is a \
-         pass that had them and did not advance",
-        driving.elapsed().as_secs_f64()
-    ))
-}
-
-/// One counter or gauge series' value, matched on its family and one label.
-fn labelled(exposition: &str, family: &str, label: &str, value: &str) -> Option<u64> {
-    exposition.lines().find_map(|line| {
-        let rest = line.strip_prefix(family)?;
-        let (labels, reading) = rest.rsplit_once(' ')?;
-        (labels.contains(&format!("{label}=\"{value}\""))
-            && labels.contains("domain=\"forwarder\""))
-        .then(|| reading.trim().parse().ok())?
-    })
-}
-
-/// One series carrying no label but the domain, read for a domain the caller
-/// names — the driver's, where every other read here is the forwarder's.
-fn in_domain(exposition: &str, family: &str, domain: &str) -> Option<u64> {
-    exposition.lines().find_map(|line| {
-        let rest = line.strip_prefix(family)?;
-        let (labels, reading) = rest.rsplit_once(' ')?;
-        labels
-            .contains(&format!("domain=\"{domain}\""))
-            .then(|| reading.trim().parse().ok())?
-    })
-}
-
-/// One series with no label but the domain.
-fn plain(exposition: &str, family: &str) -> Option<u64> {
-    exposition.lines().find_map(|line| {
-        let rest = line.strip_prefix(family)?;
-        let (labels, reading) = rest.rsplit_once(' ')?;
-        labels
-            .contains("domain=\"forwarder\"")
-            .then(|| reading.trim().parse().ok())?
+    Ok(Driven {
+        wakeups: WAKEUPS,
+        driver_domain,
     })
 }
 
@@ -919,21 +741,6 @@ fn switched_generation(serial: &[u8]) -> u32 {
 /// The change count the forwarding domain's own generation record carries, which
 /// is what tells it from the publisher's — see [`switched_generation`].
 const FORWARDER_CHANGES: &str = "0";
-
-/// One counter series' value, matched on its family and an optional label value.
-fn counted(exposition: &str, family: &str, outcome: Option<&str>) -> Option<u64> {
-    exposition.lines().find_map(|line| {
-        let rest = line.strip_prefix(family)?;
-        let (labels, value) = rest.rsplit_once(' ')?;
-        let wanted = match outcome {
-            Some(outcome) => labels.contains(&format!("outcome=\"{outcome}\"")),
-            None => true,
-        };
-        // The config domain's own shard and no other's: this family is published by
-        // one domain, and matching on it keeps that true rather than assumed.
-        (wanted && labels.contains("domain=\"config\"")).then(|| value.trim().parse().ok())?
-    })
-}
 
 /// One `key=<decimal>` field of an answer line.
 fn field(line: &str, key: &str) -> Option<u32> {

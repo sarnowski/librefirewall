@@ -103,6 +103,7 @@ fn demanded() -> Demanded<'static> {
             flooded_tuples: 0,
         },
         drop_reasons: &crate::surface_contract::DROP_REASONS,
+        submitted: None,
     }
 }
 
@@ -113,6 +114,243 @@ fn judged(snapshots: &[Snapshot]) -> Result<Agreement, String> {
         lfw_metrics::CATALOGUE_FINGERPRINT,
         &demanded(),
     )
+}
+
+/// The generation a submitting boot's fixtures are split on. Two, because a node
+/// that booted a document is already on one.
+const COMMITTED: u32 = 2;
+
+/// What a boot that drove a re-decision obliges, over the base case above.
+fn demanded_submitting(re_decision: Option<ReDecision>) -> Demanded<'static> {
+    Demanded {
+        submitted: Some(Submitted {
+            generation: COMMITTED,
+            re_decision,
+        }),
+        ..demanded()
+    }
+}
+
+fn driven() -> ReDecision {
+    ReDecision {
+        driver_domain: "nic_driver0",
+        wakeups: 4_096,
+    }
+}
+
+/// The deciding domain's counters as a boot that ran `apply` leaves them, written
+/// into whichever reading a test wants them in.
+fn decided(held: &mut Snapshot) {
+    put(
+        held,
+        CONFIG,
+        SUBMISSIONS,
+        &[("outcome", crate::config_submission_contract::APPLIED)],
+        crate::config_submission_contract::OWED_APPLIED,
+    );
+    put(
+        held,
+        CONFIG,
+        SUBMISSIONS,
+        &[("outcome", crate::config_submission_contract::REFUSED)],
+        crate::config_submission_contract::OWED_REFUSED,
+    );
+    put(
+        held,
+        CONFIG,
+        READS,
+        &[],
+        crate::config_submission_contract::OWED_READS,
+    );
+}
+
+/// A reading taken while the previous policy was still carrying traffic, holding
+/// the two conversations the bench opened.
+fn before_the_switch() -> Snapshot {
+    let mut held = sound();
+    decided(&mut held);
+    put(&mut held, FORWARDER, GENERATION, &[], 1);
+    put(&mut held, FORWARDER, TABLE_ENTRIES, ASSURED, 2);
+    held
+}
+
+/// And one taken after the switch, with the pass the commit armed finished.
+fn after_the_pass() -> Snapshot {
+    let mut held = sound();
+    decided(&mut held);
+    put(&mut held, FORWARDER, GENERATION, &[], u64::from(COMMITTED));
+    put(&mut held, FORWARDER, TABLE_ENTRIES, ASSURED, 1);
+    put(&mut held, FORWARDER, POLICY_SWEEP_RUNNING, &[], 0);
+    put(&mut held, FORWARDER, POLICY_SWEEP, COMPLETED, 1);
+    put(&mut held, FORWARDER, FLOW_LIFECYCLE, REVOKED, 1);
+    held
+}
+
+const ASSURED: &[(&str, &str)] = &[("state", "udp_assured")];
+const COMPLETED: &[(&str, &str)] = &[("outcome", "completed")];
+const REVOKED: &[(&str, &str)] = &[("event", "revoked")];
+
+fn judged_submitting(
+    snapshots: &[Snapshot],
+    re_decision: Option<ReDecision>,
+) -> Result<Agreement, String> {
+    judge(
+        "the connection history",
+        snapshots,
+        lfw_metrics::CATALOGUE_FINGERPRINT,
+        &demanded_submitting(re_decision),
+    )
+}
+
+/// The whole re-decision statement, on a file shaped like the one a boot leaves:
+/// readings from before the switch and readings from after the pass.
+#[test]
+fn a_re_decision_is_read_off_the_readings_either_side_of_the_switch() {
+    let file = [before_the_switch(), after_the_pass()];
+    let agreement = judged_submitting(&file, Some(driven())).expect("every relation holds");
+    let decided = agreement
+        .re_decision
+        .expect("a boot that drove one reports what it did");
+    assert_eq!(decided.assured_before, 2);
+    assert_eq!(decided.revoked, 1);
+    assert!(
+        agreement
+            .lines
+            .iter()
+            .any(|line| line.contains("re-decided the connection table")),
+        "{:?}",
+        agreement.lines
+    );
+}
+
+/// The occupancy before the change is the **largest** the table reached under the
+/// previous policy and not the first number a reading happened to carry: a file
+/// holds readings taken before the bench had opened its conversations at all, and
+/// the earliest of those would understate what the commit had to take back.
+#[test]
+fn the_occupancy_before_the_change_is_the_most_the_table_held() {
+    let mut empty = before_the_switch();
+    put(&mut empty, FORWARDER, TABLE_ENTRIES, ASSURED, 0);
+    let file = [empty, before_the_switch(), after_the_pass()];
+    let decided = judged_submitting(&file, Some(driven()))
+        .expect("every relation holds")
+        .re_decision
+        .expect("a boot that drove one reports what it did");
+    assert_eq!(decided.assured_before, 2);
+}
+
+/// **The gauge and not the counter is what closes the window.** A commit arriving
+/// while a pass is running does not abandon it, so a `completed` can belong to a
+/// pass an earlier generation armed while the submitted document's own is still
+/// owed. A reading taken after the switch with a pass still running is not one any
+/// of these numbers may be read from.
+#[test]
+fn a_reading_with_a_pass_still_owed_does_not_settle_the_re_decision() {
+    let mut running = after_the_pass();
+    put(&mut running, FORWARDER, POLICY_SWEEP_RUNNING, &[], 1);
+    // And the numbers it carries would have satisfied every other clause.
+    let file = [before_the_switch(), running];
+    let verdict = judged_submitting(&file, Some(driven())).expect_err("no reading settled it");
+    assert!(verdict.contains("back at zero"), "{verdict}");
+    assert!(verdict.contains("4096"), "{verdict}");
+}
+
+/// A table that was switched and never re-decided.
+#[test]
+fn a_switch_with_no_completed_pass_is_a_finding() {
+    let mut never = after_the_pass();
+    put(&mut never, FORWARDER, POLICY_SWEEP, COMPLETED, 0);
+    let verdict = judged_submitting(&[before_the_switch(), never], Some(driven()))
+        .expect_err("no pass ever finished");
+    assert!(
+        verdict.contains("switched and never re-decided"),
+        "{verdict}"
+    );
+}
+
+/// Exactly one conversation, because the submitted document narrows one accept
+/// rule by one attribute. None is a table nothing re-decided; more is one flushed.
+#[test]
+fn a_re_decision_that_took_back_anything_but_one_conversation_is_a_finding() {
+    for (took, expected) in [(0u64, "None"), (2, "More than one")] {
+        let mut wrong = after_the_pass();
+        put(&mut wrong, FORWARDER, FLOW_LIFECYCLE, REVOKED, took);
+        let verdict = judged_submitting(&[before_the_switch(), wrong], Some(driven()))
+            .expect_err("exactly one was owed");
+        assert!(verdict.contains(expected), "{verdict}");
+    }
+}
+
+/// The slot the revoked flow held has to come back, which is what separates a
+/// conversation ended from one merely counted.
+#[test]
+fn an_occupancy_that_did_not_fall_across_the_change_is_a_finding() {
+    let mut held = after_the_pass();
+    put(&mut held, FORWARDER, TABLE_ENTRIES, ASSURED, 2);
+    let verdict = judged_submitting(&[before_the_switch(), held], Some(driven()))
+        .expect_err("the occupancy did not fall");
+    assert!(verdict.contains("did not come back"), "{verdict}");
+}
+
+/// A file with nothing from before the switch says nothing about what the table
+/// held, so the fall cannot be stated across it at all.
+#[test]
+fn a_file_with_no_reading_from_before_the_switch_states_no_fall() {
+    let verdict = judged_submitting(&[after_the_pass()], Some(driven()))
+        .expect_err("nothing says what the table held before");
+    assert!(verdict.contains("below generation 2"), "{verdict}");
+}
+
+/// The deciding domain's own counters are read as a floor over the whole file and
+/// not against any one reading: a file opens with readings framed before the boot
+/// had submitted anything, and those carry zero without being a finding.
+#[test]
+fn the_submission_counters_are_a_floor_over_the_file() {
+    let mut bringing_up = sound();
+    put(
+        &mut bringing_up,
+        FORWARDER,
+        GENERATION,
+        &[],
+        u64::from(COMMITTED),
+    );
+    let file = [bringing_up, before_the_switch(), after_the_pass()];
+    judged_submitting(&file, None).expect("some reading saw every count that is owed");
+}
+
+/// And a boot whose deciding domain never reported the documents it answered for.
+#[test]
+fn a_submission_no_reading_accounts_for_is_a_finding() {
+    let mut short = before_the_switch();
+    put(
+        &mut short,
+        CONFIG,
+        READS,
+        &[],
+        crate::config_submission_contract::OWED_READS - 1,
+    );
+    let mut after = after_the_pass();
+    put(
+        &mut after,
+        CONFIG,
+        READS,
+        &[],
+        crate::config_submission_contract::OWED_READS - 1,
+    );
+    let verdict = judged_submitting(&[short, after], None).expect_err("a read is unaccounted for");
+    assert!(verdict.contains(READS), "{verdict}");
+}
+
+/// The console said the dataplane switched; a reading that never reports the
+/// generation is the same fact reaching two surfaces and only one carrying it.
+#[test]
+fn a_generation_that_reaches_no_reading_is_a_finding() {
+    let verdict = judged_submitting(&[before_the_switch()], None)
+        .expect_err("no reading has the forwarder switched");
+    assert!(
+        verdict.contains("only one of them carrying it"),
+        "{verdict}"
+    );
 }
 
 #[test]

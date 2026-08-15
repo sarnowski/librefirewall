@@ -69,6 +69,26 @@
 //! other over the length of the boot: a counter may not go backwards, and a
 //! constant may carry no number but its device's. Two back-to-back scrapes could
 //! state the first of those over milliseconds; a file states it over a whole run.
+//!
+//! # And what a boot that changed the appliance owes
+//!
+//! The three anchors above are what a reading is held to on every boot. A boot
+//! that **submits a document** owes more, and owes it here for the same reason:
+//! the deciding domain's account of the documents it answered for, and — on the
+//! boot that drives one — what the re-decision that commit armed did to the
+//! conversations the appliance was already carrying.
+//!
+//! Those were read off the scrape until this contract could carry them, and the
+//! reason they belong here is not tidiness. **The occupancy that must fall is a
+//! gauge, and a gauge is a fact about an instant.** Read twice from outside, the
+//! two instants are the harness's own — the moment before it submitted and the
+//! moment it happened to look afterwards — and a surface published on a schedule
+//! cannot answer for either. Read out of a file split on the **forwarding
+//! domain's own generation**, they become the appliance's: everything below the
+//! committed number was taken while the previous policy was carrying traffic, and
+//! everything at or above it after the switch. The lag that makes a reading
+//! awkward to assert against stops mattering, because nothing here asks when a
+//! reading was framed.
 
 use std::time::Duration;
 
@@ -273,12 +293,59 @@ pub struct Demanded<'a> {
     pub witness: PolicyWitness,
     /// The drop-reason vocabulary this build encodes, in its own order.
     pub drop_reasons: &'a [&'a str],
+    /// What a boot that **submitted a document** obliges these readings to carry.
+    /// `None` on every boot that changed nothing about the appliance.
+    pub submitted: Option<Submitted>,
+}
+
+/// What a boot that handed the appliance a document obliges its readings to
+/// carry, and the number the whole judgement is split on.
+#[derive(Clone, Copy, Debug)]
+pub struct Submitted {
+    /// The generation the configuration domain assigned, as it answered the
+    /// submission on the wire.
+    ///
+    /// **This is the split.** A reading whose forwarding shard is still below it
+    /// was taken before the dataplane switched, and one at or above it after — a
+    /// separation made at a number the appliance chose, on the appliance's own
+    /// timeline, where anything the harness derived from when it happened to look
+    /// would be a separation made by the harness's polling.
+    pub generation: u32,
+    /// The re-decision that commit armed, on the one boot that drives it to
+    /// completion. `None` where the scenario submits a document and states
+    /// nothing about the conversations already running.
+    pub re_decision: Option<ReDecision>,
+}
+
+/// What the harness did to work the re-decision a commit armed off, so the
+/// readings can be read beside it.
+#[derive(Clone, Copy, Debug)]
+pub struct ReDecision {
+    /// The shard of the driver whose port the wakeups were put on, so the
+    /// appliance's own count of what arrived can be reported beside the harness's
+    /// count of what it wrote.
+    pub driver_domain: &'static str,
+    /// Wakeups the harness manufactured.
+    pub wakeups: usize,
+}
+
+/// What the readings say the re-decision did, for the verdict line a scenario
+/// carries. The whole of it is in the evidence lines; this is the headline.
+#[derive(Clone, Copy, Debug)]
+pub struct ReDecided {
+    /// Two-way conversations the table held before the switch.
+    pub assured_before: u64,
+    /// Flows the pass took back.
+    pub revoked: u64,
 }
 
 /// What the comparison established, for a run log to carry.
 #[derive(Debug)]
 pub struct Agreement {
     pub lines: Vec<String>,
+    /// What the readings said the re-decision did, where the boot drove one, so a
+    /// scenario's own verdict can name it.
+    pub re_decision: Option<ReDecided>,
 }
 
 impl Agreement {
@@ -370,7 +437,311 @@ pub fn judge(
     lines.push(judge_signatures(target, last)?);
     lines.push(judge_traffic(target, last, demanded)?);
     lines.push(judge_ticks(target, snapshots, demanded.booted_for)?);
-    Ok(Agreement { lines })
+    let mut re_decision = None;
+    if let Some(submitted) = demanded.submitted {
+        lines.push(judge_submission(target, snapshots, submitted.generation)?);
+        if let Some(driven) = submitted.re_decision {
+            let (decided, line) =
+                judge_re_decision(target, snapshots, submitted.generation, driven)?;
+            lines.push(line);
+            re_decision = Some(decided);
+        }
+    }
+    Ok(Agreement { lines, re_decision })
+}
+
+/// The generation gauge the whole submission judgement is split on: the
+/// forwarding domain's, which is the one the dataplane decides under.
+const GENERATION: &str = "librefirewall_configuration_generation";
+
+/// Where the forwarding domain's own reading of that gauge sits.
+const FORWARDER: &str = "forwarder";
+
+/// And the domain that decides on a document, which is not the one that carries
+/// traffic under it.
+const CONFIG: &str = "config";
+
+const SUBMISSIONS: &str = "librefirewall_configuration_submissions_total";
+const READS: &str = "librefirewall_configuration_reads_total";
+const TABLE_ENTRIES: &str = "librefirewall_flow_table_entries";
+const FLOW_LIFECYCLE: &str = "librefirewall_flow_lifecycle_total";
+const POLICY_SWEEP: &str = "librefirewall_policy_sweep_total";
+const POLICY_SWEEP_RUNNING: &str = "librefirewall_policy_sweep_running";
+const RECEIVE_FRAMES: &str = "librefirewall_receive_frames_total";
+
+/// What the deciding domain's own counters owe once a boot has submitted its
+/// documents, and the reading the claim is stated over.
+///
+/// # Why the claim is stated over the file and not against one reading
+///
+/// **A reading's counters are older than the block carrying it by an unbounded
+/// amount.** The management domain publishes into the relay on its own schedule
+/// and the recorder frames whatever has settled there, at most one reading per
+/// pass, so nothing here may assume when any reading was taken. A file also opens
+/// with readings framed while the boot was still coming up, long before it had
+/// submitted anything, and those carry zero as a matter of course.
+///
+/// So the claim is the one that needs neither: **some reading in this file saw at
+/// least this much.** For a counter that only rises that is exactly the statement
+/// worth making — a boot whose deciding domain ever reported two applied documents
+/// applied two, whichever reading it was seen in — and it rests on no ordering, so
+/// it holds on a file whose ordering clause has stood down.
+///
+/// Floors and not equalities for the reason they were floors on the scrape: what
+/// they refuse is a node whose answers on the wire said one thing about its
+/// submissions and whose own counters say another.
+fn judge_submission(
+    target: &str,
+    snapshots: &[Snapshot],
+    generation: u32,
+) -> Result<String, String> {
+    for (family, outcome, least) in [
+        (
+            SUBMISSIONS,
+            Some(crate::config_submission_contract::APPLIED),
+            crate::config_submission_contract::OWED_APPLIED,
+        ),
+        (
+            SUBMISSIONS,
+            Some(crate::config_submission_contract::REFUSED),
+            crate::config_submission_contract::OWED_REFUSED,
+        ),
+        (READS, None, crate::config_submission_contract::OWED_READS),
+    ] {
+        let labels: &[(&str, &str)] = match outcome {
+            Some(outcome) => &[("outcome", outcome)],
+            None => &[],
+        };
+        let mut highest = None;
+        for reading in snapshots {
+            let held = value_of(
+                reading,
+                &SeriesAt {
+                    domain: CONFIG,
+                    family,
+                    labels,
+                },
+            )?;
+            highest = Some(highest.unwrap_or(0_u64).max(held));
+        }
+        let reported = highest.unwrap_or(0);
+        if reported < least {
+            return Err(format!(
+                "no reading in {target} reports {family}{} above {reported} and at least {least} \
+                 is owed. The answers on the wire said one thing about this node's submissions \
+                 and the domain that decided them says another",
+                outcome.map_or(String::new(), |value| format!("{{outcome={value:?}}}"))
+            ));
+        }
+    }
+
+    // And that the dataplane's own reading of the change reached a reading at
+    // all, which is what every clause below is stated over.
+    let switched = snapshots
+        .iter()
+        .filter_map(|reading| forwarder_generation(reading).ok())
+        .max()
+        .unwrap_or(0);
+    if switched < generation {
+        return Err(format!(
+            "the configuration domain committed generation {generation} and no reading in \
+             {target} has the forwarding domain above {switched}. The console said it switched, \
+             so this is the same fact reaching two surfaces and only one of them carrying it"
+        ));
+    }
+    Ok(format!(
+        "    the deciding domain's own counters account for every document this boot submitted, \
+         and the forwarding shard reaches generation {switched}"
+    ))
+}
+
+/// What the re-decision a commit armed did, as the readings report it.
+///
+/// # Why the readings are split on the generation, and never on when the harness looked
+///
+/// The occupancy that has to fall is a gauge, and the two numbers it must be read
+/// at are "before the change" and "after the pass". Reading it twice from outside
+/// makes those two instants the harness's own, which is precisely what a lagging
+/// surface cannot answer for. Splitting the file on the **forwarding domain's own
+/// generation** makes them the appliance's: a reading below the committed number
+/// was taken while the previous policy was carrying traffic, and one at or above
+/// it after the switch. Nothing here has to assume when a reading was framed.
+///
+/// # Why the pass is known to have finished, and why the gauge is what says so
+///
+/// A `completed` counter alone would state the window closed one whole pass early:
+/// a commit arriving mid-pass does not abandon the running pass, so a `completed`
+/// can belong to a pass an earlier generation armed while the submitted document's
+/// own pass is still owed. The gauge is the fact that closes it — and, split as
+/// above, closes it soundly: the forwarding domain arms the pass on the very
+/// wakeup it switches, so a reading that already reports the new generation *and*
+/// reports no pass owed is one taken after that pass finished. The two facts are
+/// in one reading because a reading is one consistent read of every shard, which
+/// is what makes reading them together mean anything.
+///
+/// # Errors
+/// The verdict, naming what the readings reported: no reading taken after the
+/// switch with the pass settled, a re-decision that took back nothing, or one that
+/// took back more than the single conversation the submitted document stops
+/// admitting.
+fn judge_re_decision(
+    target: &str,
+    snapshots: &[Snapshot],
+    generation: u32,
+    driven: ReDecision,
+) -> Result<(ReDecided, String), String> {
+    let mut before = None;
+    let mut settled = None;
+    for reading in snapshots {
+        if forwarder_generation(reading)? < generation {
+            let assured = assured(reading)?;
+            before = Some(before.unwrap_or(0_u64).max(assured));
+            continue;
+        }
+        if forwarder_running(reading)? == 0 {
+            // The last such and not the first: after the pass the gauge stays
+            // down and the generation stays up, so this is the file's own final
+            // word on a table nothing is still re-deciding.
+            settled = Some(reading);
+        }
+    }
+    // The maximum below the switch, because the occupancy this is measured against
+    // is the one the table actually reached: a file holds readings from before the
+    // bench had opened its conversations at all, and the first of those would
+    // understate what the commit had to take back.
+    let Some(assured_before) = before else {
+        return Err(format!(
+            "no reading in {target} was taken while the forwarding domain was below generation \
+             {generation}, so nothing says what the table held before the commit and a fall in \
+             occupancy cannot be stated across it"
+        ));
+    };
+    let Some(settled) = settled else {
+        return Err(format!(
+            "no reading in {target} has the forwarding domain at generation {generation} with \
+             {POLICY_SWEEP_RUNNING} back at zero, so no reading in this file was taken after the \
+             pass that commit armed had finished. The harness manufactured {} wakeup(s) to work \
+             it off and a wakeup works off at least one bounded window, so this is a re-decision \
+             that did not progress rather than one that is slow",
+            driven.wakeups
+        ));
+    };
+
+    let passes = value_of(
+        settled,
+        &SeriesAt {
+            domain: FORWARDER,
+            family: POLICY_SWEEP,
+            labels: &[("outcome", "completed")],
+        },
+    )?;
+    if passes == 0 {
+        return Err(format!(
+            "{target}'s settled reading has the forwarding domain at generation {generation} with \
+             no pass owed and {POLICY_SWEEP}{{outcome=\"completed\"}} at zero, so the table was \
+             switched and never re-decided"
+        ));
+    }
+    let revoked = value_of(
+        settled,
+        &SeriesAt {
+            domain: FORWARDER,
+            family: FLOW_LIFECYCLE,
+            labels: &[("event", "revoked")],
+        },
+    )?;
+    if revoked != 1 {
+        return Err(format!(
+            "the commit took back {revoked} flow(s) and exactly one was owed: the submitted \
+             document narrows one accept rule by one attribute, so of the two conversations the \
+             bench opened it stops admitting one. {} would be a table flushed rather than \
+             re-decided",
+            if revoked == 0 {
+                "None"
+            } else {
+                "More than one"
+            }
+        ));
+    }
+    let assured_after = assured(settled)?;
+    if assured_after >= assured_before {
+        return Err(format!(
+            "the table held {assured_before} two-way conversation(s) in a reading taken before \
+             the switch and {assured_after} in one taken after the pass had finished, so the slot \
+             the revoked flow held did not come back"
+        ));
+    }
+
+    // The driven port's own driver, beside the harness's count of what it wrote.
+    // Nothing is asserted against it: it is what tells a pass that did not advance
+    // apart from frames that never arrived, at the point where somebody reads the
+    // failure.
+    let received = value_of(
+        settled,
+        &SeriesAt {
+            domain: driven.driver_domain,
+            family: RECEIVE_FRAMES,
+            labels: &[],
+        },
+    )?;
+    Ok((
+        ReDecided {
+            assured_before,
+            revoked,
+        },
+        format!(
+            "    the commit re-decided the connection table: {assured_before} two-way \
+             conversation(s) before the switch and {assured_after} after the pass, {revoked} \
+             taken back over {passes} completed pass(es), worked off with {} manufactured \
+             wakeup(s) the {} driver counted {received} frame(s) of",
+            driven.wakeups, driven.driver_domain
+        ),
+    ))
+}
+
+/// The generation the forwarding shard of one reading carries.
+fn forwarder_generation(reading: &Snapshot) -> Result<u32, String> {
+    let held = value_of(
+        reading,
+        &SeriesAt {
+            domain: FORWARDER,
+            family: GENERATION,
+            labels: &[],
+        },
+    )?;
+    u32::try_from(held).map_err(|_| {
+        format!("a reading holds {GENERATION} of the {FORWARDER} domain at {held}, which is no generation this appliance can assign")
+    })
+}
+
+/// Whether a pass over the connection table is still owed, as one reading reports
+/// it.
+fn forwarder_running(reading: &Snapshot) -> Result<u64, String> {
+    value_of(
+        reading,
+        &SeriesAt {
+            domain: FORWARDER,
+            family: POLICY_SWEEP_RUNNING,
+            labels: &[],
+        },
+    )
+}
+
+/// How many two-way UDP conversations one reading has the table holding.
+///
+/// That state and no other: a conversation the harness has seen answered is in it,
+/// and reading one state rather than summing them keeps the number independent of
+/// the transient flows a refused packet opens and the appliance withdraws in the
+/// same evaluation.
+fn assured(reading: &Snapshot) -> Result<u64, String> {
+    value_of(
+        reading,
+        &SeriesAt {
+            domain: FORWARDER,
+            family: TABLE_ENTRIES,
+            labels: &[("state", "udp_assured")],
+        },
+    )
 }
 
 /// The two constants, held to the geometry of the two files this harness made.

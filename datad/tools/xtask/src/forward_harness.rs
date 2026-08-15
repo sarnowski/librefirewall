@@ -6469,9 +6469,12 @@ pub struct Booted {
     /// one. `None` everywhere else, and a scenario that should have made one and
     /// did not has already failed above.
     pub applied: Option<crate::config_submission_contract::Applied>,
-    /// What the re-decision that commit armed did to the conversations already
-    /// running, on the one scenario that states it. `None` everywhere else.
-    pub revoked: Option<crate::config_submission_contract::Revoked>,
+    /// What the harness spent working off the re-decision that commit armed, on
+    /// the one scenario that drives one. `None` everywhere else.
+    ///
+    /// What the pass *did* is not here: it is in this boot's metric readings, and
+    /// [`crate::snapshot_contract`] states it once the medium can be read.
+    pub drove: Option<crate::config_submission_contract::Driven>,
     /// What every real client this boot ran against the onboarding port made of
     /// it, in the order it ran them. Empty on every boot whose subject is
     /// something else.
@@ -6606,7 +6609,7 @@ fn run_boot(
     // Outside the run block for the reason the two above are: a boot that reached
     // the submission and then failed later still observed what it observed.
     let mut applied: Option<crate::config_submission_contract::Applied> = None;
-    let mut revoked: Option<crate::config_submission_contract::Revoked> = None;
+    let mut drove: Option<crate::config_submission_contract::Driven> = None;
     // What the onboarding station observed, on the three scenarios that open a
     // session. Outside the run block for the same reason, and read by the
     // contract that holds the console's account of that session to this one.
@@ -7232,21 +7235,6 @@ fn run_boot(
                                  is decided under",
                             ));
                         };
-                        // Before the submission, so the drop in occupancy the
-                        // re-decision causes is measured across the change.
-                        let assured_before = if test.traffic.re_decides() {
-                            match crate::config_submission_contract::assured_flows(host_port) {
-                                Ok(before) => before,
-                                Err(verdict) => {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
-                            }
-                        } else {
-                            0
-                        };
                         match crate::config_submission_contract::apply(
                             host_port,
                             test.topology.document(),
@@ -7286,9 +7274,7 @@ fn run_boot(
                                      pass through and this boot attached none",
                                 ));
                             };
-                            let outcome = crate::config_submission_contract::await_revocation(
-                                host_port,
-                                assured_before,
+                            let outcome = crate::config_submission_contract::drive_re_decision(
                                 driven,
                                 || {
                                     if let Some(attached) = endpoints.first_mut() {
@@ -7297,7 +7283,7 @@ fn run_boot(
                                 },
                             );
                             match outcome {
-                                Ok(proved) => revoked = Some(proved),
+                                Ok(proved) => drove = Some(proved),
                                 Err(verdict) => {
                                     break 'run Err(format!(
                                         "{verdict}; see {}",
@@ -7901,13 +7887,13 @@ fn run_boot(
             ));
         }
         // And a scenario that states what a commit did to the running
-        // conversations must have watched the re-decision finish: its last two
-        // probes' fates are the pass's, and a boot that never ran one would have
+        // conversations must have driven the re-decision: its last two probes'
+        // fates are the pass's, and a boot that never worked one off would have
         // decided them under a table the commit left untouched.
-        if test.traffic.re_decides() && revoked.is_none() {
+        if test.traffic.re_decides() && drove.is_none() {
             return Err(format!(
-                "the boot submitted a document and no pass over its connection table was \
-                 observed, so nothing was proved about the conversations it was already \
+                "the boot submitted a document and the pass over its connection table was never \
+                 driven, so nothing was proved about the conversations it was already \
                  carrying; see {}",
                 log_path.display()
             ));
@@ -7971,7 +7957,7 @@ fn run_boot(
         requests,
         installs,
         applied,
-        revoked,
+        drove,
         onboard: onboarded,
         injected: probes
             .iter()
