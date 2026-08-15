@@ -108,6 +108,16 @@ pub enum DecodeError {
     /// A batch claiming more entries than a relay can hold, which no correct
     /// writer produces.
     TooManyEntries { stated: usize, held: usize },
+    /// The entry at `at` claims a line longer than a relay slot, which no
+    /// correct writer produces either: the encoder bounds a line by that slot
+    /// before it states its length. Refused rather than shortened, because the
+    /// bound is what a caller sizes its own storage against and a length past it
+    /// is a claim to reject, not one to repair.
+    LineTooLong {
+        at: usize,
+        stated: usize,
+        held: usize,
+    },
     /// The entry at `at` does not fit the bytes that follow it.
     Truncated {
         at: usize,
@@ -360,6 +370,13 @@ pub fn decode(data: &[u8], mut each: impl FnMut(TranscriptLine<'_>)) -> Result<u
             return Err(DecodeError::UnknownFlags { at: index, flags });
         }
         let len = fields.half() as usize;
+        if len > TRANSCRIPT_LINE_BYTES {
+            return Err(DecodeError::LineTooLong {
+                at: index,
+                stated: len,
+                held: TRANSCRIPT_LINE_BYTES,
+            });
+        }
         let unix_nanos = fields.long();
         let from = at.saturating_add(TRANSCRIPT_ENTRY_HEADER_BYTES);
         let Some(line) = data.get(from..from.saturating_add(len)) else {

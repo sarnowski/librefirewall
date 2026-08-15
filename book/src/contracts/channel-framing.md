@@ -196,6 +196,13 @@ refusing the block.
 outside it rather than storing it: the bytes crossed a shared region a peer domain writes, so text
 outside the alphabet is text no domain printed.
 
+**A line longer than the bound is refused by name, not shortened.** The 256 bytes in the table above
+are the width of the relay slot the console copies a printed line into before a batch is composed, so
+a writer of these blocks cannot state a longer one — and a consumer that bounded the stated length
+only by the bytes that happened to follow it would hand its caller a line spliced out of the *next*
+entry's header, longer than the storage that caller sized from the same 256. The length is checked
+against the bound and not against what arrived.
+
 **The absence of an instant is a flag and not a zero.** Most of a boot transcript is emitted before
 the appliance has established a time, and dating those lines to 1970 would be a claim the appliance
 never made. The line itself says `time=unsynchronized` either way.

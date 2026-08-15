@@ -130,6 +130,68 @@ fn a_batch_claiming_more_entries_than_a_relay_holds_is_refused() {
     );
 }
 
+/// A length past the relay slot is a claim no writer of these blocks can make:
+/// the encoder bounds every line by that slot before it states a length. The
+/// bytes being *present* is what makes this its own refusal rather than a
+/// truncation — an entry over-declaring into the entry behind it would otherwise
+/// hand a caller a line spliced out of its neighbour's header, longer than the
+/// storage that caller sized from the same constant.
+#[test]
+fn an_entry_claiming_a_line_longer_than_a_relay_slot_is_refused() {
+    let widest: Vec<u8> = core::iter::repeat_n(b'~', TRANSCRIPT_LINE_BYTES).collect();
+    let first = "LFW-PD time=unsynchronized domain=console state=ready";
+    let mut out = [0u8; BATCH_BYTES];
+    let written = encode(
+        &mut out,
+        &[
+            entry(0, None, first),
+            Entry {
+                origin: 1,
+                unix_nanos: None,
+                line: &widest,
+            },
+            entry(2, None, "third"),
+        ],
+    )
+    .unwrap();
+    let stated = TRANSCRIPT_LINE_BYTES + 1;
+    let at = TRANSCRIPT_HEADER_BYTES + TRANSCRIPT_ENTRY_HEADER_BYTES + first.len() + 2;
+    out[at..at + 2].copy_from_slice(&(stated as u16).to_le_bytes());
+    let mut lines = Vec::new();
+    let refusal = decode(&out[..written], |line| {
+        lines.push(String::from_utf8_lossy(line.line).into_owned())
+    })
+    .expect_err("no relay slot holds a line that long");
+    assert_eq!(
+        refusal,
+        DecodeError::LineTooLong {
+            at: 1,
+            stated,
+            held: TRANSCRIPT_LINE_BYTES
+        }
+    );
+    assert_eq!(lines, [first], "the line before the refusal did not stand");
+}
+
+/// The widest line a relay slot holds still crosses, so the refusal above is a
+/// bound and not an off-by-one that costs the console its longest records.
+#[test]
+fn a_line_exactly_as_long_as_a_relay_slot_crosses() {
+    let widest: Vec<u8> = core::iter::repeat_n(b'~', TRANSCRIPT_LINE_BYTES).collect();
+    let mut out = [0u8; BATCH_BYTES];
+    let written = encode(
+        &mut out,
+        &[Entry {
+            origin: 0,
+            unix_nanos: None,
+            line: &widest,
+        }],
+    )
+    .unwrap();
+    let read = read(&out[..written]).expect("the widest line there is");
+    assert_eq!(read[0].2.len(), TRANSCRIPT_LINE_BYTES);
+}
+
 /// The lines already handed over stand: a batch whose last entry is malformed
 /// still carried the ones before it, and discarding them would lose transcript
 /// to punish its neighbour.

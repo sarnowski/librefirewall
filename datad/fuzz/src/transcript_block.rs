@@ -23,6 +23,12 @@
 //!   That is what keeps a relay slot the console never reached — zeroes — and one
 //!   read mid-write — two lines spliced — out of a store, and it is asserted on
 //!   the way out rather than trusted from the way in.
+//! * **A line fits a relay slot.** Every line handed to a caller is at most
+//!   `RELAY_LINE_BYTES` long — the width the encoder bounds one to, and the
+//!   width a caller's own storage is sized from. Asserted on the way out for the
+//!   alphabet's reason: a stated length is a peer's number and not a fact, and a
+//!   decoder that bounded it by the bytes that happened to follow would hand
+//!   over a line spliced out of the entry behind it.
 //! * **A full relay never blocks and always counts.** Publishing answers, and
 //!   every refusal moves the drop count by exactly one: the console must never
 //!   wait on the domain that writes the medium, and a silent drop would be a gap
@@ -358,6 +364,19 @@ mod tests {
             *byte = 0xff;
         }
 
+        // The first entry's stated length, moved one byte past the relay slot
+        // the encoder bounds a line by. The entry behind it supplies the bytes,
+        // so this is a length a decoder can satisfy out of its neighbour's
+        // header rather than one that runs off the end — which is what makes it
+        // its own refusal and not a truncation.
+        let mut over_long = whole.clone();
+        let stated = (RELAY_LINE_BYTES + 1) as u16;
+        if let Some(field) =
+            over_long.get_mut(TRANSCRIPT_HEADER_BYTES + 2..TRANSCRIPT_HEADER_BYTES + 4)
+        {
+            field.copy_from_slice(&stated.to_le_bytes());
+        }
+
         vec![
             // A whole batch this build wrote: the accept path, and the input the
             // header mutations below are derived from.
@@ -369,6 +388,9 @@ mod tests {
             // Text no console printed — a slot never reached, or two lines
             // spliced — which must be refused rather than stored.
             ("unprintable", unprintable),
+            // A line no relay slot could have held, with the bytes behind it
+            // present: the shape a randomised run found the decoder accepting.
+            ("line-too-long", over_long),
             ("unknown-version", wrong_version),
             // The two other things this block type carries.
             ("padding-empty", vec![0u8; 1]),
@@ -435,6 +457,10 @@ mod tests {
                 "unprintable" => assert!(matches!(
                     read(&built).err(),
                     Some(TranscriptDecodeError::Unprintable { .. })
+                )),
+                "line-too-long" => assert!(matches!(
+                    read(&built).err(),
+                    Some(TranscriptDecodeError::LineTooLong { .. })
                 )),
                 _ => {}
             }
