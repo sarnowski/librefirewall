@@ -29,12 +29,19 @@
 //!
 //! The configuration domain answers a submission when *it* has committed; the
 //! forwarding domain switches tables at its next poll boundary, which is the whole
-//! point of the two-phase handover. So the scenario polls `/metrics` until the
-//! forwarder's own `librefirewall_configuration_generation` reaches the committed
-//! number, and only then injects the traffic whose verdict must have reversed. A
-//! harness that injected immediately would be racing a protocol built to avoid
-//! exactly that race, and would fail intermittently for the right reason and the
-//! wrong evidence.
+//! point of the two-phase handover. So the scenario waits for the forwarding
+//! domain's own `LFW-CFG` record — the line that domain writes on the very wakeup
+//! it switches on — and only then injects the traffic whose verdict must have
+//! reversed. A harness that injected immediately would be racing a protocol built
+//! to avoid exactly that race, and would fail intermittently for the right reason
+//! and the wrong evidence.
+//!
+//! **The console is where that fact belongs.** The switch is an event, and the
+//! appliance states it as one: a line written by the domain that made the switch,
+//! at the moment it made it, kept in the capture for as long as the boot lasts. A
+//! gauge is the same fact reshaped into a number a reader has to catch between two
+//! polls, and reaching for one here meant asking the management domain about
+//! something the forwarding domain had already said.
 //!
 //! # No adversary
 //!
@@ -52,16 +59,20 @@ use lfw_http::Status;
 /// for its reasons: the guest may be under TCG on a loaded runner.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the forwarding domain has to pick a committed generation up.
+/// How many passes over the capture the forwarding domain is given to say it
+/// switched, and how long the harness waits between two of them.
 ///
-/// Generous, and bounded: it switches between two polls and is woken by the
-/// configuration domain's notification, so a node that has not switched inside
-/// this has not switched at all — which is the finding, reported as the generation
-/// it is still on rather than as a timeout that says nothing.
-const SWITCH_GRACE: Duration = Duration::from_secs(60);
-
-/// The gauge the forwarding domain publishes its own generation under.
-const GENERATION: &str = "librefirewall_configuration_generation";
+/// **A count of passes and never an elapsed budget.** What is bounded is how many
+/// times the console is actually read, so a loaded machine costs passes that each
+/// look for the record; a deadline would let a harness thread that was descheduled
+/// spend its whole budget without having looked once, and report a domain that had
+/// already spoken as one that never did.
+///
+/// Far more passes than a healthy boot needs — the switch happens on the wakeup
+/// the configuration domain's notification provokes, which is the next one — for
+/// the reason every wait here is generous: the cost of being wrong is asymmetric.
+const SWITCH_POLLS: usize = 240;
+const SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// What the deciding domain says it has decided, which is the independent half of
 /// every claim below: the HTTP answer is one domain's account of a submission and
@@ -265,11 +276,18 @@ fn request(
 ///
 /// `booted_with` is the document the image under test was built from, so the read
 /// before the change is judged against the node's own boot configuration rather
-/// than against a literal. What is submitted is [`SUBMITTED`].
+/// than against a literal. What is submitted is [`SUBMITTED`]. `console` answers
+/// this boot's capture as it stands, for the one step here that waits on the
+/// appliance saying something rather than on it answering a request.
 ///
 /// # Errors
 /// The verdict, naming which exchange failed and what it answered.
-pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Applied, String> {
+pub fn apply(
+    host_port: u16,
+    booted_with: &[u8],
+    document: &[u8],
+    console: impl FnMut() -> Vec<u8>,
+) -> Result<Applied, String> {
     let before = state(host_port, "before the change")?;
     // The node's own statement of what it booted with must be a document this
     // appliance would accept, and must be the *same configuration* as the file the
@@ -369,7 +387,7 @@ pub fn apply(host_port: u16, booted_with: &[u8], document: &[u8]) -> Result<Appl
     // Only now is the dataplane waited for. The configuration domain answered when
     // *it* committed; the forwarding domain switches between two polls, and the
     // traffic whose verdict must reverse may not be injected before it has.
-    let unmoved = await_dataplane(host_port, generation)?;
+    let unmoved = await_dataplane(generation, console)?;
 
     // And the deciding domain's own account of what it has done, which no answer on
     // a connection could substitute for: two documents applied — the one this image
@@ -826,47 +844,81 @@ fn state(host_port: u16, when: &str) -> Result<String, String> {
     Ok(answered.body)
 }
 
-/// Wait until the forwarding domain reports `generation`, answering the number it
-/// settled on.
+/// Wait until the forwarding domain says it switched to `generation`, answering
+/// the number it settled on.
+///
+/// `console` answers the capture as it stands and is called afresh every pass:
+/// what this waits for is a record the appliance has not written yet, so a
+/// snapshot taken before the submission could never carry one.
 ///
 /// # Errors
-/// The verdict, naming the generation it was still on when the grace ran out —
-/// which is the finding rather than a bare timeout.
-fn await_dataplane(host_port: u16, generation: u32) -> Result<u32, String> {
-    let deadline = Instant::now();
-    let mut seen = 0u32;
-    while deadline.elapsed() < SWITCH_GRACE {
-        let scraped = crate::metrics_contract::fetch(host_port)
-            .map_err(|error| format!("scraping for the forwarder's generation: {error}"))?;
-        seen = forwarder_generation(&scraped.body).unwrap_or(0);
+/// The verdict, naming the generation the forwarding domain had last said it was
+/// on — which is the finding rather than a bare timeout.
+fn await_dataplane(generation: u32, mut console: impl FnMut() -> Vec<u8>) -> Result<u32, String> {
+    for _ in 0..SWITCH_POLLS {
+        let seen = switched_generation(&console());
         if seen >= generation {
             return Ok(seen);
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(SWITCH_POLL_INTERVAL);
+    }
+    // One last read, so a record written while the final interval was being slept
+    // through is not reported missing by a pass that never happened.
+    let seen = switched_generation(&console());
+    if seen >= generation {
+        return Ok(seen);
     }
     Err(format!(
-        "the configuration domain committed generation {generation} and the forwarding domain is \
-         still on {seen} after {}s. It switches tables between two polls and is notified when a \
-         generation is released, so this is a handover that did not complete rather than one that \
-         is slow",
-        SWITCH_GRACE.as_secs()
+        "the configuration domain committed generation {generation} and the forwarding domain has \
+         said it is on {seen} after {SWITCH_POLLS} passes over the console. It switches tables \
+         between two polls, is notified when a generation is released, and writes this record on \
+         the wakeup it switches on — so this is a handover that did not complete rather than one \
+         that is slow"
     ))
 }
 
-/// The generation the *forwarding* domain publishes, which is the one the
-/// dataplane decides under. Deliberately not the configuration domain's: that one
-/// moves when a document commits, and what a probe's verdict depends on is the
-/// table the forwarder switched to.
-fn forwarder_generation(exposition: &str) -> Option<u32> {
-    exposition.lines().find_map(|line| {
-        let rest = line.strip_prefix(GENERATION)?;
-        let (labels, value) = rest.rsplit_once(' ')?;
-        labels
-            .contains("domain=\"forwarder\"")
-            .then(|| value.trim().parse().ok())
-            .flatten()
-    })
+/// The generation the **forwarding** domain last said it had switched to, or zero
+/// where it has said nothing — which is the fail-closed empty table it starts on.
+///
+/// # How the two domains' records are told apart
+///
+/// One commit produces two `outcome=applied` records and the configuration
+/// domain's comes first, so a reader that took either would stop waiting when the
+/// document was *committed* rather than when the dataplane had taken it up — which
+/// is the whole race this wait exists to avoid.
+///
+/// They are separated the way the boot transcript already separates them: the
+/// publishing domain reports how many values its diff moved, and the forwarding
+/// domain reports **no change count at all**, the diff being the publisher's
+/// record and this one saying only which generation is now carrying traffic. That
+/// holds because a commit is keyed by content — a candidate already running is
+/// `unchanged` and writes no `applied` record — so a publisher's `applied` has
+/// moved at least one value and never reads zero here.
+///
+/// The maximum rather than the last, because a generation only rises: it makes the
+/// reading independent of where in the capture a record sits, on a console two
+/// domains write and a debug kernel writes between them.
+fn switched_generation(serial: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(serial);
+    crate::console_records::records_on(&text, crate::console_records::CONFIG_PREFIX)
+        .into_iter()
+        .filter(|record| {
+            crate::console_records::value(record, "outcome")
+                == Some(lfw_log::GenerationOutcome::Applied.name())
+                && crate::console_records::value(record, "changes") == Some(FORWARDER_CHANGES)
+        })
+        .filter_map(|record| {
+            crate::console_records::value(record, "generation")?
+                .parse::<u32>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
+
+/// The change count the forwarding domain's own generation record carries, which
+/// is what tells it from the publisher's — see [`switched_generation`].
+const FORWARDER_CHANGES: &str = "0";
 
 /// One counter series' value, matched on its family and an optional label value.
 fn counted(exposition: &str, family: &str, outcome: Option<&str>) -> Option<u64> {

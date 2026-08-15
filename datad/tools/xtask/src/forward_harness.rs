@@ -7251,6 +7251,15 @@ fn run_boot(
                             host_port,
                             test.topology.document(),
                             document,
+                            // The capture as it stands, drained afresh each time
+                            // the contract asks: the submission is answered by one
+                            // domain and taken up by another, and what says the
+                            // second has taken it up is a record it has not
+                            // written yet.
+                            || {
+                                drain(&serial_receiver, &mut output);
+                                output.clone()
+                            },
                         ) {
                             Ok(proved) => applied = Some(proved),
                             Err(verdict) => {
