@@ -3552,81 +3552,126 @@ fn judge_recordings(
     // page the management domain published, and the scrape above was rendered
     // out of the shards that page was read from — two renderings of one set of
     // numbers, so a defect in either shows up here as a disagreement.
+    // The two families the surface contract reads off the scrape and sums over
+    // the pipelines that carry them. They are named here so the reading is held
+    // to the scrape for the *same* numbers that judgement uses: a slot that
+    // agreed for the recorder's own counters and not for these would leave the
+    // reading unable to stand in for the exposition it is about to outlive.
+    // The label slices the loop below hands out, owned here so they outlive the
+    // agreements that borrow them.
+    let reason_labels: Vec<[(&str, &str); 1]> = surface_contract::DROP_REASONS
+        .iter()
+        .map(|reason| [("reason", *reason)])
+        .collect();
+    let mut agreed = vec![snapshot_contract::Agreed {
+        summed: true,
+        series: snapshot_contract::SeriesAt {
+            domain: "forwarder",
+            family: "librefirewall_forwarded_frames_total",
+            labels: &[],
+        },
+        scraped: metrics_contract::forwarded_frames_total(&exposition.body)?,
+        constant: false,
+    }];
+    for (reason, labels) in surface_contract::DROP_REASONS.iter().zip(&reason_labels) {
+        // A reason the exposition carries no series under is one the reading is
+        // not owed either; what is asserted is that where the scrape has a
+        // number the reading has the same one.
+        if let Some(scraped) = metrics_contract::drop_reason_total(&exposition.body, reason)? {
+            agreed.push(snapshot_contract::Agreed {
+                summed: true,
+                series: snapshot_contract::SeriesAt {
+                    domain: "forwarder",
+                    family: "librefirewall_route_drops_total",
+                    labels,
+                },
+                scraped,
+                constant: false,
+            });
+        }
+    }
+    agreed.extend([
+        // The one that must be exactly equal: a device's capacity does not
+        // move between the two readings, so this is what proves the slots
+        // are read at the right offsets rather than merely being plausible.
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "recorder",
+                family: "librefirewall_block_capacity_sectors",
+                labels: &[],
+            },
+            scraped: metrics_contract::capacity_sectors(&exposition.body, "recorder")?,
+            constant: true,
+        },
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "store",
+                family: "librefirewall_block_capacity_sectors",
+                labels: &[],
+            },
+            scraped: metrics_contract::capacity_sectors(&exposition.body, "store")?,
+            constant: true,
+        },
+        // And the counters, each of which the recording may only be behind:
+        // one out of the domain that wrote the reading, one out of the
+        // domain that published it, and one out of a domain that touches
+        // neither — so a mapping that happened to work for the writer's own
+        // shard is not enough to pass.
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "recorder",
+                family: "librefirewall_recording_records_total",
+                labels: &[("sink", "log")],
+            },
+            scraped: metrics_contract::sink_records(&exposition.body, "log")?,
+            constant: false,
+        },
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "recorder",
+                family: "librefirewall_recording_records_total",
+                labels: &[("sink", "capture")],
+            },
+            scraped: metrics_contract::sink_records(&exposition.body, "capture")?,
+            constant: false,
+        },
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "forwarder",
+                family: "librefirewall_tap_observations_total",
+                labels: &[],
+            },
+            scraped: metrics_contract::one_value(
+                &exposition.body,
+                "librefirewall_tap_observations_total",
+                &[("domain", "forwarder")],
+            )?,
+            constant: false,
+        },
+        snapshot_contract::Agreed {
+            summed: false,
+            series: snapshot_contract::SeriesAt {
+                domain: "management",
+                family: "librefirewall_http_requests_total",
+                labels: &[],
+            },
+            scraped: metrics_contract::one_value(
+                &exposition.body,
+                "librefirewall_http_requests_total",
+                &[("domain", "management")],
+            )?,
+            constant: false,
+        },
+    ]);
     let snapshots = snapshot_contract::judge(
         pd_runtime::LOG_TARGET,
         &log_parsed.snapshots,
-        &[
-            // The one that must be exactly equal: a device's capacity does not
-            // move between the two readings, so this is what proves the slots
-            // are read at the right offsets rather than merely being plausible.
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "recorder",
-                    family: "librefirewall_block_capacity_sectors",
-                    labels: &[],
-                },
-                scraped: metrics_contract::capacity_sectors(&exposition.body, "recorder")?,
-                constant: true,
-            },
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "store",
-                    family: "librefirewall_block_capacity_sectors",
-                    labels: &[],
-                },
-                scraped: metrics_contract::capacity_sectors(&exposition.body, "store")?,
-                constant: true,
-            },
-            // And the counters, each of which the recording may only be behind:
-            // one out of the domain that wrote the reading, one out of the
-            // domain that published it, and one out of a domain that touches
-            // neither — so a mapping that happened to work for the writer's own
-            // shard is not enough to pass.
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "recorder",
-                    family: "librefirewall_recording_records_total",
-                    labels: &[("sink", "log")],
-                },
-                scraped: metrics_contract::sink_records(&exposition.body, "log")?,
-                constant: false,
-            },
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "recorder",
-                    family: "librefirewall_recording_records_total",
-                    labels: &[("sink", "capture")],
-                },
-                scraped: metrics_contract::sink_records(&exposition.body, "capture")?,
-                constant: false,
-            },
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "forwarder",
-                    family: "librefirewall_tap_observations_total",
-                    labels: &[],
-                },
-                scraped: metrics_contract::one_value(
-                    &exposition.body,
-                    "librefirewall_tap_observations_total",
-                    &[("domain", "forwarder")],
-                )?,
-                constant: false,
-            },
-            snapshot_contract::Agreed {
-                series: snapshot_contract::SeriesAt {
-                    domain: "management",
-                    family: "librefirewall_http_requests_total",
-                    labels: &[],
-                },
-                scraped: metrics_contract::one_value(
-                    &exposition.body,
-                    "librefirewall_http_requests_total",
-                    &[("domain", "management")],
-                )?,
-                constant: false,
-            },
-        ],
+        &agreed,
         lfw_metrics::CATALOGUE_FINGERPRINT,
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;

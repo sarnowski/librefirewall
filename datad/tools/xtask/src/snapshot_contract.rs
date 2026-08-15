@@ -31,11 +31,50 @@ use crate::recording_contract::Snapshot;
 
 /// One slot's identity, as a caller names it: the shard's domain, the family,
 /// and the labels that pick the series out within it.
+///
+/// Borrowed rather than `'static`, because the labels a caller names are not
+/// all fixed at compile time: a drop reason comes out of this build's
+/// vocabulary and a rule id out of the document under test, and a contract that
+/// could only name a literal would be one that stopped short of exactly the
+/// series a configuration decides.
 #[derive(Debug)]
-pub struct SeriesAt {
-    pub domain: &'static str,
-    pub family: &'static str,
-    pub labels: &'static [(&'static str, &'static str)],
+pub struct SeriesAt<'a> {
+    pub domain: &'a str,
+    pub family: &'a str,
+    pub labels: &'a [(&'a str, &'a str)],
+}
+
+/// Every series of one family, wherever the catalogue puts it and whatever else
+/// labels it — the reading's counterpart to an exposition summed over its
+/// pipelines.
+///
+/// Several families carry one series per pipeline, and what a recording is held
+/// to is the total across them: a per-pipeline slot compared alone would pass an
+/// appliance that counted one direction twice and the other never. So the shape
+/// of the comparison follows the shape of the number, and a family with no slot
+/// at all is `None` rather than a zero nothing distinguishes from an unlabelled
+/// silence.
+#[must_use]
+pub fn total_of(reading: &Snapshot, family: &str, labels: &[(&str, &str)]) -> Option<u64> {
+    let mut base = 0;
+    let mut total = None;
+    for spec in &SHARDS {
+        for (at, series) in spec.series.iter().enumerate() {
+            if series.metric.name == family
+                && labels.iter().all(|(name, value)| {
+                    series
+                        .labels
+                        .iter()
+                        .any(|held| held.name == *name && held.value == *value)
+                })
+                && let Some(held) = reading.slot(base + at)
+            {
+                total = Some(total.unwrap_or(0_u64).saturating_add(held));
+            }
+        }
+        base += spec.series.len();
+    }
+    total
 }
 
 /// Where a named series sits in a reading.
@@ -79,8 +118,12 @@ fn matches(series: &Series, wanted: &SeriesAt) -> bool {
 
 /// One agreement the reading and the scrape must satisfy.
 #[derive(Debug)]
-pub struct Agreed {
-    pub series: SeriesAt,
+pub struct Agreed<'a> {
+    pub series: SeriesAt<'a>,
+    /// Whether the reading is the sum of every series of the family the labels
+    /// select, rather than one slot. `true` for a family the exposition itself
+    /// sums over its pipelines, so the two sides are the same quantity.
+    pub summed: bool,
     /// What the scrape reported for it.
     pub scraped: u64,
     /// Whether the two must be equal, or whether the reading may only be no
@@ -151,13 +194,25 @@ pub fn judge(
         lfw_metrics::SNAPSHOT_SLOTS
     )];
     for want in agreed {
-        let at = slot_of(&want.series)?;
-        let held = last.slot(at).ok_or_else(|| {
-            format!(
-                "GET {target}'s last reading has no slot {at}, which is where {} sits",
-                want.series.family
-            )
-        })?;
+        let (at, held) = if want.summed {
+            let total = total_of(last, want.series.family, want.series.labels).ok_or_else(|| {
+                format!(
+                    "GET {target}'s last reading carries no slot of {} under {:?} at all, so the \
+                     catalogue has moved the family this contract names",
+                    want.series.family, want.series.labels
+                )
+            })?;
+            (None, total)
+        } else {
+            let at = slot_of(&want.series)?;
+            let held = last.slot(at).ok_or_else(|| {
+                format!(
+                    "GET {target}'s last reading has no slot {at}, which is where {} sits",
+                    want.series.family
+                )
+            })?;
+            (Some(at), held)
+        };
         let ok = if want.constant {
             held == want.scraped
         } else {
@@ -176,8 +231,12 @@ pub fn judge(
         let mut line = String::new();
         let _ = write!(
             line,
-            "    slot {at}: {}{{domain=\"{}\"{}}} reads {held} in the recording and {} in the \
+            "    {}: {}{{domain=\"{}\"{}}} reads {held} in the recording and {} in the \
              scrape ({})",
+            match at {
+                Some(at) => format!("slot {at}"),
+                None => format!("every slot of the family under {:?}", want.series.labels),
+            },
             want.series.family,
             want.series.domain,
             want.series

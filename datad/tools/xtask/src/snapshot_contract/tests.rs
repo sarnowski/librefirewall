@@ -1,6 +1,6 @@
 use super::*;
 
-fn capacity() -> SeriesAt {
+fn capacity() -> SeriesAt<'static> {
     SeriesAt {
         domain: "recorder",
         family: "librefirewall_block_capacity_sectors",
@@ -100,6 +100,7 @@ fn a_counter_no_larger_than_the_scrape_agrees_and_one_larger_does_not() {
                 "/logs.pcapng",
                 std::slice::from_ref(&held),
                 &[Agreed {
+                    summed: false,
                     series: capacity(),
                     scraped,
                     constant: false,
@@ -115,6 +116,7 @@ fn a_counter_no_larger_than_the_scrape_agrees_and_one_larger_does_not() {
         "/logs.pcapng",
         std::slice::from_ref(&held),
         &[Agreed {
+            summed: false,
             series: capacity(),
             scraped: 99,
             constant: false,
@@ -138,6 +140,7 @@ fn a_constant_must_be_equal_in_both_directions() {
             "/logs.pcapng",
             std::slice::from_ref(&held),
             &[Agreed {
+                summed: false,
                 series: capacity(),
                 scraped: 100,
                 constant: true,
@@ -152,6 +155,7 @@ fn a_constant_must_be_equal_in_both_directions() {
                 "/logs.pcapng",
                 std::slice::from_ref(&held),
                 &[Agreed {
+                    summed: false,
                     series: capacity(),
                     scraped,
                     constant: true,
@@ -172,6 +176,7 @@ fn the_evidence_names_every_slot_it_compared() {
         "/logs.pcapng",
         &[held],
         &[Agreed {
+            summed: false,
             series: capacity(),
             scraped: 7,
             constant: true,
@@ -186,4 +191,51 @@ fn the_evidence_names_every_slot_it_compared() {
         "{evidence}"
     );
     assert!(evidence.contains("reads 7"), "{evidence}");
+}
+
+#[test]
+fn a_family_that_spans_pipelines_is_summed_rather_than_read_at_one_slot() {
+    // The fault a per-slot read would pass: one pipeline counting twice and the
+    // other never leaves either slot plausible and only the total wrong. The
+    // exposition sums the family over its pipelines, so the reading must be the
+    // same quantity or the two are not comparable at all.
+    // The family is labelled by pipeline *and* reason, so one reason alone
+    // still spans every pipeline — which is the case a slot lookup cannot even
+    // name, its match being on the whole label set.
+    let reading = whole(|_| 3);
+
+    let one_pipeline = total_of(
+        &reading,
+        "librefirewall_route_drops_total",
+        &[("pipeline", "0"), ("reason", "no_route")],
+    )
+    .expect("the forwarder shard declares it");
+    let every_pipeline = total_of(
+        &reading,
+        "librefirewall_route_drops_total",
+        &[("reason", "no_route")],
+    )
+    .expect("the forwarder shard declares it");
+
+    assert_eq!(one_pipeline, 3, "one series was filled with three");
+    assert!(
+        every_pipeline > one_pipeline,
+        "the reason spans more than one pipeline, so its total is past any one of \
+         them: {every_pipeline} against {one_pipeline}"
+    );
+    assert!(
+        every_pipeline.is_multiple_of(3),
+        "every slot was filled with three, so the total is three per series: {every_pipeline}"
+    );
+}
+
+#[test]
+fn a_family_no_shard_declares_is_absent_rather_than_zero() {
+    // A zero would be indistinguishable from a counter that has not moved, and
+    // the caller's question is whether the catalogue still carries the family
+    // this contract names.
+    assert_eq!(
+        total_of(&whole(|_| 1), "librefirewall_nothing_declares_this", &[]),
+        None
+    );
 }
