@@ -551,7 +551,7 @@ pub use endpoint::{
 // through a second dependency on the crates that own them.
 pub use handover::{
     Committed, CommittedReader, ConfigCounters, ConfigPublisher, ConfigurationSwitch, Offer,
-    StaleOffer, endpoint_from, interfaces_from, router_from, rules_from,
+    StaleOffer, endpoint_from, router_from,
 };
 /// Re-exported rather than restated: a protection domain reaches its whole
 /// dataplane vocabulary through this crate, and the tables a poll decides under
@@ -602,8 +602,8 @@ pub use wire::{
 /// invisible: a byzantine peer's activity looks exactly like an idle link.
 ///
 /// Monotonic for the domain's life and saturating; there is no reset, because
-/// the appliance's metrics endpoint differences successive scrapes and a reset
-/// would forge a negative rate.
+/// a consumer of the appliance's metric readings differences successive ones and
+/// a reset would forge a negative rate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PoolCounters {
     /// Returns naming an index this domain never lent: forged, out of range, a
@@ -797,7 +797,7 @@ const _: () = assert!(REWRITTEN_HEADER_LEN <= BUFFER_SIZE);
 pub struct RouteCounters {
     /// The generation the most recent poll decided under. The counts below span
     /// the domain's life and no commit resets them, so this is what tells two
-    /// scrapes apart: a pair naming one generation differences to a rate under
+    /// readings apart: a pair naming one generation differences to a rate under
     /// one configuration.
     pub generation: u32,
     /// Frames rewritten for their next hop and handed to the transmitting
@@ -1400,13 +1400,12 @@ mod tests {
     /// system by a wide margin and had no such guard.
     ///
     /// Two things grew it in one change and neither is visible from this file:
-    /// the exposition's staging buffer, sized by the renderer's worst case and so
-    /// by one series per rule the configuration ABI admits, and the snapshot the
-    /// exposition is rendered from, which is every shard read whole and therefore
-    /// grew with the per-rule block reserved in each. The snapshot is a call-frame
-    /// temporary rather than a field, so it is measured beside the handler rather
-    /// than inside it — a bound that ignored it would be the wrong number about
-    /// the right stack.
+    /// the response staging buffer, sized by the longest body the management
+    /// surface answers with, and the snapshot a reading is composed from, which
+    /// is every shard read whole and therefore grew with the per-rule block
+    /// reserved in each. The snapshot is a call-frame temporary rather than a
+    /// field, so it is measured beside the handler rather than inside it — a
+    /// bound that ignored it would be the wrong number about the right stack.
     #[test]
     fn the_management_domains_state_fits_the_stack_it_is_declared_with() {
         /// `<protection_domain name="management" stack_size="0x100000">`.
@@ -3408,7 +3407,7 @@ mod tests {
     /// about.
     ///
     /// Asserted through [`policy_sample`] rather than off the counters directly,
-    /// because the mapping is the part a scrape depends on: a `denied` total in
+    /// because the mapping is the part a reading depends on: a `denied` total in
     /// the `accepted` slot, or a hit block published at the wrong offset, reports
     /// one rule's traffic under another rule's name and nothing about the
     /// counters themselves would notice.

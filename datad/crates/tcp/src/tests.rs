@@ -292,7 +292,7 @@ fn a_byte_stream_crosses_in_both_directions_and_the_close_is_clean() {
     let id = handshake(&mut stack, at(0), &mut peer);
 
     // The peer sends; the stack delivers the bytes and acknowledges them.
-    let payload = b"GET /metrics HTTP/1.1\r\n\r\n";
+    let payload = b"GET /config HTTP/1.1\r\n\r\n";
     let data = peer.data(payload);
     let received = stack.receive(at(1_000), STATION, &data, &mut out);
     assert_eq!(received.outcome, Outcome::Advanced);
@@ -2662,7 +2662,7 @@ fn a_reset_ends_a_dial_only_where_it_acknowledges_it() {
 /// segment says which: `peer_reset` for a reset this connection acted on, and
 /// `reset_sent` for one this end composed in answer. Both are asserted against
 /// the counters beside them, because a flag that disagreed with the count would
-/// be a caller and a scrape reporting different things about one segment.
+/// be a caller and a reading reporting different things about one segment.
 #[test]
 fn a_received_segment_reports_the_reset_it_carried_and_the_one_it_drew() {
     let mut stack = stack();

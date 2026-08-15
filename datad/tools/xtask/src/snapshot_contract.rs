@@ -9,15 +9,13 @@
 //!
 //! # Why an outside anchor rather than a second rendering
 //!
-//! A reading used to be held to the `GET /metrics` exposition the same boot
-//! answered, and that agreement is gone rather than replaced. It was worth
-//! having and it was never the load-bearing half: the scrape and the reading are
-//! two renderings of one set of shards, so they agree with each other about
-//! anything that went wrong upstream of both — a slot a domain published at the
-//! wrong offset reads the same on either surface, and the pair is silent. What
-//! it did catch was a defect inside one renderer. What it could not catch is
-//! exactly what the three anchors below can, and those are stated against
-//! something the appliance never chose.
+//! A second rendering of the same shards would be the cheap comparison to make,
+//! and it is the one this deliberately does not: two renderings agree with each
+//! other about anything that went wrong upstream of both — a slot a domain
+//! published at the wrong offset reads the same on either, and the pair is
+//! silent. What such a pair catches is a defect inside one renderer. What it
+//! cannot catch is exactly what the three anchors below can, and those are
+//! stated against something the appliance never chose.
 //!
 //! # The three anchors, and why each is outside the appliance
 //!
@@ -25,10 +23,10 @@
 //! the frames that come back, so `librefirewall_forwarded_frames_total` has a
 //! number measured by something the appliance cannot reach. Against a *reading*
 //! the relation can only be an inequality, and that is a real loss of sharpness
-//! against a scrape, which is taken after the traffic has settled and can be held
-//! to an equality: a reading is published on a schedule and framed when the
-//! recorder next runs, so the last one in a file legitimately predates the last
-//! frame. Nothing restores the equality, and what keeps the inequality from
+//! against a surface asked for on demand after the traffic has settled, which
+//! could be held to an equality: a reading is published on a schedule and framed
+//! when the recorder next runs, so the last one in a file legitimately predates
+//! the last frame. Nothing restores the equality, and what keeps the inequality from
 //! passing over a reading of nothing is the third anchor below: on a boot that
 //! carried traffic these families must also be non-zero, and on one that carried
 //! none the refusals must be.
@@ -38,8 +36,9 @@
 //! Holding the slot to that exact number is what proves the slots are read at the
 //! right offsets rather than merely being plausible: an off-by-one in the
 //! catalogue leaves every counter still under its wire bound and never lands on
-//! this number. The scrape proves the same thing by agreeing with itself; a disk
-//! the harness sized proves it against something the appliance never chose.
+//! this number. A second rendering proves the same thing by agreeing with
+//! itself; a disk the harness sized proves it against something the appliance
+//! never chose.
 //!
 //! **This boot's own bench.** The store medium is one the harness attached and
 //! the ownership word on it is one the harness wrote, so what the appliance may
@@ -67,8 +66,9 @@
 //!
 //! A file carries a reading per publish, so the counters can be held to each
 //! other over the length of the boot: a counter may not go backwards, and a
-//! constant may carry no number but its device's. Two back-to-back scrapes could
-//! state the first of those over milliseconds; a file states it over a whole run.
+//! constant may carry no number but its device's. Two readings taken back to
+//! back would state the first of those over milliseconds; a file states it over
+//! a whole run.
 //!
 //! # And what a boot that changed the appliance owes
 //!
@@ -78,8 +78,8 @@
 //! boot that drives one — what the re-decision that commit armed did to the
 //! conversations the appliance was already carrying.
 //!
-//! Those were read off the scrape until this contract could carry them, and the
-//! reason they belong here is not tidiness. **The occupancy that must fall is a
+//! Those are read here rather than off a surface asked for on demand, and the
+//! reason is not tidiness. **The occupancy that must fall is a
 //! gauge, and a gauge is a fact about an instant.** Read twice from outside, the
 //! two instants are the harness's own — the moment before it submitted and the
 //! moment it happened to look afterwards — and a surface published on a schedule
@@ -487,7 +487,7 @@ const RECEIVE_FRAMES: &str = "librefirewall_receive_frames_total";
 /// applied two, whichever reading it was seen in — and it rests on no ordering, so
 /// it holds on a file whose ordering clause has stood down.
 ///
-/// Floors and not equalities for the reason they were floors on the scrape: what
+/// Floors and not equalities for the reason any such bound is a floor here: what
 /// they refuse is a node whose answers on the wire said one thing about its
 /// submissions and whose own counters say another.
 fn judge_submission(
@@ -810,7 +810,8 @@ fn judge_capacities(target: &str, snapshots: &[Snapshot]) -> Result<String, Stri
 /// less the gauges and the two capacity constants: a slot that went backwards is
 /// either a domain that reset a counter or a reading composed out of two
 /// different instants. A file states this over the length of a boot, where two
-/// back-to-back scrapes could state it only over the milliseconds between them.
+/// two readings taken back to back could state it only over the milliseconds
+/// between them.
 ///
 /// **It stands down on a resumed extent, and that is a real gap.** Such a file
 /// holds earlier boots' readings ahead of this boot's, and every counter is zero

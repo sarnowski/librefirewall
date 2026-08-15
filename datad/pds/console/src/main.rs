@@ -65,7 +65,7 @@
 //!
 //! A refused **controller** this domain can still report. It cannot print, but
 //! its stats shard is its own to write, so `init` publishes it before parking and
-//! `librefirewall_uart_init_failures_total` moves — which is what lets a scrape
+//! `librefirewall_uart_init_failures_total` moves — which is what lets a reading
 //! tell a refused controller from a console that came up and printed nothing. The
 //! residue is granularity: `uart_16550` distinguishes six ways for the register
 //! sequence to fail and one counter carries none of them apart.
@@ -204,8 +204,8 @@ fn init() -> Console {
     let Ok(transmitter) = uart.initialise() else {
         // No line can be printed, so the shard is the only statement left — and it
         // is writable, the refusal being the device's and not the mapping's.
-        // Publishing here is what moves `init_failures`, so an operator who can
-        // scrape reads a refused controller rather than a shard of zeroes. Nothing
+        // Publishing here is what moves `init_failures`, so an operator reading
+        // the counters sees a refused controller rather than a shard of zeroes. Nothing
         // was printed, so the record counters are zero and the device's three
         // carry the whole of it. Parking leaves the domain idle rather than
         // retrying a controller that refused a sequence confirmed at every step.
@@ -256,7 +256,7 @@ fn init() -> Console {
         &mut relay,
     );
 
-    // Written once so a scrape taken before the first record reads a console that
+    // Written once so a reading taken before the first record reads a console that
     // is up, and thereafter only when something moved. Compared rather than
     // stored unconditionally for `pds/nic-driver`'s reason: this is a busy loop,
     // and an unconditional publish would dirty the shard's cache line millions of

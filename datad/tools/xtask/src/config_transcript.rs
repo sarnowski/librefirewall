@@ -303,8 +303,8 @@ impl ConfigContract {
 /// # Why the console is the whole of the evidence
 ///
 /// Such a node has committed no generation, and the management port is unaddressed
-/// until one commits — so there is no endpoint to scrape, no recording to download
-/// and no counter to read. What is left is the serial capture and the absence of
+/// until one commits — so no client can reach it and no counter of its own
+/// leaves it. What is left is the serial capture and the absence of
 /// any forwarded frame, and those two are what a fail-closed scenario is judged by.
 /// A harness that reached for a metric here would be asking a node with no address
 /// for its opinion.

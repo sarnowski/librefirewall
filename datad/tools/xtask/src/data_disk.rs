@@ -521,13 +521,13 @@ impl DataDisk {
     /// [`Deck::extents`]'s order, which is the connection history and then the
     /// capture. Empty on a boot that made its own medium.
     ///
-    /// A recording outlives the node, so a download taken during a boot that
-    /// resumed one answers earlier boots' records as well as this boot's, while
-    /// every counter the appliance publishes is this boot's alone. What tells
-    /// the two apart is this: the durable prefix read off the file before QEMU
-    /// was started is exactly the part of the download that is not this boot's
-    /// doing, so a contract holding the recordings to the exposition can
-    /// subtract it and stay exact instead of standing down on a carried medium.
+    /// A recording outlives the node, so a boot that resumed one leaves earlier
+    /// boots' records on the medium beside this boot's, while every counter the
+    /// appliance publishes is this boot's alone. What tells the two apart is
+    /// this: the durable prefix read off the file before QEMU was started is
+    /// exactly the part of the extent that is not this boot's doing, so a
+    /// contract holding the recordings to the counters can subtract it and stay
+    /// exact instead of standing down on a carried medium.
     ///
     /// # Errors
     /// An inherited prefix that does not parse as pcapng, which would leave

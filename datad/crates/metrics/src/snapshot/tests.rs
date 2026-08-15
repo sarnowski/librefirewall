@@ -317,3 +317,26 @@ proptest! {
         }
     }
 }
+
+/// The three build-time derivations, re-run at run time against the constants
+/// they produced: a `const fn` nothing calls again is a derivation nothing has
+/// ever executed, and the two must not be able to disagree.
+#[test]
+fn every_derived_constant_re_derives_to_itself() {
+    assert_eq!(super::snapshot_slots(), SNAPSHOT_SLOTS);
+    assert_eq!(super::fingerprint(), CATALOGUE_FINGERPRINT);
+    assert_eq!(super::fnv_field(super::FNV_OFFSET, b""), {
+        let empty = super::fnv(super::FNV_OFFSET, b"");
+        super::fnv(empty, &[0x1f])
+    });
+}
+
+/// A stated reading is the same value the codec produces from the same numbers,
+/// which is what lets a test or a caller with no region hold one.
+#[test]
+fn a_stated_reading_is_the_one_its_bytes_decode_to() {
+    let stated = MetricSnapshot::new(7, values());
+    let mut out = [0u8; SNAPSHOT_BYTES];
+    encode(&mut out, stated.unix_nanos, &stated.values).expect("room");
+    assert_eq!(decode(&out).expect("its own bytes"), stated);
+}

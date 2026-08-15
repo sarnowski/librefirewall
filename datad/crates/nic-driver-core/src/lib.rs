@@ -114,7 +114,7 @@ pub struct Traffic {
 ///
 /// Every field is **monotonic** for the protection domain's life and
 /// **saturates** at [`u64::MAX`] rather than wrapping. There is no reset: a
-/// metrics endpoint derives a rate by differencing successive scrapes, so a
+/// consumer derives a rate by differencing successive readings, so a
 /// reset would forge a negative rate, and a wrap would turn a sustained flood
 /// back into a small number — precisely when the number matters most.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -181,9 +181,9 @@ pub struct InvariantFaults {
 }
 
 /// A snapshot of everything a driver protection domain can say about its two
-/// neighbours and itself, in the shape the appliance's metrics endpoint will
-/// scrape. Taken by value because a scrape wants one consistent picture, not
-/// four live borrows.
+/// neighbours and itself, in the shape the appliance's metric catalogue counts
+/// it. Taken by value because a reading wants one consistent picture, not four
+/// live borrows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverStats {
     pub counters: Counters,

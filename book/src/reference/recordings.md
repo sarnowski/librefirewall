@@ -109,7 +109,7 @@ below that it does not know.
   | option | what it holds |
   |---|---|
   | `epb_flags` | direction; every record reads *inbound* — see below. **Absent** on the one record that is about no frame, a direction being a property of a packet on a wire |
-  | `epb_dropcount` | tap-ring observations lost before this record, and any `u64`. The recorder differences the forwarder's own tap-drop count on every pass and holds the rise as a debt until there is a record to carry it, so the number belongs to the gap before this block and not to the packet in it. It accounts for the tap ring **and nothing else**: what a sink could not encode, or could not write, is on `/metrics` and not in the file |
+  | `epb_dropcount` | tap-ring observations lost before this record, and any `u64`. The recorder differences the forwarder's own tap-drop count on every pass and holds the rise as a debt until there is a record to carry it, so the number belongs to the gap before this block and not to the packet in it. It accounts for the tap ring **and nothing else**: what a sink could not encode, or could not write, is in a [metric reading](metrics.md) and not in the packet blocks |
   | `epb_packetid` | the appliance-wide packet identity. It is the same number on the connection history's record of an event and on the capture's record of the packet that caused it, so the two files relate to each other by it |
   | `epb_verdict` | verdict kind `0xFF` and one byte: `0` forwarded, `1` dropped, `2` neither — a conversation the appliance ended itself |
   | custom option, PEN-tagged | 24 bytes carrying the whole decision — see below |
@@ -209,7 +209,7 @@ five-tuple in the causing packet's own headers, which the record carries.
 
 **A conversation that times out produces no close.** Almost every record is anchored to the packet
 that caused it, and a flow reclaimed by its idle timeout has no such packet. What states a timeout is
-`librefirewall_flow_expired_total` on [`/metrics`](metrics.md). A revocation is the one record with no
+`librefirewall_flow_expired_total` in a [metric reading](metrics.md). A revocation is the one record with no
 causing packet that *is* written, and the paragraph above says how it is written honestly; a timeout
 has no such record.
 
@@ -262,7 +262,8 @@ has no such record.
   ring dropped. A recording the encoder or the medium lost records from reads exactly like one that
   lost none, so the loss families under [the two recordings, and the reads served out of
   them](metrics.md#the-two-recordings-and-the-reads-served-out-of-them) are the other half of
-  the account, and a recording is read beside a scrape rather than alone.
+  the account, and a recording is read beside the readings inside it rather than by its packet
+  blocks alone.
 
 ## What the two recordings hold
 

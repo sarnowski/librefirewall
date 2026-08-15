@@ -3,12 +3,11 @@
 These reference chapters are the **operator's interface to librefirewall**. Because the appliance
 has no shell and no CLI — a deliberate design decision (see the
 [management design](../design/management.md)) — the console, the OpenTelemetry log stream, the
-`GET /metrics`, `GET /logs` and `GET /config` endpoints and the two recording downloads are the
-*only* windows into a running node — together they are the complete, sufficient surface for
-building dashboards, alerts, and analysis, and for debugging an incident. This chapter and its three
-companions — [Console records](console.md), [Prometheus metrics](metrics.md) and
-[Recording downloads](recordings.md) — define what that surface contains and how to interpret it, so
-an operator can rely on it as a stable contract.
+`GET /logs` and `GET /config` endpoints and the two recordings are the *only* windows into a running
+node — together they are the complete, sufficient surface for building dashboards, alerts, and
+analysis, and for debugging an incident. This chapter and its three companions —
+[Console records](console.md), [Metrics](metrics.md) and [Recordings](recordings.md) — define what
+that surface contains and how to interpret it, so an operator can rely on it as a stable contract.
 
 The conventions below are settled and binding, and they bind every surface named here whether or not
 its inventory is filled. Nothing is named in an inventory ahead of the signal it belongs to: a name
@@ -29,8 +28,11 @@ and this reference does not carry guesses.
   through `GET /logs`. It is the *live* view: external OTEL collection is routinely delayed by
   minutes and can be down entirely, and there is no shell, so this is the only way to see what a
   node is doing right now.
-- **Prometheus metrics** — the `GET /metrics` endpoint, the only metrics interface, exposing every
-  measurable moving part at bounded cardinality and no measurable dataplane cost.
+- **Metrics** — the **metric reading**, a snapshot of every named series framed into the connection
+  history on a period and carried upstream over the management channel. It is the only metrics
+  interface, and it covers every measurable moving part at bounded cardinality and no measurable
+  dataplane cost. There is no metrics endpoint: nothing on the management port answers for a
+  counter.
 - **Configuration** — the `GET /config` endpoint, returning the configuration in force as a document,
   and `POST /config`, which replaces it. The only surface of the six that **changes** anything, and
   the only one whose reach is the authority to decide what the appliance forwards.
@@ -45,12 +47,12 @@ and this reference does not carry guesses.
   never over HTTP; the *format* of what it carries is pcapng, and pcapng's
   specification, not this reference, is the contract for the bytes inside the file.
 
-**Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, tailing `GET /logs`,
-and downloading the two recordings **once** yields the entire observable state of a node: the
-configuration in force, every metric around it, what it has just been doing, and the recorded
-evidence of what it did to traffic. That *is* the debug dump — there is deliberately no other
-mechanism to extract state, so those endpoints together are designed to be sufficient to diagnose the
-system.
+**Complete-state principle.** Reading `GET /config`, tailing `GET /logs`, and taking the two
+recordings **once** yields the entire observable state of a node: the configuration in force, every
+metric around it — the readings are inside the connection history — what it has just been doing, and
+the recorded evidence of what it did to traffic. That *is* the debug dump — there is deliberately no
+other mechanism to extract state, so those surfaces together are designed to be sufficient to
+diagnose the system.
 
 ## Conventions (binding)
 
@@ -60,17 +62,17 @@ These apply to every signal and are the rules an operator can depend on.
 
 Every signal is attributable to a node and a configuration. The full common context is the **node
 identity**, the **software build and trust profile**, and the **configuration generation** in force,
-carried across the observability surfaces as OTEL resource/log attributes, Prometheus labels, and
+carried across the observability surfaces as OTEL resource/log attributes, metric labels, and
 console fields. A recording carries its own share of it differently, in the per-record annotation
-rather than as a label — see [Recording downloads](recordings.md).
+rather than as a label — see [Recordings](recordings.md).
 
-The console and the Prometheus exposition are the surfaces that exist, and the console carries one
-part of that context. What it does carry, and what it does not:
+The console and the metric readings are the surfaces that exist, and the console carries one part of
+that context. What it does carry, and what it does not:
 
 | context | on the console | what fixes it there |
 |---|---|---|
 | configuration generation | `generation=` on every `LFW-CFG` record | the datastore's counter, assigned per commit and monotonic within a boot |
-| emitting protection domain | `domain=` on every `LFW-PD` record | the domain's name in the Microkit system description, so a record and the capability topology use one identity — save that the driver's three instances share the one token `nic-driver`, which the Prometheus surface distinguishes and the console does not |
+| emitting protection domain | `domain=` on every `LFW-PD` record | the domain's name in the Microkit system description, so a record and the capability topology use one identity — save that the driver's three instances share the one token `nic-driver`, which the metric surface distinguishes and the console does not |
 | node identity | **absent** | there is no management plane to be provisioned with one, and no identifier to carry; one serial console is one node, and its reader already knows which |
 | software build and trust profile | **absent** | recorded in the release manifest beside the image (`trust_profile`, pinned inputs), never in a record the running system emits. `LFW-BOOT slot=` says which *slot* booted, which is not the same as which build it holds |
 
@@ -94,9 +96,9 @@ implementation and binds the two that follow.
   `prefix-length`, `rx-posted`, `not-virtio-net`, `unknown-interface-reference`. Never camel case,
   never a Rust identifier, never an internal enum name. Where a key names a configuration attribute
   it is spelled exactly as the configuration document spells it, so a change record points at the
-  text an operator edits rather than at a field name only the source reveals. The Prometheus surface
+  text an operator edits rather than at a field name only the source reveals. The metric surface
   writes the same words with `_` for `-`, so a metric name, a label name and a closed-vocabulary
-  label value are the same word a record spells with hyphens; [Prometheus metrics](metrics.md)
+  label value are the same word a record spells with hyphens; [Metrics](metrics.md)
   states that rule and the one class of label value it carves out of it.
 - **The vocabularies are closed.** Every `state=`, `change=`, `object=`, `field=`, `outcome=`,
   `rejected=` and `cause=` value comes from a fixed set enumerated in
@@ -106,24 +108,24 @@ implementation and binds the two that follow.
   are hardware values read against a datasheet and are `0x`-prefixed lower-case hexadecimal; every
   other numeric field — generations, sequence numbers, counts, offsets, indices — is decimal.
 - The same keys and tokens are what every other surface carries, transliterated to its own separator
-  convention. [Prometheus metrics](metrics.md) states that transliteration and the names it yields;
+  convention. [Metrics](metrics.md) states that transliteration and the names it yields;
   an OTEL attribute key is fixed with the exporter and is deliberately not invented in advance.
 - Labels and attributes are **low, bounded cardinality**: aggregate dimensions (interface, core,
   queue, subsystem, verdict class), never per-flow, per-connection, or per-packet identifiers.
 - **No signal carries packet payloads, secrets, keys, or personal data — with one named exception,
   the two recording sinks.** For the console, the OTEL log stream, the local log buffer and the
-  Prometheus exposition the rule is absolute and unqualified: none of them carries a byte of traffic,
+  metric readings the rule is absolute and unqualified: none of them carries a byte of traffic,
   and none ever will. On the console it is structural rather than a rule to remember — the only value
   type that can carry text out of a configuration document is an identifier validated to
-  `[a-z0-9-]{1,16}`, and a refusal names a *location* in the document and never the bytes at it. On
-  the exposition it is structural too: a metric value is a number and a label comes from a closed
+  `[a-z0-9-]{1,16}`, and a refusal names a *location* in the document and never the bytes at it. In
+  a reading it is structural too: a metric value is a number and a label comes from a closed
   vocabulary or a validated identifier.
 
   The exception is the two recordings, and it is stated rather than
   tolerated: a recording exists **to** carry the traffic, and a capture that omitted the payload
   would not be one. It is bounded to those two artifacts — the capture sink records payloads, the log
   sink the L2–L4 headers of the packet each record is anchored to — it is why a recording is
-  authorized rather than openly scraped, and it is why an inspected flow is meant to be
+  authorized rather than openly fetched, and it is why an inspected flow is meant to be
   recorded as ciphertext plus its keys rather than as plaintext at rest. Nothing else on any surface
   moves because of it. **That authorization is now in front of it**: a recording leaves this
   appliance over the mutually-authenticated management channel and by no other route — see
@@ -193,10 +195,10 @@ record, so two nodes' instants, or one node's across a reboot, are correlated by
 operator knows from outside the contract. Two boots of one machine also anchor to two separate CMOS
 readings.
 
-**A rate is the scraper's arithmetic.** A counter on `/metrics` carries no timestamp and the node
-contributes no time to a rate; differencing two scrapes is timed by the scraper alone. The instant
-on a log record and the counters in an exposition are separate surfaces, and nothing correlates one
-to the other on the node.
+**A rate is the consumer's arithmetic.** A counter in a reading carries no timestamp of its own and
+the node contributes no time to a rate; differencing two readings is timed by whoever holds them.
+The instant on a log record and the counters in a reading are separate surfaces, and nothing
+correlates one to the other on the node.
 
 A record additionally carries the **configuration `generation`** it belongs to and, where one
 generation produces several change records, a **`seq`** numbering them from 0 in emission order.
@@ -305,8 +307,8 @@ not named here, under the rule at the head of this chapter.
 
 `GET /config` returns the running configuration as XML (see the
 [configuration design](../design/configuration.md)). It supplies the intent half of the debug dump:
-paired with a `/metrics` scrape and a `/logs` read it gives the complete picture of *what the node
-is configured to do* alongside *what it is doing* and *what it has just done*.
+paired with a metric reading and a `/logs` read it gives the complete picture of *what the node is
+configured to do* alongside *what it is doing* and *what it has just done*.
 
 **What comes back is a rendering of the configuration in force, not the bytes that were submitted.**
 The node keeps no copy of the document — 64 KiB of text has nowhere to live in a domain with no

@@ -1493,7 +1493,7 @@ const REGIONS: &[RegionRule] = &[
     // The metric shards: one per protection domain, each with exactly one
     // writer and — for the nine that are not the reader's own — exactly one
     // reader. The perms carry the whole argument, as `cfg`'s do: the management
-    // domain renders every one of these into the exposition an operator scrapes,
+    // domain composes every one of these into the reading a recording carries,
     // so it must read all ten, and a grant that let it *write* one would let
     // the domain an attacker reaches first forge a clean line for a port that is
     // dropping every frame.
@@ -1526,9 +1526,9 @@ const REGIONS: &[RegionRule] = &[
         withheld: Some(STATS_WITHHELD),
     },
     // The one region in this description with a single mapper, and it is a
-    // decision: the renderer walks one uniform array of ten shards rather than
-    // nine regions plus a live read of its own counters, so a scrape is one set
-    // of numbers taken at one publish. It costs no cross-domain authority, which
+    // decision: the walk that composes a reading crosses one uniform array of ten
+    // shards rather than nine regions plus a live read of its own counters, so a
+    // reading is one set of numbers taken at one publish. It costs no cross-domain authority, which
     // is why "exactly one mapper" is the rule rather than a finding.
     RegionRule {
         name: "stats_management",
@@ -2074,10 +2074,9 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
 /// and the protection domain the metric surface attributes them to.
 ///
 /// This is the enforcer `lfw_metrics::PORT_DOMAINS`' precondition names.
-/// That table is the join key of the interface info family — a scraper matches
-/// `domain="nic_driver0"` on a counter series against the info series for the
-/// interface the document put on port 0 — and *which domain drives which port* is
-/// a fact of this file alone. Nothing in a configuration document states it and
+/// That table is what attributes a port's counters — a reading carries
+/// `domain="nic_driver0"` on every series a port's driver published — and *which
+/// domain drives which port* is a fact of this file alone. Nothing in a configuration document states it and
 /// nothing in a crate can derive it, so before this check it was a comment.
 ///
 /// The mapping is read off the description the way the system itself establishes
@@ -2286,16 +2285,16 @@ fn check_port_drivers(elements: &[Element], findings: &mut Vec<String>) {
             [domain] => findings.push(format!(
                 "<map mr={:?} setvar_vaddr={RECEIVE_PIPELINE_SYMBOL:?}> is made by {domain:?}, so \
                  {} is driven by that domain — and lfw_metrics::PORT_DOMAINS attributes it to \
-                 {:?}. The interface info metric joins a counter series to a configured interface \
-                 on exactly that name, so a disagreement here does not lose the join: it points \
-                 every one of that port's counters at another port's addressing",
+                 {:?}. Every series that port's driver publishes carries exactly that name, so \
+                 a disagreement here loses nothing loudly: it attributes every one of that \
+                 port's counters to another port's driver",
                 rule.receive_region, rule.port, rule.domain
             )),
             [] => findings.push(format!(
                 "no <map mr={:?} setvar_vaddr={RECEIVE_PIPELINE_SYMBOL:?}> exists, so nothing in \
                  this description drives {} — and lfw_metrics::PORT_DOMAINS still attributes it to \
-                 {:?}, which would then be an interface identity joined to counters no domain \
-                 publishes",
+                 {:?}, which would then be a domain name on a shard no driver publishes \
+                 into",
                 rule.receive_region, rule.port, rule.domain
             )),
             many => findings.push(format!(
@@ -4737,8 +4736,8 @@ mod tests {
             "the finding names the constant it disagrees with: {joined}"
         );
         assert!(
-            joined.contains("another port's addressing"),
-            "and what the disagreement costs a scraper: {joined}"
+            joined.contains("another port's driver"),
+            "and what the disagreement costs a reader: {joined}"
         );
     }
 

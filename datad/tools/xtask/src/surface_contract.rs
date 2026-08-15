@@ -743,8 +743,8 @@ fn lifecycle_differences(log: &Surface) -> Vec<String> {
 /// **This is the bullet no surface can satisfy by construction.** Two host
 /// sockets observed whether each probe came out the far side, with no help from
 /// the appliance, so a record whose annotation says otherwise is a recording that
-/// misdescribes what the appliance did — and neither file nor the exposition would
-/// notice on its own.
+/// misdescribes what the appliance did — and no reading the appliance composed
+/// would notice on its own.
 fn verdict_differences(capture: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     for injected in wire.injected.iter().filter(|injected| injected.observed) {
@@ -880,9 +880,8 @@ const _: () = assert!(matches!(
 ///   accepting rule raises that rule's hits and the denial counter together, so
 ///   both totals still agree;
 /// * an appliance nobody owns runs no filter, so no record of one names any rule.
-///   The counter join would pass such a record whenever the exposition credited
-///   the same rule — two surfaces agreeing about work that could not have
-///   happened.
+///   The counter join would pass such a record whenever the reading credited the
+///   same rule — two accounts agreeing about work that could not have happened.
 ///
 /// Only the third is ever conditional. It stands down where the boot ran **two**
 /// policies — the reconfiguration document keeps both ids and exchanges their
@@ -1052,7 +1051,7 @@ fn outcome_differences(capture: &Surface, policy: &Policy) -> Vec<String> {
 /// beside two. It is what remains of the refusal comparison that used to sit
 /// here — a count per reason held to `librefirewall_route_drops_total` under the
 /// name the position indexes — and it is the half of that pair which was never
-/// about the exposition at all: a reason outside the vocabulary indexes no name,
+/// about the counters at all: a reason outside the vocabulary indexes no name,
 /// and a recording naming one is wrong whatever any counter says.
 ///
 /// Stated over **every** record in the file, a previous boot's included, for the
@@ -1092,7 +1091,7 @@ fn vocabulary_differences(surface: &Surface) -> Vec<String> {
 }
 
 /// The drop reasons this build's tap ABI encodes, in the order it encodes them —
-/// the annotation carries the position and the exposition carries the name, so
+/// the annotation carries the position and the catalogue carries the name, so
 /// this list is what relates the two.
 ///
 /// Restated as strings rather than imported, on this module's own terms: a
@@ -1137,8 +1136,8 @@ pub const DROP_REASONS: [&str; 26] = [
 
 // The annotation carries a *position* in this vocabulary, so a reason added to
 // the appliance and not to this array does not shorten the list — it renames
-// every reason after the one that moved, and a recording then disagrees with an
-// exposition that is telling the truth. Comparing against the constant the
+// every reason after the one that moved, and a recording then disagrees with a
+// reading that is telling the truth. Comparing against the constant the
 // encoding itself is derived from is what makes that a compile error.
 const _: () = assert!(DROP_REASONS.len() == wire::TAP_DROP_REASON_COUNT as usize);
 
@@ -1179,7 +1178,8 @@ fn identities(surface: &Surface) -> BTreeMap<u64, usize> {
 ///
 /// **There is deliberately no bound in the other direction.** The one that used
 /// to stand here held the file to `librefirewall_recording_records_total` for
-/// its sink, and both halves of that pair went with the exposition. Nothing
+/// its sink, and both halves of that pair went with the surface they were read
+/// off. Nothing
 /// replaces them: a lower bound taken from a *reading* would be unsound, the
 /// relay being push-based — the recorder frames whatever the publisher last
 /// settled, at most once per pass — so a block's counters are older than the
@@ -1276,8 +1276,8 @@ fn distinctness_differences(log: &Surface, capture: &Surface) -> Vec<String> {
 /// and maps no configuration region to read them out of. Until it does, this
 /// assertion can hold the recording to the number of ports and to their indices
 /// and no further; the identity half of the same idea is
-/// `crate::metrics_contract`'s interface info family, which does compare against
-/// the document field by field.
+/// `crate::config_submission_contract`'s read of the configuration surface, which
+/// does compare against the document field by field.
 fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     let mut found = Vec::new();
     // A section's interface table restarts at zero, so the flat list holds one

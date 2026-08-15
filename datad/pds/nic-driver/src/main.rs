@@ -235,7 +235,7 @@ fn init() -> NicDriver {
                 DomainState::Ready,
                 DomainDetail::ReceivePosted(QUEUE_SIZE as u32),
             );
-            // Written once here so a scrape taken before the first frame reads
+            // Written once here so a reading taken before the first frame reads
             // a port that is up rather than a region nothing has published
             // into, and thereafter only when something moved.
             let mut published = publish(stats, &port, &sink);

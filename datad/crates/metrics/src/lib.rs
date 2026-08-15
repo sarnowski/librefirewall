@@ -1,18 +1,16 @@
 //! The appliance's metric surface: the shared-memory counter shards protection
 //! domains publish into, the catalogue that says what every slot means, and the
-//! Prometheus exposition renderer that turns a set of shards into the bytes
-//! `GET /metrics` answers with.
+//! reading that lays one pass over every shard end to end for the domain that
+//! frames it into a recording.
 //!
 //! # Adversary
 //!
-//! The **byzantine neighbour protection domain**, and through the
-//! endpoint that serves the rendered bytes, its **management-plane attacker**.
-//! Every word this crate reads out of a shard was stored by another domain, so
-//! nothing here judges a value: a counter is a `u64` and every bit pattern of
-//! one is a number an operator may read. What the adversary must not be able to
-//! do is make the *renderer* misbehave, so [`Snapshot::render`] is total over
-//! arbitrary values and arbitrary output lengths, allocates nothing, and refuses
-//! rather than truncating.
+//! The **byzantine neighbour protection domain**, and through the recording that
+//! carries a reading upstream, its **management-plane attacker**. Every word
+//! this crate reads out of a shard was stored by another domain, so nothing here
+//! judges a value: a counter is a `u64` and every bit pattern of one is a number
+//! an operator may read. What the adversary must not be able to do is make the
+//! *reader* misbehave, so [`decode`](decode_snapshot) is total over arbitrary bytes.
 //!
 //! # Why the region layout lives here and not in `wire`
 //!
@@ -20,10 +18,9 @@
 //! crate that reads them. A stats shard is the opposite case: its bytes are a
 //! flat array of `u64`, and everything that makes it *mean* anything — which
 //! slot is which series, under which name and labels — is the catalogue below.
-//! Splitting the array from the catalogue would put the two halves of one ABI in
-//! two crates and reintroduce exactly the drift a fixed layout exists to
-//! prevent, so both are here and one table ([`ShardSpec::series`]) is what the
-//! writer indexes and the reader renders.
+//! Splitting the two would put the halves of one ABI in two crates and
+//! reintroduce the drift a fixed layout exists to prevent, so one table
+//! ([`ShardSpec::series`]) is what the writer indexes and the reader walks.
 //!
 //! # One writer, no lock, and no seqlock either
 //!
@@ -35,33 +32,26 @@
 //! [`ClockCalibration`](wire::ClockCalibration) needs a seqlock and this does
 //! not, which is worth stating because the two regions sit beside each other: a
 //! calibration's three words are meaningful only *together*, and a counter has
-//! no such partner. A scrape is never atomic against a running system in any
-//! case, and Prometheus differences successive samples rather than reading a
-//! consistent cut, so one word of sequencing would buy nothing and would put a
-//! retry loop on the path of a management request.
+//! no such partner. A consumer differences successive readings rather than
+//! reading a consistent cut, so one word of sequencing would buy nothing.
 //!
 //! # The hot path pays for none of it
 //!
 //! A domain accumulates in the in-memory counters it already keeps and calls
-//! [`StatsShard::publish`] **once per drain**, not once per frame — so the whole
-//! surface costs one bounded run of relaxed stores per batch of up to
-//! `DRAIN_LIMIT` descriptors: no measurable dataplane cost.
+//! [`StatsShard::publish`] **once per drain**, not once per frame — one bounded
+//! run of relaxed stores per batch: no measurable dataplane cost.
 //!
 //! # Nothing is summed here
 //!
 //! Every series carries the `domain` label of the protection domain that
 //! produced it and no total is computed anywhere in the node. A summed total is
 //! corrupted by a domain restart — one shard resets, the sum goes backwards, and
-//! a scraper forges an enormous rate — whereas a labelled series resets alone,
-//! which Prometheus handles by design.
+//! a consumer forges an enormous rate — whereas a labelled series resets alone.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
 mod catalog;
-mod interfaces;
-mod render;
-mod rules;
 mod sample;
 mod snapshot;
 
@@ -70,36 +60,30 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use wire::MAPPING_ALIGN;
 
 pub use catalog::{
-    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Kind, Label, MANAGEMENT_SHARD, Metric, RULE_HITS,
-    SHARD_COUNT, SHARDS, Series, ShardSpec, metric,
+    ALL_METRICS, FORWARDER_SHARD, INTERFACE_INFO, Kind, Label, MANAGEMENT_PORT_DOMAIN,
+    MANAGEMENT_SHARD, Metric, PORT_DOMAINS, RULE_HITS, SHARD_COUNT, SHARDS, Series, ShardSpec,
+    metric, port_domain,
 };
-pub use interfaces::{
-    InterfaceInfo, InterfaceInventory, InventoryFull, MANAGEMENT_PORT_DOMAIN, MAX_INTERFACE_SERIES,
-    PORT_DOMAINS, Role, port_domain,
-};
-pub use render::{MAX_EXPOSITION_LEN, RenderError, Snapshot};
-pub use rules::{MAX_RULE_SERIES, RuleInventory, RulesFull};
 pub use sample::{
     CLOCK_SLOTS, CONFIG_SLOTS, CONSOLE_SLOTS, CRYPTO_PRIMITIVES, CRYPTO_SLOTS, ClockSample,
     ConfigSample, ConsoleSample, CryptoSample, DRIVER_SLOTS, DriverSample, EndpointSample,
     FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_SLOTS, FLOW_STATES,
     FORWARDER_SHARD_SLOTS, FORWARDER_SLOTS, FlowSample, ForwarderSample, GENERATION_OUTCOME_NAMES,
     GENERATION_OUTCOMES, HARDWARE_PROBE_SLOTS, HTTP_STATUSES, HardwareProbeSample, HttpSample,
-    LogSample, MANAGEMENT_SLOTS, ManagementSample, NeighbourSample, OnboardSample, OutboundSample,
-    PIPELINES, POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS,
-    PipelineSample, PolicySample, PolicySweepSample, PoolSample, RECORDER_SLOTS,
-    ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS,
-    STORE_SLOTS, SinkSample, StoreSample, TapSample, TcpSample, UartSample,
+    LogSample, MANAGEMENT_SLOTS, MAX_RULE_SERIES, ManagementSample, NeighbourSample, OnboardSample,
+    OutboundSample, PIPELINES, POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS,
+    POLICY_SWEEP_SLOTS, PipelineSample, PolicySample, PolicySweepSample, PoolSample,
+    RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample,
+    SINKS, STORE_SLOTS, SinkSample, StoreSample, TapSample, TcpSample, UartSample,
 };
 pub use snapshot::{
     CATALOGUE_FINGERPRINT, DecodeError as SnapshotDecodeError, EncodeError as SnapshotEncodeError,
     MetricSnapshot, SNAPSHOT_BYTES, SNAPSHOT_HEADER_BYTES, SNAPSHOT_KIND, SNAPSHOT_SLOTS,
-    SNAPSHOT_VERSION, decode as decode_snapshot, encode as encode_snapshot,
+    SNAPSHOT_VERSION, Snapshot, decode as decode_snapshot, encode as encode_snapshot,
 };
 
 /// Slots left free above the largest domain's table, so a new counter is a table
-/// entry rather than a region resize — which would be a capability change. Two
-/// cache lines: room for a subsystem's counters, and the shard still one page.
+/// entry rather than a region resize — which would be a capability change.
 const STATS_HEADROOM: usize = 16;
 
 /// Counter slots one shard carries.
@@ -112,11 +96,9 @@ const STATS_HEADROOM: usize = 16;
 /// error and not a dropped counter.
 ///
 /// Every shard is this wide, including the seven that publish far fewer, and that
-/// costs nothing: a shard is its own region and a region is a page, so the
-/// reservation was already a page before the per-rule block existed and still is.
-/// The alternative — a second region carrying the rule counters alone — would buy
-/// back no memory and would add a mapping to the domain that faces the
-/// management-plane attacker.
+/// costs nothing: a shard is its own region and a region is a page. A second
+/// region carrying the rule counters alone would buy back no memory and would add
+/// a mapping to the domain that faces the management-plane attacker.
 pub const STATS_SLOTS: usize = (sample::FORWARDER_SHARD_SLOTS + STATS_HEADROOM).next_multiple_of(8);
 
 /// One protection domain's counters, as the shared region lays them out.

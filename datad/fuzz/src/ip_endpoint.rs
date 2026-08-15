@@ -117,22 +117,26 @@ fn assert_one_frame_is_answered(data: &[u8]) {
         IsnSecret::from_bytes(SECRET),
     )
     .expect("a unicast pair on a /24");
+    // The configuration surface, registered as a real domain registers it: with
+    // no rendered target at all the body path below is unreachable, and a
+    // harness that cannot reach a path reads as coverage of it.
+    assert!(endpoint.serve_rendered_at("/config"));
     let mut out = [UNTOUCHED; REPLY_CAPACITY];
     let outcome = endpoint.handle(Some(now()), data, &mut out);
-    // A body of stated bytes rather than the appliance's own renderer: this
-    // harness is about the frame path, and the exposition has a target of its
-    // own. Supplied so a request that reached the server does not leave a
-    // connection waiting on one for ever.
+    // A body of stated bytes rather than a real one: this harness is about the
+    // frame path, and what a target's body says is its owner's business.
+    // Supplied so a request that reached the server does not leave a connection
+    // waiting on one for ever.
     if endpoint.body_wanted().is_some() {
-        endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
-            let body = b"# HELP x y\n# TYPE x counter\nx 1\n";
+        endpoint.supply_body(Status::Ok, Some(ContentType::Xml), |out| {
+            let body = b"<configuration/>";
             out.get_mut(..body.len())?.copy_from_slice(body);
             Some(body.len())
         });
     }
 
-    // One frame, one recorded outcome: the counters are what a scrape reads, so a
-    // path that answered without recording would be invisible.
+    // One frame, one recorded outcome: the counters are what a reading carries,
+    // so a path that answered without recording would be invisible.
     let counters = endpoint.counters();
     assert_eq!(
         counters.total(),

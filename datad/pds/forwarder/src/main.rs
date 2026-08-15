@@ -88,7 +88,7 @@
 //! # Numbers go to a shard, once per wakeup
 //!
 //! Every drop this domain counts reaches one region it is the sole writer of,
-//! which the management domain maps read-only and renders into `GET /metrics`.
+//! which the management domain maps read-only and composes into a metric reading.
 //! The write is at the end of a wakeup and not per frame, off the hot path.
 
 use lfw_log::{
@@ -251,7 +251,7 @@ impl Forwarder {
             configuration: self.switch.counters(),
             policy: self.pipeline.policy_counters(),
             // Both halves read from the one table at the same moment, so the
-            // occupancy a scrape reports is the occupancy those counters left.
+            // occupancy a reading reports is the occupancy those counters left.
             flow: flow_sample(self.flows.counters(), self.flows.occupancy()),
             sweep: &self.sweep,
             tap: self.tap.counters(),

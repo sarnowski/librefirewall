@@ -321,7 +321,7 @@ impl fmt::Display for DropReason {
 /// One counter per [`DropReason`], indexed by the reason itself so a new
 /// variant cannot be added without a slot to record it.
 ///
-/// Saturating and never reset: the rate is attacker-controlled, and a scrape
+/// Saturating and never reset: the rate is attacker-controlled, and a reading
 /// differences successive reads, so a wrap would forge a negative rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DropCounters {

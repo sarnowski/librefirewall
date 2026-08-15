@@ -88,7 +88,6 @@ mod host;
 mod image;
 mod management_contract;
 mod metric_catalogue;
-mod metrics_contract;
 mod onboard_contract;
 mod onboard_install_contract;
 mod onboard_request_contract;

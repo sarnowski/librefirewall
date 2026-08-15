@@ -34,7 +34,7 @@ Read the rest on demand:
 - Changing an exposed signal means changing its reference chapter in the same change: the console
   and metrics chapters are held to the code by the fast gate, so a chapter that drifts fails
   `make test` rather than going stale unnoticed. The same check reads the status detail chapter for
-  the counts it states about the gate — scenarios, scraped scenarios, floored crates — so a number
+  the counts it states about the gate — scenarios, scenarios reaching the management port, floored crates — so a number
   that goes stale fails there too; state a new such count in the phrasing that check looks for, or
   it is unread.
 - Run the reviewer checklist against your own change before declaring it done. A green gate is

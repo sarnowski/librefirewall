@@ -95,8 +95,8 @@ pub struct Segment {
 /// exactly like an idle link.
 ///
 /// Every field is monotonic for the queue's life and saturates at [`u64::MAX`]
-/// rather than wrapping. The appliance's metrics endpoint derives a rate by
-/// differencing successive scrapes, so a reset would forge a negative rate and
+/// rather than wrapping. A consumer of the appliance's metric readings derives a
+/// rate by differencing successive ones, so a reset would forge a negative rate and
 /// a wrap would turn a sustained flood back into a small number.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceFaults {

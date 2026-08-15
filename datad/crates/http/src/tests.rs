@@ -20,16 +20,16 @@ fn complete(bytes: &[u8]) -> (Request<'_>, usize) {
     }
 }
 
-const SCRAPE: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: 10.0.2.15\r\nUser-Agent: curl/8.14.1\r\n\
-                        Accept: */*\r\n\r\n";
+const READ: &[u8] = b"GET /config HTTP/1.1\r\nHost: 10.0.2.15\r\nUser-Agent: curl/8.14.1\r\n\
+                      Accept: */*\r\n\r\n";
 
 #[test]
-fn a_scrape_parses_into_its_fields() {
-    let (request, consumed) = complete(SCRAPE);
-    assert_eq!(consumed, SCRAPE.len());
+fn a_read_parses_into_its_fields() {
+    let (request, consumed) = complete(READ);
+    assert_eq!(consumed, READ.len());
     assert_eq!(request.method(), "GET");
     assert!(request.is_get());
-    assert_eq!(request.target(), "/metrics");
+    assert_eq!(request.target(), "/config");
     assert_eq!(request.headers().count(), 3);
     assert_eq!(request.header("host"), Some("10.0.2.15"));
     assert_eq!(request.header("HOST"), Some("10.0.2.15"));
@@ -41,14 +41,14 @@ fn a_scrape_parses_into_its_fields() {
 /// parses to the same thing as the same head arriving whole.
 #[test]
 fn a_head_split_at_every_offset_parses_identically() {
-    for split in 0..=SCRAPE.len() {
-        let head = &SCRAPE[..split];
+    for split in 0..=READ.len() {
+        let head = &READ[..split];
         match parse(head) {
-            Ok(Parsed::NeedMore) => assert!(split < SCRAPE.len()),
+            Ok(Parsed::NeedMore) => assert!(split < READ.len()),
             Ok(Parsed::Complete { request, consumed }) => {
-                assert_eq!(split, SCRAPE.len());
-                assert_eq!(consumed, SCRAPE.len());
-                assert_eq!(request.target(), "/metrics");
+                assert_eq!(split, READ.len());
+                assert_eq!(consumed, READ.len());
+                assert_eq!(request.target(), "/config");
             }
             Err(error) => panic!("prefix of {split} bytes refused: {error:?}"),
         }
@@ -60,11 +60,11 @@ fn a_head_split_at_every_offset_parses_identically() {
 /// reading a second — but the number must still be right.
 #[test]
 fn trailing_bytes_are_not_consumed() {
-    let mut buffer = SCRAPE.to_vec();
+    let mut buffer = READ.to_vec();
     buffer.extend_from_slice(b"GET /again HTTP/1.1\r\n\r\n");
     let (request, consumed) = complete(&buffer);
-    assert_eq!(consumed, SCRAPE.len());
-    assert_eq!(request.target(), "/metrics");
+    assert_eq!(consumed, READ.len());
+    assert_eq!(request.target(), "/config");
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn every_refusal_names_the_status_the_client_is_owed() {
             Status::BadRequest,
         ),
         (
-            b"GET /metrics\r\n\r\n",
+            b"GET /config\r\n\r\n",
             RequestError::MalformedRequestLine,
             Status::BadRequest,
         ),
@@ -197,7 +197,7 @@ fn every_refusal_names_the_status_the_client_is_owed() {
 }
 
 /// `Content-Length: 0` announces no body, so it is not a smuggling risk and is
-/// accepted — a scraper behind a proxy may add one. On any method, because a
+/// accepted — a client behind a proxy may add one. On any method, because a
 /// declared body of nothing is no body at all.
 #[test]
 fn a_zero_content_length_is_accepted() {
@@ -360,7 +360,7 @@ fn each_bound_is_enforced_exactly_at_its_edge() {
 #[test]
 fn a_method_this_server_does_not_answer_still_parses() {
     for method in ["POST", "DELETE", "PUT", "OPTIONS", "get"] {
-        let head = format!("{method} /metrics HTTP/1.1\r\n\r\n");
+        let head = format!("{method} /config HTTP/1.1\r\n\r\n");
         let (request, _) = complete(head.as_bytes());
         assert_eq!(request.method(), method);
         assert_eq!(request.is_get(), method == "GET");
@@ -386,12 +386,12 @@ fn head_to_string(status: Status, content_type: Option<ContentType>, length: u64
 }
 
 #[test]
-fn a_metrics_head_carries_the_type_the_length_and_the_close() {
-    let head = head_to_string(Status::Ok, Some(ContentType::Metrics), 20_480);
+fn a_document_head_carries_the_type_the_length_and_the_close() {
+    let head = head_to_string(Status::Ok, Some(ContentType::Xml), 20_480);
     assert_eq!(
         head,
         "HTTP/1.1 200 OK\r\n\
-         Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Type: application/xml; charset=utf-8\r\n\
          Content-Length: 20480\r\n\
          Connection: close\r\n\r\n"
     );
@@ -557,7 +557,7 @@ proptest! {
     #[test]
     fn a_head_states_the_length_it_was_given(length in any::<u64>()) {
         for status in Status::ALL {
-            let head = head_to_string(status, Some(ContentType::Metrics), length);
+            let head = head_to_string(status, Some(ContentType::Xml), length);
             let stated = format!("Content-Length: {length}\r\n");
             prop_assert!(head.contains(&stated));
             prop_assert!(head.contains("Connection: close\r\n"));
@@ -588,7 +588,7 @@ fn has_bad_line_ending(bytes: &[u8]) -> bool {
 /// appending.
 #[test]
 fn a_completed_head_is_read_the_same_whatever_follows_it() {
-    let head = b"POST /metrics HTTP/1.1\r\n\r\n";
+    let head = b"POST /config HTTP/1.1\r\n\r\n";
     let Ok(Parsed::Complete { consumed, .. }) = parse(head) else {
         panic!("a well-formed head completes");
     };

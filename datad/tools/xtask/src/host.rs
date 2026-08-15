@@ -197,7 +197,6 @@ const FUZZ_TARGETS: &[&str] = &[
     "onboarding_tls",
     "channel_tls",
     "channel_frames",
-    "metrics_render",
     "metric_snapshot",
     "transcript_block",
     "config_document",

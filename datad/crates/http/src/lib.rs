@@ -60,7 +60,7 @@
 //!
 //! The design's inspecting proxy needs an HTTP/1.1 parser on a path where the
 //! bytes belong to *two* untrusted parties at once, so this crate owns no
-//! buffer, decides no policy and knows nothing about `/metrics`: [`parse`] takes
+//! buffer, decides no policy and knows no target: [`parse`] takes
 //! a slice the caller accumulated and hands back borrowed fields. What the
 //! management server adds on top — which targets exist, what a response body
 //! is — is `lfw_ip_endpoint::http`. The pieces a proxy needs and a server does
@@ -91,8 +91,8 @@ mod response;
 
 pub use request::{Header, Parsed, Request, RequestError, parse};
 pub use response::{
-    ContentType, HTML_CONTENT_TYPE, MAX_HEAD_LEN, METRICS_CONTENT_TYPE, OCTET_STREAM_CONTENT_TYPE,
-    PKCS10_CONTENT_TYPE, XML_CONTENT_TYPE, write_head,
+    ContentType, HTML_CONTENT_TYPE, MAX_HEAD_LEN, OCTET_STREAM_CONTENT_TYPE, PKCS10_CONTENT_TYPE,
+    XML_CONTENT_TYPE, write_head,
 };
 
 /// Bytes of request head a caller may accumulate before the head must have
@@ -101,14 +101,14 @@ pub use response::{
 /// It is the caller's bound rather than this crate's — [`parse`] is handed a
 /// slice and never grows one — but it is stated here because it is the same
 /// decision as the four below and belongs beside them. Two kibibytes holds a
-/// browser's conditional GET with a full cookie jar and refuses anything an
-/// operator's scraper would ever send; a request that outgrows it is answered
+/// browser's conditional GET with a full cookie jar and refuses anything a
+/// management client would ever send; a request that outgrows it is answered
 /// [`Status::HeadersTooLarge`], not waited on.
 pub const MAX_REQUEST_BYTES: usize = 2048;
 
-/// Bytes of request target. Enough for `/metrics` and every management path
-/// with query parameters to spare, and short enough that a target is never
-/// the reason a request head fills its buffer.
+/// Bytes of request target. Enough for every management path with query
+/// parameters to spare, and short enough that a target is never the reason a
+/// request head fills its buffer.
 pub const MAX_TARGET_LEN: usize = 128;
 
 /// Header fields one request may carry.
@@ -163,7 +163,7 @@ pub enum Status {
     ContentTooLarge,
     UriTooLong,
     /// What a rate limiter answers with. No server here has ever been able to
-    /// say "come back later" before: the metrics port answers whatever it is
+    /// say "come back later" before: the management port answers whatever it is
     /// asked as fast as it is asked, and the one surface that must not is the
     /// one an unprovisioned appliance exposes to whoever reaches it.
     TooManyRequests,

@@ -2247,7 +2247,7 @@ fn a_full_relay_becomes_one_batch() {
 }
 
 /// The console's own drop count crosses to the domain that publishes it, which is
-/// how a gap in a recorded transcript becomes a number an operator can scrape.
+/// how a gap in a recorded transcript becomes a number an operator can reading.
 #[test]
 fn the_consoles_drop_count_is_visible_to_the_recorder() {
     let region = lines();

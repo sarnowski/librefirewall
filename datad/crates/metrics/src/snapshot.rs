@@ -33,13 +33,14 @@
 //!
 //! Two families — the per-interface information and the per-rule hit counts —
 //! have no fixed slot: which ones exist comes from the committed configuration
-//! rather than from the catalogue, so they are rendered on the exposition and
-//! are not part of a reading. A reading is exactly the closed table, which is
-//! what lets both ends hold one fingerprint over it.
+//! rather than from the catalogue, so no reading carries them. A reading is
+//! exactly the closed table, which is what lets both ends hold one fingerprint
+//! over it.
 
 use core::mem::size_of;
 
 use crate::catalog::{SHARD_COUNT, SHARDS, Series};
+use crate::{STATS_SLOTS, StatsShard};
 
 /// The kind byte of a metric reading. Never zero, which is what tells one from
 /// the padding block it shares a type and an enterprise number with.
@@ -70,6 +71,54 @@ const fn snapshot_slots() -> usize {
 
 /// Bytes one reading occupies, header and slots together.
 pub const SNAPSHOT_BYTES: usize = SNAPSHOT_HEADER_BYTES + SNAPSHOT_SLOTS * size_of::<u64>();
+
+/// One reading of every shard, taken whole before anything is composed from it.
+///
+/// Taken whole so a reading is one pass over one set of numbers rather than a
+/// re-read per family: a walk that read the shards again each time would let a
+/// counter appear to move backwards *within* one reading, which is the one shape
+/// of inconsistency a reader cannot explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    values: [[u64; STATS_SLOTS]; SHARD_COUNT],
+}
+
+impl Snapshot {
+    /// A snapshot of stated values, for a test or a fuzz harness that has no
+    /// shared region.
+    #[must_use]
+    pub const fn new(values: [[u64; STATS_SLOTS]; SHARD_COUNT]) -> Self {
+        Self { values }
+    }
+
+    /// Read every shard once, in [`SHARDS`] order.
+    #[must_use]
+    pub fn read(shards: [&StatsShard; SHARD_COUNT]) -> Self {
+        let mut values = [[0u64; STATS_SLOTS]; SHARD_COUNT];
+        for (target, shard) in values.iter_mut().zip(shards) {
+            *target = shard.sample();
+        }
+        Self { values }
+    }
+
+    /// The catalogue's slots laid end to end, in shard order, for the reading
+    /// this node hands to the domain that writes the medium — so a slot's
+    /// position here **is** its position in [`SHARDS`].
+    #[must_use]
+    pub fn relay_values(&self) -> [u64; SNAPSHOT_SLOTS] {
+        let mut out = [0u64; SNAPSHOT_SLOTS];
+        let mut at = 0;
+        for (spec, values) in SHARDS.iter().zip(&self.values) {
+            for slot in 0..spec.series.len() {
+                if let Some(target) = out.get_mut(at) {
+                    *target = values.get(slot).copied().unwrap_or(0);
+                }
+                at = at.saturating_add(1);
+            }
+        }
+        out
+    }
+}
 
 /// What the slots of a reading mean, as one number over the whole table.
 ///

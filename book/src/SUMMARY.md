@@ -7,8 +7,8 @@
 
 - [Observability surfaces](reference/observability.md)
 - [Console records](reference/console.md)
-- [Prometheus metrics](reference/metrics.md)
-- [Recording downloads](reference/recordings.md)
+- [Metrics](reference/metrics.md)
+- [Recordings](reference/recordings.md)
 - [Cryptography profile](reference/crypto-profile.md)
 
 # Design

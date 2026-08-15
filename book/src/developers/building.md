@@ -22,8 +22,8 @@ make test           # both fast gates: the ctrld gate (lock, format, warning-fre
                     #   then the datad host gate (format, clippy, unit/property tests, coverage,
                     #   the budget ratchets, the system-description, reference-chapter and
                     #   configuration checks, and dependency policy)
-make test-system    # boot the QEMU system scenarios; the ones with a reachable endpoint judge
-                    #   metrics, logs and captures against each other and against the wire
+make test-system    # boot the QEMU system scenarios; the ones with a reachable management port
+                    #   judge both recordings against each other and against the wire
 make ci             # the complete gate (both fast gates + fuzz + release image + system + A/B
                     #   + the debug image the diagnostic re-run needs)
 ```
@@ -305,7 +305,7 @@ And `reference_contract` sees less of its chapters than the row above may sugges
 the parsed tables and the counts the chapters state about themselves — and deliberately not: prose
 of any kind, a family's `HELP` text included; label *values*, because a shard's series carry what a
 running node happens to publish rather than a closed set; `librefirewall_interface_info`'s label
-names, which are byte literals in the exposition writer rather than a table; and which group a
+names, which no table holds, nothing composing that family today; and which group a
 token sits in, since a domain's tables are compared as one set per domain. In the status detail
 chapter it reads a count only where the page states a number in front of the phrase it looks for:
 a sentence that mentions the scenarios without counting them is prose and is left alone, so a

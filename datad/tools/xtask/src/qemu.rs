@@ -23,10 +23,9 @@
 //! the appliance must refuse reach nobody — driven by
 //! [`crate::forward_harness`]. Some additionally judge the `LFW-CFG` console
 //! channel through [`crate::config_transcript`], and every one whose management
-//! port a real client can reach ([`ManagementRole::Client`]) scrapes the
-//! endpoint and reads both recordings off the medium, holding the two
-//! recordings, the policy the image was built from and the wire to each other
-//! ([`crate::surface_contract`]). The exception is the forced-emulation boot,
+//! port a real client can reach ([`ManagementRole::Client`]) reads both
+//! recordings off the medium, holding the two recordings, the policy the image
+//! was built from and the wire to each other ([`crate::surface_contract`]). The exception is the forced-emulation boot,
 //! whose subject is the accelerator rather than a contract, and which therefore
 //! judges the cryptography domain alone ([`Console::JudgedOnCryptographyAlone`]).
 //!
@@ -62,7 +61,7 @@ use crate::{
         self, BootContract, BootTest, Booted, DialMisbehaviour, ManagementBacking,
         OnboardBehaviour, Traffic,
     },
-    image, management_contract, metrics_contract,
+    image, management_contract,
     onboard_contract::{self, OnboardVerdict},
     onboard_install_contract, onboard_request_contract, onboard_tls_contract, ownership_contract,
     probe_contract, recording_contract, snapshot_contract, stamp_contract, store_contract,
@@ -795,23 +794,23 @@ pub(crate) enum ManagementRole {
     /// ICMP echo request and a whole TCP exchange, and judges every answer field
     /// by field.
     Station,
-    /// The harness is a client. QEMU's user-mode stack carries the port and
-    /// `curl` pulls **every surface the endpoint serves** through a host port
-    /// forward — `GET /metrics`, `GET /logs.pcapng` and `GET /capture.pcapng` —
-    /// and all three are judged, together.
+    /// The harness lets a real client or a real peer onto that wire. QEMU's
+    /// user-mode stack carries the port, so the onboarding surface, the channel
+    /// the appliance dials out and the configuration surface are each reachable
+    /// through a host port forward by the client an administrator or a
+    /// management server would actually run.
     ///
-    /// All three, on every scenario that reaches the endpoint, because judging
-    /// one of them is the gap: a recording that silently drops, a metric that
-    /// double-counts and a tap that loses a record are each invisible in the
-    /// surface they occur in and each a disagreement between two of them
-    /// ([`crate::surface_contract`]). Nothing at frame level is asserted on this
-    /// wire; what is asserted is the HTTP responses, one metric value against
-    /// traffic the harness observed on the *dataplane* ports in the same boot,
-    /// every label of the interface info family against the configuration
-    /// document this image was built from, the two recordings against each
-    /// other and against the bytes the harness injected, and the same two
-    /// extents read straight off the disk image after the run — one artifact
-    /// reached two ways, neither of them the appliance's own account of itself.
+    /// Nothing at frame level is asserted on this wire — a station is what sees
+    /// frames, and this role is its opposite. What is asserted afterwards is
+    /// both recordings, read off the disk image once the guest has stopped: the
+    /// packet blocks against the bytes the harness injected, and the metric
+    /// readings framed inside the log recording against the policy the image was
+    /// built from and against the traffic the harness observed on the
+    /// *dataplane* ports in the same boot ([`crate::surface_contract`]). Judging
+    /// one recording alone is the gap that closes: a recording that silently
+    /// drops, a counter that double-counts and a tap that loses a record are
+    /// each invisible in the surface they occur in and each a disagreement
+    /// between two of them.
     Client,
 }
 
@@ -978,9 +977,9 @@ pub(crate) enum Console {
     /// Unlike the shape above it, this one states no port count, because a boot
     /// that reaches a server on the host is one whose management port carries
     /// user-mode networking, and nothing injects a frame into that. The evidence
-    /// that the node stayed healthy under the session is the scrape such a boot
-    /// is required to take, which is a stronger statement than a frame tally and
-    /// one this shape does not have to repeat.
+    /// that the node stayed healthy under the session is the readings such a
+    /// boot's log recording carries, which is a stronger statement than a frame
+    /// tally and one this shape does not have to repeat.
     JudgedOnTheDialledChannelSession,
     /// **An appliance that came back owned, and serves nothing.**
     ///
@@ -1134,20 +1133,20 @@ pub(crate) fn boot_the_owned_medium_source(root: &Path) -> Result<(), String> {
 ///
 /// **onboarding-adopted comes first**, and everything about the order follows from
 /// that. It is the boot that gives an appliance an owner, and a node without one
-/// forwards nothing at all — so nineteen of the boots below copy the medium it
+/// forwards nothing at all — so most of the boots below copy the medium it
 /// leaves rather than booting an appliance that would refuse every frame they
 /// inject. The pair that reads one medium twice comes after the boot that writes
 /// it, for the same shape of reason. Both dependencies are checked before a single
 /// boot runs ([`check_media_order`]), so a table edit that reordered a pair is a
 /// verdict rather than an hour of boots ending in a puzzle.
 ///
-/// The list below numbers the first nine; the ones after them carry their reasons
-/// beside the entries themselves, where a reader meets them.
+/// The list below numbers the first seven; the ones after them carry their
+/// reasons beside the entries themselves, where a reader meets them.
 ///
 /// 1. **onboarding-adopted** — an appliance nobody owns is given an owner by this
 ///    run's management server, over the surface it serves for exactly that. Its
 ///    own contract is the install; what it additionally provides is the owned
-///    medium the nineteen scenarios that need frames to cross take copies of, and
+///    medium every scenario that needs frames to cross takes a copy of, and
 ///    the *unowned* half of the ownership contract, its six probes being refused
 ///    because at the moment they are injected nothing has taken this node.
 /// 2. **routed-forwarding** — the published disk, judged by the routed contract
@@ -1166,24 +1165,15 @@ pub(crate) fn boot_the_owned_medium_source(root: &Path) -> Result<(), String> {
 ///    that shares no address and no MAC with the first, judged by both. This is
 ///    what proves the dataplane reads its table from the document: a compiled-in
 ///    table would satisfy scenarios 2 and 3 and fail every probe here.
-/// 5. **metrics-endpoint**, 6. **metrics-endpoint-alternate** and
-///    7. **recording-download** — `curl` pulls every surface the endpoint serves
-///    through QEMU's own user-mode stack: `GET /metrics`, `GET /logs.pcapng` and
-///    `GET /capture.pcapng`. Scenarios 5 and 7 run against the published disk and
-///    6 against a disk built from the second document, and each is judged
-///    against *its own* document — which is what makes the interface info family
-///    a checked statement about the running configuration, the two documents
-///    sharing no identity, so a label the build carried rather than read would
-///    pass one and fail the other. The same holds the probes the recordings are
-///    compared against: the two benches inject different bytes.
+/// 5. **recording-download** — the published disk paired with the two recording
+///    extents. Both are read off the medium once the guest has stopped and
+///    parsed as pcapng, and they are judged against each other, against the
+///    policy the image was built from and against the frames the harness put on
+///    the wire ([`crate::surface_contract`]). Judging one alone is the gap that
+///    closes: a recording that silently drops, a counter that double-counts and
+///    a tap that loses a record are each invisible in the surface they occur in.
 ///
-///    All three surfaces are judged on all three scenarios, and then against
-///    each other ([`crate::surface_contract`]). A scenario that booted a
-///    reachable endpoint and judged one of them is the gap that closes: a
-///    recording that silently drops, a metric that double-counts and a tap that
-///    loses a record are each invisible in the surface they occur in.
-///
-/// 8. **policy-filter** and 9. **policy-filter-alternate** — the filter's own
+/// 6. **policy-filter** and 7. **policy-filter-alternate** — the filter's own
 ///    two, and the only two that inject a different probe set: one packet per
 ///    outcome the filter can reach, differing from each other in the UDP
 ///    destination port and in nothing else. One is forwarded because a rule
@@ -1192,7 +1182,7 @@ pub(crate) fn boot_the_owned_medium_source(root: &Path) -> Result<(), String> {
 ///    are held apart three ways — the wire (one delivery, two absences), the drop
 ///    reason, and the per-rule hit counter — and each scenario is judged against
 ///    its own document, whose policy names different ports under different rule
-///    ids. Two rather than one for scenario 6's reason: a counter labelled with a
+///    ids. Two rather than one for scenario 4's reason: a counter labelled with a
 ///    name the build carried, rather than one it read, would satisfy one and fail
 ///    the other.
 ///
@@ -1288,59 +1278,14 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         store: StoreMedium::CopiedFrom("onboarding-adopted"),
         data: DataMedium::Fresh,
     },
-    Scenario {
-        name: "metrics-endpoint",
-        document: image::CONFIGURATION_DOCUMENT,
-        image: ImageUnderTest::Published,
-        // The console is not judged here and it is not an omission: this
-        // scenario injects no management frame, so the `frames=`/`bytes=`
-        // equality the other two hold the console to has nothing to be
-        // stated against. What it judges instead is the endpoint's answer.
-        console: Console::Ignored,
-        management: ManagementRole::Client,
-        traffic: Traffic::Routed,
-        dial: DialContract::Answered,
-        onboard: OnboardContract::Untouched,
-        channel: ChannelContract::Untouched,
-        accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::CopiedFrom("onboarding-adopted"),
-        data: DataMedium::Fresh,
-    },
-    // The same scrape against a disk built from the second document, and the
-    // one thing the scenario above cannot show: that the identity the
-    // interface info series carry comes from the document rather than from
-    // the build. Both scrapes are judged against the document their own image
-    // was assembled from, and the two documents share no id, no address and
-    // no MAC — so a label compiled in would satisfy one of the two and fail
-    // the other.
-    //
-    // Its management addressing differs too, which is why this works at all:
-    // QEMU's user-mode stack is told the network, the station and the
-    // endpoint out of the document (`forward_harness::user_netdev`), so the
-    // forward reaches whatever address the document names.
-    Scenario {
-        name: "metrics-endpoint-alternate",
-        document: ALTERNATE_DOCUMENT,
-        image: ImageUnderTest::BuiltForTheScenario,
-        console: Console::Ignored,
-        management: ManagementRole::Client,
-        traffic: Traffic::Routed,
-        dial: DialContract::Answered,
-        onboard: OnboardContract::Untouched,
-        channel: ChannelContract::Untouched,
-        accelerator: Accelerator::WhateverTheMachineOffers,
-        store: StoreMedium::CopiedFrom("onboarding-adopted"),
-        data: DataMedium::Fresh,
-    },
     // The recording milestone's own scenario. It is no longer the only one
-    // that pulls the recordings — every [`ManagementRole::Client`] scenario
-    // does, which is the point of there being one role — and it remains
-    // because it is the pairing of the published disk with the recording
-    // surfaces, where the two above pair the same surfaces with the two
-    // documents. The download proves the whole chain from tap to HTTP; the
-    // disk read after it proves what is on the medium independently, so a
-    // recorder that composed a plausible body out of nothing would pass one
-    // and fail the other.
+    // whose recordings are judged — every [`ManagementRole::Client`] scenario's
+    // are, which is the point of there being one role — and it remains because
+    // it is the pairing of the published disk with the recording surfaces. Each
+    // extent is read off the medium and parsed as pcapng, and the readings
+    // framed inside it are held to the policy the image was built from and to
+    // the frames the harness put on the wire, so a recorder that composed a
+    // plausible body out of nothing would satisfy one and fail the others.
     Scenario {
         name: "recording-download",
         document: image::CONFIGURATION_DOCUMENT,
@@ -1443,7 +1388,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // A request goes out, its reply comes back — and the reply is addressed to
     // a port neither document says anything about, so nothing in the policy
     // permits it. What carries it is the flow the request opened, and the
-    // scrape says so: `librefirewall_flow_packets_total{outcome="established"}`
+    // readings say so: `librefirewall_flow_packets_total{outcome="established"}`
     // rises while the accepting rule's hit counter counts only the openings.
     //
     // Beside it, the two refusals that keep that from being a hole: the same
@@ -1502,7 +1447,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // with the reason and the hit counter that name that rule.
     //
     // A `Client` scenario, because the whole of what it proves is on the two
-    // recordings and in the exposition: on the wire an opening and a close are
+    // recordings and in the readings inside them: on the wire an opening and a close are
     // two frames that were forwarded, nothing about either says a conversation
     // began or ended, and all a denied segment leaves is its absence.
     // The one scenario that CHANGES what the appliance is doing, and the only
@@ -1658,7 +1603,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // The conversation's reply is deferred past the burst, so **its delivery is
     // a packet the table carried after the table had absorbed the flood**, and
     // no rule of the document names the port it is addressed to: only its flow
-    // could have carried it. Beside it the exposition states the arithmetic —
+    // could have carried it. Beside it the readings state the arithmetic —
     // the openings, what gave each slot back, and an occupancy that is a small
     // fraction of the burst rather than a multiple of it.
     //
@@ -1670,7 +1615,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // judged block by block.
     //
     // A `Client` scenario, because the whole of the bounded-state claim is
-    // arithmetic in the exposition: on the wire a flood leaves nothing but
+    // arithmetic in the readings: on the wire a flood leaves nothing but
     // sixty-four absences.
     Scenario {
         name: "connection-flood",
@@ -1700,9 +1645,9 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     //
     // Its evidence is the two things such a node has, and no others. Its management
     // port takes its addressing from the *committed* configuration and is therefore
-    // unaddressed, so nothing can scrape it, download from it, or ask it anything:
-    // what is left is the **serial console** and the **absence of any forwarded
-    // frame**. Both are held inside the boot contract
+    // unaddressed, so no client can reach it and ask it anything: what is left is
+    // the **serial console** and the **absence of any forwarded frame**. Both are
+    // held inside the boot contract
     // ([`crate::forward_harness::BootContract::FailedClosed`]), which is also what
     // decides when the run may stop — such a node runs indefinitely and never
     // exits, so nothing else would end the boot.
@@ -1773,9 +1718,9 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         document: image::CONFIGURATION_DOCUMENT,
         image: ImageUnderTest::Published,
         console: Console::JudgedOnCryptographyAlone,
-        // Socket-backed, because a real client is what a scrape needs and this
-        // boot takes none: the endpoint's surfaces are the `Client` scenarios'
-        // subject, on the accelerator they already ran.
+        // Socket-backed, because this boot admits no real client: the surfaces
+        // one reaches are the `Client` scenarios' subject, on the accelerator
+        // they already ran.
         management: ManagementRole::Station,
         // The shipped probe set, injected and left unjudged. It keeps this boot
         // the same shape as the one it repeats rather than an idle guest, and no
@@ -2333,7 +2278,7 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         .iter()
         .filter(|scenario| matches!(scenario.console, Console::Judged))
         .count();
-    let scraped = scenarios
+    let reached = scenarios
         .iter()
         .filter(|scenario| scenario.management.user_network())
         .count();
@@ -2386,7 +2331,8 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         "{} system scenarios on the {} kernel, {judged} of them judged against the \
          configuration transcript, the clock record, the hardware probe's record and the \
          management port's count, and \
-         {scraped} scraped with curl against the document each was built from; {distinct}{carried}{}",
+         {reached} whose management port carried a real client or a real peer; \
+         {distinct}{carried}{}",
         scenarios.len(),
         Run::Shipping.config(),
         describe_the_emulated_boots(scenarios, &accelerated),
@@ -2832,39 +2778,12 @@ fn run_scenario(
     }
 
     let log = scenario_log(root, scenario, run);
-    // The scrape before the console, because it is the whole of what this
-    // scenario proves and its evidence belongs where a reader looks first.
-    let scraped = match &scenario.management {
+    // The recordings before the console, because on a boot that lets a real
+    // client onto the management wire they are the whole of what it proves and
+    // their evidence belongs where a reader looks first.
+    let read_back = match &scenario.management {
         ManagementRole::Station => String::new(),
-        ManagementRole::Client if booted.scrapes.is_empty() => {
-            return Err(format!(
-                "scenario {name}: the boot met its routed contract and no scrape was taken, so \
-                 nothing was proved about the metrics endpoint\n  full run log: {}",
-                log.display()
-            ));
-        }
         ManagementRole::Client => {
-            let judged = metrics_contract::judge(
-                &booted.scrapes,
-                booted.started_at.elapsed(),
-                booted.dataplane_frames,
-                booted.policy,
-                &topology,
-            )
-            .map_err(|error| {
-                format!(
-                    "scenario {name}: {error}\n  full run log: {}",
-                    log.display()
-                )
-            })?;
-            let evidence = metrics_contract::evidence(&booted.scrapes, &judged);
-            println!("{evidence}");
-            append_evidence(
-                &log,
-                "the metrics scrape this boot was judged by",
-                &evidence,
-            )
-            .map_err(|error| format!("scenario {name}: {error}"))?;
             if let Some(applied) = &booted.applied {
                 // Ahead of the recordings, because it is the whole of what this
                 // scenario proves and a reader looks for it first.
@@ -2893,9 +2812,8 @@ fn run_scenario(
             .map_err(|error| format!("scenario {name}: {error}"))?;
             match &booted.applied {
                 Some(applied) => format!(
-                    "; {} scrapes and both recordings judged together; generation {} submitted \
-                     over HTTP and in force on the dataplane{}",
-                    booted.scrapes.len(),
+                    "; both recordings judged together; generation {} submitted over HTTP and in \
+                     force on the dataplane{}",
                     applied.generation,
                     match judged.re_decision {
                         Some(decided) => format!(
@@ -2905,10 +2823,7 @@ fn run_scenario(
                         None => String::new(),
                     }
                 ),
-                None => format!(
-                    "; {} scrapes and both recordings judged together",
-                    booted.scrapes.len()
-                ),
+                None => String::from("; both recordings judged together"),
             }
         }
     };
@@ -2970,8 +2885,8 @@ fn run_scenario(
         | Console::JudgedOnCryptographyAlone
         | Console::JudgedOnTheStoredIdentityAlone => String::new(),
         // What the session itself did is judged for every boot that names a
-        // channel contract, below, and the node's health by the scrape a
-        // user-mode-networked boot must take. Neither is this arm's to state,
+        // channel contract, below, and the node's health by the readings a
+        // user-mode-networked boot's recording carries. Neither is this arm's to state,
         // and the port count the shape below it adds is not available here at
         // all: the frame injection needs a socket-backed port, and a boot that
         // dials a server on the host cannot have one.
@@ -3140,8 +3055,8 @@ fn run_scenario(
     let owned = ownership_contract::judge(&booted.serial, owner, &log)
         .map_err(|error| format!("scenario {name}: {error}"))?;
     println!(
-        "  system scenario ok: {name} on the {} kernel ({}; {owned}{judged}{channelled}{scraped}); \
-         QEMU output is in {}",
+        "  system scenario ok: {name} on the {} kernel ({}; \
+         {owned}{judged}{channelled}{read_back}); QEMU output is in {}",
         run.config(),
         booted.traffic.summary(),
         log.display()
@@ -3336,8 +3251,7 @@ fn run_store_scenario(
 ///
 /// Short by comparison with its sibling, and every omission is a surface such a
 /// node does not have. It committed no generation, so its management port is
-/// unaddressed: nothing scrapes it, nothing downloads a recording from it, and no
-/// counter exists to cross-check. What is left is the two things the criterion
+/// unaddressed: no client reaches it and no counter exists to cross-check. What is left is the two things the criterion
 /// names — the serial console, and the absence of any forwarded frame — and both
 /// are decided inside the boot contract, whose verdict is this function's.
 ///

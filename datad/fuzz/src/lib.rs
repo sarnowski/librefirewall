@@ -16,7 +16,6 @@
 //! | [`tcp`] | `lfw_tcp`'s segment parser, its option area and the state machine over them, driven as a stack | untrusted network traffic **and** a management-plane attacker |
 //! | [`flow`] | `lfw_flow`'s connection table: the TCP state machine and window checks over it, the UDP and ICMP pseudo-flows, and the quoted datagram inside an ICMP error | untrusted network traffic **and** a connection-flood attacker |
 //! | [`http_request`] | `lfw_http`'s request-head parser, cut into arbitrary segments | a management-plane attacker |
-//! | [`metrics_render`] | `lfw_metrics`' exposition renderer, over arbitrary counters and arbitrary storage | a byzantine neighbour PD **and** a management-plane attacker |
 //! | [`metric_snapshot`] | `lfw_metrics`' metric-reading codec: arbitrary bytes out of a recording, and arbitrary counters into one | whoever holds a recording **and** a byzantine neighbour PD |
 //! | [`transcript_block`] | `wire`'s console-transcript block and the relay region a printed line crosses to the medium on | whoever holds a recording **and** a byzantine neighbour PD |
 //! | [`document`] | the `config` reader, the rules over it, and the artifacts built from it | a management-plane attacker |
@@ -157,7 +156,6 @@ pub mod log_record;
 pub mod log_ring;
 pub mod log_ring_abi;
 pub mod metric_snapshot;
-pub mod metrics_render;
 pub mod neighbour;
 pub mod onboarding_install;
 pub mod onboarding_package;
@@ -280,10 +278,6 @@ mod tests {
         (
             "channel_frames",
             crate::channel_frames::channel_frames_harness,
-        ),
-        (
-            "metrics_render",
-            crate::metrics_render::metrics_render_harness,
         ),
         (
             "metric_snapshot",

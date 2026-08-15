@@ -24,8 +24,8 @@
 //!
 //! # Saturating, never reset
 //!
-//! `pipeline::DropCounters`' terms, and for its reason: a scrape differences
-//! successive samples, so a reset would forge a negative rate and a wrap would
+//! `pipeline::DropCounters`' terms, and for its reason: a consumer differences
+//! successive readings, so a reset would forge a negative rate and a wrap would
 //! turn a sustained flood back into a small number — which is exactly the signal
 //! a counter of attacker-driven events exists to carry.
 
@@ -177,7 +177,7 @@ impl TcpCounters {
     }
 
     /// Every segment refused before it could affect a connection, which is what
-    /// a scrape compares against `segments_received` to see how much of a port's
+    /// a reading compares against `segments_received` to see how much of a port's
     /// traffic is being turned away.
     #[must_use]
     pub const fn refused_total(&self) -> u64 {

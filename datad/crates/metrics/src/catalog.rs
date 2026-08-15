@@ -1,43 +1,37 @@
-//! Every metric name, label and vocabulary token this appliance exposes, and
-//! the eight shards they are grouped into.
+//! Every metric name, label and vocabulary token this appliance exposes, the
+//! eight shards they group into, and which domain drives which port.
 //!
 //! # The transliteration rule
 //!
-//! One naming scheme is fixed across every surface: the Prometheus surface
-//! carries the console's own keys and tokens, transliterated to each transport's
-//! separator convention. This is that transliteration, with no exceptions:
+//! One naming scheme across every surface, with no exceptions:
 //!
 //! > A metric name, a label name and a label value is the console key or
 //! > vocabulary token with every `-` replaced by `_`; a metric name also carries
 //! > the `librefirewall_` prefix, and a counter the `_total` suffix.
 //!
 //! So the console's `domain=nic-driver` is this surface's `domain="nic_driver0"`
-//! — the same token and separator convention, plus the instance number the
-//! console cannot carry because three driver instances share one binary. The
-//! `-`→`_` half is not a preference: Prometheus metric and label *names* are
-//! `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a hyphen is ungrammatical there, and applying
-//! the same rule to label values keeps one identifier reading the same
-//! everywhere rather than in two spellings a reader has to know about.
+//! — the same token, plus the instance number the console cannot carry because
+//! three driver instances share one binary. The `-`→`_` half is not a preference:
+//! a metric or label *name* is `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a hyphen is
+//! ungrammatical there.
 //!
 //! # Attribution is structural
 //!
-//! The binding attribution rule keeps three classes apart, and they
-//! are three different metric families here rather than three values of one
-//! label: what a **device** got wrong about its own protocol
-//! ([`DEVICE_FAULTS`]), what a **device or peer sent** that a layer refused
-//! ([`INPUT_DROPS`], [`ROUTE_DROPS`], [`TCP_REFUSED`], …), and what **we** got
-//! wrong ([`INVARIANT_FAULTS`], [`TCP_WRITE_REFUSED`],
-//! [`HTTP_EXPOSITIONS_REFUSED`], [`CONSOLE_RECORDS`]'s `unrenderable`). An alert
-//! can be written against the third class by name, which is the whole point of
-//! not merging them.
+//! The binding attribution rule keeps three classes apart as three different
+//! families rather than three values of one label: what a **device** got wrong
+//! about its own protocol ([`DEVICE_FAULTS`]), what a **device or peer sent**
+//! that a layer refused ([`INPUT_DROPS`], [`ROUTE_DROPS`], [`TCP_REFUSED`], …),
+//! and what **we** got wrong ([`INVARIANT_FAULTS`], [`TCP_WRITE_REFUSED`],
+//! [`HTTP_BODIES_REFUSED`], [`CONSOLE_RECORDS`]'s `unrenderable`). An alert can
+//! be written against the third class by name.
 
 use crate::sample::{
     ClockSample, ConfigSample, ConsoleSample, CryptoSample, DriverSample, ForwarderSample,
-    HardwareProbeSample, ManagementSample, RecorderSample, StoreSample,
+    HardwareProbeSample, ManagementSample, PIPELINES, RecorderSample, StoreSample,
 };
 
 /// Whether a series is a monotonic total or a value that may move in either
-/// direction. Prometheus needs it on the `# TYPE` line; this crate needs it
+/// direction. A consumer needs it to know how to read a number; this crate needs it
 /// because a gauge is the one shape the exposed counter semantics — never
 /// reset, saturating — deliberately do not apply to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,8 +57,7 @@ impl Kind {
 pub struct Metric {
     pub name: &'static str,
     pub kind: Kind,
-    /// One line, no newline, no backslash: [`crate::Snapshot::render`] writes it
-    /// verbatim and the exposition format escapes neither.
+    /// One line, no newline, no backslash: a consumer writes it verbatim.
     pub help: &'static str,
 }
 
@@ -1019,16 +1012,13 @@ pub const UART_INIT_FAILURES: Metric = metric(
     "librefirewall_uart_init_failures_total",
     Kind::Counter,
     "Refused initialisations of the serial controller. Non-zero means this node has no console: \
-     the domain publishes its shard from the refusal path so that a scrape can say so.",
+     the domain publishes its shard from the refusal path so that a reading can say so.",
 );
 
-/// Every family, in the order the exposition emits them.
-///
-/// The renderer walks this rather than the shard tables, because the exposition
-/// format asks for every sample of a family to arrive as one group under one
-/// `# HELP`/`# TYPE` pair — and a family's samples are spread across up to eight
-/// shards. It is exhaustive by test: a series naming a family absent from here
-/// would render with no type line at all.
+/// Every family this appliance declares, family-first rather than shard-first: a
+/// family's series are spread across up to eight shards, and a consumer that
+/// groups them needs the declaration once. It is exhaustive by test: a series
+/// naming a family absent from here would carry no declared type at all.
 pub const ALL_METRICS: &[&Metric] = &[
     &FORWARDED_FRAMES,
     &ROUTE_DROPS,
@@ -1241,8 +1231,39 @@ pub const SHARD_COUNT: usize = 12;
 pub const FORWARDER_SHARD: usize = 0;
 
 /// Where the management endpoint's own shard sits, which is the one the domain
-/// that renders the exposition also writes.
+/// that composes a reading also writes.
 pub const MANAGEMENT_SHARD: usize = 4;
+
+/// The protection domain driving each dataplane port, indexed by port number.
+///
+/// **Delegated precondition:** that port *n* is driven by the domain at index *n*
+/// is made true by `systems/qemu-x86_64/librefirewall.system`, where that domain
+/// maps port *n*'s receive pipeline as its own `rx_fwd_vaddr`. **Enforced by**
+/// `xtask::sysdesc`'s port-driver table.
+pub const PORT_DOMAINS: [&str; PIPELINES] = ["nic_driver0", "nic_driver1"];
+
+/// The dedicated management port's driver, under the same enforcer; separate
+/// because that port carries no port number.
+pub const MANAGEMENT_PORT_DOMAIN: &str = "nic_driver2";
+
+/// The domain driving `port`, or `None` where this build has no driver for it.
+#[must_use]
+pub fn port_domain(port: u8) -> Option<&'static str> {
+    PORT_DOMAINS.get(usize::from(port)).copied()
+}
+
+// One word on both sides or a reader attributes a port's traffic to the wrong
+// domain, so each port's name here is held equal to its driver shard's — which
+// sit at 1..=3 in `SHARDS`, the forwarder holding slot 0.
+const _: () = {
+    assert!(PORT_DOMAINS.len() == PIPELINES);
+    let mut port = 0;
+    while port < PIPELINES {
+        assert!(same(PORT_DOMAINS[port], SHARDS[port + 1].domain));
+        port += 1;
+    }
+    assert!(same(MANAGEMENT_PORT_DOMAIN, SHARDS[PIPELINES + 1].domain));
+};
 
 /// Whether two strings are the same text in a `const` context, which `==` is not.
 pub(crate) const fn same(left: &str, right: &str) -> bool {

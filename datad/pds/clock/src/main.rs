@@ -605,7 +605,7 @@ impl Handler for Clock {
     /// this system can produce.
     ///
     /// The acknowledgement comes first so the next period is not spent masked,
-    /// and the signal before the shard so a scrape never overtakes the wakeup it
+    /// and the signal before the shard so a reading never overtakes the wakeup it
     /// is evidence of.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         let Self::Ticking(ticking) = self else {

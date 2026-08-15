@@ -23,7 +23,7 @@
 //!
 //! # Saturating, never reset
 //!
-//! A scrape differences successive samples, so a reset would forge a negative rate
+//! A consumer differences successive readings, so a reset would forge a negative rate
 //! and a wrap would turn a sustained flood back into a small number — which is
 //! exactly the signal a counter of attacker-driven events exists to carry.
 
@@ -142,7 +142,7 @@ impl FlowCounters {
         }
     }
 
-    /// Every packet turned away, which is what a scrape compares against
+    /// Every packet turned away, which is what a reading compares against
     /// `packets_seen` to see how much of a link's traffic the tracker refuses.
     #[must_use]
     pub const fn refused_total(&self) -> u64 {

@@ -2,7 +2,7 @@ use super::*;
 
 use crate::http::{
     BODY_TIMEOUT, HttpCounters, MAX_BODY_LEN, MAX_BODY_TARGETS, MAX_STREAM_LEN, MAX_STREAM_TARGETS,
-    METRICS_TARGET, REQUEST_CAPACITY, RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
+    REQUEST_CAPACITY, RESPONSE_CAPACITY, RETRANSMIT_SPAN, Server, WINDOW_LEN,
 };
 use net_headers::{
     ARP_FRAME_LEN, ARP_PAYLOAD_LEN, ETHERNET_HEADER_LEN, ICMP_HEADER_LEN, IPV4_HEADER_LEN,
@@ -36,8 +36,8 @@ fn secret() -> IsnSecret {
     IsnSecret::from_bytes(SECRET)
 }
 
-/// A body of `len` deterministic bytes, standing in for the metric exposition a
-/// protection domain renders. Deterministic so a response can be compared to it
+/// A body of `len` deterministic bytes, standing in for the body a protection
+/// domain renders whole. Deterministic so a response can be compared to it
 /// byte for byte, and sized by the caller so a test can pick one that spans one
 /// segment or twenty.
 #[derive(Clone, Copy, Debug)]
@@ -116,8 +116,10 @@ impl Recording {
 }
 
 fn endpoint() -> Endpoint {
-    Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, Some(GATEWAY), secret())
-        .expect("a unicast pair on a /24")
+    let mut endpoint = Endpoint::new(OUR_MAC, OUR_ADDRESS, PREFIX, Some(GATEWAY), secret())
+        .expect("a unicast pair on a /24");
+    assert!(endpoint.serve_rendered_at(DOCUMENT_TARGET));
+    endpoint
 }
 
 /// An endpoint that also answers [`RECORDING_TARGET`] by streaming.
@@ -128,7 +130,7 @@ fn streaming_endpoint() -> Endpoint {
 }
 
 /// What a caller supplies between a request being counted and its answer going
-/// out: the exposition rendered whole, or a recording delivered by window.
+/// out: a body rendered whole, or a recording delivered by window.
 ///
 /// One value rather than two drivers, because the loop around it — poll until
 /// the pass has nothing left, then let the peer's acknowledgement open the
@@ -151,9 +153,8 @@ impl Supply {
         match self {
             Self::Rendered(body) => {
                 if endpoint.body_wanted().is_some() {
-                    endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
-                        body.render(out)
-                    });
+                    endpoint
+                        .supply_body(Status::Ok, Some(ContentType::Xml), |out| body.render(out));
                 }
             }
             Self::Streamed(recording) => {
@@ -1160,8 +1161,8 @@ fn window_of(frame: &[u8]) -> u16 {
         .window
 }
 
-/// A scrape request as a client puts one on the wire.
-const SCRAPE: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: 10.0.2.15\r\nUser-Agent: probe\r\n\r\n";
+/// A read of the rendered target, as a client puts one on the wire.
+const READ: &[u8] = b"GET /config HTTP/1.1\r\nHost: 10.0.2.15\r\nUser-Agent: probe\r\n\r\n";
 
 /// Take one connection from `SYN` to `ESTABLISHED`.
 fn handshake(endpoint: &mut Endpoint, station: &mut Station, out: &mut [u8]) {
@@ -1331,8 +1332,8 @@ fn get(target: &str) -> Vec<u8> {
 }
 
 /// The exchange the end-to-end gate performs, driven here through the endpoint's
-/// own surface: a handshake, a scrape answered over several segments, and a
-/// close this end initiates.
+/// own surface: a handshake, a read answered over several segments, and a close
+/// this end initiates.
 #[test]
 fn a_whole_http_exchange_crosses_the_endpoint() {
     let mut endpoint = endpoint();
@@ -1341,11 +1342,11 @@ fn a_whole_http_exchange_crosses_the_endpoint() {
     handshake(&mut endpoint, &mut station, &mut out);
     assert_eq!(endpoint.connections(), 1);
 
-    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(BODY), SCRAPE);
+    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(BODY), READ);
     assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
     assert_eq!(
         answered.header("content-type").as_deref(),
-        Some(lfw_http::METRICS_CONTENT_TYPE)
+        Some(lfw_http::XML_CONTENT_TYPE)
     );
     let (head, body) = answered.split();
     assert_eq!(body, BODY.bytes(), "the body is not what was rendered");
@@ -1391,7 +1392,7 @@ fn a_whole_http_exchange_crosses_the_endpoint() {
     // than 503 — which is what proves the release happened.
     let mut second = Station::new(40001, 0x2222_0000);
     handshake(&mut endpoint, &mut second, &mut out);
-    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), SCRAPE);
+    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), READ);
     assert_eq!(again.status_line(), "HTTP/1.1 200 OK");
     assert_eq!(endpoint.http_counters().requests, 2);
     assert_eq!(
@@ -1402,15 +1403,15 @@ fn a_whole_http_exchange_crosses_the_endpoint() {
 
 /// The staging buffer is released when the response can no longer be asked for
 /// again, not when the connection's slot is finally reaped. A `TIME_WAIT` lasts
-/// a minute, so a buffer held that long would refuse every scrape a
-/// fifteen-second scraper made — which is what this asserts is not the case.
+/// a minute, so a buffer held that long would refuse every request a client made
+/// inside it — which is what this asserts is not the case.
 #[test]
 fn the_staging_buffer_is_free_again_before_the_connection_is_reaped() {
     let mut endpoint = endpoint();
     let mut out = vec![0u8; ROOMY];
     let mut first = Station::new(40000, 0x3131);
     handshake(&mut endpoint, &mut first, &mut out);
-    let answered = exchange(&mut endpoint, &mut first, Supply::Rendered(BODY), SCRAPE);
+    let answered = exchange(&mut endpoint, &mut first, Supply::Rendered(BODY), READ);
     assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
 
     // The client closes its own half, and the connection is still very much in
@@ -1423,11 +1424,11 @@ fn the_staging_buffer_is_free_again_before_the_connection_is_reaped() {
 
     let mut second = Station::new(40001, 0x3232);
     handshake(&mut endpoint, &mut second, &mut out);
-    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), SCRAPE);
+    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), READ);
     assert_eq!(
         again.status_line(),
         "HTTP/1.1 200 OK",
-        "a scrape inside the first connection's TIME_WAIT was refused"
+        "a read inside the first connection's TIME_WAIT was refused"
     );
     assert_eq!(again.split().1, BODY.bytes());
 }
@@ -1437,18 +1438,18 @@ fn the_staging_buffer_is_free_again_before_the_connection_is_reaped() {
 #[test]
 fn every_refused_request_is_answered_by_its_own_status() {
     let cases: &[(&[u8], &str)] = &[
-        (b"GET /config HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
+        (b"GET /metrics HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
         (b"GET /logs HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
         (b"GET / HTTP/1.1\r\n\r\n", "HTTP/1.1 404 Not Found"),
         (
-            b"POST /metrics HTTP/1.1\r\n\r\n",
+            b"POST /config HTTP/1.1\r\n\r\n",
             "HTTP/1.1 405 Method Not Allowed",
         ),
         (
-            b"GET /metrics HTTP/1.0\r\n\r\n",
+            b"GET /config HTTP/1.0\r\n\r\n",
             "HTTP/1.1 505 HTTP Version Not Supported",
         ),
-        (b"GET /metrics\n\n", "HTTP/1.1 400 Bad Request"),
+        (b"GET /config\n\n", "HTTP/1.1 400 Bad Request"),
         (b"nonsense\r\n\r\n", "HTTP/1.1 400 Bad Request"),
     ];
     for (request, expected) in cases {
@@ -1485,7 +1486,7 @@ fn the_two_length_refusals_are_answered_by_their_own_statuses() {
     let mut bounded = endpoint();
     let mut station = Station::new(40001, 0x4242);
     handshake(&mut bounded, &mut station, &mut out);
-    let mut head = b"GET /metrics HTTP/1.1\r\n".to_vec();
+    let mut head = b"GET /config HTTP/1.1\r\n".to_vec();
     while head.len() < REQUEST_CAPACITY {
         head.extend_from_slice(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
     }
@@ -1521,7 +1522,7 @@ fn a_request_split_across_segments_is_answered_once_it_ends() {
     handshake(&mut endpoint, &mut station, &mut out);
 
     let mut clock = 1_000u64;
-    for byte in SCRAPE.iter().take(SCRAPE.len() - 1) {
+    for byte in READ.iter().take(READ.len() - 1) {
         let data = station.frame(
             lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH),
             core::slice::from_ref(byte),
@@ -1537,17 +1538,17 @@ fn a_request_split_across_segments_is_answered_once_it_ends() {
         &mut endpoint,
         &mut station,
         Supply::Rendered(BODY),
-        &SCRAPE[SCRAPE.len() - 1..],
+        &READ[READ.len() - 1..],
     );
     assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
     assert_eq!(endpoint.http_counters().requests, 1);
 }
 
-/// One exposition at a time. A second scrape while the first still holds the
+/// One whole body at a time. A second request while the first still holds the
 /// staging buffer is refused by name rather than answered with somebody else's
 /// bytes or with a truncated set.
 #[test]
-fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
+fn a_second_read_while_the_buffer_is_busy_is_answered_503() {
     let mut endpoint = endpoint();
     let mut out = vec![0u8; ROOMY];
     let mut first = Station::new(40000, 0x6161);
@@ -1555,7 +1556,7 @@ fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
 
     // Start the first response and stop before it is acknowledged, so the buffer
     // stays claimed.
-    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, BODY);
     let len = endpoint
@@ -1569,7 +1570,7 @@ fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
     // — which would otherwise serve whichever connection is pending.
     let mut second = Station::new(40001, 0x6262);
     handshake(&mut endpoint, &mut second, &mut out);
-    let data = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     let len = endpoint
         .handle(Some(at(2_000)), &data, &mut out)
         .reply()
@@ -1593,10 +1594,11 @@ fn a_second_scrape_while_the_buffer_is_busy_is_answered_503() {
 
 /// A renderer that will not fit its own body is **ours**, and is counted apart
 /// from a busy buffer even though both answer 503. Unreachable while
-/// `RESPONSE_CAPACITY` is derived from the renderer's bound, and driven here
-/// because a defensive path nothing exercises is one nobody knows the shape of.
+/// `RESPONSE_CAPACITY` is derived from every renderer's own bound, and driven
+/// here because a defensive path nothing exercises is one nobody knows the shape
+/// of.
 #[test]
-fn an_exposition_that_will_not_render_is_counted_as_ours() {
+fn a_rendered_body_that_will_not_fit_is_counted_as_ours() {
     let mut endpoint = endpoint();
     let mut station = Station::new(40000, 0x7171);
     let mut out = vec![0u8; ROOMY];
@@ -1605,7 +1607,7 @@ fn an_exposition_that_will_not_render_is_counted_as_ours() {
         &mut endpoint,
         &mut station,
         Supply::Rendered(UNRENDERABLE),
-        SCRAPE,
+        READ,
     );
     assert_eq!(answered.status_line(), "HTTP/1.1 503 Service Unavailable");
     assert_eq!(endpoint.http_counters().bodies_refused, 1);
@@ -1641,7 +1643,7 @@ fn the_advertised_window_follows_the_request_buffers_free_space() {
 
     // The response's own first segment is composed after the request was taken,
     // so it carries the window the request left.
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, Body(16));
     let len = endpoint
@@ -1650,7 +1652,7 @@ fn the_advertised_window_follows_the_request_buffers_free_space() {
         .expect("a response");
     assert_eq!(
         u32::from(window_of(&out[..len])),
-        (REQUEST_CAPACITY - SCRAPE.len()) as u32,
+        (REQUEST_CAPACITY - READ.len()) as u32,
         "the window did not shrink by what the request buffer holds"
     );
 }
@@ -1664,7 +1666,7 @@ fn a_retransmission_is_served_from_the_response_buffer() {
     let mut out = vec![0u8; ROOMY];
     handshake(&mut endpoint, &mut station, &mut out);
 
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, Body(64));
     let len = endpoint
@@ -1814,7 +1816,7 @@ fn a_response_larger_than_the_window_leaves_over_several_segments() {
     let mut out = vec![0u8; ROOMY];
     handshake(&mut endpoint, &mut station, &mut out);
 
-    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(body), SCRAPE);
+    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(body), READ);
     assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
     assert_eq!(answered.split().1, body.bytes());
     assert!(
@@ -1839,7 +1841,7 @@ fn a_peer_that_closes_before_its_request_ends_is_closed_on() {
 
     let partial = station.frame(
         lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH),
-        b"GET /metrics HTT",
+        b"GET /config HT",
     );
     endpoint.handle(Some(at(1_000)), &partial, &mut out);
     let fin = station.frame(lfw_tcp::Flags::FIN.with(lfw_tcp::Flags::ACK), &[]);
@@ -1948,8 +1950,8 @@ fn a_refused_send_or_close_leaves_the_server_holding() {
 
     // A connection still in `SYN_RECEIVED` can neither send nor close, so both
     // arms of `drive` are refused and nothing is counted as having gone out.
-    server.take(at(0), id, b"GET /metrics HTTP/1.1\r\n\r\n");
-    server.supply(Status::Ok, Some(ContentType::Metrics), |out| {
+    server.take(at(0), id, b"GET /config HTTP/1.1\r\n\r\n");
+    server.supply(Status::Ok, Some(ContentType::Xml), |out| {
         Body(8).render(out)
     });
     assert_eq!(server.counters().requests, 1);
@@ -1972,7 +1974,7 @@ fn a_retransmission_that_does_not_fit_is_counted_as_unavailable() {
     let mut station = Station::new(40000, 0x5555);
     let mut out = vec![0u8; ROOMY];
     handshake(&mut endpoint, &mut station, &mut out);
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, Body(32));
     endpoint.poll_output(at(1_001), &mut out);
@@ -2116,7 +2118,7 @@ fn an_eviction_gives_back_everything_this_end_held_for_the_connection() {
     station.read(&out[..len]);
     let ack = station.frame(lfw_tcp::Flags::ACK, &[]);
     endpoint.handle(Some(base), &ack, &mut out);
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(base), &data, &mut out);
     supply(&mut endpoint, Body(64));
     let sent = base.saturating_add(lfw_clock::Duration::from_nanos(1));
@@ -2217,7 +2219,7 @@ fn a_segment_trimmed_to_the_window_delivers_its_head_and_not_its_tail() {
 
     // A head stopped mid-field, so the buffer's free space is a few hundred
     // bytes and the window with it.
-    let mut head = b"GET /metrics HTTP/1.1\r\n".to_vec();
+    let mut head = b"GET /config HTTP/1.1\r\n".to_vec();
     for index in 0..8 {
         head.extend_from_slice(format!("X-Pad-{index}: {}\r\n", "a".repeat(200)).as_bytes());
     }
@@ -2283,7 +2285,7 @@ fn a_send_the_storage_would_not_hold_leaves_a_range_the_response_can_serve() {
     let mut station = Station::new(40000, 0x5a5a_0001);
     let mut out = vec![0u8; ROOMY];
     handshake(&mut endpoint, &mut station, &mut out);
-    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = station.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, Body(64));
 
@@ -2335,7 +2337,7 @@ fn a_timer_that_produces_no_frame_does_not_end_the_pass() {
     busy.read(&out[..len]);
     let ack = busy.frame(lfw_tcp::Flags::ACK, &[]);
     endpoint.handle(Some(opened), &ack, &mut out);
-    let data = busy.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = busy.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(opened), &data, &mut out);
     supply(&mut endpoint, Body(64));
     let sent = opened.saturating_add(lfw_clock::Duration::from_nanos(1));
@@ -2463,7 +2465,7 @@ fn the_client_s_own_fin_is_acknowledged() {
     let mut station = Station::new(40000, 0x5150);
     let mut out = vec![0u8; ROOMY];
     handshake(&mut endpoint, &mut station, &mut out);
-    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(BODY), SCRAPE);
+    let answered = exchange(&mut endpoint, &mut station, Supply::Rendered(BODY), READ);
     assert!(answered.closed, "the appliance did not close first");
 
     // The harness reaches this point over a real socket after tens of segments,
@@ -2491,19 +2493,19 @@ fn the_client_s_own_fin_is_acknowledged() {
     assert!(payload.is_empty(), "the final acknowledgement carries data");
 }
 
-/// A scraper is periodic, so the second scrape is the normal case and it may not
+/// A client is periodic, so the second request is the normal case and it may not
 /// be decided by timing. This is the release-kernel failure pinned: the previous
 /// connection has closed but the transport still holds its ranges — its peer's
-/// last acknowledgement has not arrived — and the next scrape is answered
+/// last acknowledgement has not arrived — and the next request is answered
 /// nonetheless. Waiting for that acknowledgement is what answered `200, 503` on
 /// the release kernel and `200, 200` on the debug one.
 #[test]
-fn a_second_scrape_is_answered_before_the_first_peer_s_last_acknowledgement() {
+fn a_second_read_is_answered_before_the_first_peer_s_last_acknowledgement() {
     let mut endpoint = endpoint();
     let mut out = vec![0u8; ROOMY];
     let mut first = Station::new(40000, 0x6161);
     handshake(&mut endpoint, &mut first, &mut out);
-    let answered = exchange(&mut endpoint, &mut first, Supply::Rendered(BODY), SCRAPE);
+    let answered = exchange(&mut endpoint, &mut first, Supply::Rendered(BODY), READ);
     assert_eq!(answered.status_line(), "HTTP/1.1 200 OK");
     assert!(answered.closed, "the appliance did not close its end");
 
@@ -2512,17 +2514,17 @@ fn a_second_scrape_is_answered_before_the_first_peer_s_last_acknowledgement() {
     // kernel reached between two `curl` runs.
     let mut second = Station::new(40001, 0x6262);
     handshake(&mut endpoint, &mut second, &mut out);
-    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), SCRAPE);
+    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), READ);
     assert_eq!(
         again.status_line(),
         "HTTP/1.1 200 OK",
-        "the second scrape was refused for want of a buffer the first no longer needs"
+        "the second read was refused for want of a buffer the first no longer needs"
     );
     assert_eq!(again.split().1, BODY.bytes());
     assert_eq!(
         endpoint.http_counters().responses[lfw_http::Status::ServiceUnavailable.slot()],
         0,
-        "a scrape was refused 503"
+        "a read was refused 503"
     );
 }
 
@@ -2538,7 +2540,7 @@ fn a_response_still_being_sent_keeps_its_buffer() {
 
     // The request is in and the body supplied, but nothing has been read off the
     // wire, so the response has not finished going out.
-    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     let _ = endpoint.handle(Some(at(1_000)), &data, &mut out).reply();
     supply(&mut endpoint, BODY);
 
@@ -2547,7 +2549,7 @@ fn a_response_still_being_sent_keeps_its_buffer() {
     // up the first connection's segments.
     let mut second = Station::new(40001, 0x7272);
     handshake(&mut endpoint, &mut second, &mut out);
-    let ask = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let ask = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     let len = endpoint
         .handle(Some(at(2_000)), &ask, &mut out)
         .reply()
@@ -2839,7 +2841,7 @@ fn a_window_that_was_not_asked_for_is_refused_and_counted() {
 /// Abandoning part way ends the connection short of the length the head
 /// announced — no padding — with a `RST` rather than a `FIN`: a truncated body
 /// closed in an orderly way reads to an intermediary as a complete one. The
-/// staging buffer comes back, which the next scrape being answered `200` rather
+/// staging buffer comes back, which the next read being answered `200` rather
 /// than `503` is what proves.
 #[test]
 fn abandoning_a_recording_resets_short_and_frees_the_buffer() {
@@ -2882,10 +2884,10 @@ fn abandoning_a_recording_resets_short_and_frees_the_buffer() {
         "the bytes that did arrive were not the recording's"
     );
 
-    // The buffer is free again, so the next scrape is answered rather than 503.
+    // The buffer is free again, so the next read is answered rather than 503.
     let mut second = Station::new(40001, 0x7788_0001);
     handshake(&mut endpoint, &mut second, &mut out);
-    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), SCRAPE);
+    let again = exchange(&mut endpoint, &mut second, Supply::Rendered(BODY), READ);
     assert_eq!(again.status_line(), "HTTP/1.1 200 OK");
 }
 
@@ -2923,10 +2925,10 @@ fn abandoning_before_the_head_is_written_answers_503() {
     assert_eq!(endpoint.http_counters().streams_abandoned, 1);
 }
 
-/// One response at a time, whichever shape it is: a scrape arriving while a
+/// One response at a time, whichever shape it is: a read arriving while a
 /// recording holds the staging array is refused by name.
 #[test]
-fn a_scrape_while_a_recording_is_in_flight_is_answered_503() {
+fn a_read_while_a_recording_is_in_flight_is_answered_503() {
     let recording = Recording(2 * WINDOW_LEN as u64);
     let mut endpoint = streaming_endpoint();
     let mut out = vec![0u8; ROOMY];
@@ -2939,7 +2941,7 @@ fn a_scrape_while_a_recording_is_in_flight_is_answered_503() {
 
     let mut second = Station::new(40001, 0x9988_0001);
     handshake(&mut endpoint, &mut second, &mut out);
-    let ask = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let ask = second.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     let len = endpoint
         .handle(Some(at(50_000)), &ask, &mut out)
         .reply()
@@ -2950,7 +2952,7 @@ fn a_scrape_while_a_recording_is_in_flight_is_answered_503() {
         head.starts_with("HTTP/1.1 503 Service Unavailable"),
         "a recording in flight had its buffer taken: {head:?}"
     );
-    // And the other way round: a recording asked for while an exposition holds
+    // And the other way round: a recording asked for while a rendered body holds
     // the array is refused too.
     assert_eq!(
         endpoint.http_counters().responses[lfw_http::Status::ServiceUnavailable.slot()],
@@ -2959,15 +2961,15 @@ fn a_scrape_while_a_recording_is_in_flight_is_answered_503() {
     assert!(endpoint.pending_stream().is_none());
 }
 
-/// An exposition in flight refuses a recording for the same reason a recording
-/// refuses a scrape: one array, one response.
+/// A rendered body in flight refuses a recording for the same reason a recording
+/// refuses a read: one array, one response.
 #[test]
-fn a_recording_asked_for_while_an_exposition_is_in_flight_is_answered_503() {
+fn a_recording_asked_for_while_a_rendered_body_is_in_flight_is_answered_503() {
     let mut endpoint = streaming_endpoint();
     let mut out = vec![0u8; ROOMY];
     let mut first = Station::new(40000, 0xaaaa_0001);
     handshake(&mut endpoint, &mut first, &mut out);
-    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), SCRAPE);
+    let data = first.frame(lfw_tcp::Flags::ACK.with(lfw_tcp::Flags::PSH), READ);
     endpoint.handle(Some(at(1_000)), &data, &mut out);
     supply(&mut endpoint, BODY);
 
@@ -2985,7 +2987,7 @@ fn a_recording_asked_for_while_an_exposition_is_in_flight_is_answered_503() {
     let head = core::str::from_utf8(&payload).expect("a status line");
     assert!(
         head.starts_with("HTTP/1.1 503 Service Unavailable"),
-        "an exposition in flight had its buffer taken: {head:?}"
+        "a rendered body in flight had its buffer taken: {head:?}"
     );
     assert!(endpoint.pending_stream().is_none());
 }
@@ -2995,10 +2997,10 @@ fn a_recording_asked_for_while_an_exposition_is_in_flight_is_answered_503() {
 /// possible on one target.
 #[test]
 fn only_a_registered_target_is_streamed() {
-    let mut server: Server<2> = Server::new();
+    let mut server: Server<2> = document_server();
     assert!(
-        !server.serve_stream_at(METRICS_TARGET),
-        "the exposition is not a stream"
+        !server.serve_stream_at(DOCUMENT_TARGET),
+        "a rendered target is not a stream"
     );
     assert!(server.serve_stream_at(RECORDING_TARGET));
     assert!(
@@ -3029,7 +3031,7 @@ fn only_a_registered_target_is_streamed() {
 }
 
 /// A registered target reached with a query string is the same target: the path
-/// is what routes, exactly as it does for the exposition.
+/// is what routes, exactly as it does for a rendered body.
 #[test]
 fn a_registered_target_is_matched_by_its_path() {
     let recording = Recording(64);
@@ -3208,6 +3210,11 @@ fn a_retransmission_of_an_abandoned_recording_is_refused_and_counted() {
 /// `POST`.
 const DOCUMENT_TARGET: &str = "/config";
 
+/// A second target answered on `GET` alone, for the two tests that need one: a
+/// rendered target a `POST` must be refused on, and a second owner the first can
+/// be told apart from.
+const RENDERED_ONLY_TARGET: &str = "/state";
+
 /// A server with the configuration surface's two registrations on it.
 fn document_server<const SLOTS: usize>() -> Server<SLOTS> {
     let mut server: Server<SLOTS> = Server::new();
@@ -3247,7 +3254,7 @@ fn a_posted_body_arrives_whole_and_is_handed_to_the_caller() {
         Some(DOCUMENT_TARGET)
     );
     assert_eq!(server.submission(), Some(body.as_slice()));
-    // Neither of the other two shapes is waiting: a submission is not a scrape.
+    // Neither of the other two shapes is waiting: a submission is not a read.
     assert_eq!(server.pending_render(), None);
     assert_eq!(server.pending_stream(), None);
 
@@ -3364,10 +3371,11 @@ fn a_method_the_target_does_not_answer_is_405_and_an_absent_target_is_404() {
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     assert!(server.serve_stream_at(RECORDING_TARGET));
+    assert!(server.serve_rendered_at(RENDERED_ONLY_TARGET));
 
     // `POST` to a target answered only on `GET`.
     let id = open(&mut stack, 40000, &mut out);
-    server.take(at(0), id, &post_head(METRICS_TARGET, 4));
+    server.take(at(0), id, &post_head(RENDERED_ONLY_TARGET, 4));
     assert_eq!(
         server.counters().responses[Status::MethodNotAllowed.slot()],
         1
@@ -3418,11 +3426,6 @@ fn a_get_of_a_post_only_target_is_405() {
 #[test]
 fn registration_refuses_a_second_get_answer_and_admits_both_methods() {
     let mut server: Server<2> = Server::new();
-    assert!(
-        !server.serve_rendered_at(METRICS_TARGET),
-        "already answered"
-    );
-    assert!(!server.serve_stream_at(METRICS_TARGET));
     assert!(server.serve_rendered_at(DOCUMENT_TARGET));
     assert!(!server.serve_rendered_at(DOCUMENT_TARGET), "twice");
     assert!(
@@ -3444,15 +3447,16 @@ fn registration_refuses_a_second_get_answer_and_admits_both_methods() {
     assert!(!server.serve_body_at("/one-too-many"));
 }
 
-/// A `GET` of the configuration is a rendered body like a scrape, and the target
-/// it names is what tells the two owners apart: the domain that renders metrics
-/// and the one that states a document are different halves of one protection
-/// domain.
+/// Two targets are answered with a whole rendered body, and the target each
+/// request names is what tells their owners apart: the half that states a
+/// document and the half that states anything else are different halves of one
+/// protection domain.
 #[test]
 fn a_rendered_target_names_itself_so_its_owner_can_tell() {
     let mut server: Server<2> = document_server();
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
+    assert!(server.serve_rendered_at(RENDERED_ONLY_TARGET));
 
     let id = open(&mut stack, 40000, &mut out);
     server.take(at(0), id, b"GET /config HTTP/1.1\r\n\r\n");
@@ -3470,35 +3474,35 @@ fn a_rendered_target_names_itself_so_its_owner_can_tell() {
     server.release(id);
 
     let id = open(&mut stack, 40001, &mut out);
-    server.take(at(0), id, SCRAPE);
+    server.take(at(0), id, b"GET /state HTTP/1.1\r\n\r\n");
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
-        Some(METRICS_TARGET)
+        Some(RENDERED_ONLY_TARGET)
     );
 }
 
-/// A submission holds the one staging array, so a scrape arriving meanwhile is
-/// `503` — the same answer two concurrent scrapes already give each other, and
+/// A submission holds the one staging array, so a read arriving meanwhile is
+/// `503` — the same answer two concurrent reads already give each other, and
 /// stated rather than hidden.
 #[test]
-fn a_submission_in_progress_refuses_a_concurrent_scrape() {
+fn a_submission_in_progress_refuses_a_concurrent_read() {
     let mut server: Server<2> = document_server();
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     let posting = open(&mut stack, 40000, &mut out);
-    let scraping = open(&mut stack, 40001, &mut out);
+    let reading = open(&mut stack, 40001, &mut out);
 
     server.take(at(0), posting, &post_head(DOCUMENT_TARGET, 64));
-    server.take(at(0), scraping, SCRAPE);
+    server.take(at(0), reading, READ);
     assert_eq!(
         server.counters().responses[Status::ServiceUnavailable.slot()],
         1
     );
-    assert_eq!(server.pending_render(), None, "the scrape was refused");
+    assert_eq!(server.pending_render(), None, "the read was refused");
 }
 
 /// A body whose answer will not fit is refused rather than truncated, on the same
-/// terms an exposition that will not fit is.
+/// terms a rendered body that will not fit is.
 #[test]
 fn an_answer_that_will_not_fit_is_refused_and_counted() {
     let mut server: Server<2> = document_server();
@@ -3533,7 +3537,7 @@ fn a_peer_that_closes_mid_body_submits_nothing() {
 }
 
 /// A submission the caller never answers holds the array until the connection is
-/// gone, and then releases it: the same shape an unsupplied exposition already
+/// gone, and then releases it: the same shape an unsupplied rendered body already
 /// has, so a caller that forgets one does not deny the port for ever.
 #[test]
 fn a_submission_nobody_answers_is_released_with_its_connection() {
@@ -3547,10 +3551,10 @@ fn a_submission_nobody_answers_is_released_with_its_connection() {
     server.release(id);
     assert_eq!(server.submission(), None);
     let next = open(&mut stack, 40001, &mut out);
-    server.take(at(0), next, SCRAPE);
+    server.take(at(0), next, READ);
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
-        Some(METRICS_TARGET),
+        Some(DOCUMENT_TARGET),
         "the array was not released"
     );
 }
@@ -3587,7 +3591,7 @@ fn a_body_that_stalls_past_its_deadline_is_answered_408() {
 }
 
 /// The point of the deadline: the surfaces that share the array answer again. A
-/// scrape refused `503` while the body was accumulating is answered `200` once it
+/// read refused `503` while the body was accumulating is answered `200` once it
 /// has been given up on, without the stalled peer doing anything at all.
 #[test]
 fn a_stalled_body_stops_refusing_the_surfaces_that_share_the_array() {
@@ -3595,32 +3599,32 @@ fn a_stalled_body_stops_refusing_the_surfaces_that_share_the_array() {
     let mut stack = tcp_stack();
     let mut out = vec![0u8; ROOMY];
     let poster = open(&mut stack, 40000, &mut out);
-    let scraper = open(&mut stack, 40001, &mut out);
+    let reader = open(&mut stack, 40001, &mut out);
 
     server.take(at(0), poster, &post_head(DOCUMENT_TARGET, MAX_BODY_LEN));
     // While the body is accumulating the array is claimed, and this is the denial
     // the deadline exists to end.
-    server.take(at(0), scraper, SCRAPE);
+    server.take(at(0), reader, READ);
     assert_eq!(
         server.counters().responses[Status::ServiceUnavailable.slot()],
         1
     );
     assert_eq!(server.pending_render(), None);
-    server.release(scraper);
+    server.release(reader);
 
     server.expire(at(BODY_TIMEOUT.as_nanos()));
 
-    let scraper = open(&mut stack, 40002, &mut out);
-    server.take(at(BODY_TIMEOUT.as_nanos()), scraper, SCRAPE);
+    let reader = open(&mut stack, 40002, &mut out);
+    server.take(at(BODY_TIMEOUT.as_nanos()), reader, READ);
     assert_eq!(
         server.pending_render().map(|(_, target)| target),
-        Some(METRICS_TARGET),
+        Some(DOCUMENT_TARGET),
         "the array was not handed back"
     );
     assert_eq!(
         server.counters().responses[Status::ServiceUnavailable.slot()],
         1,
-        "the second scrape was refused as well"
+        "the second read was refused as well"
     );
 }
 

@@ -404,7 +404,7 @@ fn the_block_counters_keep_reads_and_writes_apart() {
 
 /// Every fault the request layer can raise reaches its own slot, and no two
 /// share one: a device replaying completions and a device writing garbage
-/// statuses must be distinguishable in a scrape.
+/// statuses must be distinguishable in a reading.
 #[test]
 fn every_request_fault_reaches_a_slot_of_its_own() {
     let faults = RequestFaults {
@@ -434,7 +434,7 @@ fn every_request_fault_reaches_a_slot_of_its_own() {
 }
 
 /// The counters saturate rather than wrapping, for the reason every counter on
-/// this surface does: a scraper differences successive samples, so a wrap turns
+/// this surface does: a consumer differences successive readings, so a wrap turns
 /// a sustained rate into a negative one.
 #[test]
 fn a_block_counter_saturates_rather_than_wrapping() {

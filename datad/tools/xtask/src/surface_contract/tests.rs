@@ -788,7 +788,7 @@ fn a_resumed_recording_is_held_to_the_records_it_added_and_not_the_mediums() {
 /// And the one relation between a file and a number that a carried medium
 /// carries at all: an extent offering fewer records than the medium already held
 /// is a restart that cost a deployment its evidence. The number is the harness's
-/// own read of the disk image, so it survives having no exposition to ask.
+/// own read of the disk image, so it needs no account from the appliance.
 #[test]
 fn a_resumed_recording_offering_fewer_records_than_the_medium_held_is_a_finding() {
     let log = recording(LOG_SNAP, SOUND);
@@ -1268,9 +1268,9 @@ fn a_carried_mediums_records_are_not_held_to_this_boots_policy() {
 
 /// A refusal naming a reason this build's tap ABI has no word for.
 ///
-/// The law that survives the exposition out of the comparison it used to sit
-/// inside: it consults no counter, so it says exactly as much once there is one
-/// surface as it does while there are two.
+/// The law that survives its counter half being taken out of the comparison it
+/// used to sit inside: it consults no counter, so it says exactly as much with
+/// one surface as it did beside two.
 #[test]
 fn a_drop_reason_outside_the_vocabulary_is_a_finding() {
     let log = recording(LOG_SNAP, SOUND);

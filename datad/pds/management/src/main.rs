@@ -100,29 +100,27 @@
 //! against a device; a triple this domain refuses leaves the port answering ARP
 //! and ICMP and refusing TCP.
 //!
-//! # It answers `GET /metrics`, and it reads eleven other domains to do it
+//! # It composes the node's metric reading, and it reads eleven other domains to do it
 //!
 //! It maps **twelve** stats shards: its own read-write, and one per other
 //! protection domain READ-ONLY. That asymmetry is the whole argument — every
-//! number it renders is a claim only the domain that made it could have written,
-//! so a compromise of the domain that faces the management-plane attacker cannot
-//! forge a clean line for a port that is dropping every frame. What stays
-//! withheld is in `systems/qemu-x86_64/librefirewall.system` beside those rows.
-//! Its own shard is the one region in this system with exactly one mapper, so
-//! the renderer walks one uniform array rather than eleven regions plus a live
-//! read of its own counters.
+//! number in a reading is a claim only the domain that made it could have
+//! written, so a compromise of the domain that faces the management-plane
+//! attacker cannot forge a clean line for a port that is dropping every frame.
+//! What stays withheld is in `systems/qemu-x86_64/librefirewall.system` beside
+//! those rows. Its own shard is the one region in this system with exactly one
+//! mapper, so the walk that composes a reading crosses one uniform array rather
+//! than eleven regions plus a live read of its own counters.
 //!
 //! # Deviation from the design: the HTTP endpoint carries no TLS
 //!
 //! The design requires the management API to carry encryption, authentication and
 //! read/write authorization through an mTLS certificate pair. **The HTTP surface
 //! on this port has none of it**: this domain authenticates nobody there, so
-//! **anything that can reach the management port can read every metric this node
-//! exposes, download every packet it has recorded, read its configuration, and
-//! replace that configuration** — which is to say, decide what this firewall
+//! **anything that can reach the management port can read this node's
+//! configuration and replace it** — which is to say, decide what this firewall
 //! forwards. The port must not be exposed to an untrusted network until the
-//! required TLS termination and certificate handling exist. `GET /logs` is still
-//! absent and answers 404 rather than being stubbed.
+//! required TLS termination and certificate handling exist.
 //!
 //! The two *other* connections this port carries do have it, and neither of them
 //! is that surface: the onboarding session an administrator opens, and the
@@ -174,8 +172,8 @@
 //! The console carries system state and never traffic, so nothing here
 //! reports a frame. What it reports is the port's running total, on any pass
 //! that moved at least one: "this port is receiving", which is a fact about the
-//! node. Every count now also reaches `/metrics`, where the rest of what this
-//! domain knows about itself lives.
+//! node. Every count also reaches the node's metric reading, where the rest of
+//! what this domain knows about itself lives.
 
 mod entropy;
 
@@ -706,8 +704,8 @@ fn announce_session(sink: &dyn Sink, report: &RelayReport, port: OnboardCounters
     //
     // The port's running totals rather than this session's share of them: a
     // subtraction would be a number a reader cannot check against anything, and
-    // the same four counts reach `/metrics`, where a scrape can see them move
-    // without waiting for a session to end.
+    // the same four counts reach the node's metric reading, where a consumer can
+    // see them move without waiting for a session to end.
     announce(
         sink,
         DomainState::Ready,
@@ -1149,7 +1147,7 @@ impl Handler for Management {
         }
         // After the drain, so a resolution that arrived in this very pass is what
         // the session is carried forward on, and before the record below: the
-        // shard is published again here, so a scrape reads the channel's own
+        // shard is published again here, so a reading carries the channel's own
         // counters as of this pass rather than the one before it.
         if let Some(now) = now {
             running.channel.drive(

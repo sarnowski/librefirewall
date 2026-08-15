@@ -5,8 +5,7 @@
 //! else in the gate observes a node built around a document; this one boots a node
 //! around one document, hands it another over HTTP, and holds the *dataplane* to
 //! having reversed its verdict because of it. `curl` opens the connections through
-//! QEMU's own user-mode stack, as [`crate::metrics_contract`] does, so nothing on
-//! the wire is composed here.
+//! QEMU's own user-mode stack, so nothing on the wire is composed here.
 //!
 //! # What the four exchanges are for
 //!
@@ -57,18 +56,18 @@
 //!
 //! # No adversary
 //!
-//! As [`crate::metrics_contract`]: this reads and writes the appliance's own
-//! management surface on a wire only the harness is attached to. That the surface
-//! has no authentication at all is what makes it reachable here — and is a
-//! recorded deviation from the design, not a property to rely on.
+//! This reads and writes the appliance's own management surface on a wire only
+//! the harness is attached to. That the surface has no authentication at all is
+//! what makes it reachable here — and is a recorded deviation from the design,
+//! not a property to rely on.
 
 use std::process::Command;
 use std::time::Duration;
 
 use lfw_http::Status;
 
-/// How long a `curl` may take, end to end. [`crate::metrics_contract`]'s budget,
-/// for its reasons: the guest may be under TCG on a loaded runner.
+/// How long a `curl` may take, end to end. Generous rather than tight: the guest
+/// may be under TCG on a loaded runner.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many passes over the capture the forwarding domain is given to say it
@@ -96,11 +95,11 @@ const SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// and after both refusals. Floors rather than equalities, because a boot is free
 /// to have done more; what they refuse is the two accounts disagreeing.
 ///
-/// **Where they are judged is the connection history and not a scrape.** All three
-/// series have a slot in the metric reading the recorder frames into the log ring,
-/// so the claim is stated over the surface the appliance ships rather than over
-/// one an operator has to reach in and ask for — see `crate::snapshot_contract`,
-/// which also carries why a counter in a reading is read as a floor over the file.
+/// **Where they are judged is the connection history.** All three series have a
+/// slot in the metric reading the recorder frames into the log ring, so the claim
+/// is stated over the surface the appliance ships rather than over one an
+/// operator has to reach in and ask for — see `crate::snapshot_contract`, which
+/// also carries why a counter in a reading is read as a floor over the file.
 pub const OWED_APPLIED: u64 = 2;
 pub const OWED_REFUSED: u64 = 2;
 pub const OWED_READS: u64 = 3;

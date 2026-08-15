@@ -86,14 +86,14 @@ pub trait ByteSink {
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
 }
 
-/// What the console can say about itself, in the shape the metrics endpoint
-/// scrapes.
+/// What the console can say about itself, in the shape the metric catalogue
+/// counts it.
 ///
 /// Four failure counters rather than one, because they accuse four different
 /// parties and an operator's next action differs for each: the peer's bytes,
 /// the peer's vocabulary, this build's own renderer, and the device. Every
 /// field is monotonic for the domain's life and saturates at [`u64::MAX`]; a
-/// scrape differences successive samples, so a reset would forge a negative
+/// consumer differences successive readings, so a reset would forge a negative
 /// rate and a wrap would turn a sustained fault back into a small number.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConsoleCounters {

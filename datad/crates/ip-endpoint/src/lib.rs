@@ -53,7 +53,7 @@
 //!
 //! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
 //! request per connection and answers three shapes: a `GET` of a registered target
-//! with a body its caller renders whole, `/metrics` among them; a `GET` of a target
+//! with a body its caller renders whole; a `GET` of a target
 //! registered through [`Endpoint::serve_stream_at`] out of a body supplied a window
 //! at a time; and a `POST` to a target registered through
 //! [`Endpoint::serve_body_at`] by accumulating the request body and handing it to
@@ -171,13 +171,13 @@ pub const TCP_CONNECTIONS: usize = 8;
 
 /// The port this endpoint listens on: the management HTTP port. A constant rather
 /// than a configured value because the service is the constant — the design puts
-/// `/metrics`, `/config` and `/logs` on the management interface, and a port a
-/// document could move is one a scraper could not find.
+/// the management surfaces on the management interface, and a port a document
+/// could move is one a client could not find.
 pub const MANAGEMENT_PORT: u16 = 80;
 
 /// The largest payload this endpoint composes in one segment: the classic
 /// Ethernet maximum, and it is the response side that fixes it — the round trips
-/// a scrape costs are its length divided by this.
+/// a response costs are its length divided by this.
 pub const TCP_MSS: u16 = 1460;
 
 // Ethernet, IPv4 and a TCP header with no options, in front of a full segment,
@@ -394,9 +394,9 @@ impl Outcome {
     }
 }
 
-/// What an endpoint has seen, in the shape the metrics endpoint will
-/// scrape. Monotonic and saturating on `pipeline::DropCounters`' terms: no reset,
-/// because a scrape differences successive samples.
+/// What an endpoint has seen, in the shape the metric catalogue counts it.
+/// Monotonic and saturating on `pipeline::DropCounters`' terms: no reset,
+/// because a consumer differences successive readings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndpointCounters {
     /// ARP requests for our address, answered.
@@ -935,11 +935,11 @@ impl Endpoint {
 
     /// The target a completed request is waiting on a rendered body for.
     ///
-    /// A caller answers it by publishing whatever the body is *about* and then
-    /// calling [`supply_body`](Self::supply_body): the two steps exist so a
-    /// scrape's own request has been counted before the numbers are read. See
-    /// [`http`]'s header. The target is answered too, because the owner of one
-    /// rendered target is not the owner of another.
+    /// A caller answers it by producing whatever the body is *about* and then
+    /// calling [`supply_body`](Self::supply_body): the two steps exist because
+    /// the body's source belongs to the target's owner and not to this crate.
+    /// See [`http`]'s header. The target is answered too, because the owner of
+    /// one rendered target is not the owner of another.
     #[must_use]
     pub fn body_wanted(&self) -> Option<&'static str> {
         self.http.pending_render().map(|(_, target)| target)

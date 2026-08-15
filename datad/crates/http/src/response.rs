@@ -10,22 +10,17 @@
 //! head this writes, and it is a decision rather than an omission: keep-alive
 //! obliges a server to frame an unbounded sequence of requests on one
 //! connection, which is more state per connection and a second place for two
-//! parties to disagree about where a message ends. A scrape is one request, and
-//! answering it and closing is the complete behaviour rather than a subset of
-//! one.
+//! parties to disagree about where a message ends. A management request is one
+//! request, and answering it and closing is the complete behaviour rather than a
+//! subset of one.
 
 use crate::Status;
-
-/// The content type a Prometheus scraper expects of the classic text exposition
-/// format, verbatim.
-pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Opaque bytes: this crate parses no format and would be claiming to know one.
 pub const OCTET_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The configuration document. `application/xml` rather than `text/xml`, RFC 7303
-/// section 9.1 making the latter's default charset US-ASCII where an operator's
-/// document declares UTF-8.
+/// section 9.1 making the latter's default charset US-ASCII where an operator's document declares UTF-8.
 pub const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
 
 /// The one page an appliance ever serves a person. The charset is stated
@@ -33,10 +28,9 @@ pub const XML_CONTENT_TYPE: &str = "application/xml; charset=utf-8";
 /// document declaring its encoding twice is a document with two answers.
 pub const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
-/// A PKCS#10 certification request, as RFC 2311 section 3.5 registers it.
-/// `charset` is absent deliberately: the media type is defined over the DER
-/// structure, and the PEM armouring it travels in is US-ASCII by its own
-/// grammar rather than by a parameter.
+/// A PKCS#10 certification request, as RFC 2311 section 3.5 registers it. `charset` is absent
+/// deliberately: the media type is defined over the DER structure, and the PEM armouring it travels
+/// in is US-ASCII by its own grammar rather than by a parameter.
 pub const PKCS10_CONTENT_TYPE: &str = "application/pkcs10";
 
 /// A content type this crate can promise a head for.
@@ -49,8 +43,6 @@ pub const PKCS10_CONTENT_TYPE: &str = "application/pkcs10";
 /// one that fails to fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentType {
-    /// [`METRICS_CONTENT_TYPE`]: the classic Prometheus text exposition.
-    Metrics,
     /// [`OCTET_STREAM_CONTENT_TYPE`]: bytes this crate claims to know nothing
     /// about.
     OctetStream,
@@ -65,18 +57,11 @@ pub enum ContentType {
 impl ContentType {
     /// Every variant, so [`MAX_HEAD_LEN`] is derived by iteration rather than
     /// from a list that drifts from the enum.
-    pub const ALL: [Self; 5] = [
-        Self::Metrics,
-        Self::OctetStream,
-        Self::Xml,
-        Self::Html,
-        Self::Pkcs10,
-    ];
+    pub const ALL: [Self; 4] = [Self::OctetStream, Self::Xml, Self::Html, Self::Pkcs10];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Metrics => METRICS_CONTENT_TYPE,
             Self::OctetStream => OCTET_STREAM_CONTENT_TYPE,
             Self::Xml => XML_CONTENT_TYPE,
             Self::Html => HTML_CONTENT_TYPE,

@@ -91,7 +91,6 @@ use std::{
 
 use crate::dial_contract;
 use crate::management_contract::{self, ManagementInjection};
-use crate::metrics_contract::{self, Scrape};
 use crate::onboard_contract;
 use crate::onboard_install_contract;
 use crate::onboard_request_contract;
@@ -227,28 +226,24 @@ const CLIENT_ISN: u32 = 0x3b9a_ca07;
 
 /// The request the client sends over the connection.
 ///
-/// It is a real scrape rather than an opaque payload, so what the appliance
-/// answers with is a real exposition — tens of kibibytes over twenty-odd
-/// segments, which is what makes this exchange a test of the *stream* rather
-/// than of one segment. The one scenario that judges the exposition's contents
-/// points `curl` at the endpoint instead (`crate::metrics_contract`); what is
-/// judged here is every field of every segment that carries it.
-const TCP_REQUEST: &[u8] = b"GET /metrics HTTP/1.1\r\nHost: librefirewall\r\n\r\n";
+/// It is a real read of the configuration surface rather than an opaque payload,
+/// so what the appliance answers with is a real document — kibibytes over
+/// several segments and more than one window, which is what makes this exchange
+/// a test of the *stream* rather than of one segment. What the document says is
+/// judged where it can be compared against the document the image was built from
+/// (`crate::config_submission_contract`); what is judged here is every field of
+/// every segment that carries it.
+const TCP_REQUEST: &[u8] = b"GET /config HTTP/1.1\r\nHost: librefirewall\r\n\r\n";
 
 /// What a 200 response begins with, matched as the exact prefix of the first
 /// body bytes rather than searched for.
 const HTTP_OK: &[u8] = b"HTTP/1.1 200 OK\r\n";
 
-/// The window the client advertises. Comfortably above one segment and well
-/// below the response, so the exchange is carried by acknowledgements opening
-/// the window again — which is the multi-segment path a single-segment reply
-/// would never reach.
-const CLIENT_WINDOW: u16 = 8192;
-
-/// Scrapes the metrics scenario takes, and why it is not one: a scrape cannot
-/// contain the response it is, so the second is what carries the first's
-/// request and response (`crate::metrics_contract`).
-const SCRAPES: usize = 2;
+/// The window the client advertises. Above one segment and well below the
+/// response, so the exchange is carried by acknowledgements opening the window
+/// again several times over — which is the multi-window path a reply that fitted
+/// one window would never reach.
+const CLIENT_WINDOW: u16 = 2048;
 
 /// Response bytes the client will hold before it calls the appliance broken.
 ///
@@ -1810,13 +1805,13 @@ pub struct PolicyWitness {
     /// in any set is a TCP segment at all, so a refusal on a boot that injected
     /// none is a frame nobody put on the wire.
     pub probed_mid_stream: bool,
-    /// How many rules the policy **in force when the scrape is taken** declares,
-    /// which is the whole cardinality of the per-rule counter family.
+    /// How many rules the policy **in force when the counters are read** declares,
+    /// which is the whole cardinality of the per-rule counter block.
     ///
-    /// Not always the booted document's. A scenario that submits one is scraped
+    /// Not always the booted document's. A scenario that submits one is judged
     /// under the submitted policy, and a submission may add a rule the booted
     /// document never had — so a count taken from the built-around document alone
-    /// would refuse a scrape that is exactly right.
+    /// would refuse a reading that is exactly right.
     pub rules: usize,
     /// Whether this boot's appliance had **no owner**, so nothing could be
     /// forwarded and the cross-check that means anything is the refusal count.
@@ -1824,8 +1819,8 @@ pub struct PolicyWitness {
     /// Its own flag rather than "forwarded nothing", because those are different
     /// claims: a boot may forward nothing because its policy admitted nothing,
     /// and then the zero is the filter's. Here the zero is the appliance's, every
-    /// frame having been settled in front of admission — so what the exposition
-    /// owes is a rise under one reason and a zero under every other, which is a
+    /// frame having been settled in front of admission — so what a reading owes
+    /// is a rise under one reason and a zero under every other, which is a
     /// statement no forwarding number can make.
     pub unowned: bool,
     /// Whether the boot ran **two** policies: one it booted with and one submitted
@@ -4792,6 +4787,20 @@ impl ManagementProbe {
                         segment.flags, segment.sequence, client.expect
                     ));
                 }
+                // An acknowledgement of the request and no more is one the
+                // appliance composed **before** this end's `FIN` reached it, and
+                // it is ordinary rather than a contradiction: the target this
+                // client asks for is answered by a second protection domain, so
+                // the pass that takes the request acknowledges it with nothing to
+                // send, and a bare acknowledgement of this end's own can cross
+                // the `FIN` on the wire. Nothing in this client's model moves for
+                // it — what ends the exchange is still an acknowledgement that
+                // covers the `FIN`, or the boot's own budget expiring.
+                if segment.acknowledgement == TcpClient::sent_through_request()
+                    && segment.payload.is_empty()
+                {
+                    return Ok(TcpStep::AwaitLastAck);
+                }
                 // The client's `FIN` occupied one number past its request.
                 let owed = TcpClient::sent_through_request().wrapping_add(1);
                 if segment.acknowledgement != owed {
@@ -4899,7 +4908,7 @@ impl ManagementProbe {
             .unwrap_or("(no status line)")
             .to_owned();
         format!(
-            "  answered   http-scrape           station->mgmt  {}:{CLIENT_PORT} -> \
+            "  answered   http-read             station->mgmt  {}:{CLIENT_PORT} -> \
              {}:{MANAGEMENT_TCP_PORT}  isn {}  {status}  {} response bytes  closed cleanly",
             ipv4(self.port.station),
             ipv4(self.port.address),
@@ -5825,10 +5834,10 @@ fn judge_repeat(
 ///
 /// The stream is what a client actually has: the head parsed back into a status
 /// line and a `Content-Length`, and the body compared against the length it
-/// declared. Contents are deliberately not judged here — the exposition is
-/// judged where it can be cross-checked against traffic the harness observed
-/// itself (`crate::metrics_contract`), and a body compared against a second copy
-/// of the appliance's own renderer would agree with itself.
+/// declared. Contents are deliberately not judged here — the document is judged
+/// where it can be compared against the one the image was built from
+/// (`crate::config_submission_contract`), and a body compared against a second
+/// copy of the appliance's own writer would agree with itself.
 ///
 /// # Errors
 /// The verdict, naming the field and the two values.
@@ -5842,7 +5851,7 @@ fn judge_response(client: &TcpClient) -> Result<(), String> {
     };
     if !head.starts_with(HTTP_OK) {
         return Err(format!(
-            "the appliance answered {:?} and a scrape is owed {:?}",
+            "the appliance answered {:?} and a read of the configuration is owed {:?}",
             String::from_utf8_lossy(head.get(..head.len().min(64)).unwrap_or_default()),
             String::from_utf8_lossy(HTTP_OK)
         ));
@@ -5861,7 +5870,7 @@ fn judge_response(client: &TcpClient) -> Result<(), String> {
     }
     if body.is_empty() {
         return Err(String::from(
-            "the appliance answered 200 with an empty body, so nothing about the exposition was \
+            "the appliance answered 200 with an empty body, so nothing about the document was \
              carried by the stream",
         ));
     }
@@ -6317,8 +6326,8 @@ fn describe_management(
 ) -> String {
     let Some(wire) = wire else {
         return String::from(
-            "the management port is on QEMU's user-mode stack, so the harness put no frame on it \
-             and the scrape had not been taken",
+            "the management port is on QEMU's user-mode stack, so the harness put no frame on \
+             it",
         );
     };
     if let Some(error) = &wire.injection_failure {
@@ -6420,25 +6429,20 @@ pub struct Booted {
     /// its own. What it catches is a count that could not have been produced by
     /// this timer in the time the machine has existed.
     pub started_at: Instant,
-    /// What `curl` got out of the management endpoint, on the one scenario that
-    /// points it at one: two consecutive scrapes, because a scrape cannot carry
-    /// the response it is (`crate::metrics_contract`). Empty on every
-    /// socket-backed boot.
-    pub scrapes: Vec<Scrape>,
     /// Frames the harness itself observed coming back on the two dataplane
     /// ports.
     ///
-    /// It is the independent half of the cross-check the scrape scenario makes:
+    /// It is the independent half of the cross-check the readings are held to:
     /// every frame on a dataplane egress is one the appliance forwarded, and
     /// nothing else originates on those ports, so this number is what the
-    /// appliance's own `librefirewall_forwarded_frames_total` must equal. The
+    /// appliance's own `librefirewall_forwarded_frames_total` is bounded by. The
     /// harness counts frames rather than *deliveries* deliberately — a probe
     /// re-injected before its first delivery was observed is forwarded twice,
     /// and both counters see both.
     pub dataplane_frames: u64,
     /// What the injected probes oblige the appliance's filter to have counted,
-    /// which is the independent half of the per-rule cross-check the scrape
-    /// scenarios make.
+    /// which is the independent half of the per-rule cross-check the readings are
+    /// held to.
     pub policy: PolicyWitness,
     /// What each of the two recording extents already held **going into** this
     /// boot, in `lfw_recorder::deck::Deck::extents`' order. Empty on every boot
@@ -6597,11 +6601,9 @@ fn run_boot(
     // console's first record to it would be comparing two different handshakes
     // and would pass or fail on how far the run happened to get.
     let mut observed_claim: Option<(u32, u32)> = None;
-    // What the harness saw come back on the two dataplane ports, and what a real
-    // client got out of the management endpoint. Both live outside the run block
-    // so they survive every exit path.
+    // What the harness saw come back on the two dataplane ports. It lives outside
+    // the run block so it survives every exit path.
     let mut dataplane_frames: u64 = 0;
-    let mut scrapes: Vec<Scrape> = Vec::new();
     let mut handshakes: Vec<onboard_tls_contract::Attempt> = Vec::new();
     let mut requests: Vec<onboard_request_contract::Attempt> = Vec::new();
     let mut installs: Option<onboard_install_contract::Onboarded> = None;
@@ -7201,12 +7203,10 @@ fn run_boot(
                         }
                         break 'run Ok(());
                     }
-                    // The scrape scenario: nothing more is injected anywhere, so
-                    // the dataplane is quiet and the count the harness has
-                    // observed is final. Take it, run a real client against the
-                    // endpoint, and take it again — a number that moved across
-                    // the scrape would make the cross-check meaningless rather
-                    // than merely wrong, and is reported as its own failure.
+                    // A boot whose management port carries a real client: nothing
+                    // more is injected anywhere, so the dataplane is quiet and the
+                    // count the harness has observed is final. Bring it current,
+                    // then run whatever clients this boot's subject calls for.
                     // The configuration change, once the shipped policy's own probes
                     // have been decided and before the second wave goes out. This
                     // is the only place in the harness that *changes* what the
@@ -7292,8 +7292,8 @@ fn run_boot(
                                 }
                             }
                         }
-                        // The second wave, into a dataplane the scrape above has
-                        // just observed running the submitted generation.
+                        // The second wave, into a dataplane the console above has
+                        // just reported running the submitted generation.
                         wave = Wave::Submitted;
                         deferred_injected = !probes
                             .iter()
@@ -7327,8 +7327,8 @@ fn run_boot(
                     // owes, which is the one thing on such a boot that no other
                     // clause here waits for. The session's outcome is written by
                     // the domain that terminates it, on the pass that decided the
-                    // session; the traffic, the scrape and the recordings are all
-                    // settled by other domains and can be settled first. A run
+                    // session; the traffic and the recordings are settled by other
+                    // domains and can be settled first. A run
                     // that broke out on those alone would kill the guest with the
                     // channel's record still in the log ring and report an
                     // appliance that was about to speak as one that never did.
@@ -7342,66 +7342,34 @@ fn run_boot(
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.is_none()
-                            && scrapes.is_empty()
                             && test.channel.satisfied(&output) =>
                     {
-                        let ManagementBacking::UserNetwork {
-                            host_port,
-                            onboard_port,
-                        } = backends.management
+                        let ManagementBacking::UserNetwork { onboard_port, .. } =
+                            backends.management
                         else {
                             break 'run Err(String::from(
                                 "a boot with no management socket must be on the user-mode \
                                  backing",
                             ));
                         };
+                        // Everything the dataplane ports have handed back and
+                        // this loop has not yet taken. The count is what the
+                        // readings inside the recording are held to and the
+                        // relation is an inequality — a reading claiming more
+                        // forwarding than left the appliance is the finding — so
+                        // it has to be current at the moment the boot ends
+                        // rather than at the last pass that happened to run.
                         while let Ok((egress, frame)) = frame_receiver.try_recv() {
                             if egress != MANAGEMENT_SLOT {
                                 dataplane_frames = dataplane_frames.saturating_add(1);
                             }
                             let _ = frame;
                         }
-                        let before = dataplane_frames;
-                        // Two, back to back: the second is what carries the
-                        // first's request and response, and answering it at all
-                        // is what proves the one staging buffer was released
-                        // rather than held through the first connection's
-                        // `TIME_WAIT` (`crate::metrics_contract`).
-                        let mut fetched = Vec::new();
-                        for _ in 0..SCRAPES {
-                            match metrics_contract::fetch(host_port) {
-                                Ok(one) => fetched.push(one),
-                                Err(verdict) => {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
-                            }
-                        }
-                        while let Ok((egress, frame)) = frame_receiver.try_recv() {
-                            if egress != MANAGEMENT_SLOT {
-                                dataplane_frames = dataplane_frames.saturating_add(1);
-                            }
-                            let _ = frame;
-                        }
-                        if dataplane_frames != before {
-                            break 'run Err(format!(
-                                "{before} frames had come back on the dataplane ports when the \
-                                 scrape began and {dataplane_frames} by the time it finished, so \
-                                 the count the exposition is compared against is not the count \
-                                 the appliance had when it rendered it; see {}",
-                                log_path.display()
-                            ));
-                        }
-                        // And, where the scenario's subject is the *other*
-                        // port, the clients that reach it. After the three
-                        // surfaces above, so a boot that failed one of them
-                        // fails for that rather than for a handshake, and
-                        // through the same forward: what an administrator runs
-                        // is a TLS client, and a handshake this harness composed
-                        // itself would prove only that the appliance agrees with
-                        // the appliance.
+                        // And then the clients whose subject is this port:
+                        // through the same forward, because what an
+                        // administrator runs is a TLS client and a handshake
+                        // this harness composed itself would prove only that the
+                        // appliance agrees with the appliance.
                         if test.onboard.handshakes() {
                             // The capture as it stands, drained afresh each time
                             // the contract asks: what it waits for between its
@@ -7595,7 +7563,6 @@ fn run_boot(
                             }
                             installs = Some(driven);
                         }
-                        scrapes = fetched;
                         break 'run Ok(());
                     }
                     _ => {}
@@ -7948,7 +7915,6 @@ fn run_boot(
         management_tcp_isn: tcp_isn,
         dial_claim: observed_claim,
         management_replies: answered,
-        scrapes,
         dataplane_frames,
         policy,
         carried_recordings: Vec::new(),
@@ -11086,7 +11052,7 @@ mod tcp_client_tests {
         let mut bytes = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\n\
              Connection: close\r\n\r\n",
-            lfw_http::METRICS_CONTENT_TYPE
+            lfw_http::XML_CONTENT_TYPE
         )
         .into_bytes();
         bytes.extend((0..body_len).map(|index| b'a'.wrapping_add((index % 26) as u8)));
@@ -11349,11 +11315,11 @@ mod tcp_client_tests {
         assert_eq!(client.expect, 0x1000, "an empty segment moved the stream");
     }
 
-    /// The appliance's own initial sequence number for the scrape connection,
+    /// The appliance's own initial sequence number for the request connection,
     /// chosen so close to the wrap that every offset the repeat rule takes
     /// crosses it: an implementation comparing raw sequence numbers with `<`
     /// passes none of the tests below.
-    const SCRAPE_PEER_ISN: u32 = 0xffff_ff00;
+    const REQUEST_PEER_ISN: u32 = 0xffff_ff00;
 
     /// A client driven to the step where its request is out and the appliance
     /// owes the response: the open, the passive open answering it, and the
@@ -11363,7 +11329,7 @@ mod tcp_client_tests {
         probe.advance(&mut client).expect("the client's own SYN");
         let syn_ack = appliance_segment(
             management,
-            SCRAPE_PEER_ISN,
+            REQUEST_PEER_ISN,
             CLIENT_ISN.wrapping_add(1),
             TCP_SYN | TCP_ACK,
             &[],
@@ -11381,7 +11347,7 @@ mod tcp_client_tests {
     fn passive_open_again(management: &ManagementPort) -> Vec<u8> {
         appliance_segment(
             management,
-            SCRAPE_PEER_ISN,
+            REQUEST_PEER_ISN,
             CLIENT_ISN.wrapping_add(1),
             TCP_SYN | TCP_ACK,
             &[],
@@ -11405,7 +11371,7 @@ mod tcp_client_tests {
         );
         assert_eq!(
             client.expect,
-            SCRAPE_PEER_ISN.wrapping_add(1),
+            REQUEST_PEER_ISN.wrapping_add(1),
             "a segment carrying nothing new moved the stream"
         );
         assert!(client.response.is_empty());
@@ -11418,7 +11384,7 @@ mod tcp_client_tests {
         let answer = probe.advance(&mut client).expect("the request again");
         let sent = decode_tcp(&answer, &management).expect("it re-parses");
         assert_eq!(sent.payload, TCP_REQUEST);
-        assert_eq!(sent.acknowledgement, SCRAPE_PEER_ISN.wrapping_add(1));
+        assert_eq!(sent.acknowledgement, REQUEST_PEER_ISN.wrapping_add(1));
         assert_eq!(client.step, TcpStep::AwaitResponse);
     }
 
@@ -11439,7 +11405,7 @@ mod tcp_client_tests {
             .judge_tcp(
                 &appliance_segment(
                     &management,
-                    SCRAPE_PEER_ISN.wrapping_add(3),
+                    REQUEST_PEER_ISN.wrapping_add(3),
                     CLIENT_ISN.wrapping_add(1),
                     TCP_SYN | TCP_ACK,
                     &[],
@@ -11456,7 +11422,7 @@ mod tcp_client_tests {
             .judge_tcp(
                 &appliance_segment(
                     &management,
-                    SCRAPE_PEER_ISN,
+                    REQUEST_PEER_ISN,
                     TcpClient::sent_through_request(),
                     TCP_SYN | TCP_ACK,
                     &[],
@@ -11472,9 +11438,9 @@ mod tcp_client_tests {
         // The two that need the connection to have gone past the handshake: a
         // byte of the response proves this end's acknowledgement arrived.
         for (sequence, expected) in [
-            (SCRAPE_PEER_ISN, "already answered up to"),
+            (REQUEST_PEER_ISN, "already answered up to"),
             (
-                SCRAPE_PEER_ISN.wrapping_add(5),
+                REQUEST_PEER_ISN.wrapping_add(5),
                 "initial sequence number was",
             ),
         ] {
@@ -11483,7 +11449,7 @@ mod tcp_client_tests {
                 .judge_tcp(
                     &appliance_segment(
                         &management,
-                        SCRAPE_PEER_ISN.wrapping_add(1),
+                        REQUEST_PEER_ISN.wrapping_add(1),
                         TcpClient::sent_through_request(),
                         TCP_ACK | TCP_PSH,
                         &head,
@@ -11518,11 +11484,11 @@ mod tcp_client_tests {
         let response = response_of(200);
         let owed = TcpClient::sent_through_request();
         let (head, tail) = response.split_at(80);
-        let tail_at = SCRAPE_PEER_ISN.wrapping_add(1 + head.len() as u32);
+        let tail_at = REQUEST_PEER_ISN.wrapping_add(1 + head.len() as u32);
 
         let opening = appliance_segment(
             &management,
-            SCRAPE_PEER_ISN.wrapping_add(1),
+            REQUEST_PEER_ISN.wrapping_add(1),
             owed,
             TCP_ACK | TCP_PSH,
             head,
@@ -11589,7 +11555,7 @@ mod tcp_client_tests {
             .judge_tcp(
                 &appliance_segment(
                     &management,
-                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    REQUEST_PEER_ISN.wrapping_add(1),
                     owed,
                     TCP_ACK | TCP_PSH,
                     &head,
@@ -11604,7 +11570,7 @@ mod tcp_client_tests {
             .judge_tcp(
                 &appliance_segment(
                     &management,
-                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    REQUEST_PEER_ISN.wrapping_add(1),
                     owed,
                     TCP_ACK | TCP_PSH,
                     &altered,
@@ -11621,7 +11587,7 @@ mod tcp_client_tests {
             .judge_tcp(
                 &appliance_segment(
                     &management,
-                    SCRAPE_PEER_ISN.wrapping_add(1),
+                    REQUEST_PEER_ISN.wrapping_add(1),
                     owed.wrapping_add(9),
                     TCP_ACK | TCP_PSH,
                     &head,

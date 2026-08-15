@@ -1157,9 +1157,9 @@
 
          WHY TWELVE REGIONS AND NOT ONE. A region is the unit of grant, and the
          property worth having here is that a domain's numbers are *its own
-         testimony*: the management domain renders every one of them into the
-         exposition an operator scrapes, so it must read all twelve, and a single
-         shared region would make it a writer of all twelve too. It could then
+         testimony*: the management domain composes every one of them into the
+         reading a recording carries upstream, so it must read all twelve, and a
+         single shared region would make it a writer of all twelve too. It could then
          attribute a driver's dropped frames to another driver, or zero a count
          that accuses itself — and it is the domain that faces the
          management-plane attacker. Twelve regions with twelve writers is what
@@ -1169,9 +1169,9 @@
 
          PER-DOMAIN SERIES, NO TOTALS. Nothing in this node sums across shards.
          A summed total is corrupted by a domain restart — one shard goes back to
-         zero, the sum goes backwards, and a scraper differencing two samples
+         zero, the sum goes backwards, and a consumer differencing two readings
          forges an enormous rate — whereas a `domain=`-labelled series resets
-         alone, which Prometheus handles by design. This row set is what
+         alone, which a time-series database handles by design. This row set is what
          makes that no-total decision possible.
 
          SINGLE WRITER IS THE WHOLE SYNCHRONISATION. Exactly one domain has each
@@ -1192,14 +1192,15 @@
          AND THE READER CANNOT WRITE. Every grant to `management` below is
          READ-ONLY except its own. That is the same asymmetry `cfg` and `clock`
          have, and for a sharper reason: this domain is the one an attacker
-         reaches first, and a `/metrics` surface it could edit would let a
-         compromise of it hide the compromise.
+         reaches first, and a set of numbers it could edit would let a compromise
+         of it hide the compromise in everything it reports upstream.
 
          `stats_management` HAS EXACTLY ONE MAPPER, and that is not an oversight.
-         The management domain both writes and reads it, because the renderer
-         walks one uniform array of twelve shards rather than eleven regions plus a
-         live read of its own counters — one code path, and a set of numbers
-         taken at one publish rather than half of them changing under the render.
+         The management domain both writes and reads it, because the walk that
+         composes a reading crosses one uniform array of twelve shards rather than
+         eleven regions plus a live read of its own counters — one code path, and
+         a set of numbers taken at one publish rather than half of them changing
+         under the walk.
          It costs no cross-domain authority: no other domain maps it.
 
          Size is `lfw_metrics::STATS_REGION_SIZE`, the type's `size_of` rounded
@@ -1217,7 +1218,7 @@
          address, and an unplaced region is allocated from general-purpose
          untyped memory — precisely the retyping seL4 zeroes. A zeroed shard is
          every counter at zero, which is the state a domain that has done nothing
-         is in, so a scrape taken before a domain has published reads zeroes
+         is in, so a reading taken before a domain has published carries zeroes
          rather than rubbish. -->
     <memory_region name="stats_forwarder" size="0x1000" />
     <memory_region name="stats_nic_driver0" size="0x1000" />
@@ -1252,8 +1253,8 @@
          the ability to read whatever a peer is currently counting.
 
          WHAT THE RECORDER CANNOT DO WITH IT. It is READ-ONLY there, so a
-         compromised recorder cannot forge a number into the `/metrics` surface
-         or into another domain's shard: it can only decline to write what it
+         compromised recorder cannot forge a number into a reading or into
+         another domain's shard: it can only decline to write what it
          was handed, which is a recording that says less and never one that lies.
          And the management domain, which writes this page, gains nothing on the
          medium — it cannot place a block, only offer numbers the recorder
@@ -1704,20 +1705,20 @@
          the reply composed into storage of its own, the pool exposing no safe
          path to its bytes), a request slot of `lfw_http::MAX_REQUEST_BYTES` per
          connection, one `lfw_ip_endpoint::http::RESPONSE_CAPACITY` staging
-         buffer — about 79 KiB, because a Prometheus exposition of this node's
-         whole metric catalogue is that big and a response composed anywhere else
-         could not be retransmitted — and, since recordings became downloadable,
-         one `wire::DOWNLOAD_WINDOW_LEN` window of 32 KiB, which is where a
-         recorder's reply is copied before the transport takes it. Beside the
-         handler, and not in it, a `lfw_metrics::Snapshot` of about 36 KiB: every
-         shard read whole, once per scrape, in the frame that renders it.
+         buffer — the longest body the management surface answers with, and a
+         response composed anywhere else could not be retransmitted — and, since
+         recordings became downloadable, one `wire::DOWNLOAD_WINDOW_LEN` window
+         of 32 KiB, which is where a recorder's reply is copied before the
+         transport takes it. Beside the handler, and not in it, a
+         `lfw_metrics::Snapshot` of about 36 KiB: every shard read whole, once
+         per reading, in the frame that composes it.
 
          THE NUMBER HAS DOUBLED TWICE, BOTH TIMES BECAUSE THE MEASURED PEAK
          OVERRAN THE OLD ONE, and both times the same way: the release image
          faulted the domain with `potential stack overflow, fault address within
          one page outside of stack region` and the appliance stopped forwarding.
          The download window took it past 0x40000; the filter took it past
-         0x80000, because one rule series per rule the ABI admits grew both the
+         0x80000, because one shard slot per rule the ABI admits grew both the
          staging buffer and the snapshot, and `init` moves the handler into place
          more than once on the way out of the function. A mebibyte leaves the
          margin an unmeasured peak needs, and

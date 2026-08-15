@@ -105,7 +105,7 @@ true overrun is reported rather than hidden.
 The appliance's whole metric surface travels upstream as a **pcapng Custom Block written into the
 log ring**, once a second, in the same verbatim ring bytes as everything else. It is a snapshot and
 not a stream of deltas: what the block holds is what every counter read at one instant, and a server
-differences successive blocks exactly as a scraper differences successive scrapes.
+differences successive blocks exactly as a consumer differences successive readings.
 
 **Block type `0x00000BAD`, PEN `0xFFFFFFFF`** — the same pair the padding block carries, and the
 first byte of the data is what tells them apart. Every multi-byte field of the block's data is

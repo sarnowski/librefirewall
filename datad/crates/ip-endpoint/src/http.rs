@@ -3,9 +3,8 @@
 //!
 //! It answers three shapes of request and everything else with a status:
 //!
-//! * a `GET` of a target registered through [`Server::serve_rendered_at`] —
-//!   `/metrics` among them — with a body its owner renders into the one staging
-//!   array;
+//! * a `GET` of a target registered through [`Server::serve_rendered_at`], with
+//!   a body its owner renders into the one staging array;
 //! * a `GET` of a target registered through [`Server::serve_stream_at`] by
 //!   streaming a body that owner produces a window at a time;
 //! * a `POST` to a target registered through [`Server::serve_body_at`] by
@@ -15,15 +14,16 @@
 //! # The request body lives in the response buffer, and that is the whole design
 //!
 //! There is one staging array ([`RESPONSE_CAPACITY`]) and it is claimed by one
-//! connection at a time. A submitted body claims it exactly as an exposition
+//! connection at a time. A submitted body claims it exactly as a rendered one
 //! does, is accumulated in it, and is then overwritten by the response composed
 //! for the same connection — so a `POST` costs no second buffer anywhere, which
 //! matters because the alternative is [`MAX_BODY_LEN`] per connection slot in a
 //! protection domain's own memory.
 //!
 //! Two consequences, both stated rather than hidden. A `POST` in progress makes a
-//! concurrent scrape `503`, on exactly the terms two concurrent scrapes already
-//! refuse each other. And the owner **must read the body before it answers**:
+//! concurrent `GET` `503`, on exactly the terms two concurrent `GET`s of a
+//! rendered target already refuse each other. And the owner **must read the body
+//! before it answers**:
 //! [`Server::submission`] borrows out of the array that [`Server::supply`] then
 //! writes into, which the borrow checker enforces at the call site rather than
 //! this paragraph enforcing by asking.
@@ -59,24 +59,24 @@
 //! framing for a body, a length refused at the head, an accumulation the array
 //! itself limits, and a decision it hands upward rather than makes.
 //!
-//! # One exposition at a time, and what a second connection gets
+//! # One whole body at a time, and what a second connection gets
 //!
-//! An exposition is [`RESPONSE_CAPACITY`] bytes — about 98 KiB, most of it the
-//! one series per filter rule the configuration ABI admits — and a buffer
-//! per connection would be eight of them in a protection domain's own memory.
-//! There is therefore **one**, claimed by the connection whose request completed
-//! and released as soon as its response can no longer be *asked for* again, and
-//! a second request for `/metrics` arriving in between is answered
+//! The staging array is [`RESPONSE_CAPACITY`] bytes — the longest body a
+//! rendered target or a submission can occupy, with room for the head in front —
+//! and a buffer per connection would be eight of them in a protection domain's
+//! own memory. There is therefore **one**, claimed by the connection whose
+//! request completed and released as soon as its response can no longer be
+//! *asked for* again; a second request needing it in between is answered
 //! `503 Service Unavailable`.
 //!
 //! That is a real limit and it is stated rather than hidden: two concurrent
-//! scrapers refuse each other. Every other status needs no body at all, so it is
+//! clients refuse each other. Every other status needs no body at all, so it is
 //! composed in the connection's own slot and is never refused for want of the
 //! shared one.
 //!
 //! "No longer asked for" is [`Server::sweep`]: this end closed and the transport
 //! holds none of its ranges. Waiting for the connection's *slot* would hold it
-//! through `TIME_WAIT` — a minute — and refuse every scrape made in it.
+//! through `TIME_WAIT` — a minute — and refuse every request made in it.
 //!
 //! # Why the application holds the response bytes
 //!
@@ -115,15 +115,13 @@
 //!
 //! # The body is asked for, not fetched
 //!
-//! A completed `GET /metrics` claims the staging buffer and stops at
+//! A completed `GET` of a rendered target claims the staging buffer and stops at
 //! [`Phase::AwaitingBody`]: the caller then asks [`Server::pending_body`] and
 //! renders through [`Server::supply`]. Two steps rather than a renderer this
-//! crate calls, and the reason is freshness rather than layering. The caller is
-//! the protection domain whose *own* counters the exposition carries, and it can
-//! only publish them once the request has been counted — which happens as the
-//! head completes. Rendering inside the parse would put a scrape's own request
-//! one publish in the future, so a node that had just answered a scrape would
-//! report having answered none.
+//! crate calls, and the reason is ownership rather than layering. The body's
+//! source belongs to the target's owner — for the configuration surface, to
+//! another protection domain entirely — and this crate holds no way to reach it
+//! and no business deciding when it may be asked.
 //!
 //! # Why the advertised window is the request buffer's free space
 //!
@@ -152,11 +150,6 @@ use crate::TCP_MSS;
 /// decision: the parser's limits are stated against a head this size.
 pub const REQUEST_CAPACITY: usize = MAX_REQUEST_BYTES;
 
-/// The exposition's own target, registered by this server rather than by an
-/// owner: the metric surface is what the crate above it exists to serve, and a
-/// build that forgot to register it would answer an operator's scraper `404`.
-pub const METRICS_TARGET: &str = "/metrics";
-
 /// Bytes of request body this server will accumulate, and so the bound a
 /// `Content-Length` is refused against with `413` before a byte is taken.
 ///
@@ -168,22 +161,12 @@ pub const METRICS_TARGET: &str = "/metrics";
 pub const MAX_BODY_LEN: usize = 64 * 1024;
 
 /// Bytes the shared staging array holds: the longest head this server can write,
-/// in front of the longest body that array ever carries — an exposition the metric
-/// catalogue can produce, or a request body [`MAX_BODY_LEN`] admits.
+/// in front of the longest body that array ever carries — a request body
+/// [`MAX_BODY_LEN`] admits, every rendered body being bounded by the same number.
 ///
-/// Derived rather than chosen, which is what makes a new metric unable to
-/// silently truncate an operator's scrape — a family added to `lfw_metrics`
-/// moves this number and the array with it — and what makes a larger body bound
-/// move it too rather than overrun the array quietly.
-pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + longest_body();
-
-const fn longest_body() -> usize {
-    if lfw_metrics::MAX_EXPOSITION_LEN > MAX_BODY_LEN {
-        lfw_metrics::MAX_EXPOSITION_LEN
-    } else {
-        MAX_BODY_LEN
-    }
-}
+/// Derived rather than chosen, so a larger body bound moves this number and the
+/// array with it rather than overrunning the array quietly.
+pub const RESPONSE_CAPACITY: usize = MAX_HEAD_LEN + MAX_BODY_LEN;
 
 /// The tail a window keeps behind the byte being sent: everything the transport
 /// can re-ask for and owns no copy of, so a window slid past one of those ranges
@@ -211,8 +194,8 @@ pub const MAX_STREAM_LEN: u64 = 1 << 31;
 /// request target.
 pub const MAX_STREAM_TARGETS: usize = 4;
 
-/// Targets answered on `GET` with a body the owner renders whole, [`METRICS_TARGET`]
-/// among them. Bounded on [`MAX_STREAM_TARGETS`]' terms.
+/// Targets answered on `GET` with a body the owner renders whole. Bounded on
+/// [`MAX_STREAM_TARGETS`]' terms.
 pub const MAX_RENDERED_TARGETS: usize = 4;
 
 /// Targets that accept a request body on `POST`. One today — the configuration —
@@ -233,17 +216,15 @@ pub const MAX_BODY_TARGETS: usize = 2;
 pub const BODY_TIMEOUT: Duration = Duration::from_millis(30_000);
 
 // The bound the whole streaming design rests on, stated where both halves are
-// visible: the worst-case exposition and the head in front of it fit the buffer
-// they are composed into, so a scrape is never answered short. Both are
-// stated as numbers, so a new family moves this reservation in a diff.
+// visible: the longest body and the head in front of it fit the buffer they are
+// composed into, so a response is never answered short. Both are stated as
+// numbers, so a wider body bound moves this reservation in a diff.
 const _: () = {
-    assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + lfw_metrics::MAX_EXPOSITION_LEN);
     assert!(RESPONSE_CAPACITY >= MAX_HEAD_LEN + MAX_BODY_LEN);
     assert!(RESPONSE_CAPACITY > MAX_HEAD_LEN);
 
-    assert!(lfw_metrics::MAX_EXPOSITION_LEN == 102_393);
     assert!(MAX_BODY_LEN == 65_536);
-    assert!(RESPONSE_CAPACITY == 102_554);
+    assert!(RESPONSE_CAPACITY == MAX_HEAD_LEN + MAX_BODY_LEN);
 };
 
 // And the bound the windowed shape rests on, held to the transport's own
@@ -257,7 +238,7 @@ const _: () = {
     assert!(WINDOW_LEN as u64 <= MAX_STREAM_LEN);
 };
 
-/// What the server has done, in the shape the metrics endpoint scrapes.
+/// What the server has done, in the shape the metric catalogue counts it.
 /// Saturating and never reset, on `lfw_tcp::TcpCounters`' terms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HttpCounters {
@@ -311,8 +292,8 @@ pub struct HttpCounters {
 /// shape was decided on.
 ///
 /// Each carries the target it is about, because the owner of one target is not
-/// the owner of another: the domain that renders an exposition and the one that
-/// states a configuration are different halves of the same protection domain, and
+/// the owner of another: the half that states a configuration and the half that
+/// streams a recording are different halves of the same protection domain, and
 /// each must be able to tell whether the request waiting is its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Want {
@@ -616,7 +597,6 @@ pub struct Server<const SLOTS: usize> {
     slots: [Slot; SLOTS],
     shared: Shared,
     /// The `GET` targets answered with a body the owner renders whole.
-    /// [`METRICS_TARGET`] is here from the start, this crate being what serves it.
     rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
     /// The targets an owner registered as streamed: a fixed table this server
     /// only compares against, which keeps recordings and block devices out of it.
@@ -639,11 +619,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 bytes: [0; RESPONSE_CAPACITY],
                 start: MAX_HEAD_LEN,
             },
-            rendered: {
-                let mut table = [None; MAX_RENDERED_TARGETS];
-                table[0] = Some(METRICS_TARGET);
-                table
-            },
+            rendered: [None; MAX_RENDERED_TARGETS],
             targets: [None; MAX_STREAM_TARGETS],
             bodies: [None; MAX_BODY_TARGETS],
             counters: HttpCounters {
@@ -999,10 +975,10 @@ impl<const SLOTS: usize> Server<SLOTS> {
     ///
     /// A closed owner's claim is taken rather than waited out. Waiting for the
     /// transport to hold none of its ranges — what [`Server::sweep`] waits for —
-    /// would make the next scrape depend on the previous peer's last
+    /// would make the next request depend on the previous peer's last
     /// acknowledgement arriving first: `curl` twice in a row is answered
     /// `200, 200` on the debug kernel and `200, 503` on the release one, and a
-    /// periodic scraper's second scrape may not be decided by timing. The price is
+    /// periodic client's second request may not be decided by timing. The price is
     /// a retransmit to an already-closed connection, refused rather than answered
     /// wrongly and counted as `http_retransmits_unavailable`.
     fn claim_buffer(&mut self, index: usize, connection: ConnectionId, want: Want) {
@@ -1072,8 +1048,8 @@ impl<const SLOTS: usize> Server<SLOTS> {
     ///
     /// Read the body with [`submission`](Self::submission) and answer with
     /// [`supply`](Self::supply). Leaving one unanswered holds the staging array
-    /// and refuses every scrape meanwhile, exactly as an unsupplied exposition
-    /// already can.
+    /// and refuses every other request meanwhile, exactly as an unsupplied
+    /// rendered body already can.
     #[must_use]
     pub fn pending_submission(&self) -> Option<(ConnectionId, &'static str)> {
         self.awaiting(|want| match want {
@@ -1109,8 +1085,8 @@ impl<const SLOTS: usize> Server<SLOTS> {
 
     /// The connection whose registered stream target the caller must decide on,
     /// and which it asked for. Leaving one unanswered holds the staging array and
-    /// refuses every scrape meanwhile, as a caller that never supplies an
-    /// exposition already can.
+    /// refuses every other request meanwhile, as a caller that never supplies a
+    /// rendered body already can.
     #[must_use]
     pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
         self.awaiting(|want| match want {
@@ -1650,7 +1626,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
                 let (lo, hi, at) = window.servable(head);
                 if offset < lo || end > hi {
                     // Unreachable while the module's assertion holds; refused
-                    // rather than asserted, for `expositions_refused`'s reason.
+                    // rather than asserted, for `bodies_refused`'s reason.
                     return None;
                 }
                 // Lossless: as `chunk_for`.
@@ -1682,7 +1658,7 @@ impl<const SLOTS: usize> Server<SLOTS> {
     /// outstanding.
     ///
     /// Waiting for the connection's slot instead would hold the buffer through
-    /// `TIME_WAIT` — a minute — and refuse every scrape made in it.
+    /// `TIME_WAIT` — a minute — and refuse every request made in it.
     pub fn sweep<const CONNECTIONS: usize>(&mut self, stack: &TcpStack<CONNECTIONS>) {
         let Some(owner) = self.shared.owner else {
             return;
@@ -1784,8 +1760,8 @@ impl<const SLOTS: usize> Default for Server<SLOTS> {
     }
 }
 
-/// The path half of a request target, so `/metrics?foo=1` reaches the same
-/// handler `/metrics` does. Nothing here interprets the query: this server takes
+/// The path half of a request target, so `/config?foo=1` reaches the same
+/// handler `/config` does. Nothing here interprets the query: this server takes
 /// no parameters, and one it silently ignored would be one a caller believed in.
 fn path_of(target: &str) -> &str {
     match target.split_once('?') {

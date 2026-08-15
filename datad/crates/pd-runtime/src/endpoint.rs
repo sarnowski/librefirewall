@@ -69,13 +69,13 @@ use lfw_clock::{
 };
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
-    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, METRICS_TARGET},
+    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS},
     onboard::{Ended as OnboardEnded, StreamCounters},
     outbound::{DialFacts, Ended, OpenError, Resolutions, Session},
     route::Hop,
 };
 use lfw_log::RejectReason;
-use lfw_metrics::{InterfaceInventory, LogSample, RuleInventory};
+use lfw_metrics::LogSample;
 use net_headers::Ipv4Address;
 use wire::{CalibrationImage, ClockCalibration, ConfigHandover};
 
@@ -189,12 +189,12 @@ pub fn calibration_from(image: CalibrationImage) -> Result<Calibration, Calibrat
 /// composed here and then dropped.
 pub const MAX_REPLY_LEN: usize = BUFFER_SIZE - DEVICE_HEADER_LEN as usize;
 
-/// What a terminal endpoint has seen, in the shape the appliance's own
-/// metrics endpoint will scrape.
+/// What a terminal endpoint has seen, in the shape the appliance's own metric
+/// catalogue counts it.
 ///
 /// Monotonic for the domain's life and saturating, on
 /// [`PoolCounters`](crate::PoolCounters)'s terms: there is no reset, because a
-/// scrape differences successive samples and a reset would forge a negative rate.
+/// consumer differences successive readings and a reset would forge a negative rate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointStageCounters {
     /// Frames taken off the pipeline whose descriptor named a span inside one
@@ -235,7 +235,7 @@ pub struct EndpointStageCounters {
     pub reply_write_failed: u64,
     /// The generation the endpoint's addressing came from, and 0 while it has
     /// none. The counts above span the domain's life and no commit resets them,
-    /// so this is what tells two scrapes apart.
+    /// so this is what tells two readings apart.
     pub generation: u32,
     /// Committed images this domain would not read. It uses none of them, so a
     /// refusal changes nothing it is doing; it is counted because a publisher
@@ -244,7 +244,7 @@ pub struct EndpointStageCounters {
     pub configs_refused: u64,
     /// The calibration generation this domain is converting counter readings
     /// with, and 0 while it has none. As `generation`, it is what tells two
-    /// scrapes apart.
+    /// readings apart.
     pub clock_generation: u32,
     /// Published calibrations this domain would not use, one per pass over a
     /// region it refuses. A rising count is a clock domain publishing numbers no
@@ -281,16 +281,6 @@ pub struct EndpointStage<'ring> {
     /// picked up and an unchanged one is not re-read.
     clock_generation: u32,
     config: CommittedReader,
-    /// The interface identities the committed generation names, which the metric
-    /// surface reports and nothing else here reads. Held beside `endpoint` rather
-    /// than derived from it: the endpoint is the *management* port's addressing
-    /// alone, and the info series cover every port the document configured.
-    interfaces: InterfaceInventory,
-    /// The rule identities the committed generation declares, on `interfaces`'
-    /// terms and for the same reader. Identity alone: every hit count is in the
-    /// forwarding domain's shard, which this domain maps read-only, and the two
-    /// are joined on a rule's position.
-    rules: RuleInventory,
     /// The targets this domain answers with a body it renders whole, and the ones
     /// it accepts a request body on. Held here as well as in the endpoint because
     /// a committed generation builds a **new** endpoint, and a registration this
@@ -298,7 +288,7 @@ pub struct EndpointStage<'ring> {
     rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
     bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
-    /// each pass, and the eleven it reads to answer a scrape.
+    /// each pass, and the eleven it reads to compose a reading.
     stats: StatsRegions<'ring>,
     received: [u8; BUFFER_SIZE],
     reply: [u8; MAX_REPLY_LEN],
@@ -356,8 +346,6 @@ impl<'ring> EndpointStage<'ring> {
             calibration: None,
             clock_generation: 0,
             config: CommittedReader::new(),
-            interfaces: InterfaceInventory::EMPTY,
-            rules: RuleInventory::EMPTY,
             rendered: [None; MAX_RENDERED_TARGETS],
             bodies: [None; MAX_BODY_TARGETS],
             stats,
@@ -389,12 +377,7 @@ impl<'ring> EndpointStage<'ring> {
                     generation,
                     checked,
                 } => match crate::endpoint_from(&checked, secret.clone()) {
-                    Ok(endpoint) => Ok((
-                        generation,
-                        endpoint,
-                        crate::interfaces_from(&checked),
-                        crate::rules_from(&checked),
-                    )),
+                    Ok(endpoint) => Ok((generation, endpoint)),
                     // The image's own reader accepted the entry and this
                     // domain's endpoint would not, which is a disagreement
                     // between two checks rather than a malformed field: it is
@@ -417,15 +400,9 @@ impl<'ring> EndpointStage<'ring> {
             }
         };
         match taken {
-            Ok((generation, endpoint, interfaces, rules)) => {
+            Ok((generation, endpoint)) => {
                 self.adopt(endpoint);
                 self.apply_targets();
-                // Replaced wholesale rather than merged: what the metric
-                // surface reports is the generation in force, and an interface
-                // or a rule the new document dropped must stop being reported
-                // rather than linger as a stale series.
-                self.interfaces = interfaces;
-                self.rules = rules;
                 self.counters.generation = generation;
                 None
             }
@@ -519,10 +496,10 @@ impl<'ring> EndpointStage<'ring> {
     /// Called once at start-up: the registration outlives every committed
     /// generation, because a new document replaces the endpoint and this is what
     /// puts the target back on it. Answers `false` where the target is already
-    /// registered, where it is the exposition's own, or where the table is full
-    /// — answered rather than asserted, so a caller learns of its own mistake.
+    /// registered or where the table is full — answered rather than asserted, so
+    /// a caller learns of its own mistake.
     pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
-        if target == METRICS_TARGET || self.rendered.iter().flatten().any(|it| *it == target) {
+        if self.rendered.iter().flatten().any(|it| *it == target) {
             return false;
         }
         let Some(slot) = self.rendered.iter_mut().find(|slot| slot.is_none()) else {
@@ -552,8 +529,8 @@ impl<'ring> EndpointStage<'ring> {
     /// Put every registered target on the endpoint in force.
     ///
     /// Each registration takes: the endpoint's own tables are bounded by the same
-    /// constants these are, hold no duplicate and hold no [`METRICS_TARGET`],
-    /// which is the whole of what they refuse.
+    /// constants these are and hold no duplicate, which is the whole of what they
+    /// refuse.
     fn apply_targets(&mut self) {
         let (rendered, bodies) = (self.rendered, self.bodies);
         let Some(endpoint) = self.endpoint.as_mut() else {
@@ -670,12 +647,8 @@ impl<'ring> EndpointStage<'ring> {
                 break;
             }
         }
-        // Before the body, and this is the whole reason the body is *asked for*
-        // rather than rendered inside the parse: the exposition carries this
-        // domain's own counters, and the request it answers has just been
-        // counted. Publishing here is what makes a scrape report the scrape.
+        // A reading is composed from the shard, so this publish is what shows it.
         self.publish(log);
-        self.supply_body();
         if let Some(now) = now {
             self.drive_timers(now);
             self.drive_output(now);
@@ -684,39 +657,10 @@ impl<'ring> EndpointStage<'ring> {
         frames
     }
 
-    /// Render the exposition for a request that is waiting on one.
-    ///
-    /// The whole metric surface, read out of the twelve shards this domain is
-    /// granted, into the server's own staging buffer — which is sized by the
-    /// renderer's worst case, so the `None` path is unreachable and counted
-    /// rather than asserted (`lfw_ip_endpoint::http`).
-    fn supply_body(&mut self) {
-        let stats = self.stats;
-        let interfaces = self.interfaces;
-        let rules = self.rules;
-        let Some(endpoint) = self.endpoint.as_mut() else {
-            return;
-        };
-        // The exposition's own target and no other: a rendered body this domain
-        // does not own the source of belongs to whichever half registered it, and
-        // rendering metrics into it would answer one target with another's body.
-        if endpoint.body_wanted() != Some(METRICS_TARGET) {
-            return;
-        }
-        endpoint.supply_body(Status::Ok, Some(ContentType::Metrics), |out| {
-            stats
-                .snapshot()
-                .with_interfaces(interfaces)
-                .with_rules(rules)
-                .render(out)
-                .ok()
-        });
-    }
-
     /// Send whatever the server above the transport now owes.
     ///
     /// A response spans many segments and a pass is woken by one frame, so
-    /// without this a scrape would advance one segment per acknowledgement
+    /// without this a response would advance one segment per acknowledgement
     /// round trip. Bounded by [`OUTPUT_LIMIT`] as well as by the loop's own
     /// termination — every answer hands a range to the transport, and a
     /// connection blocks once `lfw_tcp::MAX_UNACKED` of them are outstanding.
@@ -748,10 +692,10 @@ impl<'ring> EndpointStage<'ring> {
     /// metric surface at no measurable dataplane cost: the cost of a drain of up to
     /// `DRAIN_LIMIT` descriptors is one bounded run of relaxed stores.
     ///
-    /// A scrape answered *during* a pass therefore reads this domain's own
+    /// A reading composed *during* a pass therefore carries this domain's own
     /// series as of the end of the previous one; every other domain's is as
     /// fresh as that domain last published. A self-reporting metric cannot do
-    /// better — a scrape can never include the bytes of its own answer — and
+    /// better — a reading can never include the work of composing itself — and
     /// the operator contract records it.
     pub fn publish(&self, log: LogSample) {
         let sample = crate::stats::management_sample(

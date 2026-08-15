@@ -129,11 +129,12 @@ line an operator wrote believing it was in force — and the dangerous half of t
 egress that resolve to a configured port, and a prefix length inside 32. All twelve are re-decided
 over the byte image by the forwarder itself, like every other rule.
 
-**Every rule carries its own hit counter on `/metrics`**, labelled with the id the document gave
-it — one series per rule the running generation declares and none for a slot it does not. The count
-comes from the forwarding domain's own shard and the label from the configuration the management
-domain maps read-only, joined on the rule's position, so a hit is a number only the forwarder could
-have written under a name only an operator could have chosen. Beside them the filter publishes what
+**Every rule carries its own hit counter**, at the rule's position in the forwarding domain's own
+shard — one slot per rule the running generation declares. The label that would name it is the id out
+of the configuration the management domain maps read-only, joined on that position, so a hit would be
+a number only the forwarder could have written under a name only an operator could have chosen.
+**Nothing takes those slots off the node today**: they sit past the forwarder's named table, so no
+metric reading carries them ([detail](#metrics)). Beside them the filter publishes what
 it decided in total, packets and datagram bytes, split by verdict.
 
 Held by unit and property tests in `datad/crates/pipeline` covering every criterion against a matching and
@@ -272,7 +273,7 @@ timeout sweep by two hundred and fifty-six.
 scenario opens one conversation the shipped policy admits and, alongside it from the first injection
 pass, sixty-four distinct five-tuples addressed to a port no rule is about. Each of those opens a flow
 and is then refused by the default deny, so the appliance gives every slot back in the evaluation that
-refused it. Four things hold together in the scrape that follows, and no three of them are enough:
+refused it. Four things hold together in the readings that follow, and no three of them are enough:
 
 - **The burst reached the table.** `librefirewall_flow_packets_total{outcome="new"}` counts at least
   the sixty-four openings, and the capture recording carries each of the sixty-four frames
@@ -284,7 +285,8 @@ refused it. Four things hold together in the scrape that follows, and no three o
   the table's capacity: it holds one flow, the conversation's, against a burst of sixty-four. And the
   accounting closes exactly: the openings, less the flows withdrawn, expired, evicted and revoked, are
   the flows the table is holding. A closed flow is deliberately *not* subtracted, because it keeps its
-  slot until its idle timeout. That identity is now asserted on every scraped scenario, not only this
+  slot until its idle timeout. That identity is now asserted on every scenario whose readings are
+  judged, not only this
   one, and it is the only place a leaked slot is visible at all — a node holding a hundred stale flows
   publishes an occupancy that sums to the capacity perfectly well.
 - **The established flow survived it.** The conversation's reply is deferred past the burst — it may
@@ -310,8 +312,8 @@ refused as `TableFull` — and by the `flow_table` fuzz target. What the image p
 actually decides whether a default-deny appliance can be exhausted: that a refused opening costs no
 state at all, so the boundary is not approached in the first place.
 
-**Every outcome is a signal.** Each of the twelve refusals is its own drop reason on
-`/metrics` — refused before the filter, so a frame the tracker turned away never reaches a rule — and
+**Every outcome is a signal.** Each of the twelve refusals is its own drop reason in the metric
+reading — refused before the filter, so a frame the tracker turned away never reaches a rule — and
 its own series in the tracker's own account beside the classified outcomes, the flow lifecycle, and
 the occupancy of every slot by state. `vacant` is one of those states, so the values sum to the
 table's capacity and a flood is watched as `vacant` falling.
@@ -630,7 +632,7 @@ refused snapshot, bytes that are not IPv4 over Ethernet), a frame routed out of 
 not wired to, and
 a frame recorded as forwarded that a later refusal still lost. **The tap never backpressures
 forwarding**: a full ring costs the newest observation and is counted — on both sides of the ring
-and on `/metrics` — because a tap that could stall the dataplane would make an observability
+and in the metric reading — because a tap that could stall the dataplane would make an observability
 feature a remote outage. That loss is also the one thing a recording states about itself: the
 recorder differences the writer's drop count on every pass and carries the rise onto the next
 record it places, so `epb_dropcount` is fed rather than written as a zero.
@@ -720,7 +722,7 @@ which is the shape the segmented ring forces: a reader runs short at every 1 MiB
 so a supplier handing back fewer bytes advances the response from where the bytes ended instead of
 ending it. Two compile-time assertions tie the recorder's window and the endpoint's to each other.
 Serving a body larger than the response staging buffer is what the windowed body exists for — a
-scrape of `/metrics` fits in staging, a 12 KiB recording would too, and a 16 MiB one never will.
+configuration document fits in staging, a 12 KiB recording would too, and a 16 MiB one never will.
 
 **What a recording contains.** Each segment opens with a Section Header Block naming
 `librefirewall`, then one Interface Description Block per interface — Ethernet, microsecond
@@ -740,7 +742,7 @@ and enterprise number told apart by the first byte of its data — zero, or no d
 operator-facing statement of all of it.
 
 The console names both extents at bring-up. Nothing else states them: they are compiled in rather
-than configured, `/metrics` says how much a recording has written and never where it sits, and
+than configured, a metric reading says how much a recording has written and never where it sits, and
 there is no shell to ask — so these two records are what an operator has:
 
 ```
@@ -749,10 +751,10 @@ LFW-PD time=… domain=recorder state=ready start=2048 sectors=32768
 LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 ```
 
-**What the gate proves.** Every scenario whose management port is reachable — 20 of the 37 system
+**What the gate proves.** Every scenario whose management port is reachable — 18 of the 35 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic
-every other scenario drives, `curl`s `/metrics`, and reads **both recording extents straight off the
-disk image after shutdown**, holding the two recordings, the policy the image was built from and the
+every other scenario drives, and reads **both recording extents straight off the disk image after
+shutdown**, holding the two recordings, the policy the image was built from and the
 wire to **each other** (`datad/tools/xtask/src/surface_contract.rs`). The recordings are the
 medium's own bytes, bounded by each extent's superblock durable cursor, so what every other account
 is compared against is the one account nothing inside the guest composed for a reader: every record
@@ -795,7 +797,7 @@ case: the per-rule hit family cannot become a metric reading, its labels being t
 text rather than a closed catalogue.
 
 **What the gate no longer proves about a recording, and why nothing replaces it.** Two counter
-comparisons went with the exposition. A recording used to be held to
+comparisons went with the surface they were read off. A recording used to be held to
 `librefirewall_recording_records_total` for its sink and to
 `librefirewall_forwarded_frames_total`/`librefirewall_route_drops_total` for the decisions its records
 state — each an inequality in one direction, a recording being allowed to hold fewer than the
@@ -867,7 +869,7 @@ and wall-clock times. An independent parse of the two files established:
 - **Some frames are counted and deliberately not recorded**, because `wire::TapDropReason` mirrors
   `pipeline::DropReason` exactly and there is no honest encoding for them: a frame no verdict
   was reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
-  that a later refusal still lost. An operator reconciling a recording against `/metrics` subtracts
+  that a later refusal still lost. An operator reconciling a recording against its readings subtracts
   those; the [recordings reference](../reference/recordings.md) states the reconciliation.
 - **A recording states one of its three kinds of loss.** The
   [recording design](../design/recording.md) makes `epb_dropcount` and an Interface Statistics
@@ -876,7 +878,8 @@ and wall-clock times. An independent parse of the two files established:
   and holds the rise as a debt on both recordings until a record is placed to carry it — so the
   number belongs to the gap ahead of its block rather than to the packet in it, and it is cleared
   only by a successful placement. The other two are still out of band: a record the encoder refused
-  and a write the medium lost are counted on `/metrics` and stated nowhere in the file, and no ISB
+  and a write the medium lost are counted in the metric reading and stated nowhere in the packet
+  blocks, and no ISB
   is emitted at all. A file whose *sink* fell behind therefore still reads like one that lost
   nothing.
 - **The PEN is a placeholder, and whose it will be is undecided.** Annotations are tagged
@@ -1114,8 +1117,8 @@ document that shares no address and no MAC with the first.
 
 The **management** domain terminates the connection, refuses a `Content-Length` above the 64 KiB the
 reader enforces with `413` before a byte of the body is accumulated, and accumulates what it does
-accept into the endpoint's one staging array — the same array a `/metrics` exposition is composed in,
-which is why a submission in progress answers a concurrent scrape `503` and why a `POST` costs no
+accept into the endpoint's one staging array — the same array a `GET /config` answer is composed in,
+which is why a submission in progress answers a concurrent read `503` and why a `POST` costs no
 second buffer anywhere. It then copies the body into a shared region and hands it on. **It never
 parses it.** It holds two frame pipelines, so it is the domain an attacker reaches first and the last
 that should be reading an attacker's XML.
@@ -1123,8 +1126,8 @@ that should be reading an attacker's XML.
 **A body that never finishes has a deadline of its own, because that `503` is what one connection
 can do to every other.** A peer may declare a body and then trickle it, and the transport's idle
 timeout cannot end that: it is refreshed by each arriving byte, so one byte every few minutes keeps
-the connection alive indefinitely and the staging array with it — and `/metrics` and `/config`
-answer `503` for as long as it does. **It is reachable with no adversary at all**:
+the connection alive indefinitely and the staging array with it — and `/config`
+answers `503` for as long as it does. **It is reachable with no adversary at all**:
 an operator tool that dies mid-`POST` takes the management plane down, including the surfaces they
 would use to find out why. So an accumulation that has not completed within thirty seconds is
 answered `408`, the array is handed back before a byte of the answer is composed, and the connection
@@ -1154,7 +1157,7 @@ submission is never refused for nothing.
 
 **This is the one behaviour here that is tested and not observed on a running node, and that is a
 decision rather than an oversight.** Four host tests pin it exactly — a body given up on at its
-deadline and not before, the scrape that was refused being answered once it is, an arriving byte
+deadline and not before, the read that was refused being answered once it is, an arriving byte
 unable to move the deadline, and the ending being a reset and not a close — and the endpoint-level
 one drives a real transport and reads the `408` and the `RST` off the wire it composes. A QEMU
 scenario would add thirty seconds of wall clock to every run of the full gate to re-prove what those
@@ -1213,7 +1216,7 @@ sides of the statable bound), `datad/crates/http` (the body framing: one `Conten
 only, no `Transfer-Encoding`, refused past the caller's bound), `datad/crates/ip-endpoint` (a body split
 across segments, a peer that overruns its declared length, the method/target routing, a submission
 holding the staging array, and the five that hold the body deadline — expiry at the deadline and not
-before, the refused scrape answered once the array is back, a trickle unable to move the deadline, a
+before, the refused read answered once the array is back, a trickle unable to move the deadline, a
 reset rather than a close, and a stalled or reversed clock expiring nothing), `datad/crates/pd-runtime`
 (the channel driven from both ends, every answer shape, a commit that does not move the addressing
 keeping the connections open on the port, both channel deadlines with a late answer that must not be
@@ -1428,7 +1431,7 @@ ABI accepts can put a byte outside printable ASCII into a rendered console line,
 can carry one outside `[a-z0-9-]`, so a hostile peer cannot paint terminal escape sequences onto an
 operator's console.
 
-Every end-to-end scenario now boots the **release** image, and two of the 37 system scenarios
+Every end-to-end scenario now boots the **release** image, and two of the 35 system scenarios
 assert the `LFW-CFG` console contract on it, against a transcript derived from the document the
 image under test was built from; the same two hold the management port's `LFW-PD` count to the frames
 the harness injected, the clock domain's record to the bands its own crates admit, and the hardware
@@ -1469,11 +1472,11 @@ indifferent to whether anything is printed.
   transcript with holes in it, and a session's outcome can be one of them.
 - **The console cannot say any of that, and the metrics surface can.** Every refusal is counted
   where it happens and published as `librefirewall_log_records_dropped_total` per domain, so a
-  scrape says how much of the transcript is missing even though the transcript cannot. That is the
+  reading says how much of the transcript is missing even though the transcript cannot. That is the
   whole of the mitigation: nothing recovers a refused record, nothing marks the gap in the line
   itself, and the ordering that makes the loss detectable at all — the newest record refused rather
   than the oldest overwritten — is what keeps a boot transcript readable at the cost of losing the
-  present. Reading a console beside a scrape is the discipline this leaves an operator with.
+  present. Reading a console beside a reading is the discipline this leaves an operator with.
 - **One port, one baud, both compiled in.** `0x3F8` and a divisor of 1 (115200) are build-time
   constants matched to the `<ioport>` grant, because a runtime base is a value the capability could
   not follow. There is no second console, no second UART, and no way to move either without a
@@ -1505,7 +1508,7 @@ indifferent to whether anything is printed.
 - **The console cannot report its own failure to start *on the line*, and reports one bit of it
   elsewhere.** From entry into `init` until the register sequence returns, the reporting mechanism
   is what is being started, so nothing about the failure reaches the serial port. What it does reach
-  is the metrics shard: the domain publishes from its refusal path, so a scrape that answers with
+  is the metrics shard: the domain publishes from its refusal path, so a reading carrying
   `librefirewall_uart_init_failures_total` at 1 names a refused controller — where the counter was
   structurally always zero before. That is one bit against the six distinct errors the driver
   distinguishes, and it says nothing about a refused I/O-port *capability*, which is named only on
@@ -1513,8 +1516,8 @@ indifferent to whether anything is printed.
   channel independent of the console.
 - **Every counter here is now published rather than only tallied.** The UART's bytes written, THRE
   timeouts and init failures; the renderer's printed, malformed, unknown, unrenderable and
-  write-failed; each writer's dropped and refused. All of them are now published and scrapable (see
-  *[Prometheus metrics](#prometheus-metrics)*), so a console that is silently dropping records says
+  write-failed; each writer's dropped and refused. All of them are now published and travel in a
+  reading (see *[Metrics](#metrics)*), so a console that is silently dropping records says
   so on the other surface — which is the whole of what closes this, since the console cannot report
   its own silence.
 - **A record that will not render is now dropped, not reported.** It is counted as `unrenderable`
@@ -1600,8 +1603,8 @@ That domain answers three protocols and counts everything: an **ARP request** fo
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
 identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
 is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), over which an
-HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)), `GET /config` and
-`POST /config` ([detail](#configuration-management)). Everything else is refused
+HTTP/1.1 server answers `GET /config` and `POST /config`
+([detail](#configuration-management)). Everything else is refused
 by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it
 does not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
@@ -1663,7 +1666,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
   checksum, likewise decoded rather than matched as bytes;
 - a **whole TCP exchange**, every step asserted as a field comparison: `SYN` → a `SYN-ACK` whose
   flags and acknowledgement number are checked and whose sequence number is *kept*, → `ACK` carrying
-  a `GET /metrics` → the **response as a stream**, fifty-odd segments acknowledged one at a time and
+  a `GET /config` → the **response as a stream**, several segments acknowledged one at a time and
   reassembled in order, its `Content-Length` held to the bytes that arrived → the appliance's `FIN`,
   `Connection: close` obliging it to close first → the client's `FIN` → the final `ACK`. Every
   segment's pseudo-header checksum is verified by the harness's own summation, and a segment arriving
@@ -1682,7 +1685,7 @@ a TCP connection with a minimal deterministic client of its own, and then requir
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
-Six of the 37 system scenarios additionally hold the console's own record to the frames and the bytes
+Six of the 35 system scenarios additionally hold the console's own record to the frames and the bytes
 injected — every one of them, the TCP client's segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of them boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
@@ -1693,10 +1696,9 @@ a domain that faulted or lost its place under that could not report them all.
 
 **Missing.**
 
-- **No TLS, and that gap carries a write.** HTTP answers `GET /metrics`
-  ([detail](#prometheus-metrics)), `GET /config` and `POST /config`
+- **No TLS, and that gap carries a write.** HTTP answers `GET /config` and `POST /config`
   ([detail](#configuration-management)) — all in the clear, with no authentication and no
-  authorization split, so **anything that can reach the port can scrape it, read its policy, and
+  authorization split, so **anything that can reach the port can read its policy and
   replace that policy** — which is the authority to decide what this firewall forwards. The
   recordings are no longer among them: the two downloads are gone and a recording now reaches a
   management server over the authenticated channel alone. The
@@ -1762,8 +1764,8 @@ a domain that faulted or lost its place under that could not report them all.
   gateway even now that a document can state one. An off-link station is refused and counted.
 - **The counters now reach a surface.** The console still carries only the port's cumulative
   `frames=`/`bytes=` pair, but every outcome the endpoint distinguishes — and every reply it could
-  not send — is published as the `librefirewall_endpoint_*` families and scrapable; see
-  [Prometheus metrics](../reference/metrics.md).
+  not send — is published as the `librefirewall_endpoint_*` families and travels in a reading; see
+  [Metrics](../reference/metrics.md).
 - **A change to the `management` object is audited like any other**, but only because the change
   records are keyed by a synthetic identifier: the element has no `id` of its own, so every record
   about it reads `object=management key=management`.
@@ -2019,49 +2021,40 @@ established one.
   `TIME_WAIT` on an otherwise silent port is reaped on the next frame rather than at its deadline.
   Bounded rather than unbounded — the table is also reaped under pressure — but not prompt.
 - **The counters now reach a surface.** All twenty-seven are published as
-  `librefirewall_tcp_*` and scrapable, and so are the neighbour cache's eight and the outbound
-  half's nine, as `librefirewall_endpoint_neighbour_*` and `librefirewall_endpoint_outbound_*`; see *[Prometheus metrics](#prometheus-metrics)* and the
+  `librefirewall_tcp_*` and travel in a reading, and so are the neighbour cache's eight and the
+  outbound half's nine, as `librefirewall_endpoint_neighbour_*` and
+  `librefirewall_endpoint_outbound_*`; see *[Metrics](#metrics)* and the
   [metrics reference](../reference/metrics.md).
 
-## Prometheus metrics
+## Metrics
 
-**What exists.** `GET /metrics` on the management port answers a real Prometheus exposition — 128
-metric families and 471 counter and gauge series, plus one info series per configured interface and
-one hit counter per rule the running policy declares — covering every one of the twelve protection
-domains. Its worst case is computed from the catalogue at build time (`MAX_EXPOSITION_LEN`,
-102 941 bytes), which is what the response staging buffer behind the endpoint is sized from, so a
-scrape can never be short. That bound is dominated by the rules: it covers a policy naming all 256
-the configuration accepts, so it is sized by what an operator is entitled to write rather than by
-what a node happens to be running. The end-to-end gate scrapes it with `curl` off a booted release
-image and cross-checks two numbers in it against traffic the harness watched cross the wire
-itself — the frames the appliance forwarded, and the hits against the rule that permitted them.
+**What exists.** A **metric reading** — every named series of the twelve shards, laid end to end in
+catalogue order and framed into the connection history as a PEN-tagged Custom Block — is how a
+counter leaves this node. It covers 128 metric families and 471 counter and gauge series across
+every one of the twelve protection domains, and it travels up the authenticated channel inside the
+recording that carries it. The end-to-end gate reads it off the medium's own bytes after the guest
+has stopped and cross-checks it against traffic the harness watched cross the wire itself, against
+the geometry of a disk the harness sized, and against the ownership word the harness wrote.
 
-**A per-NIC series is joinable to the interface a configuration document names.** Every counter
-family carries `domain`, the protection domain that produced it, and `domain="nic_driver0"` is a name
-out of the Microkit system description that says nothing about what an operator configured. Closing
-that took the conventional Prometheus info metric rather than more labels on the counters:
-`librefirewall_interface_info` is a gauge whose value is always `1`, one series per configured
-interface, carrying the document's own `id`, the port's `role`, its address, prefix length and MAC —
-and carrying `domain` as the join key, so a query multiplies the two together
-(`* on(domain) group_left(interface, role, address)`). Counter cardinality is unchanged and a
-re-addressed interface does not fork every counter series it has. There is deliberately no `enabled`
-label: a dataplane interface has a series whether or not it is enabled — its addressing is in the
-image either way, because the router needs the row to refuse traffic on it — while a disabled
-`<management>` element is indistinguishable from an absent one, so a truthful `enabled` would have to
-be ragged across the two roles and nothing consumes it. The
-[metrics reference](../reference/metrics.md) states the family, the worked join, the bound on its
-cardinality and that asymmetry; the interface identity crosses to the management domain in the
-configuration image it already reads, and the port-to-driver mapping the join key rests on is a fact
-of the system description that `xtask::sysdesc` now checks at build time rather than a comment
-delegating it to a caller.
+**`GET /metrics` and the Prometheus exposition behind it are gone**, and with them the response
+staging buffer's dependence on a metric bound, the `RenderError`/`MAX_EXPOSITION_LEN` half of
+`datad/crates/metrics`, and the `metrics_render` fuzz target. What went with them is stated rather
+than glossed: the HTTP head contract for that target, the assertion that two concurrent scrapes
+never contended for the staging buffer, and the ordering proof that a request was counted before the
+body it asked for was rendered. The first two are covered by `datad/crates/ip-endpoint`'s own unit
+tests against the surface that remains; the third has no replacement.
 
-**A per-rule series is joinable the same way, and by the same argument.** The per-rule hit counters
-sit in the forwarding domain's own shard, indexed by a rule's position in the running generation, and
-the `rule` label is the id out of the configuration image the management domain maps read-only —
-joined on the position. So a hit is a number only the forwarder could have written under a name only
-an operator could have chosen, which is the `domain` label's argument one level finer. A position no
-generation declared reaches no series at all: a counter under nobody's name is not something to
-expose.
+**Two families are now declared and carried by nothing**, which is the honest cost of removing that
+surface. `librefirewall_interface_info` — the info gauge whose labels joined a counter series to the
+interface a configuration document named — has no counter anywhere and was composed only by the
+renderer. `librefirewall_rule_hits_total` still has a live writer: the forwarding domain writes one
+slot per rule, at the rule's position in the running generation, into the per-rule block of its
+shard. That block sits past the domain's named table, so no reading carries it. Both stay in the
+catalogue because both describe a number the node holds; giving either a transport is a design
+change rather than a table edit, and the [metrics reference](../reference/metrics.md) says so where
+an operator meets them. The port-to-driver mapping the `domain` label rests on is still a fact of
+the system description that `xtask::sysdesc` checks at build time rather than a comment delegating
+it to a caller.
 
 The decision that shapes it is **one shared-memory counter shard per protection domain**, not one
 shared table. A shard is a 3,200-byte, cache-line aligned array of 400 `AtomicU64` slots, mapped
@@ -2072,32 +2065,21 @@ is what the width is derived from, and it costs nothing: a shard is its own regi
 page, so the reservation was already a page before the block existed. A second region carrying the
 rule counters alone would have bought back no memory and added a mapping to the domain that faces the
 management-plane attacker. So a domain publishes by relaxed store into memory
-nobody else may write, and the management domain renders by reading the twelve shard regions — no
-lock, no barrier, no seqlock, and nothing a dataplane domain does on a scrape. Counters are
-individually meaningful, so a scrape that straddles two domains' publications is still exactly what each of them
-last wrote; that is stated as a freshness boundary in the
+nobody else may write, and the management domain composes a reading by walking the twelve shard
+regions — no lock, no barrier, no seqlock, and nothing a dataplane domain does for it. Counters are
+individually meaningful, so a reading that straddles two domains' publications is still exactly what
+each of them last wrote; that is stated as a freshness boundary in the
 [metrics reference](../reference/metrics.md) rather than papered over.
 
-The exposition is rendered by `datad/crates/metrics` (`no_std`, panic-free, with a computed
-`MAX_EXPOSITION_LEN` so the buffer can never be short) and the requests are parsed by `datad/crates/http`
-(`no_std`, a bounded server-side HTTP/1.1 head parser whose typed error maps onto one of five of the
-twelve statuses that crate names). Both are fuzzed. The management domain's own shard is stored
-before the exposition is composed rather than after, which is why a scrape is never one request behind its own surface —
-stated as a freshness property in the [metrics reference](../reference/metrics.md).
+A reading is composed and encoded by `datad/crates/metrics` (`no_std`, panic-free), whose decode side
+is fuzzed against arbitrary bytes out of a recording. The management domain stores its own shard on
+the way through every pass, so a reading carries that domain's work up to the end of the previous
+one — stated as a freshness property in the [metrics reference](../reference/metrics.md).
 
 **Missing.**
 
-- **No TLS — the endpoint is plain HTTP with no client authentication, and no bound on how often it
-  may be asked.** Anyone who can reach the port can scrape it as fast as they like, and the
-  exposition names every domain, drop reason and fault class in the node. The
-  [management design](../design/management.md) removes this endpoint outright — metrics become
-  snapshots in the ring, shipped over the authenticated channel — and until then the gap is
-  recorded here and in `lfw_ip_endpoint`'s crate header, and it gates any deployment on a network
-  the management port is not already isolated on.
-- **One response is staged at a time.** A scrape arriving while another is still going out is
-  answered `503` and counted. A finished-but-not-yet-reaped connection's buffer is reclaimed rather
-  than waited out, so a periodic scraper is never refused for the previous scrape — but two
-  *concurrent* scrapers can refuse each other.
+- **Two declared families reach nobody**, as above: the interface info gauge has no writer at all,
+  and the per-rule hit block has one whose slots no reading carries.
 - **Coverage is what exists to be counted.** Per-core counters await the multicore dataplane, and
   log-buffer occupancy awaits the buffer. The connection table now publishes its own — its
   occupancy by state, its lifecycle and every refusal. Occupancy is the
@@ -2126,7 +2108,7 @@ before anything is decoded, and every field ranged.
 capability answers before relying on it, calibrates over a one-millisecond window, reads the part
 once, and emits a single `LFW-PD domain=clock state=ready tsc-hz=… utc=…` record. Every stage that
 can refuse does so with a typed error carrying what the device answered; the domain turns each into
-one of 30 console cause tokens. Two of the 37 system scenarios assert that record
+one of 30 console cause tokens. Two of the 35 system scenarios assert that record
 on the release image — that it is `ready`, that its frequency is inside the band the calibration
 accepts, and that its year is inside the band the RTC reader accepts. The counter reading and the
 wall-clock instant are anchored to one moment, the counter being re-read after the RTC, so the
@@ -2175,8 +2157,8 @@ frames to 138, and every one of the 138 is the traffic that boot was always abou
 boots went the same way, and the run that made the case did it by failing: an injected frame draws a
 console record out of the endpoint, a log ring that fills faster than a 115200-baud console drains
 it drops records, and the second of the two records a session's account is written as went missing.
-The crutch had become the defect. And every scraped
-boot holds the counter to the period: it must have moved between the two scrapes, and where they are
+The crutch had become the defect. And every boot whose readings are judged
+holds the counter to the period: it must have moved between two readings, and where they are
 more than two seconds apart the count is held to a band around what the interval names — which is
 what catches an interrupt input shared with another device, the fault that chose input 23.
 
@@ -2198,7 +2180,7 @@ what catches an interrupt input shared with another device, the fault that chose
   about how well the epoch was set. A record's instant is therefore good enough to line a node up
   against an external log to about a second, and is evidence of nothing.
 - **No metric says which domain has taken the calibration up.** It is readable per record on the log
-  stream (`time=unsynchronized` against an instant) and `/metrics` carries the gauge for the
+  stream (`time=unsynchronized` against an instant) and a metric reading carries the gauge for the
   management domain alone; the other ten writing domains publish no such series (see the
   [metrics reference](../reference/metrics.md)).
 - **No discipline and no monotonic guarantee across domains.** The part is read exactly once and
@@ -2596,7 +2578,7 @@ the only way to it.
 
 **No key material reaches any surface.** The scalar is drawn, folded into a certificate and written to
 the medium, and that is the whole of where it goes. The console records carry a public name, a
-public-key digest, and — after a reset — a generation, a count and a flag; `/metrics` says whether
+public-key digest, and — after a reset — a generation, a count and a flag; a metric reading says whether
 there *is* an identity, whether this boot had to mint one, whether a reset was asked for and how far
 the record has advanced, and never which identity it is; the committed fuzz corpus for the state
 record carries only fixed byte patterns, two of which are deliberately not private keys at all.
@@ -2709,7 +2691,7 @@ management contracts either: those are statements about the image, the accelerat
 them, and a second reading of the same fact is not worth a boot. The narrowness pays for itself twice:
 measured on this bench the boot costs about **five seconds**, no more than an accelerated scenario
 does, because it ends the moment the domain reports rather than waiting out the settle window, the
-management burst, two scrapes and two downloads — so emulating every instruction in it costs the gate
+management burst and the clients a reachable port carries — so emulating every instruction in it costs the gate
 almost nothing. On a machine with no usable KVM every boot is emulated already, and the run says so
 rather than claiming a contrast it did not draw.
 
@@ -2901,7 +2883,7 @@ holding mid-session, bytes a peer sent past the window it was given, and bytes t
 domain's answer had no room for. Those are the facts the session's account can state a fault about
 and not place — a session that ended forgotten beside a non-zero overflow is a peer that overran the
 window, and one accepted connection more than there are session records is a connection that never
-became a session. The same four, and the four beside them, are `/metrics` families too, and that is
+became a session. The same four, and the four beside them, are metric families too, and that is
 not redundancy: a console record exists only once a session has *ended*, so a peer that connects,
 floods the port and disappears leaves no record at all and moves three counters.
 
@@ -3503,7 +3485,7 @@ as well, so ownership cannot become a table composed by the parser that reads an
 document, and from the management domain, which can already ask the store domain for the identity.
 
 The system gate is arranged around it, at the cost of no extra boot. The scenario that onboards
-an appliance now runs **first**, and **24 scenarios boot a copy of an owned medium** — which is what
+an appliance now runs **first**, and **22 scenarios boot a copy of an owned medium** — which is what
 a deployed appliance is: onboarded once, long ago, running ever since.
 They cannot onboard during their own boot instead, because an accepted package shuts the onboarding
 surface for good and so an install has to be the last thing a boot does. The scenarios that stay
@@ -3511,8 +3493,8 @@ unowned are the ones whose subject that is: the six that exercise the onboarding
 that mint, reload and reset an identity, and the node that refused its own document. Every boot,
 owned or not, is held to the word its medium carried against the word the forwarding domain printed —
 so a scenario cannot come to prove a forwarding contract against an appliance that was refusing
-everything, and the unowned boots show the refusal on the console and, where they scrape, in the
-exposition.
+everything, and the unowned boots show the refusal on the console and, where their readings are
+judged, in those.
 
 The A/B run pays one boot for the same premise, and it is worth the price there. Its subject is that
 slot selection produces a *working* appliance, which for a firewall means one that carries traffic,
@@ -3541,8 +3523,8 @@ that overruns it**: the overflow and answer-refusal counts stay zero on all thre
 station that keeps to the window it is given cannot move them and one that does not is a peer this
 harness has no way to play through a lossless host socket. Nor does any scenario yet *assert* the
 crowding refusal as a counter, though the counter now exists: the boot that crowds the port needs a
-station of the harness's own on the management wire, and a scrape needs QEMU's user-mode stack on
-that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
+station of the harness's own on the management wire, and a real client needs QEMU's user-mode stack
+on that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
 states, and the counter is read by hand. On the channel the appliance dials, **what runs above the
 framing is the greeting and nothing else**: no session composes a recording range, stages a
 configuration document, or moves an acknowledgement cursor, so a booted node exercises the record
@@ -3907,18 +3889,18 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 31 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (37 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 20 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-shipment)). One pair shares the **recorder's** medium across boots — the only place the gate can say a recording
+| QEMU end-to-end gate (35 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 18 scenarios that reach the management port carry a real client or a real peer on it, and read both recording extents off the medium besides ([detail](#recording-and-shipment)). One pair shares the **recorder's** medium across boots — the only place the gate can say a recording
 outlives the node that wrote it, a recorder that started a fresh ring on every boot satisfying every
 assertion a single boot makes — and the second of the pair is held three ways: the console record
 naming the generation, segment and offset the medium held, a superblock that came out at a higher
 generation and a later write position than it went in at, and the previous boot's durable bytes still
 byte for byte where it left them. The extent is then walked block by block off the image from payload
 byte zero on every boot, carried or not, so each join two boots left in it is crossed rather than
-stepped over; and the recordings a resumed boot serves over HTTP are held to the exposition over the
-*difference* — what the download answers less what the medium already held — because the file
+stepped over; and the readings a resumed boot's recordings carry are held over the *difference* —
+what the extent holds less what the medium already held — because the file
 outlives the node and the counters beside it do not. Seven scenarios share a store medium across boots, in three groups: in the first, the second boot is held to the identity the first minted on it, which is the only shape a persistence claim has, and the third has a factory-reset request written onto that medium between the boots and must come back a different, unowned appliance with the previous scalar occurring nowhere on the medium; in the second, the appliance is given an owner and the boot after it must come back owned; in the third, a management server pushes a configuration and commits it, and the boot after it must come back running that version off the medium. Seven boots put a station on the management wire whose subject is one of the two connections that cross it: four for the channel the appliance dials out, one per way a management server or the link to it can misbehave, and three for the onboarding port it listens on, one per way a session there can end. An eighth reaches that same onboarding port with real clients instead of a station — `openssl s_client` and a bare TCP connection, four of them over one boot — and holds each handshake to the outcome token it owes, **one session at a time**: the next client is not opened until the appliance has accounted for the session before it, because every frame that port takes draws a console record and a domain's log ring holds a bounded number of them, so four sessions opened back to back would crowd out the very accounts the boot is judged on. A ninth reaches the **surface above** those handshakes with `curl`, five requests over one boot, every one of them pinned to the SPKI fingerprint the store domain printed on that same boot: the page must carry that fingerprint and the appliance's identifier, the certificate signing request must read back through `openssl req` as a PKCS#10 whose subject common name is that identifier with its own signature verified, and three requests must be refused under three different tokens. And a tenth and an eleventh are the harness playing the **management server**: it reads the request the appliance serves, verifies its subject against the identifier the console printed, issues a device certificate against a certification authority generated for this checkout alone, composes a package to the [package contract](../contracts/configuration-package.md), and uploads it — holding the appliance to the anchor fingerprint this harness computed before the appliance printed it, to the endpoint the package named, and to a generation the install advanced. Two packages are refused by name first, each under a token of its own: one well formed and certified to another appliance's key, one whose archive is not ustar. The eleventh carries that medium into a second boot and finds every address on the surface gone, the package that was accepted included — and, nothing being pointed at the endpoint that boot dials, holds it to reporting the transport's own refusal and opening no session at all. Beyond them, **6 scenarios judge the channel the appliance dials**, each against a real `openssl s_server` reached through QEMU's user-mode stack or against a deliberate silence: one establishes a mutually-authenticated TLS 1.3 session pinned to the delivered anchor and exchanges greetings, and is judged from both ends — the appliance's own records for what it made of the server, and the server's own record of the certificate it validated, whose subject must be the identifier the store domain printed and whose chain must be the one this run issued. That boot attaches a recorder medium **two earlier boots wrote**, because a fresh one never reaches the state a deployed appliance is in: a resumed recording carries a previous boot's segments, its writer picks up inside the segment the medium named, and its opening section header sits mid-segment. The channel's cursor begins where the server's greeting names — zero, for this harness's server — and what this boot holds is that none of that costs the session anything: a recording a previous boot wrote is still readable from position zero, so the appliance ships the medium whole rather than resynchronising past what the last boot left. It must drain both rings, and then — on a burst injected on the strength of the console saying it had drained them, so that what follows did not exist when it said so — ship past that drain, with the server receiving more than one upstream frame at strictly advancing positions and the first from where that recording begins on the medium. Three more are the three distinct ways it does not come up, each under a token of its own: nothing listening, a server the delivered anchor refuses, and a server that refuses this appliance — the last of which the appliance must report as the alert it was given *and* as no session coming up, the server judging the device certificate inside the handshake and never writing a byte under the traffic keys. The last two are the pair that proves a committed configuration is **durable**: the first pushes a second document over an established session and commits it, and the appliance must write it into a slot of its own medium behind a flush and report the generation and the slot it took; the second boots that very medium — the shared file and not a copy, which is the whole mechanism — and must come back running that same generation out of that same slot, read off the disk at start-up and held to the digest its own record names the slot by. Each of those boots **ends on the record it owes** rather than beside it: the domain that terminates a session writes its outcome on the pass that decided the session, which is later than the traffic, the scrape and the recordings the same boot also waits for, so a run that stopped on those alone would kill the guest with the channel's own record still unwritten and read an appliance that was about to speak as one that never did. The wait asks only whether the record has appeared, never how often the appliance re-dialled — that is the appliance's own decision — and it is bounded by the same total budget every boot takes, so an appliance that genuinely never reports fails on that budget rather than hanging the gate. The A/B run boots the onboarding scenario itself before its own eight, so the six of those that boot a slot each attach a copy of the owned medium it leaves and are held to a datagram crossing between the two NIC ports rather than to the stack merely having started — a firewall that came up carrying nothing is not a working firewall, and it is the selection machinery under test that could produce one. Single vCPU, two dataplane ports and one management port; the multi-node virtual-network E2E is open |
 | Criterion benchmarks | **partial** | `queue`, `packet-buffer`, `virtio` and `pd-runtime` (the per-packet routing cost: snapshot, parse, decide, rewrite, write back — measured with the recording tap switched *off*, so the tap's own per-frame cost is unmeasured); `nic-driver-core`'s poll pass, the block request path and the recording path are all hot or newly hot with no benchmark, and nothing gates a regression |
-| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock, the recording pass, and the management channel's stepped configuration transaction — whose input is the *order* of the operations a compromised server chooses rather than a document, that order being where the interesting sequences are. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 33 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
+| Fuzzing | **partial** | a persistent target for every crate that parses a *structure* it did not write — a descriptor, a ring, a document, a header, a record — including the block request path, the ring superblock, the recording pass, and the management channel's stepped configuration transaction — whose input is the *order* of the operations a compromised server chooses rather than a document, that order being where the interesting sequences are. `datad/fuzz/Cargo.toml` declares each target, and that declaration is what the 32 persistent fuzz targets the gate runs are held to: the run list in `datad/tools/xtask/src/host.rs` and the harness list the seed corpora replay through must each name exactly the declared set, both directions, or the fast gate fails. That comparison is what a hand-kept list wanted — one target had been declared and built under the sanitizer on every run without ever being executed, counted as covering a surface it had never touched. The register-protocol device crates (`uart-16550`, `hpet`, `rtc`) carry no target and do not need one: a single read admits one integer, which their property tests already sweep over the whole of its type. A sandbox that cannot start AddressSanitizer degrades the gate to build-plus-seed-corpus — see below |
 | SBOM (SPDX 2.3), release manifest, checksums | **partial** | none of them are signed; no SLSA/in-toto attestation; and the SBOM's scope is narrower than the payload — see below |
 | Reproducibility check | **partial** | `make verify-reproducible` covers kernel + system image, built in the release configuration so the claim is about the artifact that ships; part of no gate |
 | Dependency and license policy (`cargo-deny`) | **done** | `bans licenses sources` in the offline gate; `advisories` needs the RustSec database and so is a deliberate manual networked run (`cargo deny check advisories`) that nothing runs automatically — not in `make test` or `make ci` |

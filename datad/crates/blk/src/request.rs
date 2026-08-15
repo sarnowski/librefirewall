@@ -244,7 +244,7 @@ pub struct Token {
 ///
 /// Every count is monotonic for the driver's life and saturates at [`u64::MAX`]
 /// rather than wrapping, on the same terms as [`DeviceFaults`]: a metrics
-/// endpoint differences successive scrapes, so a reset would
+/// consumer differences successive readings, so a reset would
 /// forge a negative rate and a wrap would turn a sustained flood into a small
 /// number.
 ///

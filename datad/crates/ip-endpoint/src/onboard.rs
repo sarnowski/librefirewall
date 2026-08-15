@@ -55,9 +55,9 @@ use net_headers::{Ipv4Address, MacAddress};
 /// that port answers a plain-HTTP surface with no authentication on it at all,
 /// and this one is where a session an administrator authenticates will be
 /// terminated. Two ports rather than one path on the first, because they are
-/// two different transports serving two different things — and because a
-/// scraper pointed at the first must not reach this one by asking for a target
-/// nobody registered.
+/// two different transports serving two different things — and because a client
+/// pointed at the first must not reach this one by asking for a target nobody
+/// registered.
 pub const ONBOARDING_PORT: u16 = 4443;
 
 /// Connections the onboarding transport holds at once. See the module header on

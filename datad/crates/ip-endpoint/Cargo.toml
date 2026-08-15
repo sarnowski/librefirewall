@@ -11,14 +11,9 @@ net-headers = { path = "../net-headers" }
 lfw-tcp = { path = "../tcp" }
 lfw-clock = { path = "../clock" }
 # The request head parser and the response head builder the management server is
-# written against. It owns no buffer and knows nothing about `/metrics`; what a
-# target means is decided here.
+# written against. It owns no buffer and knows no target; what a target means is
+# decided here.
 lfw-http = { path = "../http" }
-# `MAX_EXPOSITION_LEN` alone, which is what sizes the response staging buffer.
-# Deriving that bound rather than choosing a number is what stops a metric added
-# later truncating an operator's scrape; nothing else of the crate is used, and
-# the exposition itself arrives through the `http::Exposition` trait.
-lfw-metrics = { path = "../metrics" }
 
 [dev-dependencies]
 proptest = { workspace = true }

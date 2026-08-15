@@ -365,10 +365,9 @@ impl Topology {
     /// What the document says each dataplane port *is*, port by port: its id, its
     /// address, its prefix length and its MAC.
     ///
-    /// This exists for one caller — [`crate::metrics_contract`], which holds the
-    /// appliance's interface info series to it field by field. That comparison is
-    /// only worth making against the document, so it is read out of the document
-    /// here rather than restated beside the assertion.
+    /// Read out of the document rather than restated beside the assertions that
+    /// use it: every comparison against a port's identity is only worth making
+    /// against the document the image was built from.
     pub(crate) fn interfaces(&self) -> [ConfiguredInterface; PORTS] {
         self.ports.map(|appliance| ConfiguredInterface {
             id: appliance.id,

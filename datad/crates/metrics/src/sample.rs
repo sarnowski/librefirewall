@@ -53,7 +53,6 @@ use crate::catalog::{
     TCP_RETRANSMITS, TCP_SEGMENTS, TCP_URGENT_IGNORED, TCP_WRITE_REFUSED, TRANSMIT_BYTES,
     TRANSMIT_FRAMES, UART_BYTES_WRITTEN, UART_INIT_FAILURES, UART_TRANSMITTER_TIMEOUTS, plain, s,
 };
-use crate::rules::MAX_RULE_SERIES;
 
 /// Dataplane pipelines the forwarder carries, one per direction. A build fact
 /// matching `config::PORT_COUNT`, held to it by a test in `pd_runtime`.
@@ -284,6 +283,9 @@ pub const FORWARDER_SLOTS: usize = PIPELINES
 /// forwarding domain writes here by position and the renderer reads here by
 /// position, so a slot moved on one side and not the other does not compile.
 pub const RULE_HITS_BASE: usize = FORWARDER_SLOTS;
+
+/// Slots the forwarder's shard reserves for per-rule hit counts: the ABI's bound.
+pub const MAX_RULE_SERIES: usize = wire::MAX_RULES;
 
 /// Every slot the forwarding domain writes, table and per-rule block together.
 ///
@@ -1164,7 +1166,7 @@ pub struct OutboundSample {
 ///
 /// Named fields rather than the arrays [`OutboundSample`] uses for its label
 /// pairs: three of these eight are their own family, so an array would be a
-/// grouping the exposition does not have.
+/// grouping the catalogue does not have.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OnboardSample {
     pub accepted: u64,
@@ -1321,7 +1323,7 @@ impl ManagementSample {
         plain(&OUTBOUND_OVERFLOWED),
         plain(&OUTBOUND_ANSWERS_REFUSED),
         // And the byte stream the second listening port carries, whose counts a
-        // scrape reads whether or not a session ever finished: a peer that
+        // reading carries whether or not a session ever finished: a peer that
         // floods the port and vanishes leaves no session record at all, and
         // these are where it shows.
         s(&ONBOARD_CONNECTIONS, &[Label::new("event", "accepted")]),

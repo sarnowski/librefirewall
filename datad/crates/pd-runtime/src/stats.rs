@@ -130,7 +130,7 @@ pub fn policy_sample(counters: &PolicyCounters) -> PolicySample {
 /// What the connection tracker has done, as the forwarder's shard lays it out.
 ///
 /// The two arguments are read from the one table at the same moment, so the
-/// occupancy a scrape reports is the occupancy the counters beside it left
+/// occupancy a reading reports is the occupancy the counters beside it left
 /// behind. Every array is filled by iterating the owning enum's `ALL` rather
 /// than by a written-out list, which is what keeps the slot order and the label
 /// order one order: a state or a refusal added upstream lands in its own slot or
@@ -237,8 +237,7 @@ pub fn forwarder_sample(counters: &ForwarderCounters<'_>) -> ForwarderSample {
 /// A function because the management port carries two stacks — the HTTP
 /// server's and the onboarding port's — and they are the same numbers about
 /// two different tables. Written twice, the two could drift into disagreeing
-/// about which counter is which, and the exposition keys its series by
-/// position.
+/// about which counter is which, and a reading keys its slots by position.
 fn tcp_sample(counters: TcpCounters) -> TcpSample {
     TcpSample {
         segments_received: counters.segments_received,
@@ -461,7 +460,7 @@ pub struct BlockCounters {
 
 impl BlockCounters {
     /// Record one successful completion, saturating for the reason every counter
-    /// here does: a wrap forges a negative rate between two scrapes.
+    /// here does: a wrap forges a negative rate between two readings.
     pub fn completed(&mut self, operation: Operation, bytes: u32) {
         let (count, total) = match operation {
             Operation::Read => (&mut self.reads, &mut self.read_bytes),
@@ -582,7 +581,7 @@ pub fn store_sample(
 ///
 /// Established at start-up and, on two of the five, moved afterwards: taking
 /// ownership out of an onboarding package advances the generation and turns
-/// `onboarded` on, so a scrape reads what the medium now holds rather than what
+/// `onboarded` on, so a reading carries what the medium now holds rather than what
 /// the boot found.
 ///
 /// A struct rather than four arguments because they are one answer: an
@@ -600,7 +599,7 @@ pub struct StoreIdentity {
     pub onboarded: bool,
     /// Whether this boot honoured a factory-reset request. Beside `minted` and
     /// not folded into it: both a first boot and a reset mint, and only this says
-    /// which of the two a scrape is looking at.
+    /// which of the two a reading is looking at.
     pub reset: bool,
 }
 

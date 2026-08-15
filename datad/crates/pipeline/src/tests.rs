@@ -1482,7 +1482,7 @@ fn a_hit_is_counted_against_the_position_of_the_rule_that_matched() {
 }
 
 /// Every counter saturates, on `DropCounters`' terms: a wrap forges a negative
-/// rate between two scrapes.
+/// rate between two readings.
 #[test]
 fn a_policy_counter_saturates_rather_than_wrapping() {
     let mut counters = PolicyCounters::new();

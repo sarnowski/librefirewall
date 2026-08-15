@@ -283,22 +283,22 @@ The decisions that constrain all observability code:
 - **Logs** are structured typed events with one transport — today the OpenTelemetry log stream, and
   under the [management-plane redesign](../design/management.md) the channel — never syslog, and
   never two transports at once.
-- **Metrics** are exposed in Prometheus format today, and become channel-carried snapshots under
-  the redesign; under either transport the cardinality is bounded (no per-flow, per-connection or
-  per-packet labels) and the dataplane cost is unmeasurable.
+- **Metrics** travel as channel-carried readings framed into a recording, and under no transport is
+  the cardinality unbounded (no per-flow, per-connection or per-packet labels); the dataplane cost is
+  unmeasurable.
 - **No distributed tracing** — deliberately out of scope.
 - **No surface carries packet payloads, secrets, keys, or personal data** — with one named
   exception: the [two recording sinks](../design/recording.md), which exist to carry the traffic
   itself. The exception is scoped and bounded: it reaches exactly those two artifacts (the console,
-  the metrics exposition, the log stream and the local log buffer carry no payload and no secret,
-  absolutely); a recording is authorized, never merely scraped; an inspected flow is recorded as
+  the metric readings, the log stream and the local log buffer carry no payload and no secret,
+  absolutely); a recording is authorized, never merely fetched; an inspected flow is recorded as
   ciphertext plus its keys, never as decrypted plaintext at rest; and neither sink is a licence for
   a third — widening the exception is a design change, not a commit.
 - **The debug surface is closed and enumerated, and adding to it is a design change, not a
-  commit.** Today the enumeration is six surfaces: the console, the OpenTelemetry log stream,
-  `GET /metrics`, `GET /logs`, `GET /config`, and the two recordings — which are no longer an HTTP
-  download but are reached over the management channel, shipped upstream or asked for by extent.
-  That enumeration stays true until the
+  commit.** Today the enumeration is five surfaces: the console, the OpenTelemetry log stream,
+  `GET /logs`, `GET /config`, and the two recordings — which are no longer an HTTP download but are
+  reached over the management channel, shipped upstream or asked for by extent, and which carry the
+  metric readings inside them. That enumeration stays true until the
   [management-plane redesign](../design/management.md) replaces the remaining HTTP members with the
   channel, retargeting the list to **console, channel, and recordings**; the list changes in the
   phase that changes the surface, never before. What never changes is the invariant: a new introspection
@@ -307,13 +307,13 @@ The decisions that constrain all observability code:
 
 ## Verifying on a running appliance
 
-A booted node has no shell, no CLI and no debugger. It answers only through the six surfaces above,
+A booted node has no shell, no CLI and no debugger. It answers only through the five surfaces above,
 and four of them are the instrument you reach for while developing — reason about a running system
 through them rather than about it from the source:
 
 | Surface | Answers | Reach it with |
 |---|---|---|
-| `GET /metrics` | **that** something is wrong, and where — which counter moved, in which domain | `curl` through the port forward |
+| the metric readings | **that** something is wrong, and where — which counter moved, in which domain | read them out of the log recording on the run's data disk |
 | the capture | **which packet** — the frames themselves, with the firewall's verdict on each | read the extent off the run's data disk, then `tcpdump -r` or Wireshark |
 | the connection history | **which conversations, and what happened to them** — an open with the rule that admitted it, an advance, a close with how it closed, a refusal with its reason, each on the packet that caused it | the same |
 | the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `datad/build/image/` |
@@ -326,8 +326,9 @@ the recording and look at the packets. Every QEMU scenario leaves its downloads 
 at the end.
 
 The surfaces in that table are also cross-checkable, and that is where they earn the most: the
-packet blocks in each recording, the policy the image was built from, and the frames the harness put
-on the wire all describe one traffic stream from independent vantage points, so a fault that hides
+packet blocks in each recording, the readings framed beside them, the policy the image was built from
+and the frames the harness put on the wire all describe one traffic stream from independent vantage
+points, so a fault that hides
 inside any one of them shows up as a disagreement between two. `xtask::surface_contract` holds them
 to exactly that; when you add a surface, add its agreement with the others rather than a second
 isolated smoke check.

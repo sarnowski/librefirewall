@@ -304,14 +304,14 @@ pub enum WriteError {
     TransmitterNeverReady { polls: u32 },
 }
 
-/// What this driver can say about itself, in the shape the appliance's
-/// metrics endpoint scrapes.
+/// What this driver can say about itself, in the shape the appliance's metric
+/// catalogue counts it.
 ///
 /// Every field is **monotonic** for the protection domain's life and
 /// **saturates** at [`u64::MAX`] rather than wrapping, and there is no reset: a
-/// scrape derives a rate by differencing successive samples, so a reset would
+/// consumer derives a rate by differencing successive readings, so a reset would
 /// forge a negative rate and a wrap would turn a sustained fault back into a
-/// small number exactly when it matters. Taken by value, because a scrape wants
+/// small number exactly when it matters. Taken by value, because a reading wants
 /// one consistent picture rather than a live borrow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UartStats {

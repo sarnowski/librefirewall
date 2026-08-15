@@ -84,10 +84,7 @@
 "crates/log/src/ring.rs" = 0.3936
 "crates/log/src/stamp.rs" = 0.4681
 "crates/metrics/src/catalog.rs" = 0.1156
-"crates/metrics/src/interfaces.rs" = 0.3625
 "crates/metrics/src/lib.rs" = 0.5545
-"crates/metrics/src/render.rs" = 0.2877
-"crates/metrics/src/rules.rs" = 0.4632
 "crates/metrics/src/sample.rs" = 0.0885
 "crates/metrics/src/snapshot.rs" = 0.3123
 "crates/net-headers/src/lib.rs" = 0.2154

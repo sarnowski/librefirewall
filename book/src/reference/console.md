@@ -12,7 +12,7 @@ traffic or user interactions except where those trigger a system-state change.
 `LFW-PD` for a domain's own lifecycle, and `LFW-CFG` for configuration. A third, `LFW-BOOT`, is
 written before the kernel starts and is documented under *Boot-manager records* below. All three are
 system state. **No per-frame or per-packet record appears on this surface at all**, and a dropped
-frame is counted in memory instead (see [Prometheus metrics](metrics.md)).
+frame is counted in memory instead (see [Metrics](metrics.md)).
 
 One record sits at the edge of that and is stated here rather than left to be discovered: the
 management port's `frames=`/`bytes=` pair is a *cumulative count of traffic*, emitted per drain and
@@ -39,9 +39,9 @@ At most one optional group appears, decided by the state. `domain=` is one of **
 description, ten tokens against twelve domains because the driver runs as three instances that
 share one token. **A `nic-driver` record therefore does not say
 which port it is about**, and nothing on this surface does: three instances publish into three rings
-the console interleaves, so the driver's records are not one port's transcript. `/metrics` is where
-the instances are separate, as `domain="nic_driver0"`, `1` and `2` (see
-[Prometheus metrics](metrics.md)). `state=` is one of **`starting`**, **`negotiated`**, **`ready`**,
+the console interleaves, so the driver's records are not one port's transcript. A
+[metric reading](metrics.md) is where the instances are separate, as `domain="nic_driver0"`, `1` and
+`2`. `state=` is one of **`starting`**, **`negotiated`**, **`ready`**,
 **`refused`**.
 
 Which domain emits which state is not uniform, and a reader waiting on a record that is never
@@ -72,10 +72,10 @@ the rings the other domains are publishing into.
 An entirely empty serial line after the boot manager's `LFW-BOOT` record is therefore ambiguous, and
 not in the way it first reads: the same silence is what a node that never reached userspace at all
 looks like, because on the release kernel nothing between GRUB and the console domain can print. The
-two are not distinguishable **on this surface**. A [`/metrics`](metrics.md) scrape is what separates
+two are not distinguishable **on this surface**. A [metric reading](metrics.md) is what separates
 them, and it separates three cases rather than two:
 
-- **It answers, and `librefirewall_uart_init_failures_total` is non-zero.** The controller refused
+- **One arrives, and `librefirewall_uart_init_failures_total` is non-zero.** The controller refused
   its initialisation. The domain got far enough to say so — its shard is its own to write even when
   the line is not — so a refused console is a reading rather than a silence. What it does not say is
   *which* refusal: the driver distinguishes six ways for the register sequence to fail and the one
@@ -105,7 +105,7 @@ node: an operator holding a silent appliance still has only the external act.
   forwarding domain reads it. **`unowned` means the appliance forwards nothing at all**: every frame
   is refused under the drop reason of the same name and counted as
   `librefirewall_route_drops_total{reason="unowned"}`, so the word here and the word on
-  [`/metrics`](metrics.md) are one word and not two things to line up. The forwarder states it once
+  a [metric reading](metrics.md) are one word and not two things to line up. The forwarder states it once
   at bring-up and again only if it is onboarded while running, which is the one transition a boot
   can carry — an appliance loses an owner only by a
   [factory reset](../design/updates.md#factory-reset), which takes effect on the boot after the one
@@ -147,18 +147,18 @@ node: an operator holding a silent appliance still has only the external act.
   **This is a record about system state, not a traffic log.** It says "this port is receiving" and
   the numbers are the evidence; it is emitted once per *drain* that moved a frame, never once per
   frame, so a burst of a hundred frames produces as few records as the scheduler allows and a reader
-  must not infer a frame boundary from a record. The same counts are scrapable as
-  `librefirewall_endpoint_frames_total` and `librefirewall_endpoint_bytes_total` on
-  [`/metrics`](metrics.md).
+  must not infer a frame boundary from a record. The same counts travel as
+  `librefirewall_endpoint_frames_total` and `librefirewall_endpoint_bytes_total` in a
+  [metric reading](metrics.md).
 
   **Everything else that port knows about itself bypasses this surface**, and the list grew when the
   port became an addressed endpoint: descriptors naming a span outside the pool, returns the pool
   owner's ring would not take, and every outcome the endpoint distinguishes — ARP replies and echo
   replies sent, frames not addressed to it, each reason a frame went unhandled, malformed frames, and
   replies it composed and could not send. So `frames=` and `bytes=` say the port is *receiving* and
-  nothing on the **console** says whether it is *answering*: that is readable on
-  [`/metrics`](metrics.md) — the `librefirewall_endpoint_*` families — and asserted by the QEMU gate
-  against the wire.
+  nothing on the **console** says whether it is *answering*: that is readable in a
+  [metric reading](metrics.md) — the `librefirewall_endpoint_*` families — and asserted by the QEMU
+  gate against the wire.
 
   `management` never reports `refused`, and unlike the console's silence that is not the shape of a
   failure: the domain has no device to answer it and no build datum to judge, so there is no third
@@ -190,7 +190,7 @@ node: an operator holding a silent appliance still has only the external act.
 
   This is **the only way an operator learns where a recording is.** There is no shell and no CLI,
   the extents are compiled in rather than configured, and nothing else on any surface
-  states them: `/metrics` says how much a recording has written, never where. A reader taking an
+  states them: a reading says how much a recording has written, never where. A reader taking an
   extent off a decommissioned disk needs these two numbers and gets them nowhere else.
 
   The key is `sectors=` on both records and it means two different things — a capacity on the first,
@@ -231,7 +231,7 @@ node: an operator holding a silent appliance still has only the external act.
   identifier without a generation cannot say whether the appliance came back or was just minted,
   and a generation without the owner flag cannot say whether it has been adopted. **The same
   identifier on two boots is the appliance having survived the reboot**, and it is the only place
-  that shows: nothing else on any surface carries the identifier, `/metrics` reporting whether there
+  that shows: nothing else on any surface carries the identifier, a reading saying whether there
   *is* an identity and never which one.
 - `fingerprint=<64 hex>` — **the key this appliance authenticates with**: SHA-256 over the
   DER-encoded `SubjectPublicKeyInfo` of its public key, rendered as exactly 64 lowercase hexadecimal
@@ -891,7 +891,7 @@ reported once per calibration rather than once per frame.
 
 The fifth also rides on **`state=ready`**, and is narrower still: the endpoint's target table would
 not take the configuration target, so `GET /config` and `POST /config` answer `404` while everything
-else on the port — ARP, ICMP echo, TCP, `GET /metrics` — serves normally. It is a **build fact
+else on the port — ARP, ICMP echo, TCP — serves normally. It is a **build fact
 rather than a run-time condition** (the table is a fixed size), so it is stated once at bring-up and
 never again, and the port carries on rather than refusing to start. An operator seeing it should
 read it as "this image cannot take a document over HTTP", not as a fault in the deciding domain,
@@ -1039,7 +1039,7 @@ are its evidence — but overwriting somebody's is loud by design, and this is w
 that is a property of the build rather than an omission. A reading's length and a segment's are both
 compile-time constants, and the appliance does not assemble unless one fits inside the other — so a
 reading the recorder cannot write is a build that does not exist, not a node that reports one. What
-a running node can say about them is on [`/metrics`](metrics.md):
+a running node can say about them is in a [metric reading](metrics.md):
 `librefirewall_recording_snapshots_total` counts the readings framed and the readings the publisher
 had moved on from before a settled copy could be taken.
 
@@ -1599,23 +1599,24 @@ That guarantee is exact **in the release profile**, and one caveat qualifies it 
 - **A record that will not render is dropped and counted, not reported.** There is no
   `LFW-PD unrendered=…` line and no other escape hatch: a record whose bytes the ABI refuses, whose
   vocabulary token this build does not know, or that will not fit the 228-byte line is counted and
-  discarded silently. Those counters are described below and are scrapable on
-  [`/metrics`](metrics.md), so an operator reading the console alone cannot tell a record that was
-  never emitted from one that was emitted and lost — the metrics endpoint is what can.
+  discarded silently. Those counters are described below and travel in a
+  [metric reading](metrics.md), so an operator reading the console alone cannot tell a record that
+  was never emitted from one that was emitted and lost — a reading is what can.
 
 ## What the console loses, and what counts it
 
 The path from a call site to the line is bounded at every step — encoding the event, publishing it
 into a ring, decoding it, rendering it, handing the bytes to the device — and every one of those
 bounds is lossy. Each has its own counter, because they accuse different parties. Every counter
-below follows the counter semantics stated in [Prometheus metrics](metrics.md) — monotonic for its
+below follows the counter semantics stated in [Metrics](metrics.md) — monotonic for its
 domain's life, saturating, no reset — and follows the **attribution** rule stated there: a drop
-names who misbehaved, and the three classes never merge. **Every one of them is scrapable**: the
+names who misbehaved, and the three classes never merge. **Every one of them travels in a
+reading**: the
 writer-side pair as `librefirewall_log_records_dropped_total` and
 `librefirewall_log_records_refused_total`, the console's outcomes as
 `librefirewall_console_records_total{outcome=…}`, and the UART's as the `librefirewall_uart_*`
 families. None of them appears on the console itself, so the short names below are the metric side's
-— underscored, as everything on `/metrics` is, and not tokens of the hyphenated console vocabulary.
+— underscored, as every metric name is, and not tokens of the hyphenated console vocabulary.
 
 | counter | kept by | accuses | what it means |
 |---|---|---|---|

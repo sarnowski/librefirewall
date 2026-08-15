@@ -83,8 +83,8 @@
 //! whenever the consumer refused an image, because a refusal is the *absence* of
 //! an acknowledgement and this domain holds no timer to bound the difference. So
 //! the answer names the generation that was committed, and the generation each
-//! domain is actually running is on `GET /metrics` under that domain's own label
-//! — which is the pairing an operator confirms a change with.
+//! domain is actually running is in the node's metric reading under that
+//! domain's own label — which is the pairing an operator confirms a change with.
 //!
 //! # Records go to a ring, not to `debug_println!`
 //!
@@ -531,7 +531,7 @@ impl ConfigDomain {
                 self.submissions.applied = self.submissions.applied.saturating_add(1);
                 self.generation = image.generation;
                 // Offered before the submitter is answered, so a client that
-                // scrapes the moment it is told cannot see the commit and miss the
+                // reads the moment it is told cannot see the commit and miss the
                 // offer. A stale offer is unreachable — the generation this commit
                 // assigned is strictly newer than any this publisher has offered —
                 // and is reported rather than dropped, a generation nobody was

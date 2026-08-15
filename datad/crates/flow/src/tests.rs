@@ -1909,7 +1909,7 @@ proptest! {
 
 /// A refusal reports the kind a counter and a metric label are stated in, and
 /// the mapping is onto: every kind is produced by some refusal, so a label the
-/// exposition can carry is one the table can actually reach.
+/// catalogue can carry is one the table can actually reach.
 #[test]
 fn every_refusal_names_its_kind_and_every_kind_is_reachable() {
     let refusals = [

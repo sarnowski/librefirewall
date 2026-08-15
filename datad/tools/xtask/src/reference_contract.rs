@@ -47,9 +47,9 @@
 //! * **Label values.** A family's label *names* are compared; the value
 //!   vocabularies in the same cell are not, because a shard's series carry the
 //!   values a running node happens to publish and not the closed set.
-//! * **`librefirewall_interface_info`'s label names**, which are byte literals
-//!   inside the exposition writer rather than a table, so they are not reachable
-//!   as data. Its name, type and domain set are compared.
+//! * **`librefirewall_interface_info`'s label names**, which no table holds:
+//!   nothing composes that family today, so there is no code side to compare
+//!   them against. Its name, type and domain set are compared.
 //! * **Which group a token sits in.** A domain's tables are compared as one set
 //!   per domain, so a token filed under the wrong group inside the right domain
 //!   passes.
@@ -1003,14 +1003,12 @@ fn catalogued() -> BTreeMap<&'static str, Family> {
             }
         }
     }
-    // The two families no shard holds a series of. Both are published from the
-    // committed configuration — the info family wholly, the rule family's
-    // identity half — so their domains are stated here rather than reached
-    // through a table.
+    // The two families no shard holds a series of, and which nothing composes
+    // today. Their domains are stated here rather than reached through a table,
+    // so the chapter is still held to naming the domain each would carry.
     if let Some(family) = families.get_mut(INTERFACE_INFO.name) {
-        // Its label names live in the exposition writer rather than in a table,
-        // which is why this family alone is exempt from the label comparison
-        // below.
+        // No table holds its label names, which is why this family alone is
+        // exempt from the label comparison below.
         family.domains.extend(PORT_DOMAINS);
         family.domains.insert(MANAGEMENT_PORT_DOMAIN);
     }

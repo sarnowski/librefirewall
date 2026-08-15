@@ -442,7 +442,7 @@ fn metrics_page() -> String {
     let code = catalogued();
     let series: usize = SHARDS.iter().map(|shard| shard.series.len()).sum();
     let mut page = format!(
-        "# Prometheus metrics\n\n{} families; the rest of the sentence. {series} counter and gauge \
+        "# Metrics\n\n{} families; the rest of the sentence. {series} counter and gauge \
          series from the {} shards.\n\n| Metric | Type | `domain` | Other labels | Meaning |\n\
          |---|---|---|---|---|\n",
         code.len(),
@@ -827,7 +827,7 @@ fn a_mention_that_states_no_number_is_left_alone() {
     let scenarios = crate::qemu::SCENARIOS.len();
     let mixed = format!(
         "Every system scenario boots the release image. The gate boots {scenarios} system \
-         scenarios in all, and the {} scenarios that reach the management port are scraped. \
+         scenarios in all, and the {} scenarios that reach the management port carry a client. \
          Most scenarios boot a copy of an owned medium, and {} scenarios boot a copy of an owned \
          medium in this build. Some scenarios judge the channel the appliance dials, and {} \
          scenarios judge the channel the appliance dials in this build. Coverage runs over {} \

@@ -1,22 +1,26 @@
-# Prometheus metrics
+# Metrics
 
-**Purpose:** expose every moving part of the firewall for monitoring and for the state half of the
-debug dump, scrapably and without degrading the dataplane.
+**Purpose:** account for every moving part of the firewall, for monitoring and for the state half of
+the evidence a node ships, without degrading the dataplane.
 
-**Endpoint:** `GET /metrics`, Prometheus exposition format, on the management port.
+**Transport:** the **metric reading** — a snapshot of every named series, framed into the log
+recording on a period and carried upstream over the management channel. The layout is in
+[the channel framing contract](../contracts/channel-framing.md#metric-snapshots) and where it sits in
+a file is in [Recordings](recordings.md). There is no metrics endpoint: this catalogue is what a
+reading's slots mean, and a reading is the only way a counter leaves this node.
 
-**Coverage:** the inventory below is the whole of what a scrape returns, and every family in it is a
-contract — its type, its labels and the domains that publish it. It reaches the dataplane's verdict
-and throughput counters, each NIC's own faults and losses, buffer-pool ownership, the management
-port's endpoint and its TCP and HTTP layers, the block device under the recordings and the two
-recordings themselves, the console path's losses, the applied-configuration state and the clock,
+**Coverage:** the inventory below is the whole of what this appliance names, and every family in it
+is a contract — its type, its labels and the domains that publish it. It reaches the dataplane's
+verdict and throughput counters, each NIC's own faults and losses, buffer-pool ownership, the
+management port's endpoint and its TCP and HTTP layers, the block device under the recordings and the
+two recordings themselves, the console path's losses, the applied-configuration state and the clock,
 the hardware probe's verdict, and the identity of each configured interface.
 
 **Counter semantics (binding).** Every counter is **monotonic for the protection domain's life** and
-**saturates** rather than wrapping. There is no reset: a scraper derives a rate by differencing
-successive scrapes, so a reset would forge a negative rate, and a wrap would turn a sustained flood
+**saturates** rather than wrapping. There is no reset: a consumer derives a rate by differencing
+successive readings, so a reset would forge a negative rate, and a wrap would turn a sustained flood
 back into a small number — which is exactly the signal a counter of attacker-driven events exists to
-carry. A domain restart is therefore the only discontinuity, and it is one a scraper can see.
+carry. A domain restart is therefore the only discontinuity, and it is one a consumer can see.
 
 **Attribution (binding).** A drop counter names *who* misbehaved, because a number that does not is
 not actionable. Three classes stay separate and never merge: what a **device** got wrong about its
@@ -30,45 +34,45 @@ are the console's own key or token with `-` replaced by `_`, under the `librefir
 `domain="nic_driver0"`, `1` or `2`, the instance number being what this surface adds to a token the
 console leaves whole. The rule exists so an operator reading a console line and an operator reading
 a dashboard are looking at the same word, and so neither has to keep a mapping table. A label value
-may begin with a digit (`pipeline="0"`), which the exposition format permits and a metric *name*
-does not.
+may begin with a digit (`pipeline="0"`), which a label value permits and a metric *name* does not.
 
-**The three runtime-text values of `librefirewall_interface_info` are outside that rule**, exactly
-as the console alphabet rule carves out a MAC's colons and an address's dots. `interface`, `address`
-and `mac` carry text an operator wrote in the configuration document, in the document's own
-spelling: `interface="dataplane-0"` keeps its hyphen, an address is a dotted quad and a MAC is
-colon-separated. Transliterating them would break the one property they exist for, which is that an
-identity on a dashboard is the identity in the document. Every other value on this surface comes
-from a closed vocabulary and follows the rule above.
+**The three runtime-text values `librefirewall_interface_info` declares are outside that rule**,
+exactly as the console alphabet rule carves out a MAC's colons and an address's dots. `interface`,
+`address` and `mac` would carry text an operator wrote in the configuration document, in the
+document's own spelling: `interface="dataplane-0"` keeps its hyphen, an address is a dotted quad and
+a MAC is colon-separated. Transliterating them would break the one property they exist for, which is
+that an identity on a dashboard is the identity in the document. Every other value on this surface
+comes from a closed vocabulary and follows the rule above.
 
 **No node-side pre-summing (binding).** Every series carries `domain`, and the node publishes no
 total across domains. Two pipelines forwarding four frames each are two series of `4`, never one of
-`8`. Summing is the scraper's job and it is lossless there; summing here would destroy the
+`8`. Summing is the consumer's job and it is lossless there; summing here would destroy the
 attribution the section above requires, and a node that published both would be asserting an
 equality it cannot keep across a domain restart.
 
 **Freshness (binding).** A counter is published by the domain that owns it, into that domain's own
-shared region, and a scrape reads whatever was last written. There is no barrier and no seqlock: the
-values are individually meaningful, so a scrape may straddle two publications of *different* domains
-and each number is still exactly what its owner last wrote. What a scrape is therefore *not* is an
-instantaneous snapshot of the whole node, and no cross-domain equality should be alerted on at
-single-scrape resolution. The management domain publishes its own shard before rendering, so a
-scrape always reports the request that asked for it — its own response, composed afterwards, appears
-in the *next* one.
+shared region, and a reading carries whatever was last written. There is no barrier and no seqlock:
+the values are individually meaningful, so a reading may straddle two publications of *different*
+domains and each number is still exactly what its owner last wrote. What a reading is therefore *not*
+is an instantaneous snapshot of the whole node, and no cross-domain equality should be alerted on at
+single-reading resolution. The management domain publishes its own shard on the way through every
+pass, so a reading carries its work up to the end of the previous one — the work of composing the
+reading itself appears in the *next*.
 
 ## Metric inventory
 
 125 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 470 counter and gauge series from the 12 shards,
-plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 102 085 bytes — a worst case computed from
-these tables at build time, which is what the staging buffer behind the endpoint is sized from.
+domains publishing that family. A reading is 470 counter and gauge series from the 12 shards, laid
+out slot by slot in the order these tables declare them.
 
-That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
-each under a sixteen-byte id, so a document declaring two rules produces a scrape a third of the
-size. The buffer is sized by what an operator is *entitled* to write rather than by what this
-appliance happens to be running, because the alternative is an endpoint that answers a scrape until
-somebody adds a rule.
+**Two of the families below are declared and carried by nothing today**, and they are named here
+rather than left to be discovered. `librefirewall_interface_info` has no counter anywhere: its
+labels came from the committed configuration and were composed only by the surface that has been
+removed. `librefirewall_rule_hits_total` still has a live writer — the forwarding domain writes one
+slot per rule into the per-rule block of its shard — but that block sits past the domain's named
+table, so no reading carries it. Both stay in the catalogue because both describe a number the
+appliance holds; what is missing is a transport that carries them, and adding one is a design change
+rather than a table edit.
 
 **A family's `domain` set and its label values are not a cross-product.** Several families are
 partitioned, one domain carrying part of a label's vocabulary and another domain the rest, and each
@@ -102,13 +106,16 @@ avoiding: it looks exactly like a healthy node.
 serves both directions of the dataplane, because a stage of that chain may hold state spanning a
 whole conversation. There is no per-direction number to report, so none is invented.
 
-**`librefirewall_rule_hits_total` is the one family whose cardinality an operator sets.** It carries
-one series per rule the running document declares — two rules, two series — and none at all while a
-node is on generation 0, which is the honest report of a policy that declares nothing. The `rule`
-label is the id from the document, and that is what makes the family readable: a counter labelled by
-a rule's position in the file would move under every edit above it. The count comes from the
-forwarding domain and the id from the configuration, joined on the rule's position, so a hit is a
-number only the forwarder could have written under a name only an operator could have chosen.
+**`librefirewall_rule_hits_total` is the one family whose cardinality an operator sets, and no
+reading carries it today.** The forwarding domain writes one slot per rule, at the rule's position in
+the running document, into a block of its shard that sits past the domain's named table — so the
+numbers exist on the node and nothing takes them off it. The family would carry one series per rule
+the running document declares — two rules, two series — and none at all while a node is on
+generation 0, which is the honest report of a policy that declares nothing. The `rule` label is the
+id from the document, and that is what makes the family readable: a counter labelled by a rule's
+position in the file would move under every edit above it. The count comes from the forwarding
+domain and the id from the configuration, joined on the rule's position, so a hit is a number only
+the forwarder could have written under a name only an operator could have chosen.
 
 Three checks are worth making across these families rather than reading any of them alone.
 `rule_hits` summed over the `accept` rules equals `policy_packets{verdict="accepted"}`, because
@@ -277,7 +284,7 @@ already live, which is a very different thing.
 | `librefirewall_log_records_dropped_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain could not publish because its ring had no slot. |
 | `librefirewall_log_records_refused_total` | counter | `clock`, `config`, `crypto`, `forwarder`, `hardware_probe`, `management`, `nic_driver0`, `nic_driver1`, `nic_driver2`, `recorder`, `store` | — | Records this domain minted and never put in its ring: an event the record ABI cannot carry, or a sink already borrowed further up the same stack. Ours either way, expected to stay zero. |
 | `librefirewall_uart_bytes_written_total` | counter | `console` | — | Bytes handed to the transmitter-holding register. |
-| `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. Non-zero means this node has no console: the domain publishes its shard from the refusal path so that a scrape can say so. |
+| `librefirewall_uart_init_failures_total` | counter | `console` | — | Refused initialisations of the serial controller. Non-zero means this node has no console: the domain publishes its shard from the refusal path so that a reading can say so. |
 | `librefirewall_uart_transmitter_timeouts_total` | counter | `console` | — | Bytes dropped because the transmitter never reported itself empty; the device's fault. |
 
 ### The two block devices
@@ -289,7 +296,7 @@ tells one device's numbers from the other's and reading either alone says nothin
 
 `librefirewall_block_capacity_sectors` is the device's own claim, taken once at bring-up and
 republished unchanged: it bounds every sector range the domain will name, so a device that came up
-smaller than the recording — or the state layout — configured for it is visible in a scrape rather
+smaller than the recording — or the state layout — configured for it is visible in a reading rather
 than only in a refusal.
 A sector is 512 bytes, fixed by the virtio 1.0 specification (its block-device section) regardless
 of the `blk_size` a device reports.
@@ -324,7 +331,7 @@ until a seal — which a download performs — pushes it out. Compare it against
 `librefirewall_recording_sectors_written_total` for what the device has acknowledged.
 
 **The two sinks' counts are meant to differ, and by a lot.** They record different things (see
-[Recording downloads](recordings.md)): the capture's count is every observation the recorder drained,
+[Recordings](recordings.md)): the capture's count is every observation the recorder drained,
 which is `librefirewall_recording_tap_records_total`, while the log's is the subset that carried a
 connection lifecycle or policy event. A log count close to the capture's is a node whose traffic is
 almost all connection openings and refusals; one far below it is the ordinary case, and the ratio
@@ -367,12 +374,18 @@ nothing on this surface does — no reader registers a cursor for one to be meas
 |---|---|---|---|---|
 | `librefirewall_interface_info` | gauge | `nic_driver0`, `nic_driver1`, `nic_driver2` | `interface`, `role`&nbsp;(`dataplane`, `management`), `address`, `prefix_length`, `mac` | The identity of one configured interface. **An info gauge: its value is always `1` and carries nothing at all** — everything it says is in its labels. |
 
+**Nothing carries this family today.** Its labels came from the committed configuration rather than
+from any shard, and the only surface that ever composed them has been removed; it is declared here
+because the identity it describes is still one the node holds, and because a transport for it is a
+design decision rather than a table edit. What follows is what the family means, and it is written
+in the present tense of the contract rather than of this build.
+
 **This is the one family that is not a measurement, and the counter rules above do not apply to it.**
 Monotonicity, saturation and "no reset" are statements about counters; a constant is none of them.
-It is a gauge, it therefore carries no `_total` suffix, and a reader that differenced two scrapes of
-it would be differencing `1` from `1`. What *does* change between two scrapes is which series exist
+It is a gauge, it therefore carries no `_total` suffix, and a reader that differenced two readings of
+it would be differencing `1` from `1`. What *does* change between two readings is which series exist
 and what their labels say — a re-addressed interface is a series that disappears and one that
-appears, which is exactly how Prometheus's own `*_info` families behave.
+appears, which is how an `*_info` family behaves everywhere.
 
 The labels, one by one:
 
@@ -382,12 +395,11 @@ The labels, one by one:
 | `interface` | The `id` attribute of the document's `<interface>` — `dataplane-0` on the shipped configuration. The `<management>` element has no `id`, a document holding exactly one, so its series reads `interface="management"`: the same identity a `LFW-CFG` change record about it carries as `key=management`. |
 | `role` | `dataplane` or `management`. The design makes the role the architectural unit rather than the port number (see the [architecture design](../design/architecture.md)), so it is what a query groups by. **The vocabulary is closed at those two**, and a third token is a defect rather than an extension — the deployment design's other roles, session replication and mirror, are not values this label takes. |
 | `address` | The configured IPv4 address, dotted quad. |
-| `prefix_length` | The prefix length, decimal, as a string — every Prometheus label value is one. |
+| `prefix_length` | The prefix length, decimal, as a string — every label value is one. |
 | `mac` | The configured MAC, lower case and colon-separated, the same form a console record writes it in. |
 
 **Cardinality: one series per configured interface, and no more.** At most `wire::MAX_INTERFACES` + 1
-= 9, which is what the exposition's worst-case bound reserves, and at most 7 on the largest port
-model the deployment design describes — the management port, the session-replication port, two
+= 9, and at most 7 on the largest port model the deployment design describes — the management port, the session-replication port, two
 dataplane pairs and the mirror. It does not grow with traffic, with connections, or with anything an
 adversary controls.
 
@@ -477,7 +489,7 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 ### The hardware probe
 
 The domain compiled with the SIMD target reports its verdict here as well as on the console, so a
-scrape can answer whether this node proved the hardware-cryptography profile without a serial
+reading can answer whether this node proved the hardware-cryptography profile without a serial
 capture. The three families are written once, when the probe parks, and never move again.
 
 | Metric | Type | `domain` | Other labels | Meaning |
@@ -488,7 +500,7 @@ capture. The three families are written once, when the probe parks, and never mo
 
 ### Cryptography
 
-The cryptography domain reports here as well as on the console, so a scrape answers whether this
+The cryptography domain reports here as well as on the console, so a reading answers whether this
 node proved its cryptography and what each primitive cost it, without a serial capture. The
 per-primitive label values are the console's names with hyphens turned into underscores, because a
 label value on this surface is an underscore token everywhere; the [cryptography
@@ -505,7 +517,7 @@ parks, and never move again.
 
 ### The appliance's own identity
 
-The store domain reports here as well as on the console, so a scrape answers whether this node
+The store domain reports here as well as on the console, so a reading answers whether this node
 *has* an identity without a serial capture. The five families are written once, when the domain
 parks, and never move again.
 
@@ -528,7 +540,7 @@ has advanced. Which appliance it is, and which key it authenticates with, is on 
 **`librefirewall_store_minted` is the one to alert on, and
 `librefirewall_store_reset` is what the alert has to be read with.** An appliance mints exactly once
 in its life — on its first boot, and again only after a factory reset — so a node reporting 1 where a
-previous scrape reported 0 has lost the medium's contents, and every certificate issued to it now
+previous reading reported 0 has lost the medium's contents, and every certificate issued to it now
 names a key it no longer holds. The reset gauge is what separates the two causes: `minted` and `reset`
 both at 1 is an ownership transfer somebody with the medium in their hands asked for, while `minted`
 at 1 with `reset` at 0 is a node that lost its identity and nobody asked it to. The generation is the
@@ -554,7 +566,7 @@ a counter would restate, at lower resolution, something the records already carr
 `librefirewall_clock_frequency_hertz` says what this node measured and
 `librefirewall_clock_generation` says which calibration the management domain converts
 with; the eight other writing domains publish no such gauge, so *which* of them has taken the
-calibration up is answerable from the log stream and not from a scrape. That is a gap, it is small,
+calibration up is answerable from the log stream and not from a reading. That is a gap, it is small,
 and it is named here rather than closed with a series nothing needs.
 
 The three attribution classes are kept apart exactly as stated above and are worth naming against
@@ -565,15 +577,12 @@ the table: `librefirewall_device_faults_total` is what a **device** got wrong ab
 `librefirewall_endpoint_stage_drops_total` and `librefirewall_tcp_write_refused_total` accuse **this
 code** and are expected to read zero forever — they are alerts, not traffic statistics.
 
-**What a scrape costs the dataplane.** Nothing measurable, and by construction rather than by
+**What a reading costs the dataplane.** Nothing measurable, and by construction rather than by
 measurement: a counter update is a relaxed add to a `u64` in the publishing domain's own cache-line
-aligned region, and the exposition is rendered in the management domain out of a read of those
-regions. No dataplane domain does any work on a scrape, and no lock is shared with one.
+aligned region, and a reading is composed in the management domain out of a read of those regions.
+No dataplane domain does any work when one is composed, and no lock is shared with one.
 
-**What stands in front of this endpoint.** Nothing: it is **plain HTTP with no client
-authentication**, so anyone who can reach the management port can scrape it, and a scrape carries
-the node's whole measurable state. The design requires mutual TLS on that port (see the
-[management design](../design/management.md)); this is a deviation from it, recorded in the
-[status table](../status.md) and in `lfw_ip_endpoint`'s crate header. The endpoint stages one
-response at a time, so a scrape arriving while another is still going out is answered `503` and
-counted as `librefirewall_http_responses_total{status="503"}`.
+**What stands in front of a reading.** The management channel the appliance dials out, which is
+mutually authenticated: a reading reaches a management server and nothing else, and no client on the
+management port can ask for one. That is a stronger position than the surface this catalogue used to
+be read over, and it is the one the [management design](../design/management.md) describes.

@@ -202,8 +202,8 @@ impl<'ring> NicPort<'ring> {
         }
     }
 
-    /// Sample this port in the shape the appliance's metrics endpoint
-    /// scrapes.
+    /// Sample this port in the shape the appliance's metric catalogue counts
+    /// it.
     #[must_use]
     pub fn stats(&self) -> DriverStats {
         DriverStats::sample(&self.counters, &self.receive_queue, &self.transmit_queue)
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn stats_carry_the_counters_and_both_virtqueues_device_faults() {
-        // What the metrics endpoint scrapes must reach it from all three
+        // What a reading carries must reach it from all three
         // places, or a device misbehaving at line rate looks like an idle link.
         let mut fx = PortFixture::new();
         // A frame with nothing past the header, and a completion for a
