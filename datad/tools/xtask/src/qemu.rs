@@ -3731,14 +3731,14 @@ fn judge_recordings(
     };
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
-            target: recording_contract::LOG_RECORDING,
+            recording: recording_contract::LOG_RECORDING,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN,
             parsed: log_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "log")?,
             carried: carried_log,
         },
         &surface_contract::Surface {
-            target: recording_contract::CAPTURE_RECORDING,
+            recording: recording_contract::CAPTURE_RECORDING,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN,
             parsed: capture_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "capture")?,

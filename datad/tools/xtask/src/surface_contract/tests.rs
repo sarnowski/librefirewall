@@ -12,8 +12,8 @@ use crate::recording_contract::{
     CLASSIFICATION_NEW, EVENT_FLOW_REFUSED, Interface, STATE_TIME_WAIT,
 };
 
-const LOG_TARGET: &str = "the connection history";
-const CAPTURE_TARGET: &str = "the capture";
+const LOG_RECORDING: &str = "the connection history";
+const CAPTURE_RECORDING: &str = "the capture";
 const LOG_SNAP: u32 = 128;
 const CAPTURE_SNAP: u32 = 2048;
 const PORTS: usize = 2;
@@ -163,7 +163,7 @@ const SOUND: &[(u64, usize)] = &[(0, 0), (1, 1), (2, 0), (3, 1)];
 
 fn log_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
     Surface {
-        target: LOG_TARGET,
+        recording: LOG_RECORDING,
         snap_len: LOG_SNAP,
         parsed,
         published_records: published,
@@ -173,7 +173,7 @@ fn log_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
 
 fn capture_surface(parsed: &Parsed, published: u64) -> Surface<'_> {
     Surface {
-        target: CAPTURE_TARGET,
+        recording: CAPTURE_RECORDING,
         snap_len: CAPTURE_SNAP,
         parsed,
         published_records: published,
@@ -216,8 +216,8 @@ fn two_recordings_of_the_same_traffic_agree() {
     // demanding it would be asserting a contract the appliance does not have.
     assert_eq!(agreement.probes_matched, 2);
     let evidence = agreement.evidence();
-    assert!(evidence.contains(LOG_TARGET), "{evidence}");
-    assert!(evidence.contains(CAPTURE_TARGET), "{evidence}");
+    assert!(evidence.contains(LOG_RECORDING), "{evidence}");
+    assert!(evidence.contains(CAPTURE_RECORDING), "{evidence}");
     assert!(evidence.contains("snap length of 128"), "{evidence}");
     assert!(evidence.contains("snap length of 2048"), "{evidence}");
 }
@@ -782,7 +782,7 @@ fn two_recordings_declaring_one_snap_length_are_not_two_recordings() {
     let probes = injected();
     let error = judge(
         &Surface {
-            target: LOG_TARGET,
+            recording: LOG_RECORDING,
             // The sink this download came from keeps 128, and the file it
             // answered declares 2048 — which is the duplicate showing.
             snap_len: LOG_SNAP,
@@ -1029,7 +1029,7 @@ fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
     )
     .expect_err("a refusal is a decision and owes a record");
     assert!(error.contains("no encoded record at all"), "{error}");
-    assert!(error.contains(CAPTURE_TARGET), "{error}");
+    assert!(error.contains(CAPTURE_RECORDING), "{error}");
 }
 
 /// A probe the appliance decided on and no recording holds — the tap losing an

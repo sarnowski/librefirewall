@@ -122,8 +122,8 @@ pub struct Published {
 /// One recording as this contract sees it: which it is, what it declared, and
 /// what the appliance's own metrics say it put there.
 pub struct Surface<'a> {
-    /// The request target it was pulled from, which names it in every verdict.
-    pub target: &'static str,
+    /// Which recording this is, as a verdict names it.
+    pub recording: &'static str,
     /// The sink's snap length as the build configures it. The recording states
     /// its own in every Interface Description Block, and the two are compared:
     /// that is what makes the two recordings demonstrably different files
@@ -339,7 +339,7 @@ fn events(log: &Surface) -> BTreeMap<&'static str, usize> {
 
 fn count(surface: &Surface) -> Counted {
     Counted {
-        target: surface.target,
+        target: surface.recording,
         packets: surface.parsed.packets.len(),
         inherited: surface.inherited_packets(),
         published_records: surface.published_records,
@@ -389,9 +389,9 @@ fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
         found.push(format!(
             "{} holds {} record(s) of a frame and {} holds {}; the connection history is a \
              selection of the frame observations the capture holds, so it can never hold more",
-            log.target,
+            log.recording,
             framed(log),
-            capture.target,
+            capture.recording,
             framed(capture),
         ));
     }
@@ -412,8 +412,8 @@ fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
             "{} carries packet id(s) {} does not pair: {}. Every frame observation the connection \
              history selects was offered to the capture too, so an unpaired one describes traffic \
              no packet of the capture accounts for",
-            log.target,
-            capture.target,
+            log.recording,
+            capture.recording,
             unpaired.join(", ")
         ));
     }
@@ -434,7 +434,7 @@ fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
             "{} holds {} record(s) naming no lifecycle or policy event: {}. A connection history \
              that records a packet for its own sake has the packet rate rather than the admission \
              rate, which is what a flood evicts it with",
-            log.target,
+            log.recording,
             eventless.len(),
             eventless.join(", ")
         ));
@@ -450,7 +450,7 @@ fn selection_differences(log: &Surface, capture: &Surface) -> Vec<String> {
             found.push(format!(
                 "{} holds {without} packet block(s) with no epb_packetid, which nothing can pair \
                  across the two recordings",
-                surface.target
+                surface.recording
             ));
         }
     }
@@ -477,7 +477,7 @@ fn annotation_differences(surface: &Surface) -> Vec<String> {
             found.push(format!(
                 "{}: {} carries no PEN-tagged annotation, so the record says what the bytes were \
                  and not what the appliance decided",
-                surface.target,
+                surface.recording,
                 name(packet)
             ));
             if found.len() >= REPORTED {
@@ -496,7 +496,7 @@ fn annotation_differences(surface: &Surface) -> Vec<String> {
 /// The laws one annotation must satisfy, each as its own difference.
 fn annotation_laws(surface: &Surface, packet: &Packet, annotation: Annotation) -> Vec<String> {
     let mut found = Vec::new();
-    let at = |clause: &str| format!("{}: {}: {clause}", surface.target, name(packet));
+    let at = |clause: &str| format!("{}: {}: {clause}", surface.recording, name(packet));
     if annotation.version != ANNOTATION_VERSION {
         found.push(at(&format!(
             "the annotation declares layout version {} and this build writes {ANNOTATION_VERSION}",
@@ -681,7 +681,7 @@ fn lifecycle_differences(log: &Surface) -> Vec<String> {
                     "{}: {} closes the conversation at slot {} generation {} and no earlier \
                      record opens it, so the history describes the end of something it never saw \
                      begin",
-                    log.target,
+                    log.recording,
                     name(packet),
                     annotation.flow_slot,
                     annotation.flow_generation,
@@ -720,7 +720,7 @@ fn verdict_differences(capture: &Surface, wire: &Wire) -> Vec<String> {
                 found.push(format!(
                     "{}: {} carries probe {}'s bytes under verdict {} and the harness observed it \
                      {} on the wire",
-                    capture.target,
+                    capture.recording,
                     name(packet),
                     injected.name,
                     annotation.verdict,
@@ -770,7 +770,7 @@ fn event_differences(log: &Surface, wire: &Wire) -> Result<usize, Vec<String>> {
         } else {
             missing.push(format!(
                 "{} holds no record of probe {} naming {}; records of it carry [{}]",
-                log.target,
+                log.recording,
                 injected.name,
                 event_name(owed),
                 carried.into_iter().collect::<Vec<&str>>().join(", ")
@@ -816,19 +816,19 @@ fn rule_differences(capture: &Surface, published: &Published) -> Vec<String> {
             None => found.push(format!(
                 "{} holds a record naming the rule at position {position} and the document \
                  declares {} rule(s), so the record names a rule no operator wrote",
-                capture.target,
+                capture.recording,
                 published.rules.len()
             )),
             Some(rule) => match rule.hits {
                 None => found.push(format!(
                     "{} holds a record naming the rule at position {position}, which the document \
                      calls {:?}, and librefirewall_rule_hits_total carries no series for it",
-                    capture.target, rule.id
+                    capture.recording, rule.id
                 )),
                 Some(0) => found.push(format!(
                     "{} holds a record naming rule {:?} and the appliance credits it with no hit, \
                      so the two accounts of one match disagree",
-                    capture.target, rule.id
+                    capture.recording, rule.id
                 )),
                 Some(_) => {}
             },
@@ -865,7 +865,7 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
             "{} holds {} record(s) stating a forwarded frame and \
              librefirewall_forwarded_frames_total sums to {}; a recording cannot describe \
              forwarding the appliance never counted",
-            surface.target,
+            surface.recording,
             counted(held_forwarded, was_forwarded),
             published.forwarded_frames
         ));
@@ -879,7 +879,7 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
             found.push(format!(
                 "{} holds {held} record(s) naming drop reason {reason}, which is outside the \
                  {} this build's vocabulary declares",
-                surface.target,
+                surface.recording,
                 DROP_REASONS.len()
             ));
             continue;
@@ -892,13 +892,13 @@ fn exposition_differences(surface: &Surface, published: &Published) -> Vec<Strin
             None | Some(None) => found.push(format!(
                 "{} holds {} record(s) refused as {name:?} and \
                  librefirewall_route_drops_total carries no series under that reason",
-                surface.target,
+                surface.recording,
                 counted(held, inherited)
             )),
             Some(Some(appliance)) if *appliance < records => found.push(format!(
                 "{} holds {} record(s) refused as {name:?} and the appliance counted \
                  {appliance}; a recording cannot describe refusals the appliance never made",
-                surface.target,
+                surface.recording,
                 counted(held, inherited)
             )),
             Some(Some(_)) => {}
@@ -1039,7 +1039,7 @@ fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
             "{} answers {held} packet block(s) and the medium already held {inherited} going into \
              this boot; a resumed recording continues at the byte its predecessor stopped on, so \
              a download that offers fewer records than were already there has lost some",
-            surface.target
+            surface.recording
         ));
     }
     if held.saturating_sub(inherited) > surface.published_records {
@@ -1047,7 +1047,7 @@ fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
             "{} answers {} packet block(s) and the recorder publishes \
              librefirewall_recording_records_total for this sink as {}; a recording cannot hold \
              observations the recorder never encoded",
-            surface.target,
+            surface.recording,
             counted(held, inherited),
             surface.published_records,
         ));
@@ -1056,7 +1056,7 @@ fn published_differences(surface: &Surface, may_be_empty: bool) -> Vec<String> {
         found.push(format!(
             "the recorder publishes no encoded record at all for {}, so the count the recording \
              is compared against proves nothing about either",
-            surface.target
+            surface.recording
         ));
     }
     found
@@ -1079,7 +1079,7 @@ fn clamping_differences(surface: &Surface) -> Vec<String> {
             found.push(format!(
                 "{}: {} keeps {} captured byte(s) of a {}-byte frame at a snap length of {snap}, \
                  and a sink keeps the whole frame or the snap length, whichever is smaller ({owed})",
-                surface.target,
+                surface.recording,
                 name(packet),
                 packet.captured.len(),
                 packet.original_len,
@@ -1122,7 +1122,7 @@ fn distinctness_differences(log: &Surface, capture: &Surface) -> Vec<String> {
             "{} and {} both declare a snap length of {left}, so nothing in the two files \
              distinguishes them and one ring served under both names would read as two \
              recordings",
-            log.target, capture.target,
+            log.recording, capture.recording,
         ));
     }
     found
@@ -1151,7 +1151,7 @@ fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
             "{} declares {} interface block(s) across {sections} section(s) and the \
              configuration document configures {} dataplane port(s), so a section's prologue \
              does not describe every port a packet in it can name",
-            surface.target,
+            surface.recording,
             surface.parsed.interfaces.len(),
             wire.ports,
         ));
@@ -1162,13 +1162,13 @@ fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
         if interface.name != owed {
             found.push(format!(
                 "{}: interface block {at} is named {:?} and the port it describes is {owed}",
-                surface.target, interface.name,
+                surface.recording, interface.name,
             ));
         }
         if interface.snap_len != surface.snap_len {
             found.push(format!(
                 "{}: interface block {at} declares a snap length of {} and this sink keeps {}",
-                surface.target, interface.snap_len, surface.snap_len,
+                surface.recording, interface.snap_len, surface.snap_len,
             ));
         }
         if found.len() >= REPORTED {
@@ -1186,7 +1186,7 @@ fn interface_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
     if !stray.is_empty() {
         found.push(format!(
             "{} holds packet block(s) naming an interface outside the document's {} port(s): {}",
-            surface.target,
+            surface.recording,
             wire.ports,
             stray.join(", ")
         ));
@@ -1280,7 +1280,7 @@ fn fabrication_differences(surface: &Surface, wire: &Wire) -> Vec<String> {
             found.push(format!(
                 "{}: {} carries {} captured byte(s) of a claimed {}-byte frame that is no prefix \
                  of anything the harness injected{}",
-                surface.target,
+                surface.recording,
                 name(packet),
                 packet.captured.len(),
                 packet.original_len,
