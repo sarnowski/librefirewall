@@ -298,7 +298,7 @@ pub struct EndpointStage<'ring> {
     rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
     bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
-    /// each pass, and the seven it reads to answer a scrape.
+    /// each pass, and the eleven it reads to answer a scrape.
     stats: StatsRegions<'ring>,
     received: [u8; BUFFER_SIZE],
     reply: [u8; MAX_REPLY_LEN],
@@ -686,7 +686,7 @@ impl<'ring> EndpointStage<'ring> {
 
     /// Render the exposition for a request that is waiting on one.
     ///
-    /// The whole metric surface, read out of the eight shards this domain is
+    /// The whole metric surface, read out of the twelve shards this domain is
     /// granted, into the server's own staging buffer — which is sized by the
     /// renderer's worst case, so the `None` path is unreachable and counted
     /// rather than asserted (`lfw_ip_endpoint::http`).

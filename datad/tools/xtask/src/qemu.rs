@@ -3681,11 +3681,39 @@ fn judge_recordings(
             constant: false,
         },
     ]);
+    // What each extent held before the boot, in `Deck::extents`' order, which is
+    // the connection history and then the capture — the same order the two
+    // downloads and the two expectations above are in. A boot that made its own
+    // medium carries none, and each surface is then compared against nothing.
+    let [carried_log, carried_capture] = match booted.carried_recordings.as_slice() {
+        [] => [None, None],
+        [log, capture] => [Some(log), Some(capture)],
+        other => {
+            return Err(format!(
+                "this boot inherited {} recording extent(s) and the contract is stated over two, \
+                 so nothing says which download the counts belong to",
+                other.len()
+            ));
+        }
+    };
+
     let snapshots = snapshot_contract::judge(
         recording_contract::LOG_RECORDING,
         &log_parsed.snapshots,
         &agreed,
         lfw_metrics::CATALOGUE_FINGERPRINT,
+        // And what the readings are held to that the appliance had no part in
+        // composing: the frames this harness counted on the wire, the sizes it
+        // gave the two devices, and the vocabulary this build encodes. These
+        // outlive the exposition beside them, which is the point of stating them
+        // while both surfaces are still here to be compared.
+        &snapshot_contract::Demanded {
+            booted_for: booted.started_at.elapsed(),
+            forwarded_frames: booted.dataplane_frames,
+            resumed_medium: carried_log.is_some(),
+            witness: booted.policy,
+            drop_reasons: &surface_contract::DROP_REASONS,
+        },
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
 
@@ -3714,21 +3742,6 @@ fn judge_recordings(
     )
     .map_err(|error| format!("{error}\n  full run log: {}", log.display()))?;
 
-    // What each extent held before the boot, in `Deck::extents`' order, which is
-    // the connection history and then the capture — the same order the two
-    // downloads and the two expectations above are in. A boot that made its own
-    // medium carries none, and each surface is then compared against nothing.
-    let [carried_log, carried_capture] = match booted.carried_recordings.as_slice() {
-        [] => [None, None],
-        [log, capture] => [Some(log), Some(capture)],
-        other => {
-            return Err(format!(
-                "this boot inherited {} recording extent(s) and the contract is stated over two, \
-                 so nothing says which download the counts belong to",
-                other.len()
-            ));
-        }
-    };
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
             recording: recording_contract::LOG_RECORDING,

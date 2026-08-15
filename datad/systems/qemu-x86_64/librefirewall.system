@@ -1197,7 +1197,7 @@
 
          `stats_management` HAS EXACTLY ONE MAPPER, and that is not an oversight.
          The management domain both writes and reads it, because the renderer
-         walks one uniform array of eleven shards rather than ten regions plus a
+         walks one uniform array of twelve shards rather than eleven regions plus a
          live read of its own counters — one code path, and a set of numbers
          taken at one publish rather than half of them changing under the render.
          It costs no cross-domain authority: no other domain maps it.
@@ -1206,7 +1206,7 @@
          up to the mapping granularity, on the same footing as every constant
          above and held to it the same way — `xtask::sysdesc` carries a rule per
          region and compares it. A `StatsShard` is 2688 bytes, so each rounds to
-         one page and the eleven cost 44 KiB. It grew from 768 with the filter, and
+         one page and the twelve cost 48 KiB. It grew from 768 with the filter, and
          the page count did not: the shard is sized by the widest set a domain
          publishes, and the forwarder's now reserves one slot per rule the
          configuration ABI admits — which is why a second region for those

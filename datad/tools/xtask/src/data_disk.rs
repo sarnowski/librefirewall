@@ -59,7 +59,7 @@ use crate::recording_contract;
 /// 64 MiB: far more than the two sectors this milestone touches, and enough for
 /// the recording milestone to exercise a segmented ring with a wrap in it
 /// without the file becoming something a build tree should not be creating.
-const DATA_DISK_BYTES: u64 = 64 * 1024 * 1024;
+pub const DATA_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The pattern seeded into sector 0 before boot.
 ///
@@ -772,7 +772,7 @@ mod tests;
 /// to [`lfw_store::STORE_SECTORS`], and everything past that is deliberately
 /// unused. Made exactly one mebibyte rather than exactly the layout, so a sector
 /// the appliance is *not* meant to touch exists to be found untouched.
-const STORE_DISK_BYTES: u64 = 1024 * 1024;
+pub const STORE_DISK_BYTES: u64 = 1024 * 1024;
 
 /// One run's store device: the medium the appliance's own identity lives on.
 ///

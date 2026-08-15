@@ -100,16 +100,16 @@
 //! against a device; a triple this domain refuses leaves the port answering ARP
 //! and ICMP and refusing TCP.
 //!
-//! # It answers `GET /metrics`, and it reads seven other domains to do it
+//! # It answers `GET /metrics`, and it reads eleven other domains to do it
 //!
-//! It maps **eight** stats shards: its own read-write, and one per other
+//! It maps **twelve** stats shards: its own read-write, and one per other
 //! protection domain READ-ONLY. That asymmetry is the whole argument — every
 //! number it renders is a claim only the domain that made it could have written,
 //! so a compromise of the domain that faces the management-plane attacker cannot
 //! forge a clean line for a port that is dropping every frame. What stays
 //! withheld is in `systems/qemu-x86_64/librefirewall.system` beside those rows.
 //! Its own shard is the one region in this system with exactly one mapper, so
-//! the renderer walks one uniform array rather than seven regions plus a live
+//! the renderer walks one uniform array rather than eleven regions plus a live
 //! read of its own counters.
 //!
 //! # Deviation from the design: the HTTP endpoint carries no TLS
