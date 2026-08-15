@@ -58,8 +58,13 @@ fn a_series_the_catalogue_does_not_declare_is_named_rather_than_guessed() {
 
 #[test]
 fn a_recording_with_no_reading_at_all_is_a_finding() {
-    let error = judge("/logs.pcapng", &[], &[], lfw_metrics::CATALOGUE_FINGERPRINT)
-        .expect_err("no reading");
+    let error = judge(
+        "the connection history",
+        &[],
+        &[],
+        lfw_metrics::CATALOGUE_FINGERPRINT,
+    )
+    .expect_err("no reading");
     assert!(error.contains("no metric reading at all"), "{error}");
 }
 
@@ -68,7 +73,7 @@ fn a_reading_from_another_catalogue_is_refused_whole() {
     let mut foreign = whole(|_| 0);
     foreign.fingerprint = lfw_metrics::CATALOGUE_FINGERPRINT ^ 0xffff;
     let error = judge(
-        "/logs.pcapng",
+        "the connection history",
         &[foreign],
         &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
@@ -80,7 +85,7 @@ fn a_reading_from_another_catalogue_is_refused_whole() {
 #[test]
 fn a_reading_of_another_slot_count_is_refused() {
     let error = judge(
-        "/logs.pcapng",
+        "the connection history",
         &[reading(3, |_| 0)],
         &[],
         lfw_metrics::CATALOGUE_FINGERPRINT,
@@ -97,7 +102,7 @@ fn a_counter_no_larger_than_the_scrape_agrees_and_one_larger_does_not() {
     for scraped in [100u64, 101, u64::MAX] {
         assert!(
             judge(
-                "/logs.pcapng",
+                "the connection history",
                 std::slice::from_ref(&held),
                 &[Agreed {
                     summed: false,
@@ -113,7 +118,7 @@ fn a_counter_no_larger_than_the_scrape_agrees_and_one_larger_does_not() {
     }
 
     let error = judge(
-        "/logs.pcapng",
+        "the connection history",
         std::slice::from_ref(&held),
         &[Agreed {
             summed: false,
@@ -137,7 +142,7 @@ fn a_constant_must_be_equal_in_both_directions() {
 
     assert!(
         judge(
-            "/logs.pcapng",
+            "the connection history",
             std::slice::from_ref(&held),
             &[Agreed {
                 summed: false,
@@ -152,7 +157,7 @@ fn a_constant_must_be_equal_in_both_directions() {
     for scraped in [99u64, 101] {
         assert!(
             judge(
-                "/logs.pcapng",
+                "the connection history",
                 std::slice::from_ref(&held),
                 &[Agreed {
                     summed: false,
@@ -173,7 +178,7 @@ fn the_evidence_names_every_slot_it_compared() {
     let at = slot_of(&capacity()).expect("declared");
     let held = whole(|slot| if slot == at { 7 } else { 0 });
     let agreement = judge(
-        "/logs.pcapng",
+        "the connection history",
         &[held],
         &[Agreed {
             summed: false,

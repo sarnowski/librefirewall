@@ -1,15 +1,14 @@
-//! What a downloaded recording must be, judged as bytes rather than as a
-//! console line.
+//! What a recording must be, judged as bytes rather than as a console line.
 //!
 //! # What this proves that a metric cannot
 //!
 //! `librefirewall_recording_records_total` is the appliance's own count of what
 //! it believes it encoded. It is worth exposing and it is not evidence: a
 //! recorder that encoded twelve malformed blocks would publish the identical
-//! number. What settles the question is a file a process outside the guest
-//! pulled through a real HTTP client and parsed as pcapng, and the same bytes
-//! read straight off the disk image afterwards — two paths to one artifact,
-//! neither of them the guest's own account of itself.
+//! number. What settles the question is the extent read straight off the disk
+//! image, bounded by the superblock's own durable cursor and walked as pcapng by
+//! a process the guest cannot reach — the one account of a recording that
+//! nothing inside the guest composed for a reader.
 //!
 //! # No adversary
 //!
@@ -18,7 +17,7 @@
 //! and this module walks them by length, which is exactly the discipline it is
 //! asserting the guest kept.
 
-use std::{fmt::Write as _, process::Command, time::Duration};
+use std::fmt::Write as _;
 
 /// pcapng framing: the block type, the total length, and the total length
 /// again at the end.
@@ -159,35 +158,14 @@ const IDB_OPTIONS_AT: usize = 16;
 /// length.
 const EPB_CAPTURE_AT: usize = 28;
 
-/// How long a recording download may take. Generous: the body is megabytes and
-/// crosses the emulated wire one 32 KiB window per round trip.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// What a real client got out of a recording endpoint.
-#[derive(Clone, Debug)]
-pub struct Download {
-    /// The request target it came from, carried rather than recovered from
-    /// [`Self::command`]: every caller that pairs a download with what it must
-    /// be needs to know which recording it holds, and parsing that back out of
-    /// a command line would be a second, weaker statement of the same fact.
-    pub target: &'static str,
-    /// The command as it was run, verbatim, so a reader can repeat it.
-    pub command: String,
-    pub status_line: String,
-    pub headers: Vec<String>,
-    /// The body as bytes. A recording is not text and reading it as one would
-    /// silently replace every byte a `String` cannot hold.
-    pub body: Vec<u8>,
-}
-
-impl Download {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.eq_ignore_ascii_case(name).then(|| value.trim())
-        })
-    }
-}
+/// What each recording is called wherever a verdict names one.
+///
+/// The two are read off the medium in `lfw_recorder::deck::Deck::extents`'
+/// order, and this is what a finding says instead of an extent's start sector:
+/// a reader who has to map a sector back to a recording before the sentence
+/// makes sense is a reader the sentence failed.
+pub const LOG_RECORDING: &str = "the connection history";
+pub const CAPTURE_RECORDING: &str = "the capture";
 
 /// One Interface Description Block, read back into the fields a reader resolves
 /// a packet's `interface_id` through.
@@ -498,60 +476,6 @@ impl Parsed {
     }
 }
 
-/// `GET path` through the forwarded host port, as bytes.
-///
-/// # Errors
-/// A `curl` that could not be started, one that failed, or an answer with no
-/// HTTP head in it.
-pub fn fetch(host_port: u16, target: &'static str) -> Result<Download, String> {
-    let url = format!("http://127.0.0.1:{host_port}{target}");
-    let arguments = [
-        "--silent",
-        "--show-error",
-        "--http1.1",
-        "--include",
-        "--max-time",
-        // A string rather than the constant's `Debug`, so the printed command
-        // is the command.
-        "180",
-        &url,
-    ];
-    let command = format!("curl {}", arguments.join(" "));
-    debug_assert_eq!(FETCH_TIMEOUT.as_secs(), 180);
-
-    let output = Command::new("curl")
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("run `{command}`: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{command}` failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let separator = b"\r\n\r\n";
-    let at = output
-        .stdout
-        .windows(separator.len())
-        .position(|window| window == separator)
-        .ok_or_else(|| format!("`{command}` answered no HTTP head"))?;
-    let head = String::from_utf8_lossy(&output.stdout[..at]).into_owned();
-    let body = output.stdout[at + separator.len()..].to_vec();
-    let mut lines = head.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| format!("`{command}` answered an empty head"))?
-        .to_owned();
-    Ok(Download {
-        target,
-        command,
-        status_line,
-        headers: lines.map(ToOwned::to_owned).collect(),
-        body,
-    })
-}
-
 /// Walk `bytes` as pcapng, block by block, by the lengths the file states.
 ///
 /// Every block carries its total length twice, at its head and at its tail, and
@@ -754,10 +678,12 @@ fn long(value: &[u8]) -> Option<u64> {
         .map(|chunk| u64::from_le_bytes(*chunk))
 }
 
-/// One recording the scenario judges: what it was fetched as, and the bounds it
+/// One recording the scenario judges: which of the two it is, and the bounds it
 /// must meet.
 pub struct Expectation {
-    pub target: &'static str,
+    /// What this recording is called in a finding — one of [`LOG_RECORDING`]
+    /// and [`CAPTURE_RECORDING`].
+    pub recording: &'static str,
     /// The sink's snap length, which no captured length may exceed.
     pub snap_len: usize,
     /// The fewest packet blocks the recording must hold, which is what the
@@ -765,61 +691,42 @@ pub struct Expectation {
     pub least_packets: usize,
 }
 
-/// Judge one download against its expectation, answering the evidence line.
+/// Judge one recording's durable bytes against its expectation.
+///
+/// `bytes` is the extent's durable prefix as the medium holds it — the reading
+/// no process inside the guest composed for a reader — so what is judged here is
+/// the artifact itself rather than an account of it.
 ///
 /// # Errors
-/// A response that is not `200`, one that declares no length at all or whose
-/// declared length disagrees with its body, a body that does not parse as
-/// pcapng, a body the walk did not consume whole, too few packets, or a
-/// captured length past the sink's snap length.
-pub fn judge(download: &Download, expected: &Expectation) -> Result<Parsed, String> {
-    let target = expected.target;
-    if download.target != target {
+/// Bytes that do not parse as pcapng, a body the walk did not consume whole, one
+/// carrying no interface block, too few packets, or a captured length past the
+/// sink's snap length.
+pub fn judge(bytes: &[u8], expected: &Expectation) -> Result<Parsed, String> {
+    let recording = expected.recording;
+    let parsed =
+        parse(bytes).map_err(|error| format!("{recording} is not a pcapng file: {error}"))?;
+    // Mandatory, not conditional: the durable prefix is a whole number of
+    // blocks by construction, so a walk that stopped short of it is a recorder
+    // that wrote a length disagreeing with what it wrote after it — which every
+    // other assertion here would pass over, each of them reading only as far as
+    // the walk got.
+    if parsed.consumed != bytes.len() {
         return Err(format!(
-            "a download of {} was judged against the contract for {target}, so the two \
-             recordings have been paired the wrong way round",
-            download.target
-        ));
-    }
-    if !download.status_line.contains("200") {
-        return Err(format!(
-            "`{}` was answered {:?}",
-            download.command, download.status_line
-        ));
-    }
-    // Mandatory, not conditional: the endpoint answers an exact length, and a
-    // regression that stopped emitting one would leave this contract green
-    // because `curl` reads to close and the body still parses.
-    let stated: usize = download
-        .header("content-length")
-        .ok_or_else(|| format!("GET {target} carries no Content-Length"))?
-        .parse()
-        .map_err(|error| format!("GET {target} stated an unreadable Content-Length: {error}"))?;
-    if stated != download.body.len() {
-        return Err(format!(
-            "GET {target} states a Content-Length of {stated} and carries {} body bytes",
-            download.body.len()
-        ));
-    }
-    let parsed = parse(&download.body)
-        .map_err(|error| format!("GET {target} did not answer a pcapng file: {error}"))?;
-    if parsed.consumed != download.body.len() {
-        return Err(format!(
-            "GET {target} answered {} bytes of which the block walk consumed {}, so a block's \
-             own length disagrees with the file",
-            download.body.len(),
+            "{recording} holds {} durable byte(s) of which the block walk consumed {}, so a \
+             block's own length disagrees with the file",
+            bytes.len(),
             parsed.consumed
         ));
     }
     if parsed.interfaces.is_empty() {
         return Err(format!(
-            "GET {target} carries no Interface Description Block, so no packet in it names an \
+            "{recording} carries no Interface Description Block, so no packet in it names an \
              interface a reader can resolve"
         ));
     }
     if parsed.packets.len() < expected.least_packets {
         return Err(format!(
-            "GET {target} holds {} packet blocks and the harness put {} frames across the \
+            "{recording} holds {} packet blocks and the harness put {} frames across the \
              appliance, so the recording is missing observations",
             parsed.packets.len(),
             expected.least_packets
@@ -827,7 +734,7 @@ pub fn judge(download: &Download, expected: &Expectation) -> Result<Parsed, Stri
     }
     if parsed.longest_capture() > expected.snap_len {
         return Err(format!(
-            "GET {target} holds a packet block claiming {} captured bytes, past the sink's snap \
+            "{recording} holds a packet block claiming {} captured bytes, past the sink's snap \
              length of {}",
             parsed.longest_capture(),
             expected.snap_len
@@ -836,17 +743,15 @@ pub fn judge(download: &Download, expected: &Expectation) -> Result<Parsed, Stri
     Ok(parsed)
 }
 
-/// The evidence line one judged download leaves.
+/// The evidence line one judged recording leaves.
 #[must_use]
-pub fn evidence(download: &Download, parsed: &Parsed, snap_len: usize) -> String {
+pub fn evidence(recording: &str, len: usize, parsed: &Parsed, snap_len: usize) -> String {
     let mut line = String::new();
     let _ = write!(
         line,
-        "  {}: {} bytes, {} section header(s), {} interface block(s), {} packet block(s), \
-         {} metric reading(s), {} transcript batch(es) of {} line(s), {} padding block(s), \
-         longest capture {} of a snap length of {snap_len}",
-        download.target,
-        download.body.len(),
+        "  {recording}: {len} bytes, {} section header(s), {} interface block(s), {} packet \
+         block(s), {} metric reading(s), {} transcript batch(es) of {} line(s), {} padding \
+         block(s), longest capture {} of a snap length of {snap_len}",
         parsed.sections,
         parsed.interfaces.len(),
         parsed.packets.len(),

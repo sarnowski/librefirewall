@@ -44,8 +44,7 @@ use crate::catalog::{
     RECEIVE_FRAMES, RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
     RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
-    RECORDING_SNAPSHOTS, RECORDING_STAGING_DEFERRALS, RECORDING_STREAM_BYTES,
-    RECORDING_STREAM_WINDOWS, RECORDING_STREAMS, RECORDING_TAP_DROPPED_BY_WRITER,
+    RECORDING_SNAPSHOTS, RECORDING_STAGING_DEFERRALS, RECORDING_TAP_DROPPED_BY_WRITER,
     RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_TRANSCRIPT_LINES,
     RECORDING_TRANSCRIPTS, RECORDING_WRAPS, ROUTE_DROPS, ROUTE_STAGE_DROPS, STORE_GENERATION,
     STORE_IDENTITY, STORE_MINTED, STORE_ONBOARDED, STORE_RESET, STORE_SIGN_REFUSALS,
@@ -1180,7 +1179,7 @@ pub struct OnboardSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 143;
+pub const MANAGEMENT_SLOTS: usize = 139;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1198,7 +1197,6 @@ pub struct ManagementSample {
     pub endpoint: EndpointSample,
     pub neighbours: NeighbourSample,
     pub outbound: OutboundSample,
-    /// The transport under the HTTP server.
     pub tcp: TcpSample,
     /// And the one under the onboarding port, which is its own table with its
     /// own numbers: a second peer's handshake is refused by *this* stack, and
@@ -1207,8 +1205,6 @@ pub struct ManagementSample {
     pub http: HttpSample,
     /// The second listening port's own account of itself.
     pub onboard: OnboardSample,
-    /// Streams begun, given up on, windows handed over, and their bytes.
-    pub streams: [u64; 4],
     pub log: LogSample,
 }
 
@@ -1707,10 +1703,6 @@ impl ManagementSample {
         plain(&HTTP_BODY_OVERRUNS),
         plain(&HTTP_RETRANSMITS_UNAVAILABLE),
         plain(&HTTP_SLOTS_EXHAUSTED),
-        s(&RECORDING_STREAMS, &[Label::new("outcome", "started")]),
-        s(&RECORDING_STREAMS, &[Label::new("outcome", "abandoned")]),
-        plain(&RECORDING_STREAM_WINDOWS),
-        plain(&RECORDING_STREAM_BYTES),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
@@ -1840,7 +1832,6 @@ impl ManagementSample {
         put(&mut values, &mut at, http.retransmits_unavailable);
         put(&mut values, &mut at, http.slots_exhausted);
 
-        put_all(&mut values, &mut at, &self.streams);
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);
         values

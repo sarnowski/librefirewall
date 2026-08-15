@@ -1,51 +1,53 @@
-# Recording downloads
+# Recordings
 
 **Purpose:** hand an analyst the appliance's own record of the traffic it handled, in a format their
 tools already open. This is the evidence half of the debug dump, and the one surface that carries the
 traffic itself.
 
-**Endpoints:** `GET /logs.pcapng` and `GET /capture.pcapng` on the management port. Each returns one
-of the two recording sinks (see the [recording design](../design/recording.md)) — the same encoder,
-the same ring machinery, the same download path. What differs is **what each one records**:
-`/logs.pcapng` is a connection history, holding a record where the appliance reached a connection
-lifecycle or policy event, and `/capture.pcapng` holds every observation with the verdict on it.
+**Where they are:** two ring extents on the appliance's own block device (see the
+[recording design](../design/recording.md)) — the same encoder and the same ring machinery. What
+differs is **what each one records**: the **connection history** holds a record where the appliance
+reached a connection lifecycle or policy event, and the **capture** holds every observation with the
+verdict on it.
 
-> **These bodies carry packet payloads.** They are the single named exception to the no-payload rule
+**How they leave the appliance:** over the mutually-authenticated
+[management channel](../design/management.md) and by no other route. Each is shipped upstream
+continuously from a cursor the management server acknowledges, and an operator asks for a byte
+extent of either with a range read over the same connection. There is no HTTP download; the two that
+existed have been removed.
+
+> **These carry packet payloads.** They are the single named exception to the no-payload rule
 > stated under the conventions in [Observability surfaces](observability.md), and nothing else on
-> any surface carries a byte of traffic.
-> **They are unauthenticated**: the port has neither TLS nor client authentication, so anyone who
-> can reach it can download every packet the appliance recorded. Treat reachability of the
-> management port as equivalent to handing over the recordings.
+> any surface carries a byte of traffic. The authorization the exception is conditioned on is the
+> channel's: a recording reaches a management server that presented a certificate this appliance's
+> own delivered anchor accepts, and reaches nobody else.
 
-## What a response is
+## How a recording reaches a reader
 
-| property | value |
-|---|---|
-| method | `GET`; anything else is `405` |
-| `Content-Type` | `application/octet-stream` — this appliance's HTTP layer names no pcapng type and would be claiming to know a format it does not parse |
-| `Content-Length` | always present, always exact, and **committed before the first body byte** |
-| `Connection` | `close`, on every response, as on every other endpoint here |
-| concurrency | one response at a time; a request arriving while another is going out is answered `503` |
-| conditional and partial requests | none — no `Range`, no `If-Match`, no `ETag`. A client takes the whole recording or nothing |
+Two paths over the one channel, and neither has a format of its own: both carry the recording's own
+pcapng bytes, at the ring position they were read from.
 
-**The length is pinned, not estimated.** The first window of a download seals the named recording —
-flushing whatever was still in staging out to the medium — and takes a snapshot: the oldest segment
-the ring still holds, and the durable write position. That snapshot fixes the body length, the
-response commits to it in `Content-Length`, and every later window is located against the *same*
-snapshot even though the recording keeps growing underneath it. A recording whose length could not be
-stated is never begun rather than begun and truncated, and one longer than 2 GiB is refused outright
-rather than served wrong.
+- **Shipping** is continuous and in order. The appliance reads its own cursor into each ring and
+  sends the bytes upstream frame by frame, each frame stating the recording and the absolute append
+  position it starts at, so a frame is self-locating whatever its size. The cursor moves only on a
+  frame the far end answered, so a shipment may cross twice and can never be lost. A management
+  server states, per recording, how far it has durably ingested — in its greeting, which is where a
+  session resumes from, and in acknowledgements as the session runs — and that position is written
+  into the recording's own superblock, so a reboot resumes rather than restarts.
+- **A range read** answers a question. An operator names a recording, a start and a length, and the
+  answer is a sequence of frames at strictly advancing positions, or a status saying why the extent
+  cannot be served: `Overwritten` where the ring has rolled past it, `MediumRefused` where the
+  medium refused. It is never a short read dressed as a complete one, and it moves no cursor.
 
-**A body is assembled a window at a time and never held whole.** The recorder answers up to 32 KiB
-per round trip out of its staging window, the endpoint copies each into a 16 KiB sliding transport
-window twice the span it may be asked to retransmit out of, and no domain holds a second copy of a
-megabyte. Nothing between the medium and the wire parses the recording.
+**Every bound on either path is this appliance's own.** A range request is capped at one mebibyte
+and 1024 answer frames, with one answer in flight per session; a second request under one is a
+protocol violation that closes the connection. The medium is shared out between the two shipping
+cursors and one range answer in turn, so neither a peer asking for extent after extent starves the
+channel's own purpose, nor the traffic starves an operator's request.
 
-**A window is a bound, not a demand.** The endpoint names both where the next bytes begin and the
-most it will take, and a supplier handing over fewer than that **advances** the response in place:
-the next window is asked for at the byte after what arrived, and the span behind it is never given
-up. A reader of a segmented ring runs short at every extent boundary, so a short window is the
-ordinary case rather than a failure, and it is neither an early end to the body nor a shorter one.
+**A recording is read a window at a time and never held whole.** The recorder answers up to 32 KiB
+per round trip out of its staging window, and no domain holds a second copy of a megabyte. Nothing
+between the medium and the wire parses the recording.
 
 **An extent taken off the disk never describes itself further than it was written.** This matters to
 anyone who reads the medium directly rather than downloading — a recovered disk, a forensic copy —
@@ -67,35 +69,22 @@ itself: an unwritten checkpoint costs the extent its statement of where it ends,
 
 ## When it goes wrong
 
-There is no error body, and **where the failure falls decides what a client sees**:
-
-- **Before the head is written** — nothing is on the wire yet, so the request is answered
-  `503 Service Unavailable` with no body. A recorder that has nothing to serve, and a recording whose
-  length exceeds the 2 GiB a windowed response can address, both land here.
-- **After the head** — `Content-Length` has already been committed, so the connection is **reset**
-  short of it, rather than finished. A `FIN` under an exact `Content-Length` presents a truncated
-  message to an intermediary as a complete one, and a reset cannot be read that way. **A client sees
-  a truncated body, never a wrong one**, and a truncated body is detectable by anything that counts
-  what it received; `curl` reports it.
-
-The ways a download ends early, wherever it falls:
+A read the recorder cannot answer ends the frame sequence with a status rather than with short
+bytes, and the cause that the wire cannot carry is put on the console instead — the wire has three
+statuses and the recorder has six refusals, so the mapping is lossy by construction and the console
+is where the lost cause goes.
 
 | condition | what it means | counted as |
 |---|---|---|
-| `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-download | `librefirewall_recording_download_overruns_total{sink}` and `librefirewall_recording_streams_total{outcome="abandoned"}` |
-| `DeviceError` | the block device refused the read, or completed it having moved fewer bytes than were asked for — a short read is an error here and never bytes to serve | `librefirewall_recording_streams_total{outcome="abandoned"}` |
-| `NotReady` / `OutOfRange` / `NoSuchSink` | the recorder has nothing to serve for that request | `librefirewall_recording_streams_total{outcome="abandoned"}` |
-| the transport and the recorder disagree about the range in flight | ours, and expected never to happen | `librefirewall_recording_streams_total{outcome="abandoned"}` |
+| `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-read. Answers `Overwritten` to a range read, and moves a shipping cursor to where the medium now begins | `librefirewall_recording_download_overruns_total{sink}` |
+| `DeviceError` | the block device refused the read, or completed it having moved fewer bytes than were asked for — a short read is an error here and never bytes to serve | `librefirewall_recording_downloads_total{outcome="refused"}` |
+| `NotReady` / `OutOfRange` / `NoSuchSink` / `NoSuchReader` | the recorder has nothing to serve for that request; the last two are this appliance's own defect, since it composes the request | `librefirewall_recording_downloads_total{outcome="refused"}` |
 
-None is retried: none is a state a retry improves. A download that completed is
-`librefirewall_recording_streams_total{outcome="started"}` with no matching `abandoned`, and the
-bytes and windows it took are `librefirewall_recording_stream_bytes_total` and
-`librefirewall_recording_stream_windows_total`.
+None is retried in place: none is a state a retry improves. A shipping cursor comes back to the same
+position on the next turn and loses nothing; a range answer ends, saying which of the two statuses
+it ended on. A recorder that says nothing at all inside the reply timeout gives its slot back and is
+reported on the console under a token of its own, distinct from a recorder that said no.
 
-**A `404` on either target is a build fact, not a fault.** It means the endpoint's streamed-target
-table would not take both recordings, which is stated once on the console as
-`recording-targets-unregistered` (see [Console records](console.md)). The recorder is unaffected and
-still writing to the medium.
 
 ## What is inside the file
 
@@ -204,7 +193,7 @@ zero — which no frame the appliance reaches a verdict on can have, having pars
 Ethernet — carries no `epb_flags` and no classification, and names no rule. What it *does* carry is
 the flow it ended and the state that conversation was in when the commit reached it, so it folds onto
 the record that opened the conversation by the same (slot, occupant) pair every other record is
-folded by. It appears in `/logs.pcapng` alone: a capture is the frames themselves, and this one was
+folded by. It appears in the connection history alone: a capture is the frames themselves, and this one was
 on no wire.
 
 That is the honest shape rather than the convenient one. Writing a plausible frame into the block
@@ -225,10 +214,10 @@ causing packet that *is* written, and the paragraph above says how it is written
 has no such record.
 
 - **A Custom Block of padding** fills whatever the encoder must leave empty to keep every write to
-  the device a whole sector: the rest of a segment when one is sealed, the rest of the open sector
-  before every download, and the rest of the open sector behind every counter block and every
-  console-transcript block below. A downloaded file therefore carries padding in its interior and
-  not only at a segment's end — in `/logs.pcapng`, one block of it after each of those two, which is
+  the device a whole sector: the rest of a segment when one is sealed, and the rest of the open
+  sector behind every counter block and every
+  console-transcript block below. A recording therefore carries padding in its interior and
+  not only at a segment's end — in the connection history, one block of it after each of those two, which is
   why that file holds roughly a sector per console line. It is skipped by any reader that does not
   know the PEN, and by `tcpdump`.
 - **Why those two are padded and a packet is not.** The header each extent carries states how far
@@ -239,11 +228,10 @@ has no such record.
   when nothing else is happening keeps the header pointing at a block boundary in the case that
   would otherwise be the common one. It does **not** hold generally: a packet block is not padded,
   one sector per frame being a cost a capture cannot carry, so between those points the position
-  the header states can still fall inside a packet block. A download is not exposed to this — the
-  appliance seals the recording before it serves one — and neither is a reader following the
-  recording upstream, which is handed the bytes as a stream. It is the direct reader of the medium
-  who must be prepared for a short final block.
-- **A Custom Block of counters** appears in `/logs.pcapng` about once a second, carrying the whole
+  the header states can still fall inside a packet block. A reader following the recording upstream
+  is not exposed to this, being handed the bytes as a stream. It is the direct reader of the medium
+  — a recovered disk, a forensic copy — who must be prepared for a short final block.
+- **A Custom Block of counters** appears in the connection history about once a second, carrying the whole
   metric surface as it stood at one instant. It shares the block type and the enterprise number with
   the padding above and is told apart by the first byte of its data: **empty data, or a leading zero
   byte, is padding**, `1` is a metric reading and `2` is a console transcript. Its layout is in
@@ -254,7 +242,7 @@ has no such record.
   per-interface information and no per-rule hit count in a recording, because neither has a fixed
   place in the catalogue to occupy. A reader that does not recognise the PEN skips these exactly as
   it skips the padding, so a recording carrying them opens in `tcpdump` unchanged.
-- **A Custom Block of console lines** appears in `/logs.pcapng` carrying a batch of the lines the
+- **A Custom Block of console lines** appears in the connection history carrying a batch of the lines the
   appliance printed on its serial console, byte for byte as it printed them, each with the
   protection-domain ring it was drained from and the instant it was emitted at. Its kind byte is `2`
   and its layout is in
@@ -272,18 +260,18 @@ has no such record.
 - **Neither an Interface Statistics Block nor a Decryption Secrets Block appears.** `epb_dropcount`
   is therefore the whole of what a file says about its own loss, and it says one thing: what the tap
   ring dropped. A recording the encoder or the medium lost records from reads exactly like one that
-  lost none, so the loss families under [the two recordings, and the downloads served out of
-  them](metrics.md#the-two-recordings-and-the-downloads-served-out-of-them) are the other half of
+  lost none, so the loss families under [the two recordings, and the reads served out of
+  them](metrics.md#the-two-recordings-and-the-reads-served-out-of-them) are the other half of
   the account, and a recording is read beside a scrape rather than alone.
 
 ## What the two recordings hold
 
-**`/capture.pcapng` holds every observation of a frame, with its verdict.** Every frame the appliance
+**the capture holds every observation of a frame, with its verdict.** Every frame the appliance
 reached a decision about is a record, and every record carries the annotation above: allow or deny, the reason,
 the rule where one matched, and the conversation it belongs to. It keeps up to 2048 bytes of each
 frame, which is the whole of every frame a dataplane link carries at a standard MTU.
 
-**`/logs.pcapng` holds a record only where the appliance reached a lifecycle or policy event** — a
+**the connection history holds a record only where the appliance reached a lifecycle or policy event** — a
 conversation opened, advanced, closed or revoked, a policy refusal, a tracker refusal. Its records of
 *frames* are therefore a subset of the capture's, relatable to them one for one by `epb_packetid`, and
 it holds **no record for a packet that caused no event**: traffic on a conversation already accounted
@@ -303,8 +291,8 @@ the capture's job.
 
 Four further limits an operator will otherwise infer wrongly:
 
-- **Only the dataplane is recorded.** The management port is not tapped, so nothing on it — including
-  the download itself — appears in either file.
+- **Only the dataplane is recorded.** The management port is not tapped, so nothing on it —
+  including the channel carrying the recordings themselves — appears in either file.
 - **One observation per frame.** A forwarded frame is recorded once and not once per direction, so
   every `epb_flags` reads inbound. `epb_packetid` is minted and monotone, and there is never a
   second record of one frame to relate within a file — the pairing it serves is between the two files.
@@ -312,8 +300,8 @@ Four further limits an operator will otherwise infer wrongly:
   reached about, one routed out of a port the stage is not wired to, and one recorded as forwarded
   that a later refusal lost are all counted on the dataplane families and encoded in no recording,
   because the tap ABI mirrors the router's drop reasons exactly and has none for them. See
-  [the two recordings, and the downloads served out of
-  them](metrics.md#the-two-recordings-and-the-downloads-served-out-of-them) for the reconciliation.
+  [the two recordings, and the reads served out of
+  them](metrics.md#the-two-recordings-and-the-reads-served-out-of-them) for the reconciliation.
 - **A connection's history reduces from its events, and a reader performs that fold.** The rings are
   append-only, so the appliance keeps no one-row-per-connection table; every record carries the flow
   identity and the state as then known, so a conversation whose earlier records have already been

@@ -97,7 +97,7 @@ use crate::onboard_install_contract;
 use crate::onboard_request_contract;
 use crate::onboard_tls_contract;
 use crate::qemu::{GuestNic, every_guest_nic};
-use crate::recording_contract::{self, Download};
+use crate::recording_contract;
 use crate::surface_contract::Injected;
 use crate::topology::{Endpoint, ManagementPort, PORTS, PortPolicy, Topology};
 
@@ -6440,20 +6440,17 @@ pub struct Booted {
     /// which is the independent half of the per-rule cross-check the scrape
     /// scenarios make.
     pub policy: PolicyWitness,
-    /// What `curl` got out of `/logs.pcapng` and `/capture.pcapng`, in that
-    /// order, on every boot whose management port a real client can reach.
-    /// Empty on every socket-backed boot.
-    pub recordings: Vec<Download>,
-    /// What each of those two extents already held **going into** this boot, in
-    /// the same order. Empty on every boot that made its own medium.
+    /// What each of the two recording extents already held **going into** this
+    /// boot, in `lfw_recorder::deck::Deck::extents`' order. Empty on every boot
+    /// that made its own medium.
     ///
     /// Filled by the caller rather than here, because it is a fact about the
     /// image that was attached and not about anything the guest did: this
     /// function never opens the medium, and the reading has to be taken before
     /// QEMU is spawned to mean anything at all. What it is for is
-    /// [`crate::surface_contract::Surface::carried`] — a download taken on a
-    /// resumed recording answers earlier boots' records, and this is what tells
-    /// them from the ones this boot's counters are an account of.
+    /// [`crate::surface_contract::Surface::carried`] — a recording that was
+    /// resumed holds earlier boots' records, and this is what tells them from
+    /// the ones this boot's counters are an account of.
     pub carried_recordings: Vec<recording_contract::Parsed>,
     /// Both recording extents as the **medium** holds them once the guest has
     /// stopped, in [`lfw_recorder::deck::Deck::extents`]'s order.
@@ -6602,7 +6599,6 @@ fn run_boot(
     // so they survive every exit path.
     let mut dataplane_frames: u64 = 0;
     let mut scrapes: Vec<Scrape> = Vec::new();
-    let mut recordings: Vec<Download> = Vec::new();
     let mut handshakes: Vec<onboard_tls_contract::Attempt> = Vec::new();
     let mut requests: Vec<onboard_request_contract::Attempt> = Vec::new();
     let mut installs: Option<onboard_install_contract::Onboarded> = None;
@@ -7403,25 +7399,6 @@ fn run_boot(
                                 log_path.display()
                             ));
                         }
-                        // After the metrics, and through the same client: what
-                        // an operator runs is `curl`, and a body this harness
-                        // composed itself would prove nothing about the
-                        // transport that carries a megabyte. Every boot that
-                        // reaches the endpoint pulls both, because a scenario
-                        // that booted a reachable endpoint and judged one
-                        // surface of the three is the gap the cross-surface
-                        // contract closes.
-                        for target in [pd_runtime::LOG_TARGET, pd_runtime::CAPTURE_TARGET] {
-                            match recording_contract::fetch(host_port, target) {
-                                Ok(one) => recordings.push(one),
-                                Err(verdict) => {
-                                    break 'run Err(format!(
-                                        "{verdict}; see {}",
-                                        log_path.display()
-                                    ));
-                                }
-                            }
-                        }
                         // And, where the scenario's subject is the *other*
                         // port, the clients that reach it. After the three
                         // surfaces above, so a boot that failed one of them
@@ -7979,7 +7956,6 @@ fn run_boot(
         scrapes,
         dataplane_frames,
         policy,
-        recordings,
         carried_recordings: Vec::new(),
         on_the_medium: Vec::new(),
         handshakes,

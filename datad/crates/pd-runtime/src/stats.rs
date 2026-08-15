@@ -39,9 +39,8 @@ use crate::{ConfigCounters, EndpointStageCounters, PoolCounters, RouteCounters, 
 /// order.
 ///
 /// One value rather than eight arguments because the order **is** the ABI: a
-/// snapshot reads slot 3 as `nic_driver2`'s, and a domain that handed them over
-/// in another order would attribute one port's traffic to another. Copy, so the
-/// endpoint that renders from it owns it outright.
+/// snapshot reads slot 3 as `nic_driver2`'s, and another order would attribute
+/// one port's traffic to another. Copy, so the renderer owns it outright.
 #[derive(Clone, Copy)]
 pub struct StatsRegions<'ring> {
     pub shards: [&'ring StatsShard; SHARD_COUNT],
@@ -404,21 +403,15 @@ pub fn management_sample(
         onboarding,
         http,
         onboard,
-        streams: [
-            stage.downloads.started,
-            stage.downloads.abandoned,
-            stage.downloads.windows,
-            stage.downloads.bytes,
-        ],
         log,
     }
 }
 
 /// What the deciding domain has decided, in the console's own outcome order.
 ///
-/// A struct rather than six arguments: the array `ConfigSample` publishes is
-/// keyed by position, and counts handed over out of order would attribute a
-/// refusal to a generation that applied.
+/// A struct rather than six arguments: the array `ConfigSample` publishes is keyed
+/// by position, and counts out of order would attribute a refusal to a generation
+/// that applied.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubmissionCounters {
     pub applied: u64,

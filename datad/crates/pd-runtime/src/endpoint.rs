@@ -69,7 +69,7 @@ use lfw_clock::{
 };
 use lfw_ip_endpoint::{
     ConnectionId, ContentType, Endpoint, IsnSecret, Status,
-    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, MAX_STREAM_TARGETS, METRICS_TARGET},
+    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS, METRICS_TARGET},
     onboard::{Ended as OnboardEnded, StreamCounters},
     outbound::{DialFacts, Ended, OpenError, Resolutions, Session},
     route::Hop,
@@ -194,40 +194,37 @@ pub const MAX_REPLY_LEN: usize = BUFFER_SIZE - DEVICE_HEADER_LEN as usize;
 ///
 /// Monotonic for the domain's life and saturating, on
 /// [`PoolCounters`](crate::PoolCounters)'s terms: there is no reset, because a
-/// scrape differences successive samples and a reset would forge a negative
-/// rate.
+/// scrape differences successive samples and a reset would forge a negative rate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointStageCounters {
     /// Frames taken off the pipeline whose descriptor named a span inside one
     /// pool buffer.
     pub frames: u64,
     /// Bytes those frames carried, as the descriptors named them. It is the
-    /// *ingress driver's* measurement — that domain clamped the length its
-    /// device reported to the buffer behind it — and never a length this domain
-    /// derived, which is why `malformed_descriptor` is counted separately
-    /// rather than folded in.
+    /// *ingress driver's* measurement — that domain clamped the length its device
+    /// reported to the buffer behind it — and never a length this domain derived,
+    /// which is why `malformed_descriptor` is counted separately.
     pub bytes: u64,
     /// Descriptors naming a span outside the pool. Their bytes are counted
-    /// nowhere: a span this domain cannot believe is not a frame length it may
-    /// add to a total an operator reads.
+    /// nowhere: a span this domain cannot believe is not a length it may add to
+    /// a total an operator reads.
     pub malformed_descriptor: u64,
     /// Spans the pool refused to snapshot, leaving nothing to answer.
     pub snapshot_failed: u64,
     /// Returns the receive pool owner's ring would not take. Each loses its
-    /// buffer to that owner's ledger for good, so a rising count is a shrinking
-    /// pool.
+    /// buffer for good, so a rising count is a shrinking pool.
     pub return_ring_full: u64,
     /// Frames that arrived before any generation was committed, so there was no
-    /// address to answer at. Counted apart from every refusal the endpoint
-    /// makes: an unaddressed port is a node that has not been configured yet,
-    /// not a frame anybody rejected.
+    /// address to answer at. Counted apart from every refusal the endpoint makes:
+    /// an unaddressed port is a node not configured yet, not a frame anybody
+    /// rejected.
     pub unaddressed: u64,
     /// Replies the endpoint composed and this stage handed to the driver.
     pub replies_sent: u64,
     /// Replies composed and then lost, one counter per place they can be: a
-    /// transmit pool with every buffer still in flight, and a transmit ring the
-    /// driver has stopped draining. Both leave the *received* frame counted and
-    /// its buffer returned; what is lost is the answer.
+    /// transmit pool with every buffer in flight, and a transmit ring the driver
+    /// has stopped draining. Both leave the frame counted and its buffer
+    /// returned; what is lost is the answer.
     pub reply_pool_exhausted: u64,
     pub reply_ring_full: u64,
     /// A reply the pool would not take the bytes of. Unreachable while
@@ -258,10 +255,6 @@ pub struct EndpointStageCounters {
     /// Segments this stage's transport composed out of its own timers — a
     /// retransmission, a reset, a close — as against a reply to a frame.
     pub timer_segments: u64,
-    /// What the recording downloads served through this endpoint have done.
-    /// Carried here rather than passed to `publish` so the protection domain
-    /// routes one value into its shard and not two (`crate::download`).
-    pub downloads: crate::download::DownloadCounters,
 }
 
 /// A pipeline's consuming end where the descriptor goes no further: it counts
@@ -298,16 +291,10 @@ pub struct EndpointStage<'ring> {
     /// forwarding domain's shard, which this domain maps read-only, and the two
     /// are joined on a rule's position.
     rules: RuleInventory,
-    /// The targets this domain answers by streaming. Held here as well as in the
-    /// endpoint because a committed generation builds a **new** endpoint: a
-    /// registration made at start-up would otherwise be lost the first time an
-    /// operator published a document, and the target would start answering 404.
-    targets: [Option<&'static str>; MAX_STREAM_TARGETS],
     /// The targets this domain answers with a body it renders whole, and the ones
-    /// it accepts a request body on. Held here for `targets`' reason exactly: a
-    /// commit builds a new endpoint, and a registration this domain did not keep
-    /// would be lost with the old one — which for the configuration target would
-    /// mean an operator's first successful submission made the next one a `404`.
+    /// it accepts a request body on. Held here as well as in the endpoint because
+    /// a committed generation builds a **new** endpoint, and a registration this
+    /// domain did not keep would be lost with the old one.
     rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
     bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
@@ -371,7 +358,6 @@ impl<'ring> EndpointStage<'ring> {
             config: CommittedReader::new(),
             interfaces: InterfaceInventory::EMPTY,
             rules: RuleInventory::EMPTY,
-            targets: [None; MAX_STREAM_TARGETS],
             rendered: [None; MAX_RENDERED_TARGETS],
             bodies: [None; MAX_BODY_TARGETS],
             stats,
@@ -527,38 +513,16 @@ impl<'ring> EndpointStage<'ring> {
         }
     }
 
-    /// Register `target` as one this domain answers by streaming a body it
-    /// produces window by window, rather than with `404`.
+    /// Register `target` as one this domain answers on `GET` with a body it
+    /// renders whole, rather than with `404`.
     ///
     /// Called once at start-up: the registration outlives every committed
     /// generation, because a new document replaces the endpoint and this is what
     /// puts the target back on it. Answers `false` where the target is already
     /// registered, where it is the exposition's own, or where the table is full
-    /// — none of which a fixed set of start-up registrations can reach, and all
-    /// of which are answered rather than asserted so a caller learns of its own
-    /// mistake instead of having it swallowed.
-    pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
-        if target == METRICS_TARGET
-            || self.targets.iter().flatten().any(|it| *it == target)
-            || self.rendered.iter().flatten().any(|it| *it == target)
-        {
-            return false;
-        }
-        let Some(slot) = self.targets.iter_mut().find(|slot| slot.is_none()) else {
-            return false;
-        };
-        *slot = Some(target);
-        self.apply_targets();
-        true
-    }
-
-    /// Register `target` as one this domain answers on `GET` with a body it renders
-    /// whole, on [`serve_stream_at`](Self::serve_stream_at)'s terms.
+    /// — answered rather than asserted, so a caller learns of its own mistake.
     pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
-        if target == METRICS_TARGET
-            || self.rendered.iter().flatten().any(|it| *it == target)
-            || self.targets.iter().flatten().any(|it| *it == target)
-        {
+        if target == METRICS_TARGET || self.rendered.iter().flatten().any(|it| *it == target) {
             return false;
         }
         let Some(slot) = self.rendered.iter_mut().find(|slot| slot.is_none()) else {
@@ -587,19 +551,14 @@ impl<'ring> EndpointStage<'ring> {
 
     /// Put every registered target on the endpoint in force.
     ///
-    /// Each registration takes: the endpoint's own table is [`MAX_STREAM_TARGETS`]
-    /// entries and this one is bounded by the same constant, holds no duplicate
-    /// and holds no [`METRICS_TARGET`], which is the whole of what that table
-    /// refuses. Re-registering one it already holds is refused there and changes
-    /// nothing here.
+    /// Each registration takes: the endpoint's own tables are bounded by the same
+    /// constants these are, hold no duplicate and hold no [`METRICS_TARGET`],
+    /// which is the whole of what they refuse.
     fn apply_targets(&mut self) {
-        let (targets, rendered, bodies) = (self.targets, self.rendered, self.bodies);
+        let (rendered, bodies) = (self.rendered, self.bodies);
         let Some(endpoint) = self.endpoint.as_mut() else {
             return;
         };
-        for target in targets.iter().flatten() {
-            endpoint.serve_stream_at(target);
-        }
         for target in rendered.iter().flatten() {
             endpoint.serve_rendered_at(target);
         }
@@ -647,63 +606,6 @@ impl<'ring> EndpointStage<'ring> {
             // could not compose one gets.
             (written == bytes.len()).then_some(written)
         });
-    }
-
-    /// The registered target a request is waiting on a decision about, and the
-    /// connection that asked.
-    ///
-    /// Answered with [`begin_stream`](Self::begin_stream) where this domain can
-    /// produce the body and [`abandon_stream`](Self::abandon_stream) where it
-    /// cannot; leaving it unanswered holds the endpoint's one staging buffer and
-    /// refuses every scrape made in the meantime.
-    #[must_use]
-    pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
-        self.endpoint.as_ref()?.pending_stream()
-    }
-
-    /// Answer that target with a body of `total` bytes, delivered window by
-    /// window. `false` leaves the request unanswered, and this domain then owes
-    /// it an [`abandon_stream`](Self::abandon_stream).
-    pub fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
-        self.endpoint
-            .as_mut()
-            .is_some_and(|endpoint| endpoint.begin_stream(total, content_type))
-    }
-
-    /// The body byte a window must begin at before the streamed response can go
-    /// on, the most the endpoint will take there, and the connection waiting on
-    /// it.
-    ///
-    /// It is a window **start** and not the next byte to send: it lies a
-    /// retransmit span behind, because the transport owns no copy of a range it
-    /// may re-ask for. The length is a bound rather than a demand — fewer bytes
-    /// advance the response and the remainder is asked for again — which is what
-    /// lets a supplier reading a segmented medium answer at all.
-    #[must_use]
-    pub fn stream_wanted(&self) -> Option<(ConnectionId, u64, usize)> {
-        self.endpoint.as_ref()?.window_wanted()
-    }
-
-    /// Hand the endpoint the window beginning at body byte `start`. `false`
-    /// where it is not the window that was asked for, which is counted there and
-    /// leaves the response where it was.
-    pub fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
-        self.endpoint
-            .as_mut()
-            .is_some_and(|endpoint| endpoint.supply_window(start, bytes))
-    }
-
-    /// Give up on the streamed response: the connection closes short of the
-    /// length its head announced rather than being padded to it.
-    /// Take the download half's counters, so this domain's shard carries them.
-    pub fn note_downloads(&mut self, counters: crate::download::DownloadCounters) {
-        self.counters.downloads = counters;
-    }
-
-    pub fn abandon_stream(&mut self) {
-        if let Some(endpoint) = self.endpoint.as_mut() {
-            endpoint.abandon_stream();
-        }
     }
 
     /// The instant `now` names, or `None` while no calibration has been taken.

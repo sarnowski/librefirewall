@@ -34,15 +34,15 @@ and this reference does not carry guesses.
 - **Configuration** — the `GET /config` endpoint, returning the configuration in force as a document,
   and `POST /config`, which replaces it. The only surface of the six that **changes** anything, and
   the only one whose reach is the authority to decide what the appliance forwards.
-- **Recording download** — `GET /logs.pcapng` and `GET /capture.pcapng`, the two pcapng recording
-  sinks (see the [recording design](../design/recording.md)). The first is a **connection history**,
+- **Recordings** — the two pcapng recording sinks (see the
+  [recording design](../design/recording.md)). The first is a **connection history**,
   holding a record where the appliance reached a connection lifecycle or policy event; the second
   holds **every observation with the verdict on it**. This surface carries **evidence rather
   than state**: nothing on it is summarised, a reader is a packet analyser rather than a dashboard,
-  and it is the only one of the six that carries the traffic itself, at a volume the medium under it
-  bounds rather than memory. It is HTTP on the management port, like `GET /metrics`, `GET /logs` and
-  `GET /config`, and counted by the same metrics, so the families describing it are specified in
-  [Prometheus metrics](metrics.md) — but the *format* of what it returns is pcapng, and pcapng's
+  and it is the only one that carries the traffic itself, at a volume the medium under it
+  bounds rather than memory. It is reached over the authenticated management channel — shipped
+  upstream from a cursor the server acknowledges, or asked for by extent with a range read — and
+  never over HTTP; the *format* of what it carries is pcapng, and pcapng's
   specification, not this reference, is the contract for the bytes inside the file.
 
 **Complete-state principle.** Scraping `GET /metrics`, reading `GET /config`, tailing `GET /logs`,
@@ -119,15 +119,15 @@ implementation and binds the two that follow.
   the exposition it is structural too: a metric value is a number and a label comes from a closed
   vocabulary or a validated identifier.
 
-  The exception is `GET /logs.pcapng` and `GET /capture.pcapng`, and it is stated rather than
+  The exception is the two recordings, and it is stated rather than
   tolerated: a recording exists **to** carry the traffic, and a capture that omitted the payload
   would not be one. It is bounded to those two artifacts — the capture sink records payloads, the log
-  sink the L2–L4 headers of the packet each record is anchored to — it is why a recording is an
-  authorized download rather than an open scrape, and it is why an inspected flow is meant to be
+  sink the L2–L4 headers of the packet each record is anchored to — it is why a recording is
+  authorized rather than openly scraped, and it is why an inspected flow is meant to be
   recorded as ciphertext plus its keys rather than as plaintext at rest. Nothing else on any surface
-  moves because of it. **That authorization is not in front of the port**: it carries neither TLS nor
-  client authentication, so anyone who can reach it can download every recorded packet — see
-  [Recording downloads](recordings.md).
+  moves because of it. **That authorization is now in front of it**: a recording leaves this
+  appliance over the mutually-authenticated management channel and by no other route — see
+  [Recordings](recordings.md).
 
   One consequence worth stating where a reader will look for it: `sectors=`/`leading=` on the console
   is **not** an instance of the exception. It is eight bytes of a sector rendered as an integer, and

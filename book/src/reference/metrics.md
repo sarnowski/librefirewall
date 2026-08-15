@@ -58,10 +58,10 @@ in the *next* one.
 
 ## Metric inventory
 
-128 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A scrape is 474 counter and gauge series from the 12 shards,
+125 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A scrape is 470 counter and gauge series from the 12 shards,
 plus one info series per configured interface and one hit counter per rule the running policy
-declares, and the document they render into is bounded at 102 941 bytes — a worst case computed from
+declares, and the document they render into is bounded at 102 085 bytes — a worst case computed from
 these tables at build time, which is what the staging buffer behind the endpoint is sized from.
 
 That bound is dominated by the rules: it covers a policy naming all 256 the configuration accepts,
@@ -313,7 +313,7 @@ Either domain's virtqueue faults are **not** a family of their own: they are
 virtqueue that lied about its own protocol is one kind of event whatever the queue carries, and an
 operator alerting on it should not have to know which domain owns which device.
 
-### The two recordings, and the downloads served out of them
+### The two recordings, and the reads served out of them
 
 Every family here carries `sink` where it describes one recording and omits it where it describes
 the tap between the forwarder and this domain, which is one ring feeding both.
@@ -356,14 +356,6 @@ misreporting rather than a lost record.
 | `librefirewall_recording_transcript_lines_total` | counter | `recorder` | — | Console lines those batches carried, which is what a management server stores as this appliance's log. |
 | `librefirewall_recording_transcripts_total` | counter | `recorder` | `outcome`&nbsp;(`dropped`, `written`) | Batches of console transcript lines the recorder framed into the connection history, and those it could not: one no segment could hold. |
 | `librefirewall_recording_wraps_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Times a ring returned to its first segment, evicting the oldest history it held. |
-
-The download's other half is on the management domain, because that is the domain that serves it:
-
-| Metric | Type | `domain` | Other labels | Meaning |
-|---|---|---|---|---|
-| `librefirewall_recording_stream_bytes_total` | counter | `management` | — | Body bytes those windows carried. |
-| `librefirewall_recording_stream_windows_total` | counter | `management` | — | Windows of a recording handed to the transport. |
-| `librefirewall_recording_streams_total` | counter | `management` | `outcome`&nbsp;(`abandoned`, `started`) | Recording downloads this domain began, and those it gave up on part-sent. |
 
 **No series describes ring occupancy**, and none describes how much history a recording holds. A
 wrap count says a segment was evicted; it does not say how far behind a reader was when it went, and

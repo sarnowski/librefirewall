@@ -889,13 +889,13 @@ domain published a calibration this domain will not convert readings with, so th
 and ICMP echo — neither needs a time — and refuses TCP, counting each segment as unclocked. They are
 reported once per calibration rather than once per frame.
 
-The fifth also rides on **`state=ready`**, and is narrower still: the endpoint's streamed-target
-table would not take both recording targets, so `GET /logs.pcapng` and `GET /capture.pcapng` answer
-`404` while everything else on the port — ARP, ICMP echo, TCP, `GET /metrics` — serves normally. It
-is a **build fact rather than a run-time condition** (the table is a fixed size), so it is stated
-once at bring-up and never again, and the port carries on rather than refusing to start. An operator
-seeing it should read it as "this image cannot serve its recordings", not as a fault in the recorder,
-which is unaffected and still writing them to the medium.
+The fifth also rides on **`state=ready`**, and is narrower still: the endpoint's target table would
+not take the configuration target, so `GET /config` and `POST /config` answer `404` while everything
+else on the port — ARP, ICMP echo, TCP, `GET /metrics` — serves normally. It is a **build fact
+rather than a run-time condition** (the table is a fixed size), so it is stated once at bring-up and
+never again, and the port carries on rather than refusing to start. An operator seeing it should
+read it as "this image cannot take a document over HTTP", not as a fault in the deciding domain,
+which is unaffected.
 
 The sixth rides on **`state=ready`** as well, and it is not a failure at all: this appliance has
 nowhere to dial. An appliance learns where its management plane is when it takes an owner, so an
@@ -954,7 +954,7 @@ anything.
 |---|---|
 | the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the three 64-bit draws failed) |
 | the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused), `clock-implausible-epoch` (the nanoseconds refused) |
-| the recording targets (a `ready` record, no `detail=`; the port serves everything else) | `recording-targets-unregistered` |
+| the configuration target (a `ready` record, no `detail=`; the port serves everything else) | `configuration-target-unregistered` |
 | nowhere to dial (a `ready` record, no `detail=`; the port serves everything else and opens no channel) | `dial-endpoint-unpublished` |
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
 | an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown`, `relay-wanted-unknown` |

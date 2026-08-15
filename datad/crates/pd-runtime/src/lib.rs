@@ -540,9 +540,7 @@ pub use configuration::{
     CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Outcome, Submissions, reject_reason_of,
     write_result_line,
 };
-pub use download::{
-    CAPTURE_TARGET, DownloadCounters, Downloads, LOG_TARGET, Shipped, Stream, sink_for,
-};
+pub use download::{Downloads, Shipped};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,
     EndpointStageCounters, MAX_REPLY_LEN, ONBOARD_LIMIT, OUTPUT_LIMIT, TIMER_LIMIT,

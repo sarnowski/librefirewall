@@ -296,11 +296,12 @@ The decisions that constrain all observability code:
   a third — widening the exception is a design change, not a commit.
 - **The debug surface is closed and enumerated, and adding to it is a design change, not a
   commit.** Today the enumeration is six surfaces: the console, the OpenTelemetry log stream,
-  `GET /metrics`, `GET /logs`, `GET /config`, and the recording download — one surface carrying two
-  files, `/logs.pcapng` and `/capture.pcapng`. That enumeration stays true until the
-  [management-plane redesign](../design/management.md) replaces the HTTP members with the channel,
-  retargeting the list to **console, channel, and recordings**; the list changes in the phase that
-  changes the surface, never before. What never changes is the invariant: a new introspection
+  `GET /metrics`, `GET /logs`, `GET /config`, and the two recordings — which are no longer an HTTP
+  download but are reached over the management channel, shipped upstream or asked for by extent.
+  That enumeration stays true until the
+  [management-plane redesign](../design/management.md) replaces the remaining HTTP members with the
+  channel, retargeting the list to **console, channel, and recordings**; the list changes in the
+  phase that changes the surface, never before. What never changes is the invariant: a new introspection
   mechanism — a debug endpoint, a side channel, a diagnostic dump — changes the product's attack
   surface and is a design change.
 
@@ -313,8 +314,8 @@ through them rather than about it from the source:
 | Surface | Answers | Reach it with |
 |---|---|---|
 | `GET /metrics` | **that** something is wrong, and where — which counter moved, in which domain | `curl` through the port forward |
-| `GET /capture.pcapng` | **which packet** — the frames themselves, with the firewall's verdict on each | `curl`, then `tcpdump -r` or Wireshark |
-| `GET /logs.pcapng` | **which conversations, and what happened to them** — an open with the rule that admitted it, an advance, a close with how it closed, a refusal with its reason, each on the packet that caused it | the same |
+| the capture | **which packet** — the frames themselves, with the firewall's verdict on each | read the extent off the run's data disk, then `tcpdump -r` or Wireshark |
+| the connection history | **which conversations, and what happened to them** — an open with the rule that admitted it, an advance, a close with how it closed, a refusal with its reason, each on the packet that caused it | the same |
 | the console | **what a domain said about itself** — bring-up, refusals, configuration commits | the serial capture a run leaves in `datad/build/image/` |
 
 A counter is a summary and a capture is evidence. When a dataplane question is open — is the frame
@@ -324,7 +325,7 @@ the recording and look at the packets. Every QEMU scenario leaves its downloads 
 `make test-system` run the evidence is already on disk. Use the surfaces while developing, not only
 at the end.
 
-The three HTTP surfaces in that table are also cross-checkable, and that is where they earn the
+The three surfaces in that table are also cross-checkable, and that is where they earn the
 most: the
 recorder's own record counts, the packet blocks in each recording, and the frames the harness put
 on the wire all describe one traffic stream from three independent vantage points, so a fault that

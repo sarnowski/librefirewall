@@ -64,9 +64,8 @@ use crate::{
     image, management_contract, metrics_contract,
     onboard_contract::{self, OnboardVerdict},
     onboard_install_contract, onboard_request_contract, onboard_tls_contract, ownership_contract,
-    probe_contract,
-    recording_contract::{self, Download},
-    snapshot_contract, stamp_contract, store_contract, surface_contract,
+    probe_contract, recording_contract, snapshot_contract, stamp_contract, store_contract,
+    surface_contract,
     topology::{PORTS, Topology},
     transcript_contract,
     util::{copy_file, locate, require_file, run_command},
@@ -3439,23 +3438,23 @@ pub(crate) fn boot_and_forward(
     )
 }
 
-/// Judge both recordings a boot pulled — each on its own terms, then the two of
-/// them against each other, against the exposition the same boot answered, and
-/// against the bytes the harness put on the wire.
+/// Judge both recordings this boot left on the medium — each on its own terms,
+/// then the two of them against each other, against the exposition the same boot
+/// answered, and against the bytes the harness put on the wire.
 ///
-/// The order is the order the findings are worth reading in. A body that is not
-/// a pcapng file at all is reported as that and not as a pairing failure; only
-/// once both parse is the interesting question reachable, which is whether the
-/// three surfaces tell one story ([`crate::surface_contract`]).
+/// The order is the order the findings are worth reading in. An extent that is
+/// not a pcapng file at all is reported as that and not as a pairing failure;
+/// only once both parse is the interesting question reachable, which is whether
+/// the surfaces tell one story ([`crate::surface_contract`]).
 ///
-/// Both bodies are also written into the build tree, so a human can open them
+/// **The bytes are the medium\'s own**, read by [`crate::data_disk`] off the disk
+/// image after the guest has stopped and bounded by each extent\'s superblock
+/// durable cursor. That is what makes them evidence rather than an account the
+/// appliance composed for a reader: nothing inside the guest chose them, and a
+/// recorder that reported plausible counters over an empty medium fails here.
+///
+/// Both extents are also written into the build tree, so a human can open them
 /// in Wireshark or `tcpdump -r` after a run without booting anything again.
-///
-/// The disk half — read separately by [`crate::data_disk`] — is what makes the
-/// download evidence rather than a round trip through the appliance's own
-/// memory: a recorder that answered a plausible body out of nothing would
-/// satisfy the client and leave the medium empty, and a harness that only asked
-/// over HTTP would not notice.
 fn judge_recordings(
     root: &Path,
     scenario: &str,
@@ -3475,12 +3474,12 @@ fn judge_recordings(
         .count();
     let expectations = [
         recording_contract::Expectation {
-            target: pd_runtime::LOG_TARGET,
+            recording: recording_contract::LOG_RECORDING,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN as usize,
             least_packets: owed_events,
         },
         recording_contract::Expectation {
-            target: pd_runtime::CAPTURE_TARGET,
+            recording: recording_contract::CAPTURE_RECORDING,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN as usize,
             // The frames the harness itself put across the appliance, which is
             // the number of observations the router must have decided on. At
@@ -3489,35 +3488,49 @@ fn judge_recordings(
             least_packets: booted.dataplane_frames as usize,
         },
     ];
-    if booted.recordings.len() != expectations.len() {
+    if booted.on_the_medium.len() != expectations.len() {
         return Err(format!(
-            "the boot met its contract and pulled {} recordings rather than {}, so nothing was \
-             proved about the download path\n  full run log: {}",
-            booted.recordings.len(),
+            "the boot met its contract and left {} recording extent(s) on the medium rather than \
+             {}, so nothing was proved about either recording\n  full run log: {}",
+            booted.on_the_medium.len(),
             expectations.len(),
             log.display()
         ));
     }
-    let mut evidence = String::from("  both recordings, downloaded and parsed as pcapng:");
+    let mut evidence =
+        String::from("  both recordings, read off the disk image and parsed as pcapng:");
     let mut parsed = Vec::new();
-    for (download, expected) in booted.recordings.iter().zip(&expectations) {
-        let found = recording_contract::judge(download, expected)?;
+    for (extent, expected) in booted.on_the_medium.iter().zip(&expectations) {
+        // The durable prefix and not the whole payload area: the superblock is
+        // what says where the recording ends, and the bytes past it are a ring
+        // nothing has written this boot.
+        let durable = extent.payload.get(..extent.durable).ok_or_else(|| {
+            format!(
+                "{} states a durable cursor at {} of a {}-byte payload area, so the medium \
+                 describes a recording longer than the extent holding it",
+                expected.recording,
+                extent.durable,
+                extent.payload.len()
+            )
+        })?;
+        let found = recording_contract::judge(durable, expected)?;
         evidence.push('\n');
         evidence.push_str(&recording_contract::evidence(
-            download,
+            expected.recording,
+            durable.len(),
             &found,
             expected.snap_len,
         ));
         evidence.push('\n');
-        evidence.push_str(&keep(root, scenario, download)?);
+        evidence.push_str(&keep(root, scenario, expected.recording, durable)?);
         parsed.push(found);
     }
 
     // The second scrape, which is the one `metrics_contract` judges and the one
     // whose counters have advanced past the first connection.
     let exposition = booted.scrapes.last().ok_or(
-        "the recordings were pulled and no scrape was taken, so the recorder's own published \
-         counts are not available to compare them against",
+        "the recordings were read off the medium and no scrape was taken, so the recorder's own \
+         published counts are not available to compare them against",
     )?;
     let [log_parsed, capture_parsed] = parsed.as_slice() else {
         return Err(format!(
@@ -3669,7 +3682,7 @@ fn judge_recordings(
         },
     ]);
     let snapshots = snapshot_contract::judge(
-        pd_runtime::LOG_TARGET,
+        recording_contract::LOG_RECORDING,
         &log_parsed.snapshots,
         &agreed,
         lfw_metrics::CATALOGUE_FINGERPRINT,
@@ -3683,15 +3696,14 @@ fn judge_recordings(
     // invented. Neither surface can agree with the other by construction, which
     // is the whole reason this comparison is worth its cost.
     let transcript = transcript_contract::judge(
-        pd_runtime::LOG_TARGET,
+        recording_contract::LOG_RECORDING,
         &log_parsed.transcript,
         log_parsed.transcript_batches,
         &booted.serial,
         &transcript_contract::Demanded {
             // A floor rather than a count, and a low one: how much of a boot
-            // transcript reaches the medium before the download depends on how
-            // fast the emulated block device came up. What it refuses is the
-            // vacuous pass.
+            // transcript reaches the medium depends on how fast the emulated
+            // block device came up. What it refuses is the vacuous pass.
             at_least: 4,
             // The anchor is a record the recorder itself emits once its device is
             // live, so it is printed after the domain that drains the relay has
@@ -3719,14 +3731,14 @@ fn judge_recordings(
     };
     let agreement = surface_contract::judge(
         &surface_contract::Surface {
-            target: pd_runtime::LOG_TARGET,
+            target: recording_contract::LOG_RECORDING,
             snap_len: lfw_recorder::deck::LOG_SNAP_LEN,
             parsed: log_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "log")?,
             carried: carried_log,
         },
         &surface_contract::Surface {
-            target: pd_runtime::CAPTURE_TARGET,
+            target: recording_contract::CAPTURE_RECORDING,
             snap_len: lfw_recorder::deck::CAPTURE_SNAP_LEN,
             parsed: capture_parsed,
             published_records: metrics_contract::sink_records(&exposition.body, "capture")?,
@@ -3752,21 +3764,24 @@ fn judge_recordings(
     Ok(evidence)
 }
 
-/// Write one downloaded recording into the build tree, answering the line that
-/// says where it landed.
+/// Write one recording\'s durable bytes into the build tree, answering the line
+/// that says where it landed.
 ///
 /// A run that proves something about a file and then discards it leaves a
 /// reader with nothing to open: the next question after "the contract held" is
 /// always "what was in it", and re-running a ten-minute boot to ask it is the
-/// cost this avoids. The name carries the scenario, so two scenarios' captures
+/// cost this avoids. The name carries the scenario, so two scenarios\' captures
 /// cannot overwrite each other.
-fn keep(root: &Path, scenario: &str, download: &Download) -> Result<String, String> {
-    let file = download.target.trim_start_matches('/');
+fn keep(root: &Path, scenario: &str, recording: &str, bytes: &[u8]) -> Result<String, String> {
+    let file = if recording == recording_contract::CAPTURE_RECORDING {
+        "capture.pcapng"
+    } else {
+        "logs.pcapng"
+    };
     let path = root
         .join("build/image")
         .join(format!("qemu-{scenario}-{file}"));
-    fs::write(&path, &download.body)
-        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    fs::write(&path, bytes).map_err(|error| format!("write {}: {error}", path.display()))?;
     Ok(format!(
         "    kept at {} — open it with `tcpdump -r` or Wireshark",
         path.display()

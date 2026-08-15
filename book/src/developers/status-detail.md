@@ -436,7 +436,7 @@ conversation's to still crossing — carried by its flow, which no rule of eithe
   connection history is anchored to the packet that caused it, and a flow the sweep collected has no
   such packet, so its end is visible on `librefirewall_flow_expired_total` and in no recording. The
   design's answer is the periodic state event that re-anchors long-lived connections, and nothing
-  emits one. See *[Recording and download](#recording-and-download)*.
+  emits one. See *[Recording and shipment](#recording-and-shipment)*.
 - **A refusal names no flow.** The two refusals that are *about* an existing flow — a segment outside
   its window, and one its state does not admit — are recorded with their reason and not with the
   conversation they were refused against, because `lfw_flow::Refusal` carries the value that refused
@@ -472,7 +472,7 @@ it is no decision at all, and once back — 34 bytes of header, never the payloa
 
 **The tap makes it three, and adds a second parse.** Every frame the pipeline decides on is copied a
 third time, out of the routing domain's scratch into the tap ring the recorder reads
-([detail](#recording-and-download)) — up to 2048 bytes, the whole frame rather than its header. The
+([detail](#recording-and-shipment)) — up to 2048 bytes, the whole frame rather than its header. The
 copy is taken between the decision and the forwarding rewrite, which is what makes a recorded frame
 the one the wire delivered, and the cost of splitting the two is that the rewrite re-parses the frame
 the decision already parsed. Neither cost is measured: `datad/crates/pd-runtime`'s Criterion routing bench
@@ -611,10 +611,12 @@ that the *read* crossed to the medium and not merely to the driver's own staging
   acknowledges its reset; the block driver was not, so a device that refuses its reset here has
   already been made a bus master. Nothing in the appliance depends on the early grant.
 
-## Recording and download
+## Recording and shipment
 
 **What exists.** Every frame the pipeline decides on is observed, both recordings are written to the
-medium as pcapng, and either can be downloaded whole over HTTP.
+medium as pcapng, and either is shipped up the management channel and readable by extent over it.
+Neither is served over HTTP any longer: the plain-HTTP recording downloads have been removed, and
+what replaces them is the channel's own shipping cursor and range read.
 
 The forwarder taps its own routing stage. `RouteStage` already snapshots each frame into private
 scratch before deciding, so an observation costs one copy into a shared ring and no second read of
@@ -639,8 +641,8 @@ The recorder keeps two recordings on the one device, both `lfw_recorder::Sink` o
 
 | Recording | Records | Extent | Segment | Snap length |
 |---|---|---|---|---|
-| connection history (`/logs.pcapng`) | an observation carrying a lifecycle or policy event | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
-| capture (`/capture.pcapng`) | every observation **of a frame** | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
+| connection history | an observation carrying a lifecycle or policy event | sector 2048, 32768 sectors (16 MiB) | 1 MiB | 128 bytes |
+| capture | every observation **of a frame** | sector 34816, 65536 sectors (32 MiB) | 1 MiB | 2048 bytes |
 
 One record is in the history and in no capture, and it is the only one that is about
 no frame: a conversation a policy commit ended. There was nothing on a wire, so it
@@ -700,18 +702,17 @@ this boot could not continue — because a node with no shell has no other way t
 the two look identical on every other surface.
 
 Each pass of the recorder's loop settles up to eight completions, drains up to sixteen tap records
-into both recordings, hands the medium whatever is ready, and services at most one download. A
+into both recordings, hands the medium whatever is ready, and services at most one read. A
 record a recording cannot take yet is **held**, not dropped: `wire::TapReader` consumes a slot
 irrevocably, so the pass stops drawing new records until both recordings have taken the one in hand.
 Every counter reading is converted to a wall-clock instant here, against the calibration the clock
 domain publishes; before there is one, a record states no instant rather than a counter value
 dressed as a time.
 
-A download pins a snapshot: offset zero seals the named recording, flushes it, and answers with the
-length the response commits to; later offsets are located against that same snapshot, read back off
-the medium, and delivered a window at a time. A ring that wrapped past a reader answers `Overrun`, a
-medium that refused answers `DeviceError`, and either ends the response rather than truncating it
-silently. The management domain drives that from `EndpointStage`'s windowed body, so nothing holds
+A ring read is located in the ring's own append space, read back off the medium, and answered a
+window at a time. A ring that wrapped past a reader answers `Overrun`, a medium that refused answers
+`DeviceError`, and either ends the read rather than truncating it silently. The management domain
+drives that for two purposes — the shipping cursor and an operator's range read — so nothing holds
 a second copy of a megabyte: the recorder answers up to 32 KiB per round trip, the endpoint copies
 each into a 16 KiB sliding window sized above the transport's retransmit span, and a client that
 stops reading abandons the stream. **The window the endpoint names is a bound and not a demand**,
@@ -728,14 +729,14 @@ timestamps, `if_snaplen` the sink's own. Every observation is an Enhanced Packet
 `epb_packetid`, `epb_verdict`, and a PEN-tagged custom option holding a layout version, the
 verdict, the drop reason, the interface, the direction and the **configuration generation the
 decision was made under**. Padding is a Custom Block any reader skips, and it appears wherever the
-encoder must leave a sector whole: the tail of a closed segment, the open sector before a download
+encoder must leave a sector whole: the tail of a closed segment, the open sector before a read
 is served, and — since a durable cursor must not be allowed to fall inside a block a reader will
 follow — the open sector behind every metric reading and every console-transcript block.
 **The connection history additionally carries the whole metric surface** about
 once a second, and the console transcript as it is printed, each as a Custom Block of the same type
 and enterprise number told apart by the first byte of its data — zero, or no data at all, is padding,
 `1` a reading and `2` a batch of console lines — which is what gives the management server's
-`metric_samples` and `log_events` tables their producers without a second transport. The [recording download endpoints reference](../reference/recordings.md) is the
+`metric_samples` and `log_events` tables their producers without a second transport. The [recordings reference](../reference/recordings.md) is the
 operator-facing statement of all of it.
 
 The console names both extents at bring-up. Nothing else states them: they are compiled in rather
@@ -750,8 +751,11 @@ LFW-PD time=… domain=recorder state=ready start=34816 sectors=65536
 
 **What the gate proves.** Every scenario whose management port is reachable — 20 of the 37 system
 scenarios — boots the release image on QEMU's user-mode stack, drives the same dataplane traffic every other
-scenario drives, and then `curl`s `/metrics`, `/logs.pcapng` and `/capture.pcapng`, holding the
-three to **each other** as well as to the wire (`datad/tools/xtask/src/surface_contract.rs`): every record
+scenario drives, `curl`s `/metrics`, and reads **both recording extents straight off the disk image
+after shutdown**, holding the exposition, the two recordings and the wire to **each other**
+(`datad/tools/xtask/src/surface_contract.rs`). The recordings are the medium's own bytes, bounded by each
+extent's superblock durable cursor, so what every other account is compared against is the one
+account nothing inside the guest composed for a reader: every record
 of the connection history *of a frame* pairs into the capture by `epb_packetid` and none of it names
 no event, the one record that is about no frame is held instead to claiming none of the four things a
 frame has, neither recording exceeds the record count the recorder publishes for that sink, every
@@ -764,7 +768,7 @@ hit under the id the document gave it; a refusal it names is one the exposition 
 often; a close names a state a conversation does not leave and an earlier record opens the same
 conversation; and the lifecycle or policy event each probe had to cause is in the history, on the
 packet that caused it. A fault that hides inside any one surface shows up as a disagreement between
-two. The harness walks the downloaded bytes block by block *by the lengths the file states* — the
+two. The harness walks the medium's bytes block by block *by the lengths the file states* — the
 discipline a reader actually depends on — and holds the capture to carrying at least as many packet
 blocks as frames the harness put across the appliance, the history to at least as many as the events
 its probes owe, and neither to a captured length past its sink's snap length. Afterwards it reads the two extents straight off the disk image and requires
@@ -775,10 +779,10 @@ them the appliance's own account of itself.
 was booted under OVMF with a 64 MiB virtio-blk data device attached at 00:05.0, and 14 routable
 IPv4/UDP frames of 84 to 1384 bytes were injected on dataplane-0 for the appliance to route to
 dataplane-1. This was a one-off: the script and its artifacts live under the ignored `datad/build/` tree
-and are not in the repository, so what is *repeatable* is the `recording-download` scenario above and
-this is corroboration beside it. Over the management port, `curl http://…/logs.pcapng` and
-`curl http://…/capture.pcapng` each returned a whole number of 512-byte sectors — which is the
-padding block doing its job — 3584 and 12288 bytes for that hand-run traffic.
+and are not in the repository, so what is *repeatable* is the scenarios above and
+this is corroboration beside it. Read off the medium, the two extents each held a whole number of
+512-byte sectors — which is the padding block doing its job — 3584 and 12288 bytes for that hand-run
+traffic.
 `tcpdump -r` reads both natively and lists all 14 packets with their real addresses, ports, lengths
 and wall-clock times. An independent parse of the two files established:
 
@@ -791,8 +795,8 @@ and wall-clock times. An independent parse of the two files established:
   generation the console had just recorded as applied;
 - both files carry one Section Header Block, two Interface Description Blocks and a trailing padding
   Custom Block, and the padding is transparent to `tcpdump`;
-- reading the two extents straight off the data-disk image after shutdown yields **exactly the bytes
-  the downloads returned**, so the medium is proved independently of the download path.
+- the two extents were read straight off the data-disk image after shutdown, which is where every
+  byte judged above came from: no path through the appliance's own memory was involved at all.
 
 **Missing.**
 
@@ -812,8 +816,8 @@ and wall-clock times. An independent parse of the two files established:
   crossing it, indefinitely, with no way to say otherwise. The filter rules are not that selector and
   cannot stand in for one — they decide what the appliance *forwards*, and a packet a rule dropped is
   recorded with its refusal exactly as a forwarded one is.
-- **No TLS and no authentication in front of either download.** The
-  [management design](../design/management.md) now erases these downloads outright — a recording
+- **The plain-HTTP recording downloads are gone.** The
+  [management design](../design/management.md) erased them — a recording
   reaches the management server over the authenticated channel or not at all — and until that
   replacement exists the gap stands at its full width ([detail](#full-port-role-model)): anyone who
   can reach the management port is handed every packet the appliance recorded. The design makes
@@ -882,7 +886,7 @@ and wall-clock times. An independent parse of the two files established:
 - **The seal restores that property where it is written and does not establish it generally.** A
   packet block draws no seal — one per frame would cost a sector per frame — so between the seal
   points the durable cursor still lands wherever the last whole sector fell, which can be inside an
-  ordinary packet block. A download is unaffected, because serving one seals the recording first;
+  ordinary packet block. A ring read is unaffected, because it is bounded by the durable cursor;
   what meets it is a reader that has only the medium and the superblock, and what such a reader
   meets is a final block whose stated length runs past the bytes that are there. That is a
   pre-existing property of the layout rather than something the seal introduced, and closing it
@@ -891,10 +895,9 @@ and wall-clock times. An independent parse of the two files established:
   slots and one is registered: the management channel's, which the [management](../design/management.md)
   and [recording](../design/recording.md) designs make the ring's cursor-holding reader. A server
   states how far it has durably ingested each recording, the recorder writes that position into the
-  recording's own superblock, and the next boot reads it back and republishes it. The other reader,
-  an operator's download, registers nothing — its coordinate is recomputed at each boot and could
-  not survive one — and that unregistered cursor is why no series says how much history a recording
-  still holds: a wrap count states that a segment was evicted, and there is no cursor for it to have
+  recording's own superblock, and the next boot reads it back and republishes it. The range read
+  that answers an operator registers nothing — it moves no cursor at all, by design — and no series
+  says how much history a recording still holds: a wrap count states that a segment was evicted, and there is no cursor for it to have
   been evicted past. A restart no longer costs the registered one its place. A resumed recording
   continues inside the segment the medium's own writer cursor names, at that offset, opening a
   pcapng section there, so the byte an earlier boot's server acknowledged is still a byte this one
@@ -903,7 +906,7 @@ and wall-clock times. An independent parse of the two files established:
   behind it was padded by the roll that closed it. What is not yet proven is the whole of it end to
   end: no scenario drives a server that acknowledges a position, reads that slot back off the disk
   image, and boots the medium a second time to watch it republished.
-- **A download is the whole recording.** No `Range`, no `If-Match`, no `ETag`, and no way to ask for
+- **A shipment walks the whole recording.** No `If-Match`, no `ETag`, and no way to ask for
   one segment or a byte extent — the [management design](../design/management.md) serves recording
   range reads over the channel, and the download it replaces cannot even express one. A body over
   2 GiB is refused outright rather than served wrong.
@@ -930,8 +933,7 @@ and wall-clock times. An independent parse of the two files established:
   hand goes before an answer frame in hand, because the at-least-once catch-up of the rings is what
   the channel is for; and the medium itself is shared out between the two rings and one answer in
   turn, so two of every three reads are a ring's and an answer still advances by a frame every third
-  read. An operator physically downloading a recording over the HTTP surface outranks all three,
-  which is the fairness that was already there. **Missing:** no booted node has been asked for an
+  read. **Missing:** no booted node has been asked for an
   extent, so the whole path is held together by unit and property cover on both domains rather than
   by a scenario, and the management server can decode a range answer but offers an operator no way to
   ask for one.
@@ -1086,8 +1088,8 @@ that should be reading an attacker's XML.
 **A body that never finishes has a deadline of its own, because that `503` is what one connection
 can do to every other.** A peer may declare a body and then trickle it, and the transport's idle
 timeout cannot end that: it is refreshed by each arriving byte, so one byte every few minutes keeps
-the connection alive indefinitely and the staging array with it — and `/metrics`, `/config` and both
-recording downloads answer `503` for as long as it does. **It is reachable with no adversary at all**:
+the connection alive indefinitely and the staging array with it — and `/metrics` and `/config`
+answer `503` for as long as it does. **It is reachable with no adversary at all**:
 an operator tool that dies mid-`POST` takes the management plane down, including the surfaces they
 would use to find out why. So an accumulation that has not completed within thirty seconds is
 answered `408`, the array is handed back before a byte of the answer is composed, and the connection
@@ -1102,10 +1104,10 @@ and each one is a stretch in which the other body-bearing surfaces were refusing
 The two channels behind the endpoint carry the same bound for the same reason, because the array is
 also held while a *neighbouring domain* decides. A configuration request unanswered for five seconds
 is given up on with `503` — nothing about the document is known to be wrong, and what failed is the
-node's own ability to decide about it — and a recording window unanswered for ten seconds abandons
-the download. Both matter twice over: each domain holds one outstanding-request slot, so without a
-deadline a single unanswered request would be the last configuration exchange or the last download
-that domain ever completed. A reply arriving after either deadline answers a sequence number no
+node's own ability to decide about it — and a ring read unanswered for ten seconds gives its slot
+back. Both matter twice over: each domain holds one outstanding-request slot, so without a deadline
+a single unanswered request would be the last configuration exchange or the last recording read that
+domain ever completed. A reply arriving after either deadline answers a sequence number no
 pending request is held against, which both requesters read as no answer at all, so a late answer
 cannot be mistaken for the next request's.
 
@@ -1380,8 +1382,8 @@ total and non-blocking, and a relay the recorder is not draining fast enough cos
 did not get. And **the origin is the ring rather than the record's own `domain=` token**, because a
 writing domain may claim to be any domain in a record it publishes and cannot claim to be another
 domain's ring. A recorded transcript is therefore a *subset* of a printed one, and every boot in the
-gate holds the containment: each line the recording it downloads carries must be one the same boot
-printed on the serial console, which is the only check that can catch either rendering being wrong.
+gate holds the containment: each line the recording read off the medium carries must be one the same
+boot printed on the serial console, which is the only check that can catch either rendering being wrong.
 
 Three persistent fuzz targets drive it (`log_record`, `log_ring`, `transcript_block`), the second modelling both sides as
 independently hostile — a forged cursor arriving between two steps of one drain, a slot rewritten
@@ -1520,8 +1522,8 @@ judges over every channel at once.
   holds only in its healthy half for the domain that carries traffic. (The management domain gained a
   refusal path with its transport: it refuses to start at all when the hardware will not produce a
   per-boot secret for its sequence numbers, reports a published calibration it will not use without
-  refusing to run, and — new with the recordings — reports an endpoint that could not register both
-  download targets, again without refusing to run. The recorder reports the medium it found and
+  refusing to run, and reports an endpoint that could not register the configuration target, again
+  without refusing to run. The recorder reports the medium it found and
   where each recording lives, which is the only place an operator learns an extent.)
 - **Nothing orders one domain's records against another's.** Within a domain they are totally
   ordered — one writer per ring, drained in the order it wrote them, with non-decreasing instants —
@@ -1563,9 +1565,8 @@ That domain answers three protocols and counts everything: an **ARP request** fo
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
 identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
 is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), over which an
-HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)), `GET /config`, both recording
-downloads ([detail](#recording-and-download)) and `POST /config`
-([detail](#configuration-management)). Everything else is refused
+HTTP/1.1 server answers `GET /metrics` ([detail](#prometheus-metrics)), `GET /config` and
+`POST /config` ([detail](#configuration-management)). Everything else is refused
 by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it
 does not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
@@ -1657,15 +1658,16 @@ a domain that faulted or lost its place under that could not report them all.
 
 **Missing.**
 
-- **No TLS, and now that gap carries a write.** HTTP answers `GET /metrics`
-  ([detail](#prometheus-metrics)), `GET /config`, both recordings
-  ([detail](#recording-and-download)) and `POST /config` ([detail](#configuration-management)) — all
-  in the clear, with no authentication and no authorization split, so **anything that can reach the
-  port can scrape it, download every packet the appliance recorded, read its policy, and replace
-  that policy** — which is the authority to decide what this firewall forwards. The
-  [management design](../design/management.md) erases this surface in favor of onboarding and the
-  authenticated channel; the channel now comes up but carries none of these operations yet, so until
-  it does the port belongs on an isolated network. `/logs` does
+- **No TLS, and that gap carries a write.** HTTP answers `GET /metrics`
+  ([detail](#prometheus-metrics)), `GET /config` and `POST /config`
+  ([detail](#configuration-management)) — all in the clear, with no authentication and no
+  authorization split, so **anything that can reach the port can scrape it, read its policy, and
+  replace that policy** — which is the authority to decide what this firewall forwards. The
+  recordings are no longer among them: the two downloads are gone and a recording now reaches a
+  management server over the authenticated channel alone. The
+  [management design](../design/management.md) erases the rest of this surface in favor of
+  onboarding and the channel, which already carries every operation that remains, so until they are
+  removed the port belongs on an isolated network. `/logs` does
   not exist, so of the debug dump the
   [observability reference](../reference/observability.md) describes, the state half, the running
   document and the two recordings are what a node can be asked for and the retained records cannot be.
@@ -3870,7 +3872,7 @@ is *done* currently sits.
 | Hermetic, pinned build in a rootless OCI builder | **done** | base image by digest, dated Debian snapshot, exact version per apt package, checksum-verified SDK/toolchain/GRUB/syft, `--locked` throughout |
 | Host gate: format, Clippy `-D warnings`, comment/`unsafe` ratchets, unit + property tests | **done** | run by the pre-commit hook; Clippy covers the library crates, `xtask`, and all ten protection-domain binaries — the hardware probe, the cryptography domain and the store domain against their own SIMD target, one cargo invocation each so a domain's feature set is the set its own manifest asks for — in each of the two seL4 kernel configurations — which, now that every end-to-end scenario boots the release image, is the **only** thing in any gate that still compiles the debug configuration, and so the only thing keeping it buildable for the diagnostic re-run that needs it. The ratchets (`datad/tools/xtask/src/budgets.rs` against `datad/tools/xtask/budgets.toml`) record a comment-line ratio per production file and an `unsafe` block/fn/impl count per crate, and fail the gate on any rise. Their reach is scoped rather than universal, and `Cargo.toml` now says so: the two `unsafe` denials are workspace lints and reach every member, while the ratchets read `datad/crates/` and `datad/pds/` alone — for `xtask` and the fuzz harnesses the discipline is review |
 | Coverage floor | **done** | 94% combined and 90% per library crate, enforced in the gate as line coverage, over the 31 library crates. Every one of them is named in `LIBRARY_PACKAGES` (`datad/tools/xtask/src/host.rs`), and that list is what the count above is read from rather than restated beside — a number in prose that nothing compares is a number that goes stale. Every workspace member is either measured or carries a recorded reason from the closed list of allowed coverage exemptions (only observable under seL4, build orchestration, or test/benchmark harness) for being exempt, and a member in neither fails the build. **The headroom above the floor is not restated here**: the numbers a previous revision quoted predate four new crates, and `make coverage` reports the current per-crate figures |
-| QEMU end-to-end gate (37 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 20 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-download)). One pair shares the **recorder's** medium across boots — the only place the gate can say a recording
+| QEMU end-to-end gate (37 system scenarios, eight A/B scenarios) | **partial** | every scenario boots the **release** image — the configuration a deployment gets, so the shipped profile is the tested one — and a scenario that fails there is re-run once on the debug kernel to diagnose it, which never changes the verdict. Two raw disks are attached on every invocation — the recorder's at 00:05.0 and the appliance's own store medium at 00:06.0 — and the 20 scenarios that reach the management port judge all three of its surfaces against one another and read both extents off the first besides ([detail](#recording-and-shipment)). One pair shares the **recorder's** medium across boots — the only place the gate can say a recording
 outlives the node that wrote it, a recorder that started a fresh ring on every boot satisfying every
 assertion a single boot makes — and the second of the pair is held three ways: the console record
 naming the generation, segment and offset the medium held, a superblock that came out at a higher

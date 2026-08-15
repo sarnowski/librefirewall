@@ -4,23 +4,20 @@
 //! # The transliteration rule
 //!
 //! One naming scheme is fixed across every surface: the Prometheus surface
-//! carries the console's own keys and tokens transliterated
-//! to each transport's own separator convention. This is that transliteration,
-//! and it is one rule with no exceptions:
+//! carries the console's own keys and tokens, transliterated to each transport's
+//! separator convention. This is that transliteration, with no exceptions:
 //!
 //! > A metric name, a label name and a label value is the console key or
-//! > vocabulary token with every `-` replaced by `_`. A metric name additionally
-//! > carries the `librefirewall_` prefix, and a counter the `_total` suffix.
+//! > vocabulary token with every `-` replaced by `_`; a metric name also carries
+//! > the `librefirewall_` prefix, and a counter the `_total` suffix.
 //!
 //! So the console's `domain=nic-driver` is this surface's `domain="nic_driver0"`
-//! — the same token, the same separator convention throughout, and the instance
-//! number the console cannot carry because three driver instances share one
-//! binary and therefore one domain name. The `-`→`_` half is not a preference:
-//! Prometheus metric and label *names* are `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a
-//! hyphen is ungrammatical there, and applying the same rule to label values —
-//! where a hyphen would be legal — is what keeps one identifier reading the same
-//! everywhere on this surface rather than in two spellings a reader has to know
-//! about.
+//! — the same token and separator convention, plus the instance number the
+//! console cannot carry because three driver instances share one binary. The
+//! `-`→`_` half is not a preference: Prometheus metric and label *names* are
+//! `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a hyphen is ungrammatical there, and applying
+//! the same rule to label values keeps one identifier reading the same
+//! everywhere rather than in two spellings a reader has to know about.
 //!
 //! # Attribution is structural
 //!
@@ -991,24 +988,6 @@ pub const RECORDING_DOWNLOAD_OVERRUNS: Metric = metric(
     "Downloads the ring wrapped past mid-read, by sink; a reader the traffic outran.",
 );
 
-pub const RECORDING_STREAMS: Metric = metric(
-    "librefirewall_recording_streams_total",
-    Kind::Counter,
-    "Recording downloads the management endpoint began, and those it gave up on part-sent.",
-);
-
-pub const RECORDING_STREAM_WINDOWS: Metric = metric(
-    "librefirewall_recording_stream_windows_total",
-    Kind::Counter,
-    "Windows of a recording handed to the transport.",
-);
-
-pub const RECORDING_STREAM_BYTES: Metric = metric(
-    "librefirewall_recording_stream_bytes_total",
-    Kind::Counter,
-    "Body bytes those windows carried.",
-);
-
 // ── The console and its device ──────────────────────────────────────────────
 
 pub const CONSOLE_RECORDS: Metric = metric(
@@ -1153,9 +1132,6 @@ pub const ALL_METRICS: &[&Metric] = &[
     &RECORDING_TRANSCRIPT_LINES,
     &RECORDING_DOWNLOAD_OVERRUNS,
     &RECORDING_RECORDS_UNCLOCKED,
-    &RECORDING_STREAMS,
-    &RECORDING_STREAM_WINDOWS,
-    &RECORDING_STREAM_BYTES,
     &CONSOLE_RECORDS,
     &CONSOLE_TRANSCRIPT_LINES,
     &UART_BYTES_WRITTEN,

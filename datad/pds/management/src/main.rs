@@ -982,10 +982,9 @@ fn init() -> Management {
     let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
     let relay = Relay::attach(relay_request, relay_reply);
     let mut stage = stage;
-    // Both recordings and the configuration surface, before the first frame: a
-    // target registered late would answer `404` to a client that asked at exactly
-    // the wrong moment.
-    let registered = downloads.register(&mut stage) && configurations.register(&mut stage);
+    // The configuration surface, before the first frame: a target registered late
+    // would answer `404` to a client that asked at exactly the wrong moment.
+    let registered = configurations.register(&mut stage);
     // The port is unaddressed until a generation is committed and unclocked until
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
@@ -998,7 +997,7 @@ fn init() -> Management {
             &sink,
             DomainState::Ready,
             DomainDetail::Refusal(Refusal {
-                cause: "recording-targets-unregistered",
+                cause: "configuration-target-unregistered",
                 detail: RefusalDetail::None,
                 signalled: false,
             }),
@@ -1134,7 +1133,7 @@ impl Handler for Management {
         // is the only state in which reading ring bytes for it is worth a round
         // trip to the recorder.
         let shipping = running.relay.shipping();
-        running.downloads.poll(now, &mut running.stage, shipping);
+        running.downloads.poll(now, shipping);
         // And the configuration channel, on the download channel's terms exactly:
         // an answer that landed between wakeups is in the endpoint's hands by the
         // time this pass composes a segment.
@@ -1143,9 +1142,8 @@ impl Handler for Management {
         }
         let log = log_sample(running.sink.dropped(), running.sink.refused());
         let moved = running.stage.poll(ticks, log);
-        // And after them, because a request parsed in this very pass is what puts
-        // a stream in `pending_stream` or a document in `submission`.
-        running.downloads.poll(now, &mut running.stage, shipping);
+        // And again after them, because a request parsed in this very pass is what
+        // puts a document in `submission`.
         if running.configurations.poll(now, &mut running.stage) {
             CONFIG.notify();
         }

@@ -12,8 +12,8 @@ use crate::recording_contract::{
     CLASSIFICATION_NEW, EVENT_FLOW_REFUSED, Interface, STATE_TIME_WAIT,
 };
 
-const LOG_TARGET: &str = "/logs.pcapng";
-const CAPTURE_TARGET: &str = "/capture.pcapng";
+const LOG_TARGET: &str = "the connection history";
+const CAPTURE_TARGET: &str = "the capture";
 const LOG_SNAP: u32 = 128;
 const CAPTURE_SNAP: u32 = 2048;
 const PORTS: usize = 2;
@@ -216,8 +216,8 @@ fn two_recordings_of_the_same_traffic_agree() {
     // demanding it would be asserting a contract the appliance does not have.
     assert_eq!(agreement.probes_matched, 2);
     let evidence = agreement.evidence();
-    assert!(evidence.contains("/logs.pcapng"), "{evidence}");
-    assert!(evidence.contains("/capture.pcapng"), "{evidence}");
+    assert!(evidence.contains(LOG_TARGET), "{evidence}");
+    assert!(evidence.contains(CAPTURE_TARGET), "{evidence}");
     assert!(evidence.contains("snap length of 128"), "{evidence}");
     assert!(evidence.contains("snap length of 2048"), "{evidence}");
 }
@@ -1029,7 +1029,7 @@ fn only_the_history_may_be_empty_and_only_where_nothing_was_carried() {
     )
     .expect_err("a refusal is a decision and owes a record");
     assert!(error.contains("no encoded record at all"), "{error}");
-    assert!(error.contains("/capture.pcapng"), "{error}");
+    assert!(error.contains(CAPTURE_TARGET), "{error}");
 }
 
 /// A probe the appliance decided on and no recording holds — the tap losing an

@@ -1,6 +1,6 @@
 use super::*;
 
-const TARGET: &str = "/logs.pcapng";
+const TARGET: &str = "the connection history";
 
 fn serial(lines: &[&str]) -> Vec<u8> {
     let mut out = String::from("Booting `librefirewall`...\r\nseL4 kernel starting\r\n");

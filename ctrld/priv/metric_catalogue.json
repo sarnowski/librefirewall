@@ -1,6 +1,6 @@
 {
-  "fingerprint": 1620972380,
-  "slots": 474,
+  "fingerprint": 3346186459,
+  "slots": 470,
   "series": [
     {"domain": "forwarder", "family": "librefirewall_forwarded_frames_total", "labels": {"pipeline": "0"}},
     {"domain": "forwarder", "family": "librefirewall_route_drops_total", "labels": {"pipeline": "0", "reason": "unowned"}},
@@ -345,10 +345,6 @@
     {"domain": "management", "family": "librefirewall_http_body_overruns_total", "labels": {}},
     {"domain": "management", "family": "librefirewall_http_retransmits_unavailable_total", "labels": {}},
     {"domain": "management", "family": "librefirewall_http_slots_exhausted_total", "labels": {}},
-    {"domain": "management", "family": "librefirewall_recording_streams_total", "labels": {"outcome": "started"}},
-    {"domain": "management", "family": "librefirewall_recording_streams_total", "labels": {"outcome": "abandoned"}},
-    {"domain": "management", "family": "librefirewall_recording_stream_windows_total", "labels": {}},
-    {"domain": "management", "family": "librefirewall_recording_stream_bytes_total", "labels": {}},
     {"domain": "management", "family": "librefirewall_log_records_dropped_total", "labels": {}},
     {"domain": "management", "family": "librefirewall_log_records_refused_total", "labels": {}},
     {"domain": "console", "family": "librefirewall_console_records_total", "labels": {"outcome": "printed"}},
