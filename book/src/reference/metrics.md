@@ -61,8 +61,8 @@ reading itself appears in the *next*.
 
 ## Metric inventory
 
-125 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A reading is 470 counter and gauge series from the 12 shards, laid
+124 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A reading is 469 counter and gauge series from the 12 shards, laid
 out slot by slot in the order these tables declare them.
 
 **Two of the families below are declared and carried by nothing today**, and they are named here
@@ -422,7 +422,7 @@ This is the one thing about the family an operator will otherwise read wrong:
 
 An `enabled` label is deliberately absent rather than pending. It would have to be ragged across the
 two roles to be truthful, nothing consumes it, and the exact running configuration — enable flags
-included — is what `GET /config` returns. The state that *matters* for reading a counter is already
+included — is the version the management server committed and holds. The state that *matters* for reading a counter is already
 observable: an interface configured and refusing traffic shows as an `interface_disabled` drop count
 beside an info series.
 
@@ -483,8 +483,7 @@ reasons and neither bounds the other, so the metric names them apart and nothing
 | `librefirewall_clock_ticks_total` | counter | `clock` | — | Periodic wakeups this domain's timer has raised and it has passed on. It stands still on a node whose timer could not be armed, which is the node whose schedules only advance when a frame arrives. |
 | `librefirewall_configuration_generation` | gauge | `config`, `forwarder`, `management` | — | The configuration generation this domain is running under; 0 is the fail-closed empty table. |
 | `librefirewall_configuration_images_total` | counter | `forwarder`, `management` | `outcome`&nbsp;(`applied`, `refused`) | Configuration images this domain applied or refused. **Only the forwarder carries `applied`**: the management port's endpoint reads a committed image for its own address and never applies one, so it reports `refused` alone. |
-| `librefirewall_configuration_reads_total` | counter | `config` | — | Times the running configuration document was read out of this node. |
-| `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`, `staged`, `confirmed`, `reverted`) | Configuration operations this node decided, by outcome. Three come from either path: `applied` moved the generation, `unchanged` was the configuration already running, and `refused` broke a rule — or, for an operation rather than a document, could not be carried out. Three come only from the management channel, which takes a commit apart into steps: `staged` held a document as the candidate without committing it, `confirmed` made a provisional commit permanent, and `reverted` put back what one displaced because no confirmation arrived over a fresh connection. |
+| `librefirewall_configuration_submissions_total` | counter | `config` | `outcome`&nbsp;(`applied`, `refused`, `unchanged`, `staged`, `confirmed`, `reverted`) | Configuration operations this node decided, by outcome, every one of them arriving over the management channel. `applied` moved the generation, `unchanged` was the configuration already running, and `refused` broke a rule — or, for an operation rather than a document, could not be carried out. The other three are the steps a commit is taken apart into: `staged` held a document as the candidate without committing it, `confirmed` made a provisional commit permanent, and `reverted` put back what one displaced because no confirmation arrived over a fresh connection. |
 
 ### The hardware probe
 

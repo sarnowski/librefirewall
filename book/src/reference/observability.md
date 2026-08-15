@@ -3,9 +3,9 @@
 These reference chapters are the **operator's interface to librefirewall**. Because the appliance
 has no shell and no CLI — a deliberate design decision (see the
 [management design](../design/management.md)) — the console, the OpenTelemetry log stream, the
-`GET /logs` and `GET /config` endpoints and the two recordings are the *only* windows into a running
-node — together they are the complete, sufficient surface for building dashboards, alerts, and
-analysis, and for debugging an incident. This chapter and its three companions —
+authenticated management channel and the two recordings it carries are the *only* windows into a
+running node — together they are the complete, sufficient surface for building dashboards, alerts,
+and analysis, and for debugging an incident. This chapter and its three companions —
 [Console records](console.md), [Metrics](metrics.md) and [Recordings](recordings.md) — define what
 that surface contains and how to interpret it, so an operator can rely on it as a stable contract.
 
@@ -24,18 +24,21 @@ and this reference does not carry guesses.
 - **OpenTelemetry logs** — the structured log stream to an external receiver. Everything the console
   says is also emitted here, plus audit, traffic, and per-subsystem logs. This is the only log
   transport; there is no syslog. There is no distributed tracing.
-- **Local log buffer** — a bounded, on-node ring of the most recent structured log records, read
-  through `GET /logs`. It is the *live* view: external OTEL collection is routinely delayed by
-  minutes and can be down entirely, and there is no shell, so this is the only way to see what a
-  node is doing right now.
+- **Local log buffer** — a bounded, on-node ring of the most recent structured log records. It is the
+  *live* view: external OTEL collection is routinely delayed by minutes and can be down entirely,
+  and there is no shell, so this is the only way to see what a node is doing right now. It has no
+  surface of its own; what a node hands over are the recordings, which carry its log events framed
+  inside them.
 - **Metrics** — the **metric reading**, a snapshot of every named series framed into the connection
   history on a period and carried upstream over the management channel. It is the only metrics
   interface, and it covers every measurable moving part at bounded cardinality and no measurable
   dataplane cost. There is no metrics endpoint: nothing on the management port answers for a
   counter.
-- **Configuration** — the `GET /config` endpoint, returning the configuration in force as a document,
-  and `POST /config`, which replaces it. The only surface of the six that **changes** anything, and
-  the only one whose reach is the authority to decide what the appliance forwards.
+- **Configuration** — the stepped transaction the management channel carries: a document staged,
+  validated, provisionally committed, and confirmed over a connection opened afterwards. The only
+  surface that **changes** anything, and the only one whose reach is the authority to decide what
+  the appliance forwards. It is reached over the authenticated channel and nowhere else — there is
+  no configuration endpoint, and nothing on the management port answers for a document.
 - **Recordings** — the two pcapng recording sinks (see the
   [recording design](../design/recording.md)). The first is a **connection history**,
   holding a record where the appliance reached a connection lifecycle or policy event; the second
@@ -47,12 +50,12 @@ and this reference does not carry guesses.
   never over HTTP; the *format* of what it carries is pcapng, and pcapng's
   specification, not this reference, is the contract for the bytes inside the file.
 
-**Complete-state principle.** Reading `GET /config`, tailing `GET /logs`, and taking the two
-recordings **once** yields the entire observable state of a node: the configuration in force, every
-metric around it — the readings are inside the connection history — what it has just been doing, and
-the recorded evidence of what it did to traffic. That *is* the debug dump — there is deliberately no
-other mechanism to extract state, so those surfaces together are designed to be sufficient to
-diagnose the system.
+**Complete-state principle.** Taking the two recordings **once** yields the entire observable state
+of a node: every metric — the readings are inside the connection history — the log events framed
+beside them, and the recorded evidence of what it did to traffic, with the configuration in force
+being whatever the management server last committed and holds in its own version history. That *is*
+the debug dump — there is deliberately no other mechanism to extract state, so those surfaces
+together are designed to be sufficient to diagnose the system.
 
 ## Conventions (binding)
 
@@ -286,8 +289,8 @@ transport rather than a second set of call sites.
 **Purpose:** answer "what is this node doing *right now*" without waiting on the external log
 pipeline, and keep a node diagnosable when that pipeline is unavailable.
 
-**Endpoint:** `GET /logs` on the management port, returning the retained records in the same
-structured form as the OTEL stream.
+**Surface:** none of its own. The records are framed into the connection history and travel upstream
+over the authenticated management channel in the same structured form as the OTEL stream.
 
 **Semantics — a debugging surface, not a log archive:**
 
@@ -303,46 +306,36 @@ structured form as the OTEL stream.
 **Record and retention inventory:** the buffer size, the retention bound and the query semantics are
 not named here, under the rule at the head of this chapter.
 
-## Configuration endpoint: reading the policy and replacing it
+## Configuration: replacing the policy over the channel
 
-`GET /config` returns the running configuration as XML (see the
-[configuration design](../design/configuration.md)). It supplies the intent half of the debug dump:
-paired with a metric reading and a `/logs` read it gives the complete picture of *what the node is
-configured to do* alongside *what it is doing* and *what it has just done*.
+A configuration change reaches this appliance as the stepped transaction the
+[management design](../design/management.md) defines and nothing else: a management server stages a
+document over the authenticated channel, the appliance validates it, a provisional commit takes
+effect and ends the session, and a confirmation on a connection opened *afterwards* makes it
+permanent. There is no configuration endpoint and no way to read the running document out of a node —
+a change is an edit of the version the server already holds, and the server's own history is where
+the document lives.
 
-**What comes back is a rendering of the configuration in force, not the bytes that were submitted.**
-The node keeps no copy of the document — 64 KiB of text has nowhere to live in a domain with no
-allocator — so the answer is produced from the model the appliance is actually deciding under. Three
-consequences, and each is the reason it is the stronger answer:
+**The appliance keeps no copy of the document it committed** — 64 KiB of text has nowhere to live in
+a domain with no allocator — so what it holds is the model it is actually deciding under, plus the
+bytes in the version slot the store domain wrote. A configuration whose canonical form would not fit
+the document bound is refused at validation with `rejected=rendering-too-large` rather than
+committed, so every version the history holds is one this appliance would itself accept.
 
-- Reformat a document, submit it, and read it back: what returns is the canonical form, not the
-  whitespace and attribute order that were sent. Two documents that are one configuration state one
-  document, which is the same property that makes re-submitting an unchanged configuration commit
-  nothing.
-- A value the schema admits in more than one spelling comes back in one of them — `protocol="6"`
-  reads back as `protocol="tcp"`, a port range whose ends are equal as the single port.
-- The generation a node committed **at boot** is stateable, which an echo of submitted bytes could
-  never be: no other domain ever saw that document.
-
-**What comes back is always a document the appliance would itself accept.** A configuration whose
-canonical form would not fit the document bound is refused at submission with
-`rejected=rendering-too-large` rather than committed, precisely so the read stays the first step of a
-change: a policy an operator can read and not resubmit is one they cannot edit.
-
-`POST /config` submits a replacement. The body is an XML document bounded by the same 64 KiB the
-reader enforces; a longer one is refused `413 Content Too Large` at the request head, before a byte of
-it is accumulated. The document becomes the candidate, is validated, and is committed under the next
-generation; the answer is one line in the field vocabulary `LFW-CFG` uses on the console:
+The result of every step comes back as one line in the field vocabulary `LFW-CFG` uses on the
+console:
 
 ```text
 generation=<n> outcome=applied changes=<n>
 generation=<n> outcome=unchanged changes=0
+generation=<n> outcome=staged changes=<n>
+generation=<n> outcome=confirmed changes=<n>
+generation=<n> outcome=reverted changes=<n>
 generation=<n> outcome=refused rejected=<reason> offset=<n>
 ```
 
-`200` for the first two, `400` for a refusal — the document is the client's and the node is
-working — and the `rejected=` token is one of the reasons the [console chapter](console.md) lists.
-A refusal changes nothing: the generation named is the one still running.
+The `rejected=` token is one of the reasons the [console chapter](console.md) lists, and a refusal
+changes nothing: the generation named is the one still running.
 
 The generation the answer names is the one the **configuration domain** committed. The forwarding
 domain switches tables at its next poll boundary, which is what the two-phase handover exists to make

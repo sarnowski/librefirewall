@@ -141,7 +141,6 @@
 pub mod blk;
 pub mod channel_frames;
 pub mod channel_tls;
-pub mod config_submission;
 pub mod config_transaction;
 pub mod document;
 pub mod driver;
@@ -300,10 +299,6 @@ mod tests {
             crate::onboarding_install::onboarding_install_harness,
         ),
         ("config_document", crate::document::document_harness),
-        (
-            "config_submission",
-            crate::config_submission::config_submission_harness,
-        ),
         (
             "config_transaction",
             crate::config_transaction::config_transaction_harness,

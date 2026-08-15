@@ -420,8 +420,6 @@ pub struct SubmissionCounters {
     pub staged: u64,
     pub confirmed: u64,
     pub reverted: u64,
-    /// Times the running document was stated out of this node.
-    pub reads: u64,
 }
 
 /// The configuration publisher's shard.
@@ -443,7 +441,6 @@ pub const fn config_sample(
             submissions.confirmed,
             submissions.reverted,
         ],
-        reads: submissions.reads,
         log,
     }
 }

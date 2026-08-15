@@ -200,7 +200,6 @@ const FUZZ_TARGETS: &[&str] = &[
     "metric_snapshot",
     "transcript_block",
     "config_document",
-    "config_submission",
     "config_transaction",
     "spsc_ring_peer",
     "log_ring",

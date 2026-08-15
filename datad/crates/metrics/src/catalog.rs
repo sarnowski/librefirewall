@@ -269,16 +269,9 @@ pub const CONFIGURATION_GENERATION: Metric = metric(
 pub const CONFIGURATION_SUBMISSIONS: Metric = metric(
     "librefirewall_configuration_submissions_total",
     Kind::Counter,
-    "Documents submitted to this node over the management API, by what the \
+    "Documents submitted to this node over the management channel, by what the \
      configuration domain decided: `applied` moved the generation, `unchanged` was \
      the configuration already running, `refused` broke a rule and changed nothing.",
-);
-
-/// Documents the deciding domain was asked for.
-pub const CONFIGURATION_READS: Metric = metric(
-    "librefirewall_configuration_reads_total",
-    Kind::Counter,
-    "Times the running configuration document was read out of this node.",
 );
 
 pub const CONFIGURATION_IMAGES: Metric = metric(
@@ -1129,7 +1122,6 @@ pub const ALL_METRICS: &[&Metric] = &[
     &UART_INIT_FAILURES,
     &CONFIGURATION_GENERATION,
     &CONFIGURATION_SUBMISSIONS,
-    &CONFIGURATION_READS,
     &CONFIGURATION_IMAGES,
     &INTERFACE_INFO,
     &CLOCK_GENERATION,

@@ -400,67 +400,37 @@
     <memory_region name="cfg" size="0x8000" />
     <memory_region name="cfgack" size="0x1000" />
 
-    <!-- The configuration SUBMISSION channel, one region per direction, and the
-         path by which a document reaches this appliance at all.
+    <!-- THE CONFIGURATION SUBMISSION CHANNEL, one region per direction, and the
+         only path by which a document reaches this appliance at all.
 
-         `cfg_request` carries what the management domain is asking — an operation
-         word, a length, and up to `wire::MAX_DOCUMENT_BYTES` of document — and
-         `cfg_reply` carries the answer: a status from a closed set, the generation
-         now in force, a reject reason and the number that locates it, and, for a
-         read, the document the appliance is running. MANAGEMENT maps `cfg_request`
-         READ-WRITE and `cfg_reply` READ-ONLY; the CONFIG domain maps
-         `cfg_request` READ-ONLY and `cfg_reply` READ-WRITE. Each writes exactly
-         the direction it speaks in, which is `dl_request`/`dl_reply`'s split and
-         is here for a sharper reason than there.
+         `chan_cfg_request` carries what the cryptography domain is asking — an
+         operation word, a length, and up to `wire::MAX_DOCUMENT_BYTES` of document
+         — and `chan_cfg_reply` carries the answer: a status from a closed set, the
+         generation now in force, and a reject reason with the number that locates
+         it. The CONFIG domain maps `chan_cfg_request` READ-ONLY and
+         `chan_cfg_reply` READ-WRITE; the CRYPTO domain maps them the other way
+         round. Each writes exactly the direction it speaks in, which is
+         `dl_request`/`dl_reply`'s split and is here for a sharper reason than
+         there.
 
-         WHY THE DIRECTION OF TRUST RUNS THIS WAY. The management domain is the
-         one an attacker reaches first and it holds two frame pipelines; the
-         config domain holds no device, no pool and no dataplane ring. So the
-         domain that PARSES an operator's — or an attacker's — XML must be the
-         config domain, and the management domain's whole part is to copy bytes
-         from a TCP connection into `cfg_request` and hand on. It never parses
-         them. A parser in the management domain would put the reader of a hostile
-         document in the same domain as a frame buffer and leave this split with
-         nothing to withhold.
+         WHY THE REQUESTER IS THE CRYPTOGRAPHY DOMAIN AND NOT THE MANAGEMENT ONE.
+         A document arrives inside a mutually authenticated TLS session, and the
+         domain that terminates that session is the only one holding its plaintext:
+         the management domain owns the PORT and carries ciphertext across the
+         relay, so it has no document to submit and is granted no part of this
+         pair. A submission channel admits ONE requester in any case — its sequence
+         number is the whole correlation, and a second writer would answer under
+         numbers the first has outstanding — so the requester is a choice this file
+         makes exactly once.
 
-         AND WHY MANAGEMENT MAY NOT WRITE `cfg_reply`. That region carries the
-         document `GET /config` answers with. A management domain that could write
-         it could serve an operator a configuration the appliance is not running —
-         a fabricated statement about the policy in force, which is worse than a
-         wrong answer because an operator would edit and resubmit it. The read
-         grant it does hold lets it copy that document to a client and nothing
-         else.
-
-         Sizes are `wire::CONFIG_REQUEST_REGION_SIZE` and
-         `wire::CONFIG_REPLY_REGION_SIZE`, on the same footing as every constant
-         above and held to them the same way: `xtask::sysdesc` carries a rule for
-         each and compares it. Both are 64 KiB of document plus a header, so
-         seventeen pages each; they are placed at 0x3_100_000 and 0x3_200_000,
-         clear of the eight-page `cfg` window this file's address-map block
-         describes, so neither can grow into it.
-
-         Neither carries phys_addr, for cfg's reason exactly: no device is told
-         where they are, so an unplaced region — which Microkit allocates from
-         general-purpose untyped memory, and which seL4 therefore zeroes — is the
-         stronger position. -->
-    <memory_region name="cfg_request" size="0x11000" />
-    <memory_region name="cfg_reply" size="0x11000" />
-
-    <!-- THE MANAGEMENT CHANNEL'S OWN SUBMISSION CHANNEL: the same ABI, a second
-         instance, between the domain that terminates the channel and the domain
-         that decides about a document.
-
-         WHY A SECOND PAIR AND NOT THE ONE ABOVE. A submission channel admits ONE
-         requester — its sequence number is the whole correlation, and a second
-         writer would answer under numbers the first has outstanding — so two
-         requesting domains are two channels by construction rather than by
-         preference. And the two requesters are two domains at different points in
-         the trust order: the domain that owns the management PORT is not the
-         domain that terminates the management CHANNEL, and a region pair either
-         could write would let each answer for the other. The CONFIG domain maps
-         `chan_cfg_request` READ-ONLY and `chan_cfg_reply` READ-WRITE; the CRYPTO
-         domain maps them the other way round, exactly as MANAGEMENT holds the pair
-         above.
+         WHY THE CONFIG DOMAIN PARSES AND NOTHING ELSE DOES. The cryptography
+         domain terminates a management server's session and the management domain
+         holds two frame pipelines; the config domain holds no device, no pool and
+         no dataplane ring. So the domain that PARSES an operator's — or an
+         attacker's — XML is the config domain, and every other domain's part is to
+         carry bytes. A parser in either of the other two would put the reader of a
+         hostile document in the same domain as a private key or a frame buffer and
+         leave this split with nothing to withhold.
 
          WHAT THE CRYPTO DOMAIN GAINS, STATED PLAINLY: the ability to submit a
          configuration document and to ask that a commit be made, confirmed or put
@@ -472,11 +442,6 @@
          accepted, and it maps no part of `cfg`, the handover region the forwarding
          domain actually reads.
 
-         AND WHAT THE CONFIG DOMAIN GAINS: nothing but a second question to answer.
-         It maps one more region read-only and one more read-write, holds no new
-         device, no pool, no ring and no network region, and its whole reach is
-         still the handover it publishes and the two channels it answers.
-
          WHY THE DOCUMENT DOES NOT TRAVEL THE RELAY. The cryptography domain
          already speaks to the management domain over `relay_request`/`relay_reply`,
          and routing a staged document through them was considered and rejected:
@@ -487,9 +452,18 @@
          pair the deciding domain reads directly costs one more mapping in each of
          two domains and adds no parser anywhere.
 
-         Sizes and placement are `cfg_request`'s: seventeen pages each, at
-         0x3_300_000 and 0x3_400_000, clear of that pair's windows so neither can
-         grow into the other. Neither carries phys_addr, for the same reason. -->
+         Sizes are `wire::CONFIG_REQUEST_REGION_SIZE` and
+         `wire::CONFIG_REPLY_REGION_SIZE`, on the same footing as every constant
+         above and held to them the same way: `xtask::sysdesc` carries a rule for
+         each and compares it. Both are 64 KiB of document plus a header, so
+         seventeen pages each; they are placed at 0x3_300_000 and 0x3_400_000,
+         clear of the eight-page `cfg` window this file's address-map block
+         describes, so neither can grow into it.
+
+         Neither carries phys_addr, for cfg's reason exactly: no device is told
+         where they are, so an unplaced region — which Microkit allocates from
+         general-purpose untyped memory, and which seL4 therefore zeroes — is the
+         stronger position. -->
     <memory_region name="chan_cfg_request" size="0x11000" />
     <memory_region name="chan_cfg_reply" size="0x11000" />
 
@@ -1415,8 +1389,6 @@
         <program_image path="config-pd.elf" />
         <map mr="cfg" vaddr="0x3_000_000" perms="rw" cached="true" setvar_vaddr="cfg_vaddr" />
         <map mr="cfgack" vaddr="0x3_008_000" perms="r" cached="true" setvar_vaddr="cfgack_vaddr" />
-        <map mr="cfg_request" vaddr="0x3_100_000" perms="r" cached="true" setvar_vaddr="cfg_request_vaddr" />
-        <map mr="cfg_reply" vaddr="0x3_200_000" perms="rw" cached="true" setvar_vaddr="cfg_reply_vaddr" />
         <map mr="chan_cfg_request" vaddr="0x3_300_000" perms="r" cached="true" setvar_vaddr="chan_cfg_request_vaddr" />
         <map mr="chan_cfg_reply" vaddr="0x3_400_000" perms="rw" cached="true" setvar_vaddr="chan_cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
@@ -1738,8 +1710,6 @@
         <map mr="relay_request" vaddr="0x2_800_000" perms="rw" cached="true" setvar_vaddr="relay_request_vaddr" />
         <map mr="relay_reply" vaddr="0x2_900_000" perms="r" cached="true" setvar_vaddr="relay_reply_vaddr" />
         <map mr="cfg" vaddr="0x3_000_000" perms="r" cached="true" setvar_vaddr="cfg_vaddr" />
-        <map mr="cfg_request" vaddr="0x3_100_000" perms="rw" cached="true" setvar_vaddr="cfg_request_vaddr" />
-        <map mr="cfg_reply" vaddr="0x3_200_000" perms="r" cached="true" setvar_vaddr="cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
         <map mr="endpoint" vaddr="0x3_00b_000" perms="r" cached="true" setvar_vaddr="endpoint_vaddr" />
         <map mr="log_management" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
@@ -2508,47 +2478,6 @@
     <channel>
         <end pd="recorder" id="0" notify="true" />
         <end pd="management" id="1" notify="false" />
-    </channel>
-
-    <!-- The configuration submission channel, and the SECOND channel in this
-         system granted in BOTH directions. It is also the channel that ended
-         MANAGEMENT_CHANNEL_ONE_WAY: before it the management domain held no send
-         capability at all, on any channel, and this was the first. It is now one
-         of exactly two — this one and the TLS relay's below, and nothing else.
-
-         WHY MANAGEMENT MUST BE ABLE TO SIGNAL. The config domain has no polling
-         loop: it runs `init` to completion and then blocks in the Microkit event
-         loop, which is the whole reason it costs nothing at the highest priority
-         in the system. A submitted document in `cfg_request` is therefore
-         invisible to it until something wakes it, and the only party that knows a
-         document has arrived is the domain that copied it in. Making the config
-         domain poll instead would burn a core forever to catch an operator action
-         that happens once a month.
-
-         WHAT THAT SEND CAPABILITY IS WORTH TO AN ATTACKER, stated plainly because
-         it is the one authority this landing hands to the domain an attacker
-         reaches first: a wakeup, at whatever rate they choose. What the config
-         domain does on a wakeup is bounded — it takes at most one demand per
-         change of the requester's sequence and answers it — and the same party
-         could provoke exactly that by `POST`ing a document, which is a request
-         this appliance is now built to accept. So the capability adds no reach
-         beyond what the feature itself grants, and it grants nothing on the
-         dataplane: this channel's other end is a domain holding no device, no pool
-         and no ring.
-
-         AND WHY CONFIG MUST BE ABLE TO SIGNAL BACK. The management domain is
-         `notified`-driven too — it is woken, it drains, it returns — so without
-         the reverse direction it would learn that its submission had been decided
-         only when the next frame happened to wake it, which for a client holding a
-         connection open is a stall of unbounded length. The recorder's channel is
-         granted for exactly that reason in exactly that direction.
-
-         Both ends state `notify` rather than leaning on Microkit's default of
-         true, as the config/forwarder pair does: a direction that matters is a
-         direction written down. -->
-    <channel>
-        <end pd="config" id="1" notify="true" />
-        <end pd="management" id="2" notify="true" />
     </channel>
 
     <!-- The signing delegation's channel, granted in ONE direction: the

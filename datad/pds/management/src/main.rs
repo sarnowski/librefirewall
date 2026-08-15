@@ -50,12 +50,8 @@
 //! `pd_runtime::CommittedReader` is that weaker role, and it holds the whole of
 //! it.
 //!
-//! What that costs is smaller than it was and is still real. This domain now holds
-//! a channel to the configuration domain — it has to, being the only party that
-//! knows a submitted document has arrived — but the channel carries *submissions*
-//! and not the commit protocol: this domain still reads the committed generation
-//! from `cfg` and takes no part in releasing one. So a commit somebody else
-//! provoked still reaches it only when something wakes it.
+//! What that costs is real: a commit somebody else provoked reaches this domain
+//! only when something wakes it.
 //!
 //! # It is woken by frames and by the passage of time
 //!
@@ -185,12 +181,11 @@ use lfw_log::{
 };
 use lfw_metrics::StatsShard;
 use pd_runtime::{
-    CalibrationRefused, ChannelStream, ClockCalibration, ConfigHandover, ConfigReply,
-    ConfigRequest, Configurations, DialFacts, Downloads, Ended, EndpointRegions, EndpointStage,
-    ForwardRings, Half, Hop, Ipv4Address, IsnSecret, OnboardCounters, OpenError, PdClock, Pool,
-    RELAY_ANSWER_TIMEOUT, Reconnect, Relay, RelayFailure, RelayReport, Resolutions, ReturnRing,
-    Shipped, SnapshotSchedule, StatsRegions, Via, Wait, attach_region, log_sample,
-    read_timestamp_counter,
+    CalibrationRefused, ChannelStream, ClockCalibration, ConfigHandover, DialFacts, Downloads,
+    Ended, EndpointRegions, EndpointStage, ForwardRings, Half, Hop, Ipv4Address, IsnSecret,
+    OnboardCounters, OpenError, PdClock, Pool, RELAY_ANSWER_TIMEOUT, Reconnect, Relay,
+    RelayFailure, RelayReport, Resolutions, ReturnRing, Shipped, SnapshotSchedule, StatsRegions,
+    Via, Wait, attach_region, log_sample, read_timestamp_counter,
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
@@ -209,14 +204,8 @@ use wire::{
 /// attacker, and this domain has no document to read.
 const PORTS: u8 = 2;
 
-/// The configuration domain, and one of the **two** send capabilities this domain
-/// holds in this system. It blocks in the Microkit event loop and never polls, so
-/// a document written into the submission region is invisible to it until it is
-/// woken.
-const CONFIG: Channel = Channel::new(2);
-
-/// The cryptography domain, and the other one. It is woken for the same reason
-/// and it is the same shape of reason: that domain blocks in the event loop, so
+/// The cryptography domain, and the **one** send capability this domain holds in
+/// this system. That domain blocks in the Microkit event loop and never polls, so
 /// a record written into the relay's request region is invisible to it until it
 /// is woken. What the capability is worth to whoever reaches this domain is a
 /// wakeup at their chosen rate on a domain holding no device, no pool and no
@@ -963,9 +952,6 @@ fn init() -> Management {
     let request: &'static DownloadRequest = attach_region!(dl_request_vaddr: DownloadRequest);
     let reply: &'static DownloadReply = attach_region!(dl_reply_vaddr: DownloadReply);
     let downloads = Downloads::attach(request, reply);
-    let cfg_request: &'static ConfigRequest = attach_region!(cfg_request_vaddr: ConfigRequest);
-    let cfg_reply: &'static ConfigReply = attach_region!(cfg_reply_vaddr: ConfigReply);
-    let configurations = Configurations::attach(cfg_request, cfg_reply);
     // The relay's two regions, whose directions are the system description's:
     // the request is this domain's to write and the terminating domain's to
     // read, and the reply is the reverse. Nothing here restates that — the
@@ -979,33 +965,14 @@ fn init() -> Management {
     let relay_request: &'static RelayRequest = attach_region!(relay_request_vaddr: RelayRequest);
     let relay_reply: &'static RelayReply = attach_region!(relay_reply_vaddr: RelayReply);
     let relay = Relay::attach(relay_request, relay_reply);
-    let mut stage = stage;
-    // The configuration surface, before the first frame: a target registered late
-    // would answer `404` to a client that asked at exactly the wrong moment.
-    let registered = configurations.register(&mut stage);
     // The port is unaddressed until a generation is committed and unclocked until
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
     announce(&sink, DomainState::Ready, DomainDetail::None);
-    if !registered {
-        // A build fact rather than a run-time condition — the endpoint's target
-        // table is one size — so it is recorded and the port carries on serving
-        // everything else.
-        announce(
-            &sink,
-            DomainState::Ready,
-            DomainDetail::Refusal(Refusal {
-                cause: "configuration-target-unregistered",
-                detail: RefusalDetail::None,
-                signalled: false,
-            }),
-        );
-    }
 
     Management::Running(Running {
         stage,
         downloads,
-        configurations,
         relay,
         handover,
         clock,
@@ -1049,9 +1016,6 @@ struct Running {
     /// The recording downloads this port serves. Kept for the same reason: it
     /// holds this domain's position in the request channel's sequence.
     downloads: Downloads<'static>,
-    /// The configuration surface this port serves, holding this domain's position
-    /// in the submission channel's sequence for the same reason.
-    configurations: Configurations<'static>,
     /// The onboarding port's relay, holding this domain's position in that
     /// channel's sequence for the same reason again.
     relay: Relay<'static>,
@@ -1132,19 +1096,8 @@ impl Handler for Management {
         // trip to the recorder.
         let shipping = running.relay.shipping();
         running.downloads.poll(now, shipping);
-        // And the configuration channel, on the download channel's terms exactly:
-        // an answer that landed between wakeups is in the endpoint's hands by the
-        // time this pass composes a segment.
-        if running.configurations.poll(now, &mut running.stage) {
-            CONFIG.notify();
-        }
         let log = log_sample(running.sink.dropped(), running.sink.refused());
         let moved = running.stage.poll(ticks, log);
-        // And again after them, because a request parsed in this very pass is what
-        // puts a document in `submission`.
-        if running.configurations.poll(now, &mut running.stage) {
-            CONFIG.notify();
-        }
         // After the drain, so a resolution that arrived in this very pass is what
         // the session is carried forward on, and before the record below: the
         // shard is published again here, so a reading carries the channel's own

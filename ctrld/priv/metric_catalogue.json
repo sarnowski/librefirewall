@@ -1,6 +1,6 @@
 {
-  "fingerprint": 3346186459,
-  "slots": 470,
+  "fingerprint": 3671318875,
+  "slots": 469,
   "series": [
     {"domain": "forwarder", "family": "librefirewall_forwarded_frames_total", "labels": {"pipeline": "0"}},
     {"domain": "forwarder", "family": "librefirewall_route_drops_total", "labels": {"pipeline": "0", "reason": "unowned"}},
@@ -364,7 +364,6 @@
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "staged"}},
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "confirmed"}},
     {"domain": "config", "family": "librefirewall_configuration_submissions_total", "labels": {"outcome": "reverted"}},
-    {"domain": "config", "family": "librefirewall_configuration_reads_total", "labels": {}},
     {"domain": "config", "family": "librefirewall_log_records_dropped_total", "labels": {}},
     {"domain": "config", "family": "librefirewall_log_records_refused_total", "labels": {}},
     {"domain": "clock", "family": "librefirewall_clock_frequency_hertz", "labels": {}},

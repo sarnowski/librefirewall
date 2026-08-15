@@ -540,21 +540,16 @@ const DOWNLOAD_WITHHELD: &str = "the forwarder maps NEITHER download region, in 
 /// What `cfg` having two readers and `cfgack` one writer withholds, quoted into
 /// the finding on the management domain gaining the acknowledgement region.
 /// What the submission channel's two rows withhold, in both directions at once.
-const CONFIG_SUBMISSION_WITHHELD: &str = "the FORWARDER maps NEITHER submission region, in \
-     either direction, and neither does any driver or the recorder: a document on its way to \
-     being decided is not something a dataplane domain has any use for, and a forwarder able to \
-     write `cfg_reply` could answer an operator's `GET /config` with a policy the appliance is \
-     not running. The two mappers are the two ends of one conversation and the perms carry which \
-     end speaks in which direction";
-
 const CHANNEL_CONFIG_WITHHELD: &str = "the MANAGEMENT domain maps NEITHER of these regions, in \
-     either direction, and that is the point of their being a second pair: a submission channel \
-     admits one requester, so the domain that owns the management PORT and the domain that \
-     terminates the management CHANNEL each hold their own and cannot answer for the other. No \
-     dataplane domain, driver or recorder maps either, on `cfg_request`'s terms. And the \
-     cryptography domain maps NO part of `cfg` or `cfgack`: it may ask that a document be decided \
-     and can neither publish a handover nor acknowledge one, so what it holds is the authority a \
-     management plane has by definition and no part of applying it";
+     either direction, and it is the domain an attacker reaches first: it owns the management \
+     PORT and carries a management server's session across the relay as ciphertext, so it has no \
+     document to submit and is granted no part of the pair that submits one. The FORWARDER maps \
+     neither either, and neither does any driver or the recorder: a document on its way to being \
+     decided is not something a dataplane domain has any use for, and a forwarder able to write \
+     the reply could tell the requester that a policy the appliance is not running had been \
+     accepted. And the cryptography domain maps NO part of `cfg` or `cfgack`: it may ask that a \
+     document be decided and can neither publish a handover nor acknowledge one, so what it \
+     holds is the authority a management plane has by definition and no part of applying it";
 
 const CONFIG_DELEGATION_RECEIVE_ONLY: &str = "the CONFIG domain holds no send \
      capability on the cryptography domain: its answer is published into a region that domain \
@@ -1081,45 +1076,19 @@ const REGIONS: &[RegionRule] = &[
         grants: &[read_only("forwarder"), read_write("recorder")],
         withheld: Some(TAP_WITHHELD),
     },
-    // The configuration submission channel: the same two-region mirror, and the
-    // pair whose direction carries the most. `cfg_request` is management's to write
-    // because a document arrives on a TCP connection it terminates; `cfg_reply` is
-    // the config domain's, because it holds the datastore and is the only domain
-    // that can say what is running. Crossing either is the finding: a config domain
-    // able to write the request would decide on bytes nobody submitted, and a
-    // management domain able to write the reply would answer `GET /config` with a
-    // document the appliance is not running — which an operator would then edit and
-    // submit, so a fabricated statement about the policy in force is worse than a
-    // wrong one.
+    // The configuration submission channel: the two-region mirror by which a
+    // document reaches this appliance at all. `chan_cfg_request` is the
+    // cryptography domain's to write because a document arrives inside the TLS
+    // session that domain terminates; `chan_cfg_reply` is the config domain's,
+    // because it holds the datastore and is the only domain that can say what is
+    // running. Crossing either is the finding: a config domain able to write the
+    // request would decide on bytes nobody submitted, and a requesting domain
+    // able to write the reply would tell itself a document had been accepted.
     //
     // The direction of *parsing* is what the exclusion below claims, and it is the
     // whole reason the config domain exists: the domain that reads an attacker's
-    // XML holds no frame buffer, and the domain that holds two frame pipelines
-    // reads none of it.
-    RegionRule {
-        name: "cfg_request",
-        size: ExpectedSize {
-            rust_name: "wire::CONFIG_REQUEST_REGION_SIZE",
-            bytes: CONFIG_REQUEST_REGION_SIZE,
-        },
-        cacheability: Cacheability::Cached,
-        grants: &[read_write("management"), read_only("config")],
-        withheld: Some(CONFIG_SUBMISSION_WITHHELD),
-    },
-    RegionRule {
-        name: "cfg_reply",
-        size: ExpectedSize {
-            rust_name: "wire::CONFIG_REPLY_REGION_SIZE",
-            bytes: CONFIG_REPLY_REGION_SIZE,
-        },
-        cacheability: Cacheability::Cached,
-        grants: &[read_only("management"), read_write("config")],
-        withheld: Some(CONFIG_SUBMISSION_WITHHELD),
-    },
-    // The management channel's own submission channel: the same ABI, a second
-    // instance, with the cryptography domain as requester. Its own rule rather
-    // than a widening of the pair above, because the *grants* are what differ —
-    // the management domain is not among the mappers at all.
+    // XML holds no frame buffer and no private key, and the two domains that hold
+    // those read none of it.
     RegionRule {
         name: "chan_cfg_request",
         size: ExpectedSize {
@@ -1878,8 +1847,8 @@ const DRIVER_CHANNEL_ONE_WAY: &str = "pds/nic-driver's crate header takes this a
 /// its own rather than a third use of that one, because what it protects is not
 /// the same thing: the forwarder's two ends are about a domain that holds one
 /// send capability and must hold no more, and this end is about a domain that
-/// holds none at all.
-const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY TWO send      capabilities in this system — on the configuration domain, where a submitted document is      otherwise invisible to a peer that never polls, and on the cryptography domain, where a      TLS record written into the relay is invisible for the same reason — and this is an end      that says it is neither. It is a notified-driven consumer here: it is woken, it drains,      it returns. A send capability on this end would be one on a driver that never leaves      `init` and so could never observe it — authority for nothing — and it would make      pds/nic-driver's claim that its `notified` entrypoint is unreachable by *capability*      false for the third instance while staying true for the other two";
+/// holds exactly one and must hold no second.
+const MANAGEMENT_CHANNEL_ONE_WAY: &str = "the management domain holds EXACTLY ONE send      capability in this system — on the cryptography domain, where a TLS record written into the      relay is otherwise invisible to a peer that never polls — and this is an end that says it      is not that one. It is a notified-driven consumer here: it is woken, it drains,      it returns. A send capability on this end would be one on a driver that never leaves      `init` and so could never observe it — authority for nothing — and it would make      pds/nic-driver's claim that its `notified` entrypoint is unreachable by *capability*      false for the third instance while staying true for the other two";
 
 /// As [`MANAGEMENT_CHANNEL_ONE_WAY`], for the store domain's one and only end. A
 /// claim of its own rather than a third use of that one, because what it protects
@@ -1975,29 +1944,6 @@ const CHANNEL_ENDS: &[ChannelEnd] = &[
         notification: Notification::MayNotSend {
             claim: MANAGEMENT_CHANNEL_ONE_WAY,
         },
-    },
-    // The configuration submission channel, granted in BOTH directions, and the
-    // one place the management domain holds a send capability at all. It must: the
-    // config domain has no polling loop — it blocks in the Microkit event loop,
-    // which is why it costs nothing at the highest priority in the system — so a
-    // document copied into `cfg_request` is invisible to it until it is woken, and
-    // the only party that knows one arrived is the domain that copied it. What the
-    // capability is worth to an attacker is a wakeup at a rate they choose, on a
-    // domain whose answer to one is bounded and which holds no device, no pool and
-    // no ring; the same party provokes exactly that by submitting a document,
-    // which is the request this appliance is now built to accept. The reverse
-    // direction is the recorder channel's argument: a management domain that
-    // learned of a decision only when the next frame woke it would stall a client
-    // holding a connection open.
-    ChannelEnd {
-        domain: "config",
-        id: "1",
-        notification: Notification::MaySend,
-    },
-    ChannelEnd {
-        domain: "management",
-        id: "2",
-        notification: Notification::MaySend,
     },
     // The signing delegation, one-directional. The asker must be able to signal:
     // the holder blocks in the Microkit event loop, so a request written into

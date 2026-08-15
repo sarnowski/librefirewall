@@ -295,13 +295,12 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
     let config = ConfigSample {
         generation: 7,
         submissions: [11, 13, 17, 31, 37, 41],
-        reads: 19,
         log: LogSample {
             dropped: 23,
             refused: 29,
         },
     };
-    assert_eq!(config.values(), [7, 11, 13, 17, 31, 37, 41, 19, 23, 29]);
+    assert_eq!(config.values(), [7, 11, 13, 17, 31, 37, 41, 23, 29]);
     assert_eq!(config.values().len(), CONFIG_SLOTS);
 
     // The store domain's, which is the only shard carrying four independent

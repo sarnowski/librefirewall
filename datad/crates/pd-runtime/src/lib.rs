@@ -47,9 +47,8 @@
 //! one made a second configuration unrepresentable — the borrow lasted as long
 //! as the stage — and passing it per call also settles *when* a commit takes
 //! effect without a lock: a Microkit protection domain runs one `notified` to
-//! completion at a time, so the caller cannot run while a poll holds what it
-//! was lent. For the chain, a stage of it may hold state spanning both
-//! directions, which a per-direction owner would split in half.
+//! completion at a time, so the caller cannot run while a poll holds what it was
+//! lent. For the chain, a stage of it may hold state spanning both directions.
 //!
 //! # What a hostile peer cannot cause, and what enforces it
 //!
@@ -367,11 +366,10 @@ pub unsafe fn attach_region<'a, T: Sync>(ptr: *mut T) -> &'a T {
 ///
 /// A [`ForwardRings`] region is mapped read-write into three protection domains
 /// at once and a [`ReturnRing`] into two; a [`Pool`] is mapped into the
-/// transmitting driver alone and is additionally a DMA target of both NICs; the
-/// two configuration regions are mapped into two domains, each writable in one
-/// of them. Sharing any of them as a `&` is sound in the face of that because
-/// none exposes a safe path to those bytes; whether the peers behave is the
-/// protocol question the crate header answers, not a soundness one.
+/// transmitting driver alone and is additionally a DMA target of both NICs.
+/// Sharing any of them as a `&` is sound in the face of that because none
+/// exposes a safe path to those bytes; whether the peers behave is the protocol
+/// question the crate header answers, not a soundness one.
 ///
 /// The calling crate must depend on `sel4-microkit`; this crate deliberately
 /// does not, so the protocol stays host-testable.
@@ -536,10 +534,7 @@ pub mod stats;
 pub mod tap;
 
 pub use clock::{PdClock, TICK_PERIOD, TICKS_PER_SECOND, read_timestamp_counter};
-pub use configuration::{
-    CONFIG_TARGET, Configurations, MAX_ANSWER_LEN, Outcome, Submissions, reject_reason_of,
-    write_result_line,
-};
+pub use configuration::{MAX_ANSWER_LEN, Outcome, reject_reason_of, write_result_line};
 pub use download::{Downloads, Shipped};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,

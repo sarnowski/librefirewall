@@ -316,12 +316,10 @@ fn the_submission_counters_land_under_the_outcomes_they_name() {
             staged: 23,
             confirmed: 29,
             reverted: 31,
-            reads: 19,
         },
         log_sample(0, 0),
     );
     assert_eq!(sample.generation, 3);
-    assert_eq!(sample.reads, 19);
     let named: Vec<(&str, u64)> = lfw_metrics::GENERATION_OUTCOME_NAMES
         .iter()
         .copied()

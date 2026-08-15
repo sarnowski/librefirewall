@@ -806,7 +806,7 @@ node: an operator holding a silent appliance still has only the external act.
 ## `LFW-PD` refusal causes
 
 Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 36 the `management` domain raises, 47
+`nic-driver` domain raises, 30 the `clock` domain raises, 35 the `management` domain raises, 47
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 185 the `crypto` domain
 raises, and 175 the `store` domain raises. A token outside all eight is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
@@ -875,7 +875,7 @@ metrics surface.
 | the date it named | `rtc-civil-before-epoch` (year), `rtc-civil-month-out-of-range` (month), `rtc-civil-day-out-of-range` (month, day), `rtc-civil-hour-out-of-range` (hour), `rtc-civil-minute-out-of-range` (minute), `rtc-civil-second-out-of-range` (second), `rtc-civil-nanosecond-out-of-range` (nanosecond) |
 | the epoch conversion | `epoch-out-of-range` (the seconds since 1970 that would not fit nanoseconds) |
 
-**`management`.** Thirty-six tokens, and the groups differ in what they mean for the domain.
+**`management`.** Thirty-five tokens, and the groups differ in what they mean for the domain.
 
 The first two are a **`state=refused` record and the domain's last act**: without a per-boot secret
 its transport's initial sequence numbers would be predictable, and a predictable one lets an off-path
@@ -889,15 +889,7 @@ domain published a calibration this domain will not convert readings with, so th
 and ICMP echo — neither needs a time — and refuses TCP, counting each segment as unclocked. They are
 reported once per calibration rather than once per frame.
 
-The fifth also rides on **`state=ready`**, and is narrower still: the endpoint's target table would
-not take the configuration target, so `GET /config` and `POST /config` answer `404` while everything
-else on the port — ARP, ICMP echo, TCP — serves normally. It is a **build fact
-rather than a run-time condition** (the table is a fixed size), so it is stated once at bring-up and
-never again, and the port carries on rather than refusing to start. An operator seeing it should
-read it as "this image cannot take a document over HTTP", not as a fault in the deciding domain,
-which is unaffected.
-
-The sixth rides on **`state=ready`** as well, and it is not a failure at all: this appliance has
+The fifth rides on **`state=ready`** as well, and it is not a failure at all: this appliance has
 nowhere to dial. An appliance learns where its management plane is when it takes an owner, so an
 appliance nobody owns has no destination to open a channel to — and saying so once is what separates
 that node from one whose channel is failing silently. It is stated once per boot and the moment a
@@ -947,14 +939,13 @@ request this domain composed wrongly and should never appear. `upstream-range-fa
 port could not believe and `upstream-range-unanswered` a recorder that said nothing inside the reply
 timeout: a byzantine neighbour and a silent one, which are different places to look.
 
-`signalled=` is always `false` on all thirty-six: no device was told to stop, because none was told
+`signalled=` is always `false` on all thirty-five: no device was told to stop, because none was told
 anything.
 
 | group | tokens |
 |---|---|
 | the per-boot secret (a `refused` record; the domain does not start) | `rdrand-not-supported` (the `CPUID.01H:ECX` word read), `rdrand-exhausted` (which of the three 64-bit draws failed) |
 | the published calibration (a `ready` record; TCP alone is refused) | `clock-not-published` (no `detail=`), `clock-implausible-frequency` (the hertz refused), `clock-implausible-epoch` (the nanoseconds refused) |
-| the configuration target (a `ready` record, no `detail=`; the port serves everything else) | `configuration-target-unregistered` |
 | nowhere to dial (a `ready` record, no `detail=`; the port serves everything else and opens no channel) | `dial-endpoint-unpublished` |
 | the terminating domain's own refusal of an onboarding session (a `ready` record; none carries a `detail=`) | `relay-refused-no-connection`, `relay-refused-payload-too-long`, `relay-refused-no-such-operation`, `relay-refused-session-failed` |
 | an answer this port could not believe (`detail=` is the word that could not be read, and a pair where two are needed: the operation asked and the one answered, or the status and the length it carried) | `relay-status-unknown`, `relay-operation-unknown`, `relay-wrong-operation`, `relay-len-past-payload`, `relay-bytes-on-refusal`, `relay-closed-unknown`, `relay-agreed-unknown`, `relay-wanted-unknown` |
@@ -1516,7 +1507,7 @@ anything.
 
 **A submitted document produces the same records as the one a build embeds.** Nothing on this channel
 says where a document came from, and that is deliberate: what the console carries is the system's
-state, and a generation is the same fact however it arrived. So a `POST /config` that commits reads as
+state, and a generation is the same fact however it arrived. So a pushed document that commits reads as
 its change records, the publisher's `outcome=applied`, and the consumer's `outcome=applied changes=0`
 when the dataplane switches — the same three shapes a boot produces, under the next generation number.
 A refused submission reads as one `rejected=` record and moves nothing. What distinguishes a submitted

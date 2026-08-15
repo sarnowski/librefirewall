@@ -295,20 +295,20 @@ The decisions that constrain all observability code:
   ciphertext plus its keys, never as decrypted plaintext at rest; and neither sink is a licence for
   a third — widening the exception is a design change, not a commit.
 - **The debug surface is closed and enumerated, and adding to it is a design change, not a
-  commit.** Today the enumeration is five surfaces: the console, the OpenTelemetry log stream,
-  `GET /logs`, `GET /config`, and the two recordings — which are no longer an HTTP download but are
-  reached over the management channel, shipped upstream or asked for by extent, and which carry the
-  metric readings inside them. That enumeration stays true until the
-  [management-plane redesign](../design/management.md) replaces the remaining HTTP members with the
-  channel, retargeting the list to **console, channel, and recordings**; the list changes in the
-  phase that changes the surface, never before. What never changes is the invariant: a new introspection
+  commit.** The enumeration is now **console, channel, and recordings**: the console, the
+  authenticated management channel — over which a configuration is staged, committed and confirmed
+  and a recording is shipped upstream or asked for by extent — and the two recordings themselves,
+  which carry the metric readings and the log events inside them. The
+  [management-plane redesign](../design/management.md) is what retargeted it: no HTTP member
+  remains, the last of them having gone with the phase that removed the configuration endpoint.
+  What never changes is the invariant: a new introspection
   mechanism — a debug endpoint, a side channel, a diagnostic dump — changes the product's attack
   surface and is a design change.
 
 ## Verifying on a running appliance
 
-A booted node has no shell, no CLI and no debugger. It answers only through the five surfaces above,
-and four of them are the instrument you reach for while developing — reason about a running system
+A booted node has no shell, no CLI and no debugger. It answers only through the three surfaces above,
+and while developing you read them as the four instruments below — reason about a running system
 through them rather than about it from the source:
 
 | Surface | Answers | Reach it with |
