@@ -381,6 +381,10 @@ fn run_scenario(
                     // about the image, which the scenario whose subject that is
                     // already makes.
                     channel: crate::channel_contract::ChannelContract::Untouched,
+                    // And no commit transcript: which slot booted is the subject,
+                    // and the console records of a commit are judged where the
+                    // system gate judges them.
+                    transcript: None,
                     // And so nothing to push a frame down either.
                     server: None,
                     // This boot's own copy of the medium this run's onboarding

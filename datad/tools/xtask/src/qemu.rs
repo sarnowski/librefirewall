@@ -244,6 +244,9 @@ struct Bench<'a> {
     /// What the appliance owes on the console for the channel it dials out, and
     /// so what such a boot waits for before it ends.
     channel: ChannelContract,
+    /// The `LFW-CFG` transcript this boot's document obliges, where the scenario
+    /// judges the console, and what such a boot waits for before it ends.
+    transcript: Option<&'a ConfigContract>,
     /// The management server this run started, where the boot pushes frames down
     /// it while the guest is up. Borrowed, because the caller reads its
     /// transcript back once the guest has stopped.
@@ -274,6 +277,11 @@ pub(crate) struct ForwardBench<'a> {
     pub(crate) dial: DialContract,
     pub(crate) onboard: OnboardContract,
     pub(crate) channel: ChannelContract,
+    /// The transcript this boot's document obliges, where the scenario judges the
+    /// console. Built before the boot rather than after it because a routed run
+    /// waits for it: a commit's records are written over several passes, and a
+    /// boot that ended when its traffic was decided would cut the tail off.
+    pub(crate) transcript: Option<&'a ConfigContract>,
     pub(crate) server: Option<&'a mut channel_contract::Server>,
     pub(crate) store: StoreMedium,
     pub(crate) data: DataMedium,
@@ -795,15 +803,16 @@ pub(crate) enum ImageUnderTest {
 /// reply, and a harness that lets a real client in sees none of them. Asserting
 /// both in one boot would mean two things on one wire.
 pub(crate) enum ManagementRole {
-    /// The harness is the station: it injects opaque frames, an ARP request, an
-    /// ICMP echo request and a whole TCP exchange, and judges every answer field
-    /// by field.
+    /// The harness is the station: it injects opaque frames, an ARP request and
+    /// an ICMP echo request, plays the far end of the channel the appliance dials
+    /// and — where the scenario asks for one — opens an onboarding session, and
+    /// judges every answer field by field.
     Station,
     /// The harness lets a real client or a real peer onto that wire. QEMU's
-    /// user-mode stack carries the port, so the onboarding surface, the channel
-    /// the appliance dials out and the configuration surface are each reachable
-    /// through a host port forward by the client an administrator or a
-    /// management server would actually run.
+    /// user-mode stack carries the port, so the onboarding surface is reachable
+    /// through a host port forward and the channel the appliance dials out
+    /// reaches a real management server — each driven by the client an
+    /// administrator or a management server would actually run.
     ///
     /// Nothing at frame level is asserted on this wire — a station is what sees
     /// frames, and this role is its opposite. What is asserted afterwards is
@@ -828,8 +837,9 @@ impl ManagementRole {
 }
 
 impl Scenario {
-    /// Whether a real client can reach this boot's management port, and so whether
-    /// it pulls every surface the endpoint serves and holds the three to each other.
+    /// Whether a real client or a real peer can reach this boot's management
+    /// port, and so whether the surfaces the appliance serves and dials are driven
+    /// by software nothing in this repository wrote.
     ///
     /// Exposed because the status pages state how many scenarios do, and a count
     /// restated in prose beside a list nothing compares it to goes stale
@@ -1461,7 +1471,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // It boots the published disk, so the policy in force is the shipped
     // document's, and injects the two probes that document decides: the
     // accepted port is forwarded and the denied one is dropped by a rule. It
-    // then hands the node, over HTTP and with `curl`, a document that is the
+    // then hands the node, over the channel it dialled, a document that is the
     // shipped one with those two rules' ACTIONS SWAPPED and nothing else
     // changed — reads the running document back, holds the answer to naming the
     // generation it assigned, submits a malformed document and holds *that* to
@@ -1476,8 +1486,9 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // deciding — and the forwarded totals it publishes rise across the swap
     // rather than resetting, which is what says no domain restarted under it.
     //
-    // A `Client` scenario necessarily: the document is submitted with a real
-    // client through QEMU's own user-mode stack. What the node says about that
+    // A `Client` scenario necessarily: the document is submitted by a real
+    // management server over the channel this node dialled out through QEMU's own
+    // user-mode stack. What the node says about that
     // submission it says on channels of its own — the generation the dataplane
     // switched to on the console, and the deciding domain's own counts in the
     // metric reading its connection history carries — so neither is asked for.
@@ -1521,8 +1532,9 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // flush satisfying every other clause here. And that crossing is also the
     // dataplane demonstrably still forwarding across the commit.
     //
-    // A `Client` scenario necessarily: the document goes over HTTP with a real
-    // client. Three of the four statements are metric series, and all three are
+    // A `Client` scenario necessarily: the document goes over the channel this
+    // node dialled to a real management server. Three of the four statements are
+    // metric series, and all three are
     // read out of the metric readings this boot's own connection history
     // carries — split on the forwarding domain's generation, so "before the
     // change" and "after the pass" are the appliance's instants and not the
@@ -1561,8 +1573,9 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
     // opens no conversation, so a filter decision on it names no lifecycle event
     // unless the record says which policy outcome it was.
     //
-    // A `Client` scenario necessarily: the document goes over HTTP with a real
-    // client, and the classification is a metric.
+    // A `Client` scenario necessarily: the document goes over the channel this
+    // node dialled to a real management server, and the classification is a
+    // metric.
     Scenario {
         name: "related-icmp",
         document: image::CONFIGURATION_DOCUMENT,
@@ -2263,7 +2276,7 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
 struct Observed {
     /// The initial sequence number the appliance answered this boot's one
     /// management connection with, where it opened one.
-    management_tcp_isn: Option<u32>,
+    dial_isn: Option<u32>,
     /// The identity the store domain reported, where the boot judged one.
     /// Reported back rather than re-read, because the claim the pair makes is
     /// between two boots and only the run has seen both.
@@ -2288,12 +2301,13 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         .filter(|scenario| scenario.management.user_network())
         .count();
 
-    // What each boot chose for its one management connection, kept so the
+    // What each boot chose for the connection it dialled, kept so the
     // *unpredictability* of it can be judged across boots. RFC 6528 makes that a
     // security property and no single boot can show it: a constant initial
     // sequence number is an off-path injection primitive against exactly the
     // adversary this port faces, and it looks perfectly correct in one
-    // scenario.
+    // scenario. The endpoint has one generator under one per-boot secret, so a
+    // number taken from the dial is that generator's number.
     let mut sequence_numbers: Vec<(&str, u32)> = Vec::new();
     // Which accelerator each boot actually got, which is what the run may claim
     // about them and nothing more.
@@ -2311,7 +2325,7 @@ fn run_scenarios(root: &Path, scenarios: &[Scenario]) -> Result<String, String> 
         let owner = ownership_at_boot(scenarios, scenario)?;
         match run_scenario(root, scenario, Run::Shipping, owner) {
             Ok(observed) => {
-                if let Some(isn) = observed.management_tcp_isn {
+                if let Some(isn) = observed.dial_isn {
                     sequence_numbers.push((scenario.name, isn));
                 }
                 if let Some(identity) = observed.store_identity {
@@ -2606,8 +2620,8 @@ fn describe_the_emulated_boots(scenarios: &[Scenario], accelerated: &[(&str, boo
 pub(crate) fn judge_sequence_numbers(observed: &[(&str, u32)]) -> Result<String, String> {
     if observed.is_empty() {
         return Err(String::from(
-            "no scenario opened a TCP connection to the management port, so nothing was judged \
-             about the sequence numbers the appliance chooses. Every routed scenario opens one, so \
+            "no scenario saw the appliance open the connection it dials, so nothing was judged \
+             about the sequence numbers it chooses. Every station-backed scenario watches one, so \
              this means none of them reached the point where it could",
         ));
     }
@@ -2615,7 +2629,7 @@ pub(crate) fn judge_sequence_numbers(observed: &[(&str, u32)]) -> Result<String,
         for (second, later) in &observed[index + 1..] {
             if earlier == later {
                 return Err(format!(
-                    "scenarios {first} and {second} were both answered with initial sequence \
+                    "scenarios {first} and {second} both dialled with initial sequence \
                      number {earlier}. Nothing but the per-boot RDRAND secret and a monotonic time \
                      component separates two boots of one disk (RFC 6528), so an equal pair means \
                      one of the two is not reaching the generator — and a predictable initial \
@@ -2630,7 +2644,7 @@ pub(crate) fn judge_sequence_numbers(observed: &[(&str, u32)]) -> Result<String,
     // this wording is what let the claim outlive the comparison behind it.
     let distinct: BTreeSet<u32> = observed.iter().map(|&(_, isn)| isn).collect();
     Ok(format!(
-        "{} distinct initial sequence numbers across the {} boot(s) that opened a connection",
+        "{} distinct initial sequence numbers across the {} boot(s) whose dial reached the wire",
         distinct.len(),
         observed.len()
     ))
@@ -2730,17 +2744,23 @@ fn run_scenario(
         | Console::JudgedOnTheResumedRecordings => {}
     }
 
+    // The transcript this document obliges, derived before the boot rather than
+    // after it: a routed run waits for it, because a commit's records are written
+    // over several passes and a boot that ended when its traffic was decided would
+    // cut the tail off and report it as never written.
+    let transcript = match scenario.console {
+        Console::Judged => Some(
+            ConfigContract::from_document(&document)
+                .map_err(|error| format!("scenario {name}: {error}"))?,
+        ),
+        _ => None,
+    };
+
     let log_name = format!("{}.log", scenario_run_label(name, run));
     let backing = if scenario.management.user_network() {
-        // Both at once, because a reservation that released its socket before the
-        // next one bound would let the host answer with the same port twice — and
-        // QEMU refuses a duplicate forwarding rule by exiting.
-        let [host_port, onboard_port] = forward_harness::reserve_host_ports::<2>()
+        let [onboard_port] = forward_harness::reserve_host_ports::<1>()
             .map_err(|error| format!("scenario {name}: {error}"))?;
-        ManagementBacking::UserNetwork {
-            host_port,
-            onboard_port,
-        }
+        ManagementBacking::UserNetwork { onboard_port }
     } else {
         ManagementBacking::Socket
     };
@@ -2766,6 +2786,7 @@ fn run_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            transcript: transcript.as_ref(),
             // Borrowed for the boot and handed back: the run loop pushes this
             // boot's frames down the server's pipe while the guest is up, and
             // the verdict below reads the same server's transcript once it has
@@ -3007,8 +3028,11 @@ fn run_scenario(
             format!("; {handshakes}")
         }
         Console::Judged => {
-            let contract = ConfigContract::from_document(&document)
-                .map_err(|error| format!("scenario {name}: {error}"))?;
+            // The very contract the run waited on, so what was waited for and what
+            // is judged cannot be two different transcripts.
+            let contract = transcript.as_ref().ok_or_else(|| {
+                format!("scenario {name}: no transcript was derived for this boot")
+            })?;
             contract
                 .judge(&booted.serial, &log)
                 .map_err(|error| format!("scenario {name}: {error}"))?;
@@ -3072,7 +3096,7 @@ fn run_scenario(
         log.display()
     );
     Ok(Observed {
-        management_tcp_isn: booted.management_tcp_isn,
+        dial_isn: booted.dial_isn,
         store_identity: identity,
         accelerated: booted.hardware_accelerated,
     })
@@ -3175,6 +3199,9 @@ fn run_cryptography_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            // No transcript either: these boots judge the console on their own
+            // subject rather than on a commit's records.
+            transcript: None,
             // Nothing to push down: these boots hand a server every frame it
             // sends before QEMU starts, or start none at all.
             server: None,
@@ -3195,7 +3222,7 @@ fn run_cryptography_scenario(
         log.display()
     );
     Ok(Observed {
-        management_tcp_isn: None,
+        dial_isn: None,
         store_identity: None,
         accelerated: booted.hardware_accelerated,
     })
@@ -3235,6 +3262,7 @@ fn run_store_scenario(
             dial: scenario.dial,
             onboard: scenario.onboard,
             channel: scenario.channel,
+            transcript: None,
             // Likewise nothing to push down.
             server: None,
             store: scenario.store,
@@ -3255,7 +3283,7 @@ fn run_store_scenario(
         log.display()
     );
     Ok(Observed {
-        management_tcp_isn: None,
+        dial_isn: None,
         store_identity: Some(identity),
         accelerated: booted.hardware_accelerated,
     })
@@ -3313,7 +3341,7 @@ fn run_fail_closed_scenario(
         log.display()
     );
     Ok(Observed {
-        management_tcp_isn: None,
+        dial_isn: None,
         store_identity: None,
         accelerated: booted.hardware_accelerated,
     })
@@ -3338,6 +3366,7 @@ pub(crate) fn boot_and_forward(
         dial,
         onboard,
         channel,
+        transcript,
         server,
         store,
         data,
@@ -3359,6 +3388,7 @@ pub(crate) fn boot_and_forward(
             dial,
             onboard,
             channel,
+            transcript,
             server,
             store,
             data,
@@ -3673,6 +3703,8 @@ pub(crate) fn boot_and_fail_closed(
             // A node that refused its own document has been told nowhere to
             // dial, so there is no channel here to owe a record.
             channel: ChannelContract::Untouched,
+            // The document is refused, so there is no commit transcript to wait for.
+            transcript: None,
             server: None,
             store,
             data,
@@ -3710,6 +3742,8 @@ pub(crate) fn boot_and_halt(
             onboard: OnboardContract::Untouched,
             // No slot boots, so nothing dials and nothing reports.
             channel: ChannelContract::Untouched,
+            // No slot boots, so nothing writes a transcript to wait for.
+            transcript: None,
             server: None,
             // A fresh medium, so the appliance on it has no owner — which decides
             // nothing here: no slot boots, so no domain reads the word.
@@ -3739,6 +3773,7 @@ fn boot(
         dial,
         onboard,
         channel,
+        transcript,
         server,
         store,
         data: data_medium,
@@ -3842,6 +3877,7 @@ fn boot(
             dial,
             onboard,
             channel,
+            transcript,
             server,
             hardware_accelerated: acceleration.is_hardware(),
         },

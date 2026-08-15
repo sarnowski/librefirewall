@@ -203,6 +203,39 @@ impl ConfigContract {
         })
     }
 
+    /// Whether the capture already carries everything this contract is about,
+    /// which is what lets a run stop waiting rather than spend its whole budget —
+    /// and, more importantly, what stops it ending while the transcript is still
+    /// being written.
+    ///
+    /// A commit's transcript is one record per value moved, and a document that
+    /// moves forty of them is forty console lines the domain emits over several
+    /// passes. Nothing else a routed boot waits for is downstream of them, so
+    /// without this a run whose other contracts are met early kills the guest
+    /// mid-transcript and reports the tail as absent.
+    ///
+    /// Deliberately only the *positive* half, on
+    /// [`FailClosedContract::satisfied`]'s terms: the absences are judged once the
+    /// capture is complete, because a record that has not arrived yet and one that
+    /// never will look alike while a guest is still running.
+    pub(crate) fn satisfied(&self, serial: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(serial);
+        let carried = config_records(&text);
+        let observed = borrowed(&carried);
+        let (Ok(committed), Ok(switched)) = (self.committed(), Self::switched()) else {
+            // A transcript this build cannot render is a contract that fails in
+            // `judge`, which is where a verdict belongs. Waiting forever for a
+            // record that cannot be composed would report it as a timeout
+            // instead.
+            return true;
+        };
+        self.changes
+            .iter()
+            .all(|change| observed.contains(&change.as_str()))
+            && observed.contains(&committed.as_str())
+            && observed.contains(&switched.as_str())
+    }
+
     /// Judge one boot's serial capture against this transcript.
     ///
     /// # Errors
@@ -827,6 +860,42 @@ mod tests {
             contract
                 .judge(capture(&contract).as_bytes(), log())
                 .expect("the transcript the document describes");
+        }
+    }
+
+    /// The wait a routed boot makes on this transcript, in both directions: a
+    /// capture still short of one record is not satisfied, and the whole one is.
+    ///
+    /// The negative half is the one that earns the test. A commit's records are
+    /// written over several passes, so a run that stopped as soon as the traffic
+    /// was decided would kill the guest with the tail of the transcript still
+    /// unwritten and report those records as ones the appliance never made — a
+    /// verdict about the harness's timing wearing the appliance's name.
+    #[test]
+    fn a_transcript_still_being_written_is_not_satisfied_and_the_whole_one_is() {
+        for document in [SHIPPED, ALTERNATE] {
+            let contract = ConfigContract::from_document(document).expect("a shipped document");
+            let whole = capture(&contract);
+            assert!(contract.satisfied(whole.as_bytes()));
+
+            // One required record missing at a time — every change the document
+            // moves, the publisher's summary and the forwarder's switch — because
+            // any one of them absent is a boot that has not finished.
+            let mut required = contract.changes.clone();
+            required.push(contract.committed().expect("a renderable summary"));
+            required.push(ConfigContract::switched().expect("a renderable switch"));
+            for record in &required {
+                let without: Vec<&str> = whole
+                    .lines()
+                    .filter(|line| line.trim_end() != record)
+                    .collect();
+                let capture = format!("{}\r\n", without.join("\r\n"));
+                assert!(
+                    !contract.satisfied(capture.as_bytes()),
+                    "a capture missing {record:?} passed for complete"
+                );
+            }
+            assert!(!contract.satisfied(b""));
         }
     }
 

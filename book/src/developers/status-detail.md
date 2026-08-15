@@ -1661,35 +1661,27 @@ and a pool-sized run proving every buffer comes back.
 The QEMU gate asserts all of it on the release image. Every system scenario except the
 forced-emulation boot — which injects nothing on that wire, its subject being the accelerator rather
 than this port — puts six frames into the management port once the capture proves every port is up:
-four opaque frames of four different lengths, an ARP request and an ICMP echo request. It then opens
-a TCP connection with a minimal deterministic client of its own, and then requires:
+four opaque frames of four different lengths, an ARP request and an ICMP echo request. It then
+requires:
 
 - a **well-formed ARP reply** carrying the configured MAC, decoded and compared field by field;
 - a **well-formed ICMP echo reply** with matching identifier, sequence and payload and a valid
   checksum, likewise decoded rather than matched as bytes;
-- a **whole TCP exchange**, every step asserted as a field comparison: `SYN` → a `SYN-ACK` whose
-  flags and acknowledgement number are checked and whose sequence number is *kept*, → `ACK` carrying
-  a `GET /config` → the **response as a stream**, several segments acknowledged one at a time and
-  reassembled in order, its `Content-Length` held to the bytes that arrived → the appliance's `FIN`,
-  `Connection: close` obliging it to close first → the client's `FIN` → the final `ACK`. Every
-  segment's pseudo-header checksum is verified by the harness's own summation, and a segment arriving
-  at a step it does not belong to is refused. One that repeats sequence space the client has already
-  taken is the exception, because it is the appliance re-sending a segment whose acknowledgement has
-  not reached it and that is a peer working: the client compares it against what was sent at those
-  numbers before, answers as a peer answers one — the request again where the passive open is what
-  was repeated — and leaves its own model where it was. Those are counted, so an appliance that only
-  ever repeats itself still fails the boot; a `SYN` on a connection that has gone past its handshake
-  is refused as it always was;
-- **distinct initial sequence numbers across the boots**, compared between scenarios — two boots of
-  one disk are separated only by the per-boot `RDRAND` secret and the time component, so an equal
-  pair would mean one of the two is not reaching the generator (RFC 6528);
+- **distinct initial sequence numbers across the boots**, taken from the `SYN` the appliance itself
+  sends when it dials its channel and compared between scenarios — two boots of one disk are
+  separated only by the per-boot `RDRAND` secret and the time component, so an equal pair would mean
+  one of the two is not reaching the generator (RFC 6528). The endpoint has one generator under one
+  secret, so a number taken from any connection it opens is that generator's number;
 - **exactly one of each stateless reply**, since one request is one reply;
-- **nothing else on that wire at all** — no opaque frame answered, no dataplane probe leaked;
+- **nothing else on that wire at all** — no opaque frame answered, no dataplane probe leaked, and no
+  TCP segment addressed anywhere but the two conversations the appliance takes part in: the channel
+  it dials and the onboarding session it accepts. That refusal is what says the port serves no
+  request surface;
 - and the **mutual exclusion in both directions**: no frame the harness put on the management wire
   ever appears on a dataplane port, and no dataplane probe ever appears on the management port.
 
 Six of the 35 system scenarios additionally hold the console's own record to the frames and the bytes
-injected — every one of them, the TCP client's segments included, accumulated as the harness sends
+injected — every one of them, each station's own segments included, accumulated as the harness sends
 them rather than tallied in advance — to the frame and to the byte; and one of them boots a
 *second* document whose management MAC, address and prefix all differ, so a compiled-in address could
 not satisfy it. Four of the six are the boots whose station misbehaves, and there the same equality
@@ -1790,7 +1782,8 @@ a domain that faulted or lost its place under that could not report them all.
 
 **What exists.** `datad/crates/tcp` is a first-party TCP implementation that completes a real handshake
 with a real client, carries a byte stream, and closes cleanly — proven on the booting **release**
-image by the gate performing a whole TCP exchange against the management port. It is not a
+image by the gate driving an onboarding session against the port frame by frame and by the channel
+the appliance dials out of it. It is not a
 management-endpoint toy: it is the stack the dataplane proxy will run on, and every constraint below
 comes from that.
 
@@ -1906,6 +1899,21 @@ established one.
 
 **Missing.**
 
+- **Nothing on a booted node sends a multi-segment body any more.** Until the request surface was
+  erased, one scenario per station-backed boot read a document off the management port and judged the
+  answer as a *stream*: several segments carrying one body, acknowledged one at a time, the window
+  reopening under those acknowledgements, retransmissions taken and answered, a declared length held
+  to the bytes that arrived, and a clean close — every field of every segment compared by the
+  harness's own reader. With no request surface there is no such body to ask for, and the assertion
+  went with the surface rather than being restated against a refusal. What still exercises this stack
+  on a running node is narrower in one respect and wider in another: the onboarding station drives a
+  handshake, one payload segment, a close and its acknowledgement field by field, and the dial
+  station judges the appliance's own `SYN` and handshake the same way, but neither reads a body split
+  across segments; the onboarding surface does stream a real page and a real certificate request to
+  `curl` over TLS on the release image, and the channel ships recordings measured in megabytes to a
+  real management server, so a multi-segment body does cross a booted node and is judged by its
+  *content* at the far end rather than field by field on the wire. Segment-level evidence for the
+  multi-segment path is host tests, property tests and the `tcp_segments` fuzz target alone.
 - **No SACK.** Its value is retransmitting the holes in a reassembly queue, and there is no
   reassembly queue — that would be a buffer the crate owns. The SACK-permitted option is parsed and
   recorded, so adding it is a change to the state machine rather than to the parser.
