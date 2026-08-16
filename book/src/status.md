@@ -444,8 +444,17 @@ not yet made and known risks. They are recorded here so they are not mistaken fo
   hypotheses, to resolve in the crypto milestone: whether the IPC fastpath preserves XMM across a
   *domain boundary* (the probe holds no channel, so its preemptions exercise the context switch and
   not the fastpath), and whether a domain can be opted out of paying for FPU state it does not use.
+  **The second of those is a live cost rather than a tidiness question**: the per-thread control is
+  an opt-out, so every protection domain has the unit enabled today and pays the save and restore of
+  x87 and SSE state on every context switch it takes — including every domain that never names an
+  XMM register, the forwarder among them, which takes more of those switches than anything else
+  here. What is unmeasured is the size of that bill, and it stays unmeasurable until the flag can be
+  reached per domain; what is known is only the direction of the default.
   AVX and AVX2 are genuinely unavailable without building the kernel ourselves, and are deferred —
-  and BMI2 has joined them there, for the encoding reason recorded above rather than for the saved
+  the kernel's configuration would have to move to XSAVE feature set 7 with an 832-byte save area,
+  two constants in a kernel this project would then have to build and pin rather than consume, as
+  the [architecture chapter](design/architecture.md#hardware-cryptography-profile) records — and
+  BMI2 has joined them there, for the encoding reason recorded above rather than for the saved
   state.
 - **Full-rate capture of everything is not reachable, and the recording selector is the sizing
   control.** A capture sink recording all traffic at the target rate (see the

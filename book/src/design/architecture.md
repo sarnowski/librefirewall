@@ -285,6 +285,32 @@ default, not the kernel. The work splits into three tiers, and only one touches 
   seL4 ourselves instead of consuming the SDK's prebuilt kernel. AVX and AVX2 would buy ChaCha20,
   SHA-2 and ML-KEM a factor of two to four; AES-NI is the large win and needs only SSE.
 
+The size of that rebuild is worth stating exactly, because it is two constants and a change of
+supplier. Feature set 3 is the XSAVE state-component bitmap for x87 plus SSE, and the pinned
+configuration's save area of 576 bytes is what confirms that reading rather than merely agreeing
+with it: 512 bytes of legacy `FXSAVE` region and a 64-byte XSAVE header, with nothing left over for
+a third component. The YMM upper halves are that third component and cost 256 bytes more, so
+admitting them is **feature set 7 with a save area of 832** — two numbers in the kernel's own
+configuration and no more. What makes it expensive is where those numbers live rather than what they
+are: the pinned SDK ships a *prebuilt* kernel, so moving them means this project builds, pins and
+carries a kernel of its own, and the
+[trusted computing base](threat-model.md#assets-adversaries-and-trust-boundaries) stops being
+something it consumes and becomes something it produces. That is the whole of the deferral, and it
+is why the tier is deferred rather than merely unimplemented: the work is not the edit, it is taking
+ownership of the one component this design does not test.
+
+**The FPU is enabled by default, and the dataplane should not be paying for it.** The kernel's
+per-thread FPU control is an *opt-out*: a thread has the unit available unless something disables it
+for that thread, which is the right default for a general-purpose system and the wrong one here. A
+protection domain that never names an XMM register still has x87 and SSE state saved and restored
+around every context switch it takes, and under the profile above only the domains compiled against
+the SIMD target have any use for that state — the forwarding path, which takes more of those
+switches than anything else here, has none. The intent is therefore that every domain not needing
+the unit is opted out of it, so the cost falls where the benefit does. Whether the static component
+model exposes that per-thread flag per protection domain is the one thing this rests on, and it is
+an open question rather than a setting nobody reached: the [development status](../status.md)
+carries it as such.
+
 **BMI2 was in the free tier, and putting it there was wrong.** The reasoning was that its
 instructions touch no vector register and so carry no saved state — sound about the register file
 and beside the point, because what ties an instruction to the vector state is its **encoding**, not
