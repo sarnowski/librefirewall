@@ -34,9 +34,13 @@ Read the rest on demand:
 - Changing an exposed signal means changing its reference chapter in the same change: the console
   and metrics chapters are held to the code by the fast gate, so a chapter that drifts fails
   `make test` rather than going stale unnoticed. The same check reads the status detail chapter for
-  the counts it states about the gate — scenarios, scenarios reaching the management port, floored crates — so a number
-  that goes stale fails there too; state a new such count in the phrasing that check looks for, or
-  it is unread.
+  the counts it states about the gate — system scenarios, scenarios reaching the management port,
+  scenarios booting a copy of an owned medium, scenarios judging the channel the appliance dials,
+  persistent fuzz targets, floored library crates — so a number that goes stale fails there too;
+  state a new such count in the phrasing that check looks for, or it is unread. A second fast-gate
+  check reads the crypto profile chapter the same way, holding its enabled target features to the
+  SIMD target specification, its primitives to `lfw_log::Primitive::ALL`, and the ones it marks
+  measured to the cycles ceilings the QEMU judge enforces — every comparison in both directions.
 - Run the reviewer checklist against your own change before declaring it done. A green gate is
   necessary, never sufficient.
 - A change with security consequence — the capability topology in `datad/systems/`, a trust

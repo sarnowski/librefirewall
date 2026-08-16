@@ -254,6 +254,7 @@ itself to: a green gate is necessary, never sufficient. What it checks mechanica
 | That the system description is a document Microkit can read at all: UTF-8 bytes, no `--` inside a comment, an XML declaration only at the first byte, exactly one root element, whitespace between attributes, and attribute values free of a raw `<`, an undefined entity reference or a control character | `xtask test` (`sysdesc::check`) |
 | The shipped configuration document is one the appliance would accept: it goes through the same `config::load` the configuration domain runs at boot | `xtask test` (`image::check_configuration`) |
 | The console and metrics reference chapters agree with the code, both directions: every `cause=` refusal token per domain, every `rejected=` reason, every metric family with its type, label-name set and publishing domains, and the counts those chapters state about themselves — plus the counts the status detail chapter states about the gate: how many system scenarios there are, how many reach the management port, how many boot a copy of an owned medium, how many judge the channel the appliance dials, how many persistent fuzz targets run, and how many library crates carry the coverage floor | `xtask test` (`reference_contract`) |
+| The cryptography profile chapter agrees with the build, every comparison in both directions: the processor features it states against the ones the SIMD target specification enables, the primitives it lists against the vocabulary the cryptography domain reports in, and the ones it marks measured against the primitives a booted judge holds to a cost ceiling | `xtask test` (`crypto_profile`) |
 | The two tables the management server reads an appliance's recordings through — the metric catalogue a snapshot's slots are named by, and the protection-domain list a recorded console line's origin byte is read through — are the ones this build declares, so a table committed under the other component cannot drift from the code that fills it | `xtask test` (`metric_catalogue`) |
 | The fuzz targets the gate runs, and the harnesses the seed corpora replay through, are each exactly the set the fuzz manifest declares — both directions, so a declared target left off either list fails here rather than building under the sanitizer and never running | `xtask test`, `xtask fuzz` (the seed smoke tests) |
 | Fuzz targets build and their seed corpora replay; each also runs bounded where the sandbox lets an instrumented binary start | `xtask fuzz` |
@@ -279,10 +280,12 @@ than XML on any rule an edit to this file can trip.
 
 `reference_contract` is why the book's *content* is now gated without the book becoming a build
 input: rendering is still a reading convenience, mdbook is still not pinned into the builder, and
-no gate calls `make book` — but three chapters are read as data and held to the code, so the
-operator's interface definition can no longer go stale with every stage green. Two of them are the
-reference chapters; the third is the status detail, read for the counts it states about the gate,
-because three of those had gone stale at once with every stage passing.
+no gate calls `make book` — but three chapters are read as data by that check and held to the code,
+so the operator's interface definition can no longer go stale with every stage green. Two of them
+are the reference chapters; the third is the status detail, read for the counts it states about the
+gate, because three of those had gone stale at once with every stage passing. `crypto_profile` reads
+a fourth on the same terms and for the same reason, the cryptography profile being a chapter a
+deployment buys hardware against.
 
 Four things that table must not be read as saying.
 

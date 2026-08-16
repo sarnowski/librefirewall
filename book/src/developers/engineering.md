@@ -259,9 +259,13 @@ there is no shell and no CLI. The exact contract — the console records, the lo
 metric names and labels, the recording downloads — is the book's reference part, which is the
 operator's interface definition. Keep it true: **any change to an exposed signal updates the
 matching reference chapter in the same change.** The console and metrics chapters are read as data
-by the gate and held to the code, as are the counts the [status detail](status-detail.md) states
-about the gate itself, so those cannot go stale unnoticed; everything else in the book is held true
-by review.
+by the gate and held to the code, and so is the [cryptography
+profile](../reference/crypto-profile.md) — the processor features it states against the ones the
+accelerated protection domains are compiled to use, the primitives it lists against the vocabulary
+the cryptography domain reports in, and the ones it marks measured against the primitives a booted
+judge holds to a cost ceiling, every comparison in both directions — as are the counts the [status
+detail](status-detail.md) states about the gate itself. None of those can go stale unnoticed;
+everything else in the book is held true by review.
 
 The decisions that constrain all observability code:
 

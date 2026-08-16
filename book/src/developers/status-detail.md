@@ -3186,10 +3186,10 @@ session that carried it; one is an acknowledgement past what this end has sent, 
 however often a server repeats the claim; and six are the range read — a request this appliance will
 not serve, and a frame of an answer that does not match the request in hand. **No metric counts a
 violation yet**, and no scenario drives one: the counting the contract asks of a violation belongs
-with the domain that has a metric to count into, and the six boots that judge the channel point a
-real `openssl s_server`, a deliberate silence, or a carried medium at the appliance — a peer that
-breaks the framing is not one `s_server` can be made to play. What is still missing above the frames
-themselves is the flush cadence.
+with the domain that has a metric to count into, and the 9 scenarios judge the channel the appliance
+dials by pointing a real `openssl s_server`, a deliberate silence, or a carried medium at it — a
+peer that breaks the framing is not one `s_server` can be made to play. What is still missing above
+the frames themselves is the flush cadence.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
 request head through the same bounded, fuzzed parser `datad/crates/http` provides and serves exactly two
@@ -3505,12 +3505,14 @@ harness has no way to play through a lossless host socket. Nor does any scenario
 crowding refusal as a counter, though the counter now exists: the boot that crowds the port needs a
 station of the harness's own on the management wire, and a real client needs QEMU's user-mode stack
 on that same wire, so one boot cannot have both. The absence on the wire is what that scenario still
-states, and the counter is read by hand. On the channel the appliance dials, **what runs above the
-framing is the greeting and nothing else**: no session composes a recording range, stages a
-configuration document, or moves an acknowledgement cursor, so a booted node exercises the record
-layer and the handshake in full and the protocol above them barely at all. No metric counts a framing
-violation, and no boot provokes one — the four that judge the channel meet a real `openssl s_server`
-or a deliberate silence, and a peer that breaks the framing is not one `s_server` can be made to play.
+states, and the counter is read by hand. On the channel the appliance dials, **what no session above
+the framing reaches is the range read and the acknowledgement cursor**: no boot asks for a recording
+extent, and none drives a server that acknowledges what it ingested, so those two parts of the
+protocol are held together by host cover where the greeting, the shipments and the configuration
+transaction are exercised on a booted node. No metric counts a framing violation, and no boot
+provokes one — the 9 scenarios judge the channel the appliance dials against a real
+`openssl s_server` or a deliberate silence, and a peer that breaks the framing is not one
+`s_server` can be made to play.
 The **ending** a session that came up reports is the recorded deviation above: host-driven through
 every ending a peer can produce, and unobserved on a booted node because the only peer those boots use
 closes its connection without a `close_notify`. The boot's own **self**-session is still proved against
