@@ -420,6 +420,9 @@ impl Event<Cause> {
         if let Self::Domain { detail, .. } = self {
             match detail {
                 DomainDetail::None => record.detail = LogDetailKind::None.to_bits(),
+                DomainDetail::ListensForNothing => {
+                    record.detail = LogDetailKind::ListensForNothing.to_bits();
+                }
                 DomainDetail::Features(bits) => {
                     record.detail = LogDetailKind::Features.to_bits();
                     record.features = *bits;
@@ -940,6 +943,7 @@ impl Event<Cause> {
 fn decode_detail(detail: &CheckedDetail) -> Result<DomainDetail<Cause>, DecodeError> {
     Ok(match detail {
         CheckedDetail::None => DomainDetail::None,
+        CheckedDetail::ListensForNothing => DomainDetail::ListensForNothing,
         CheckedDetail::Features(bits) => DomainDetail::Features(*bits),
         CheckedDetail::ReceivePosted(count) => DomainDetail::ReceivePosted(*count),
         // Total: `wire` refused the zero frequency and every `u64` of
@@ -1408,6 +1412,7 @@ impl<'a> TryFrom<Event<&'a str>> for Event<Cause> {
                 state,
                 detail: match detail {
                     DomainDetail::None => DomainDetail::None,
+                    DomainDetail::ListensForNothing => DomainDetail::ListensForNothing,
                     DomainDetail::Features(bits) => DomainDetail::Features(bits),
                     DomainDetail::ReceivePosted(count) => DomainDetail::ReceivePosted(count),
                     DomainDetail::Established { tsc_hz, utc } => {

@@ -32,17 +32,14 @@ use crate::catalog::{
     ENDPOINT_TIMER_SEGMENTS, ENDPOINT_UNCLOCKED, ENDPOINT_UNHANDLED, FLOW_LIFECYCLE, FLOW_PACKETS,
     FLOW_PACKETS_REFUSED, FLOW_PACKETS_SEEN, FLOW_PROBE_COLLISIONS, FLOW_TABLE_ENTRIES,
     FORWARDED_FRAMES, HARDWARE_PROBE_ITERATIONS, HARDWARE_PROBE_PREEMPTIONS, HARDWARE_PROBE_PROVEN,
-    HTTP_BODIES_REFUSED, HTTP_BODIES_TAKEN, HTTP_BODIES_TIMED_OUT, HTTP_BODY_OVERRUNS,
-    HTTP_REQUESTS, HTTP_REQUESTS_OVERFLOWED, HTTP_RESPONSE_BYTES, HTTP_RESPONSES,
-    HTTP_RETRANSMITS_UNAVAILABLE, HTTP_SLOTS_EXHAUSTED, INPUT_DROPS, INVARIANT_FAULTS,
-    LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label, NEIGHBOUR_ENTRIES_EXPIRED, NEIGHBOUR_REPLIES,
-    NEIGHBOUR_REQUESTS, NEIGHBOUR_RESOLUTIONS_FAILED, ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES,
-    ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED, ONBOARD_SESSIONS_CLOSED, OUTBOUND_ANSWERS_REFUSED,
-    OUTBOUND_BYTES, OUTBOUND_DIALS, OUTBOUND_OVERFLOWED, OUTBOUND_SEGMENTS_DROPPED,
-    OUTBOUND_SESSIONS, POLICY_BYTES, POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS,
-    POLICY_SWEEP_RUNNING, POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES,
-    RECORDING_DOWNLOAD_OVERRUNS, RECORDING_DOWNLOADS, RECORDING_PADDING_BYTES,
-    RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
+    INPUT_DROPS, INVARIANT_FAULTS, LOG_RECORDS_DROPPED, LOG_RECORDS_REFUSED, Label,
+    NEIGHBOUR_ENTRIES_EXPIRED, NEIGHBOUR_REPLIES, NEIGHBOUR_REQUESTS, NEIGHBOUR_RESOLUTIONS_FAILED,
+    ONBOARD_ANSWERS_REFUSED, ONBOARD_BYTES, ONBOARD_CONNECTIONS, ONBOARD_OVERFLOWED,
+    ONBOARD_SESSIONS_CLOSED, OUTBOUND_ANSWERS_REFUSED, OUTBOUND_BYTES, OUTBOUND_DIALS,
+    OUTBOUND_OVERFLOWED, OUTBOUND_SEGMENTS_DROPPED, OUTBOUND_SESSIONS, POLICY_BYTES,
+    POLICY_PACKETS, POLICY_SWEEP, POLICY_SWEEP_PROGRESS, POLICY_SWEEP_RUNNING,
+    POOL_RETURNS_REFUSED, QUEUE_POSTED, RECEIVE_BYTES, RECEIVE_FRAMES, RECORDING_DOWNLOADS,
+    RECORDING_PADDING_BYTES, RECORDING_RECORD_BYTES, RECORDING_RECORDS, RECORDING_RECORDS_DROPPED,
     RECORDING_RECORDS_UNCLOCKED, RECORDING_SECTORS_WRITTEN, RECORDING_SEGMENTS_CLOSED,
     RECORDING_SNAPSHOTS, RECORDING_STAGING_DEFERRALS, RECORDING_TAP_DROPPED_BY_WRITER,
     RECORDING_TAP_RECORDS, RECORDING_TAP_REFUSED, RECORDING_TRANSCRIPT_LINES,
@@ -159,13 +156,6 @@ pub const ROUTE_STAGE_DROP_REASONS: [&str; 9] = [
     "ipv4_checksum_invalid",
     "misrouted",
     "writeback_failed",
-];
-
-/// Status codes the management server can answer with, in the order
-/// [`HttpSample::responses`] holds them; `lfw_http::Status::ALL` is the same set
-/// and a test in `lfw_ip_endpoint` holds the two together.
-pub const HTTP_STATUSES: [&str; 12] = [
-    "200", "400", "404", "405", "408", "410", "413", "414", "429", "431", "503", "505",
 ];
 
 /// Every writing domain's own account of its log ring.
@@ -1117,21 +1107,6 @@ pub struct TcpSample {
     pub write_refused: u64,
 }
 
-/// What the management HTTP server did with the connections it carried.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct HttpSample {
-    pub requests: u64,
-    pub responses: [u64; HTTP_STATUSES.len()],
-    pub response_bytes: u64,
-    pub overflowed: u64,
-    pub bodies_refused: u64,
-    pub bodies_taken: u64,
-    pub bodies_timed_out: u64,
-    pub bodies_overrun: u64,
-    pub retransmits_unavailable: u64,
-    pub slots_exhausted: u64,
-}
-
 /// What the neighbour cache under an endpoint has decided, one field per
 /// decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1181,7 +1156,7 @@ pub struct OnboardSample {
 
 /// Slots [`ManagementSample`] occupies — the largest of the eight, and what
 /// [`crate::STATS_SLOTS`] is sized by.
-pub const MANAGEMENT_SLOTS: usize = 139;
+pub const MANAGEMENT_SLOTS: usize = 118;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManagementSample {
@@ -1204,8 +1179,7 @@ pub struct ManagementSample {
     /// own numbers: a second peer's handshake is refused by *this* stack, and
     /// counting it in the other one's would attribute it to the wrong port.
     pub onboarding: TcpSample,
-    pub http: HttpSample,
-    /// The second listening port's own account of itself.
+    /// The listening port's own account of itself.
     pub onboard: OnboardSample,
     pub log: LogSample,
 }
@@ -1334,178 +1308,188 @@ impl ManagementSample {
         s(&ONBOARD_SESSIONS_CLOSED, &[Label::new("by", "consumer")]),
         plain(&ONBOARD_OVERFLOWED),
         plain(&ONBOARD_ANSWERS_REFUSED),
-        // The transport, twice: the two listening ports carry their own stacks
-        // with their own tables, and `service` is what tells the two apart. One
-        // family set rather than two, because the meaning of a segment refused or
-        // a connection accepted is the same whichever port it happened on.
-        // The HTTP port's.
+        // The transport, twice: the two ports carry their own stacks with their
+        // own tables, and `service` is what tells the two apart. One family set
+        // rather than two, because the meaning of a segment refused or a
+        // connection accepted is the same whichever port it happened on.
+        // The channel's: the port the appliance dials out of and answers on
+        // never.
         s(
             &TCP_SEGMENTS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "received"),
             ],
         ),
         s(
             &TCP_SEGMENTS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "sent"),
             ],
         ),
         s(
             &TCP_CONNECTIONS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("event", "accepted"),
             ],
         ),
         s(
             &TCP_CONNECTIONS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("event", "dialled"),
             ],
         ),
         s(
             &TCP_CONNECTIONS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("event", "established"),
             ],
         ),
         s(
             &TCP_CONNECTIONS,
-            &[Label::new("service", "http"), Label::new("event", "closed")],
+            &[
+                Label::new("service", "channel"),
+                Label::new("event", "closed"),
+            ],
         ),
         s(
             &TCP_CONNECTIONS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("event", "evicted"),
             ],
         ),
         s(
             &TCP_CONNECTIONS,
-            &[Label::new("service", "http"), Label::new("event", "reaped")],
+            &[
+                Label::new("service", "channel"),
+                Label::new("event", "reaped"),
+            ],
         ),
         s(
             &TCP_CONNECTIONS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("event", "abandoned"),
             ],
         ),
         s(
             &TCP_BYTES,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "received"),
             ],
         ),
         s(
             &TCP_BYTES,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "sent"),
             ],
         ),
         s(
             &TCP_BYTES,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "retransmitted"),
             ],
         ),
-        s(&TCP_RETRANSMITS, &[Label::new("service", "http")]),
+        s(&TCP_RETRANSMITS, &[Label::new("service", "channel")]),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "malformed"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "bad_checksum"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "out_of_window"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "table_full"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "not_listening"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "no_connection"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "unacceptable_ack"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "no_acknowledgement"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "not_a_handshake"),
             ],
         ),
         s(
             &TCP_REFUSED,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("reason", "out_of_order"),
             ],
         ),
-        s(&TCP_URGENT_IGNORED, &[Label::new("service", "http")]),
-        s(&TCP_CHALLENGE_ACKS, &[Label::new("service", "http")]),
-        s(&TCP_CHALLENGES_SUPPRESSED, &[Label::new("service", "http")]),
+        s(&TCP_URGENT_IGNORED, &[Label::new("service", "channel")]),
+        s(&TCP_CHALLENGE_ACKS, &[Label::new("service", "channel")]),
+        s(
+            &TCP_CHALLENGES_SUPPRESSED,
+            &[Label::new("service", "channel")],
+        ),
         s(
             &TCP_RESETS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "received"),
             ],
         ),
         s(
             &TCP_RESETS,
             &[
-                Label::new("service", "http"),
+                Label::new("service", "channel"),
                 Label::new("direction", "sent"),
             ],
         ),
-        s(&TCP_WRITE_REFUSED, &[Label::new("service", "http")]),
+        s(&TCP_WRITE_REFUSED, &[Label::new("service", "channel")]),
         // And the onboarding port's.
         s(
             &TCP_SEGMENTS,
@@ -1684,27 +1668,6 @@ impl ManagementSample {
         ),
         s(&TCP_WRITE_REFUSED, &[Label::new("service", "onboarding")]),
         // The server above it.
-        plain(&HTTP_REQUESTS),
-        s(&HTTP_RESPONSES, &[Label::new("status", "200")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "400")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "404")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "405")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "408")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "410")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "413")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "414")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "429")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "431")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "503")]),
-        s(&HTTP_RESPONSES, &[Label::new("status", "505")]),
-        plain(&HTTP_RESPONSE_BYTES),
-        plain(&HTTP_REQUESTS_OVERFLOWED),
-        plain(&HTTP_BODIES_REFUSED),
-        plain(&HTTP_BODIES_TAKEN),
-        plain(&HTTP_BODIES_TIMED_OUT),
-        plain(&HTTP_BODY_OVERRUNS),
-        plain(&HTTP_RETRANSMITS_UNAVAILABLE),
-        plain(&HTTP_SLOTS_EXHAUSTED),
         plain(&LOG_RECORDS_DROPPED),
         plain(&LOG_RECORDS_REFUSED),
     ];
@@ -1821,18 +1784,6 @@ impl ManagementSample {
         put(&mut values, &mut at, onboarding.resets_received);
         put(&mut values, &mut at, onboarding.resets_sent);
         put(&mut values, &mut at, onboarding.write_refused);
-
-        let http = &self.http;
-        put(&mut values, &mut at, http.requests);
-        put_all(&mut values, &mut at, &http.responses);
-        put(&mut values, &mut at, http.response_bytes);
-        put(&mut values, &mut at, http.overflowed);
-        put(&mut values, &mut at, http.bodies_refused);
-        put(&mut values, &mut at, http.bodies_taken);
-        put(&mut values, &mut at, http.bodies_timed_out);
-        put(&mut values, &mut at, http.bodies_overrun);
-        put(&mut values, &mut at, http.retransmits_unavailable);
-        put(&mut values, &mut at, http.slots_exhausted);
 
         put(&mut values, &mut at, self.log.dropped);
         put(&mut values, &mut at, self.log.refused);
@@ -2314,13 +2265,12 @@ pub struct SinkSample {
     pub wraps: u64,
     pub sectors_written: u64,
     pub padding_bytes: u64,
-    pub download_overruns: u64,
 }
 
 /// Recordings this appliance keeps: the capture sink and the log sink.
 pub const SINKS: usize = 2;
 
-const SINK_SLOTS: usize = 10;
+const SINK_SLOTS: usize = 9;
 
 /// Slots [`RecorderSample`] occupies.
 pub const RECORDER_SLOTS: usize = 12 + SINKS * SINK_SLOTS + 12;
@@ -2399,7 +2349,6 @@ impl RecorderSample {
         s(&RECORDING_WRAPS, &[Label::new("sink", "log")]),
         s(&RECORDING_SECTORS_WRITTEN, &[Label::new("sink", "log")]),
         s(&RECORDING_PADDING_BYTES, &[Label::new("sink", "log")]),
-        s(&RECORDING_DOWNLOAD_OVERRUNS, &[Label::new("sink", "log")]),
         s(&RECORDING_RECORDS, &[Label::new("sink", "capture")]),
         s(&RECORDING_RECORD_BYTES, &[Label::new("sink", "capture")]),
         s(
@@ -2424,10 +2373,6 @@ impl RecorderSample {
         s(&RECORDING_WRAPS, &[Label::new("sink", "capture")]),
         s(&RECORDING_SECTORS_WRITTEN, &[Label::new("sink", "capture")]),
         s(&RECORDING_PADDING_BYTES, &[Label::new("sink", "capture")]),
-        s(
-            &RECORDING_DOWNLOAD_OVERRUNS,
-            &[Label::new("sink", "capture")],
-        ),
         plain(&RECORDING_TAP_RECORDS),
         plain(&RECORDING_TAP_REFUSED),
         plain(&RECORDING_TAP_DROPPED_BY_WRITER),
@@ -2463,7 +2408,6 @@ impl RecorderSample {
             put(&mut values, &mut at, sink.wraps);
             put(&mut values, &mut at, sink.sectors_written);
             put(&mut values, &mut at, sink.padding_bytes);
-            put(&mut values, &mut at, sink.download_overruns);
         }
         put_all(&mut values, &mut at, &self.tap);
         put_all(&mut values, &mut at, &self.downloads);

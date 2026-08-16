@@ -335,12 +335,9 @@ fn deck(medium: &mut Fake) -> Deck {
         .0
 }
 
-/// One demand, minted the way the management domain's requester mints one.
-fn demand(sink: DownloadSink, offset: u64, len: usize) -> DownloadDemand {
-    minted(DownloadReader::Snapshot, sink, offset, len)
-}
-
-/// The same, in the coordinate the management channel's ring cursor asks in.
+/// One demand, minted the way the management domain's requester mints one: in
+/// the coordinate the management channel's ring cursor asks in, which is the
+/// only one there is.
 fn ring_demand(sink: DownloadSink, position: u64, len: usize) -> DownloadDemand {
     minted(DownloadReader::Ring, sink, position, len)
 }
@@ -1015,7 +1012,7 @@ fn download(
     let mut body = Vec::new();
     let mut offset = 0u64;
     for _ in 0..256 {
-        deck.demand(demand(sink, offset, DOWNLOAD_WINDOW_LEN));
+        deck.demand(ring_demand(sink, offset, DOWNLOAD_WINDOW_LEN));
         match pump(deck, medium, reader, &mut scratch, 32) {
             Some(Answer::Bytes(bytes, _)) if bytes.is_empty() => break,
             Some(Answer::Bytes(bytes, _)) => {
@@ -1055,16 +1052,30 @@ fn a_download_delivers_exactly_what_is_on_the_medium() {
 }
 
 #[test]
-fn a_download_of_an_untouched_recording_delivers_its_prologue_and_no_packets() {
+fn a_read_of_an_untouched_recording_delivers_no_packets_and_seals_nothing() {
     let mut medium = Fake::new();
     let ring = Ring::new();
     let mut deck = deck(&mut medium);
     let mut reader = ring.reader();
 
+    // A reader is offered what the medium has taken and never more, and asking
+    // is not what makes a recording durable: nothing seals on a reader's
+    // account, so an untouched recording yields the records it holds — none —
+    // rather than a segment padded out to be shown.
     let body = download(&mut deck, &mut medium, &mut reader, DownloadSink::Capture);
-    let (sections, packets) = walk(&body);
-    assert_eq!(sections, 1, "the segment prologue is already durable");
-    assert_eq!(packets, 0, "and nothing has been observed yet");
+    let (_, packets) = walk(&body);
+    assert_eq!(packets, 0, "nothing has been observed yet");
+    assert_eq!(
+        deck.counters().sinks[0].segments_closed,
+        0,
+        "a read sealed a segment"
+    );
+    // And the second read agrees with the first: a read is a read.
+    assert_eq!(
+        download(&mut deck, &mut medium, &mut reader, DownloadSink::Capture),
+        body,
+        "two reads of one recording disagreed"
+    );
 }
 
 #[test]
@@ -1077,7 +1088,11 @@ fn an_offset_past_the_end_answers_no_bytes_under_the_right_total() {
 
     let body = download(&mut deck, &mut medium, &mut reader, DownloadSink::Capture);
     let mut scratch = [0u8; TAP_SNAP_LEN];
-    deck.demand(demand(DownloadSink::Capture, body.len() as u64 + 1, 64));
+    deck.demand(ring_demand(
+        DownloadSink::Capture,
+        body.len() as u64 + 1,
+        64,
+    ));
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {
         Some(Answer::Bytes(bytes, total_len)) => {
@@ -1085,38 +1100,6 @@ fn an_offset_past_the_end_answers_no_bytes_under_the_right_total() {
             assert_eq!(total_len, body.len() as u64);
         }
         other => panic!("past the end is not a refusal: {other:?}"),
-    }
-}
-
-#[test]
-fn a_later_offset_with_no_snapshot_pinned_is_refused_as_not_ready() {
-    let mut medium = Fake::new();
-    let ring = Ring::new();
-    let mut deck = deck(&mut medium);
-    let mut reader = ring.reader();
-    deck.demand(demand(DownloadSink::Log, 4096, 64));
-    let mut scratch = [0u8; TAP_SNAP_LEN];
-    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 4) {
-        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::NotReady),
-        other => panic!("a download nobody started is refused: {other:?}"),
-    }
-    assert_eq!(deck.counters().downloads_refused, 1);
-}
-
-#[test]
-fn an_offset_pinned_against_the_other_recording_is_refused_rather_than_answered() {
-    let mut medium = Fake::new();
-    let ring = Ring::new();
-    let mut deck = deck(&mut medium);
-    let mut reader = ring.reader();
-    run(&mut deck, &mut medium, &ring, &mut reader, 4, 128, 8);
-    let _ = download(&mut deck, &mut medium, &mut reader, DownloadSink::Log);
-
-    deck.demand(demand(DownloadSink::Capture, 128, 64));
-    let mut scratch = [0u8; TAP_SNAP_LEN];
-    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 4) {
-        Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::NotReady),
-        other => panic!("the snapshot pinned is the log's, not the capture's: {other:?}"),
     }
 }
 
@@ -1134,7 +1117,7 @@ fn a_read_the_medium_fails_answers_a_device_error_rather_than_hanging() {
     for _ in 0..8 {
         deck.poll(&mut medium, &mut reader, &mut scratch, clock(), None, None);
     }
-    deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
+    deck.demand(ring_demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
     medium.fail = 1;
     let served = pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16);
     match served {
@@ -1166,7 +1149,7 @@ fn a_read_the_device_under_delivers_is_refused_rather_than_served_as_content() {
     // reads within one pass — the read this device cuts short.
     let mut scratch = [0u8; TAP_SNAP_LEN];
     medium.short_reads = 1;
-    deck.demand(demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
+    deck.demand(ring_demand(DownloadSink::Log, 0, DOWNLOAD_WINDOW_LEN));
     match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 16) {
         Some(Answer::Refused(reason, ..)) => assert_eq!(reason, DownloadRefusal::DeviceError),
         other => panic!("a read the device cut short is refused, not served: {other:?}"),
@@ -1777,7 +1760,7 @@ fn a_ring_position_past_what_the_medium_took_answers_nothing_yet() {
 }
 
 #[test]
-fn a_ring_read_neither_seals_nor_pins_and_leaves_a_download_alone() {
+fn a_read_never_seals_the_recording_it_reads() {
     let mut medium = Fake::new();
     let ring = Ring::new();
     let mut deck = deck(&mut medium);
@@ -1785,35 +1768,20 @@ fn a_ring_read_neither_seals_nor_pins_and_leaves_a_download_alone() {
     run(&mut deck, &mut medium, &ring, &mut reader, 12, 300, 8);
     let mut scratch = [0u8; TAP_SNAP_LEN];
 
-    // Open a download, which pins a snapshot.
-    deck.demand(demand(DownloadSink::Log, 0, 512));
-    let opened = match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
-        Some(Answer::Bytes(bytes, total_len)) => {
-            assert!(!bytes.is_empty());
-            (bytes, total_len)
-        }
-        other => panic!("a download of offset zero is served: {other:?}"),
-    };
-
-    // A ring read in between, which must neither move the pin nor seal.
-    deck.demand(ring_demand(DownloadSink::Log, 0, 512));
+    // A read is a read: it pads nothing, so a reader cannot make the recording
+    // write on its account however often it asks.
     let sealed = deck.counters().sinks[0].padding_bytes;
-    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
-        Some(Answer::Bytes(bytes, _)) => assert!(!bytes.is_empty()),
-        other => panic!("a ring read of a written recording is served: {other:?}"),
-    }
-    assert_eq!(
-        deck.counters().sinks[0].padding_bytes,
-        sealed,
-        "a ring read wrote padding into the recording"
-    );
-
-    // And the download carries on from where it was, against the snapshot it
-    // pinned rather than one the ring read replaced.
-    deck.demand(demand(DownloadSink::Log, opened.0.len() as u64, 512));
-    match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
-        Some(Answer::Bytes(_, total_len)) => assert_eq!(total_len, opened.1),
-        other => panic!("the download continues against its own snapshot: {other:?}"),
+    for position in [0u64, 512] {
+        deck.demand(ring_demand(DownloadSink::Log, position, 512));
+        match pump(&mut deck, &mut medium, &mut reader, &mut scratch, 32) {
+            Some(Answer::Bytes(bytes, _)) => assert!(!bytes.is_empty()),
+            other => panic!("a read of a written recording is served: {other:?}"),
+        }
+        assert_eq!(
+            deck.counters().sinks[0].padding_bytes,
+            sealed,
+            "a read wrote padding into the recording"
+        );
     }
 }
 

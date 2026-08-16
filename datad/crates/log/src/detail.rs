@@ -143,6 +143,16 @@ impl fmt::Display for Cause {
 pub enum DomainDetail<C = &'static str> {
     /// The state is the whole record.
     None,
+    /// The management port holds a number and answers on it for nobody: its
+    /// transport dials and refuses every `SYN`.
+    ///
+    /// A record of its own, once at bring-up, because an operator who can reach
+    /// that port and gets nothing has two explanations — a node that is not up,
+    /// and a node that is up and serves nothing — and only the appliance can
+    /// tell them apart. It carries no operand, and it is never written per
+    /// segment: a refused `SYN` is a counter, the console carrying system state
+    /// and never traffic.
+    ListensForNothing,
     /// The feature bits a driver and its device settled on, as the bitmap:
     /// which bit means what is `virtio`'s vocabulary, and decoding it here
     /// would be a second copy of that vocabulary to keep in step.

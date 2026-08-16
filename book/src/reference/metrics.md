@@ -12,7 +12,7 @@ reading's slots mean, and a reading is the only way a counter leaves this node.
 **Coverage:** the inventory below is the whole of what this appliance names, and every family in it
 is a contract — its type, its labels and the domains that publish it. It reaches the dataplane's
 verdict and throughput counters, each NIC's own faults and losses, buffer-pool ownership, the
-management port's endpoint and its TCP and HTTP layers, the block device under the recordings and the
+management port's endpoint and the two TCP stacks on it, the block device under the recordings and the
 two recordings themselves, the console path's losses, the applied-configuration state and the clock,
 the hardware probe's verdict, and the identity of each configured interface.
 
@@ -61,8 +61,8 @@ reading itself appears in the *next*.
 
 ## Metric inventory
 
-124 families; the `domain` column lists every value that appears, which is the set of protection
-domains publishing that family. A reading is 469 counter and gauge series from the 12 shards, laid
+113 families; the `domain` column lists every value that appears, which is the set of protection
+domains publishing that family. A reading is 446 counter and gauge series from the 12 shards, laid
 out slot by slot in the order these tables declare them.
 
 **Two of the families below are declared and carried by nothing today**, and they are named here
@@ -234,46 +234,39 @@ appearing here. It is counted by the transport under this port —
 ### The management port: the two TCP transports
 
 The management port carries **two** transports with two connection tables, and every family here is
-published once for each: the stack under the HTTP server, and the stack under the onboarding port.
-`service` is what tells them apart, and it is a label rather than a second set of families because a
+published once for each: the stack the appliance dials its management channel out of, and the stack
+under the onboarding port. `service` is what tells them apart, and it is a label rather than a
+second set of families because a
 refused segment or an accepted connection means the same thing whichever port it happened on —
 `sum by (service)` separates them and a query that omits the label gets the whole port, which is
 usually what a first look wants.
 
-Read the two differently. The HTTP stack both listens and dials, so its `connections_total` moves on
-`accepted` and on `dialled`. The onboarding stack only ever listens: `dialled` and `abandoned` stay
-at zero there, and a number in either is a defect rather than a peer. Its table holds one
-connection, so `refused{reason="table_full"}` is the ordinary answer to a second administrator
-connecting while a session runs — on the HTTP stack the same series means eight connections were
-already live, which is a very different thing.
+Read the two differently, because only one of them listens. The **channel** stack dials and accepts
+nothing: its `connections_total` moves on `dialled` and never on `accepted`, and a number under
+`accepted` there is a defect rather than a peer. What a station knocking on that port produces is
+`refused{reason="not_listening"}` — the same series a segment for a port this node never had lands
+in, because it is the same fact about the stack. The **onboarding** stack only ever listens:
+`dialled` and `abandoned` stay at zero there, and it holds one connection, so
+`refused{reason="table_full"}` is the ordinary answer to a second administrator connecting while a
+session runs.
+
+**`refused{service="channel", reason="not_listening"}` is the whole of what plain HTTP left
+behind.** Nothing serves on that port; it carries the appliance's outbound channel and refuses
+everything else. The console says so once at bring-up, and this counter is where a station knocking
+repeatedly shows up — the console never carries a line per segment.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_tcp_bytes_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
-| `librefirewall_tcp_challenge_acks_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments challenged rather than acted on under RFC 5961 — a blind in-window `RST` (§3.2) or a `SYN` on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's answer. |
-| `librefirewall_tcp_challenges_suppressed_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge acknowledgement, or the reset a segment naming no connection would have drawn. The budget is per transport and shared across that transport's whole connection table, so this rising is the node declining to be an amplifier and not a connection in trouble. |
-| `librefirewall_tcp_connections_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `event`&nbsp;(`abandoned`, `accepted`, `closed`, `dialled`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. `accepted` is a handshake a peer began and `dialled` one this node began, and the two are never merged: dials rising while `established` stays flat is a node that cannot reach where it is trying to go. Only the HTTP stack dials, so `dialled` and `abandoned` are zero under `service="onboarding"`. |
-| `librefirewall_tcp_refused_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_a_handshake`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. `not_a_handshake` is a segment answering a connection this node dialled that carried neither `SYN` nor `RST`, which such a connection has no window to refuse under. |
-| `librefirewall_tcp_resets_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
-| `librefirewall_tcp_retransmits_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments re-sent, data and control alike. |
-| `librefirewall_tcp_segments_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |
-| `librefirewall_tcp_urgent_ignored_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments carrying URG, whose urgent pointer is ignored and data delivered in band. |
-| `librefirewall_tcp_write_refused_total` | counter | `management` | `service`&nbsp;(`http`, `onboarding`) | Segments the stack decided to send that did not fit its caller's storage; ours. |
-
-### The management port: the HTTP server
-
-| Metric | Type | `domain` | Other labels | Meaning |
-|---|---|---|---|---|
-| `librefirewall_http_bodies_refused_total` | counter | `management` | — | Response bodies a renderer would not fit in the staging buffer, whichever target asked; ours, expected to stay zero. |
-| `librefirewall_http_bodies_taken_total` | counter | `management` | — | Request bodies accumulated whole and handed to the domain that decides on them. |
-| `librefirewall_http_bodies_timed_out_total` | counter | `management` | — | Request bodies given up on for not arriving whole in time, answered 408 and reset; each one is a stretch in which the other body-bearing surfaces answered 503. |
-| `librefirewall_http_body_overruns_total` | counter | `management` | — | Request-body bytes a client sent past the length it declared, dropped unread. |
-| `librefirewall_http_requests_overflowed_total` | counter | `management` | — | Requests that outgrew the bounded request buffer before their head ended. |
-| `librefirewall_http_requests_total` | counter | `management` | — | Requests the server read to their end and decided on. |
-| `librefirewall_http_response_bytes_total` | counter | `management` | — | Response bytes handed to the transport, headers included. |
-| `librefirewall_http_responses_total` | counter | `management` | `status`&nbsp;(`200`, `400`, `404`, `405`, `408`, `410`, `413`, `414`, `429`, `431`, `503`, `505`) | Responses composed, by status code. `429` and `410` are the onboarding surface's — its rate limiter, and an appliance that has an owner and has shut that surface — and neither can appear on this port, which limits nothing and is never shut: the label set is the whole of what this appliance's one response writer can compose. |
-| `librefirewall_http_retransmits_unavailable_total` | counter | `management` | — | Ranges the transport asked for again that no response buffer held; ours, expected to stay zero. |
-| `librefirewall_http_slots_exhausted_total` | counter | `management` | — | Connections the server had no slot for; ours, the tables being one size, expected to stay zero. |
+| `librefirewall_tcp_bytes_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`), `direction`&nbsp;(`received`, `retransmitted`, `sent`) | Payload bytes delivered in order, handed to the stack to send, or re-sent. |
+| `librefirewall_tcp_challenge_acks_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`) | Segments challenged rather than acted on under RFC 5961 — a blind in-window `RST` (§3.2) or a `SYN` on a synchronized connection (§4). Whether the acknowledgement left is §7's budget's answer. |
+| `librefirewall_tcp_challenges_suppressed_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`) | Unsolicited replies withheld by RFC 5961 §7's per-second budget: a challenge acknowledgement, or the reset a segment naming no connection would have drawn. The budget is per transport and shared across that transport's whole connection table, so this rising is the node declining to be an amplifier and not a connection in trouble. |
+| `librefirewall_tcp_connections_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`), `event`&nbsp;(`abandoned`, `accepted`, `closed`, `dialled`, `established`, `evicted`, `reaped`) | Connections that reached each lifecycle event. `accepted` is a handshake a peer began and `dialled` one this node began, and the two are never merged: dials rising while `established` stays flat is a node that cannot reach where it is trying to go. Only the channel stack dials and only the onboarding stack accepts, so `dialled` and `abandoned` are zero under `service="onboarding"` and `accepted` is zero under `service="channel"`. |
+| `librefirewall_tcp_refused_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`), `reason`&nbsp;(`bad_checksum`, `malformed`, `no_acknowledgement`, `no_connection`, `not_a_handshake`, `not_listening`, `out_of_order`, `out_of_window`, `table_full`, `unacceptable_ack`) | Segments the transport refused, by the cause it named; what a peer sent. `not_a_handshake` is a segment answering a connection this node dialled that carried neither `SYN` nor `RST`, which such a connection has no window to refuse under. |
+| `librefirewall_tcp_resets_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Resets accepted or sent. |
+| `librefirewall_tcp_retransmits_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`) | Segments re-sent, data and control alike. |
+| `librefirewall_tcp_segments_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`), `direction`&nbsp;(`received`, `sent`) | Segments the stack received or composed. |
+| `librefirewall_tcp_urgent_ignored_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`) | Segments carrying URG, whose urgent pointer is ignored and data delivered in band. |
+| `librefirewall_tcp_write_refused_total` | counter | `management` | `service`&nbsp;(`channel`, `onboarding`) | Segments the stack decided to send that did not fit its caller's storage; ours. |
 
 ### The console path, and what it loses
 
@@ -346,7 +339,6 @@ misreporting rather than a lost record.
 
 | Metric | Type | `domain` | Other labels | Meaning |
 |---|---|---|---|---|
-| `librefirewall_recording_download_overruns_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Downloads the ring wrapped past mid-read, by sink; a reader the traffic outran. |
 | `librefirewall_recording_downloads_total` | counter | `recorder` | `outcome`&nbsp;(`refused`, `served`) | Download windows the recorder answered, by whether it served bytes or refused. |
 | `librefirewall_recording_padding_bytes_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Bytes of pcapng padding written to keep every device write a whole sector. |
 | `librefirewall_recording_record_bytes_total` | counter | `recorder` | `sink`&nbsp;(`capture`, `log`) | Bytes those records occupy, padding excluded. |

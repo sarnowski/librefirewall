@@ -187,6 +187,7 @@ fn write_detail<C: fmt::Display>(detail: &DomainDetail<C>, cursor: &mut Cursor<'
     match detail {
         DomainDetail::None => Ok(()),
         DomainDetail::Features(bits) => write!(cursor, " features={bits:#x}"),
+        DomainDetail::ListensForNothing => write!(cursor, " listening=none"),
         DomainDetail::ReceivePosted(count) => write!(cursor, " rx-posted={count}"),
         DomainDetail::Established { tsc_hz, utc } => {
             write!(cursor, " tsc-hz={tsc_hz} utc=")?;
@@ -1638,6 +1639,7 @@ mod tests {
         let causes = ["", "a", "not-virtio-net", "queue-setup-queue-too-small"];
         prop_oneof![
             Just(DomainDetail::None),
+            Just(DomainDetail::ListensForNothing),
             any::<u64>().prop_map(DomainDetail::Features),
             any::<u32>().prop_map(DomainDetail::ReceivePosted),
             (1..=u64::MAX, any::<u64>()).prop_map(|(hz, nanos)| established(hz, nanos)),

@@ -300,7 +300,8 @@ The decisions that constrain all observability code:
   and a recording is shipped upstream or asked for by extent — and the two recordings themselves,
   which carry the metric readings and the log events inside them. The
   [management-plane redesign](../design/management.md) is what retargeted it: no HTTP member
-  remains, the last of them having gone with the phase that removed the configuration endpoint.
+  remains, the resources having gone one phase at a time and the server that answered `404` in their
+  place with the last of them, so the management port now dials and listens for nothing.
   What never changes is the invariant: a new introspection
   mechanism — a debug endpoint, a side channel, a diagnostic dump — changes the product's attack
   surface and is a design change.

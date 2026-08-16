@@ -288,6 +288,25 @@ fn arp_request(target: Ipv4Address) -> Vec<u8> {
     frame
 }
 
+/// The station's ARP reply to a request this appliance sent, which is what lets
+/// the dial address the segment its transport is holding.
+fn arp_reply_from_station() -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&OUR_MAC.0);
+    frame.extend_from_slice(&STATION_MAC.0);
+    frame.extend_from_slice(&EtherType::ARP.0.to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
+    frame.push(6);
+    frame.push(4);
+    frame.extend_from_slice(&2u16.to_be_bytes());
+    frame.extend_from_slice(&STATION_MAC.0);
+    frame.extend_from_slice(&STATION_ADDRESS.octets());
+    frame.extend_from_slice(&OUR_MAC.0);
+    frame.extend_from_slice(&OUR_ADDRESS.octets());
+    frame
+}
+
 /// An ICMP echo request to `target` carrying `payload`.
 fn echo_request(target: Ipv4Address, payload: &[u8]) -> Vec<u8> {
     let mut icmp = vec![8u8, 0, 0, 0, 0x12, 0x34, 0, 7];
@@ -1121,11 +1140,15 @@ fn a_segment_before_the_clock_is_counted_and_arp_still_answered() {
     assert_eq!(fixture.transmitted().len(), 1);
 }
 
-/// A handshake across the pipeline, and the transport's own timer re-sending the
-/// `SYN-ACK` on a later pass. That second frame is the one no received frame
-/// asked for, and it is what proves the timers are driven at all.
+/// A `SYN` for the management port is refused across the pipeline, and the dial's
+/// own timer re-sends its `SYN` on a later pass.
+///
+/// Two properties in one drive, because the port has one connection and it is
+/// this end's. The refusal is the security property: nothing a station sends
+/// opens anything here. The re-send is the frame no received frame asked for,
+/// and it is what proves the timers are driven at all.
 #[test]
-fn a_handshake_crosses_the_pipeline_and_its_timer_re_sends() {
+fn a_syn_is_refused_and_the_dials_own_timer_re_sends() {
     let mut fixture = Fixture::new();
     fixture.clock.publish(&CalibrationImage {
         tsc_hz: TSC_HZ,
@@ -1136,24 +1159,47 @@ fn a_handshake_crosses_the_pipeline_and_its_timer_re_sends() {
 
     fixture.receive(&tcp_syn(40000)).expect("a buffer");
     assert_eq!(fixture.stage.poll_stage(NOW), 1);
-    let frames = fixture.transmitted();
-    assert_eq!(frames.len(), 1, "a SYN-ACK did not leave");
-    let first = tcp_flags(&frames[0]);
-    assert_eq!(first & 0x12, 0x12, "the answer was not a SYN-ACK");
-
+    assert!(
+        fixture.transmitted().is_empty(),
+        "a SYN for the port that dials only was answered"
+    );
     let endpoint = fixture.stage.endpoint().expect("an addressed port");
-    assert_eq!(endpoint.counters().tcp_segments, 1);
-    assert_eq!(endpoint.tcp_counters().connections_accepted, 1);
+    assert_eq!(endpoint.counters().tcp_segments, 1, "and was still counted");
+    assert_eq!(endpoint.tcp_counters().connections_accepted, 0);
+    assert_eq!(endpoint.tcp_counters().refused_not_listening, 1);
+    assert_eq!(endpoint.connections(), 0);
+
+    // The one connection this port has is the one it makes. The next hop is
+    // unresolved when the dial is composed, so that `SYN` is dropped rather
+    // than queued — the transport holds it, and once the station answers the
+    // resolution it is the timer that puts it on the wire.
+    fixture
+        .stage
+        .open_dial(STATION_ADDRESS, 4433)
+        .expect("an addressed port")
+        .expect("an on-link destination");
+    let now = fixture.stage.monotonic(NOW).expect("a calibration");
+    fixture.stage.drive_dial(now);
+    fixture
+        .receive(&arp_reply_from_station())
+        .expect("a buffer");
+    fixture.stage.poll_stage(NOW);
+    fixture.stage.drive_dial(now);
+    fixture.transmitted();
     assert_eq!(fixture.stage.counters().timer_segments, 0);
 
     // A pass a whole retransmission timeout later, with no frame at all: the
     // timer is what produces the segment.
     let later = Ticks(NOW.0 + TSC_HZ * 2);
     assert_eq!(fixture.stage.poll_stage(later), 0);
-    assert!(fixture.stage.counters().timer_segments >= 1);
     let frames = fixture.transmitted();
+    assert!(fixture.stage.counters().timer_segments >= 1);
     assert!(!frames.is_empty(), "the timer sent nothing");
-    assert_eq!(tcp_flags(&frames[0]) & 0x12, 0x12);
+    assert_eq!(
+        tcp_flags(&frames[0]) & 0x12,
+        0x02,
+        "the timer re-sent something other than the dial's SYN"
+    );
 }
 
 /// A `SYN` for the management port, framed the way a station puts one on the wire.

@@ -17,13 +17,14 @@
 //! holding every recorded payload, which is the one grant this split exists to
 //! withhold.
 //!
-//! # Two readers over one channel, telling each other's coordinates apart
+//! # One reader, and a word that still names it
 //!
-//! The same domain also feeds the management channel, which ships ring bytes
-//! upstream, so one window serves two readers whose offsets mean different
-//! things — [`DownloadReader`] carries which. One channel rather than two: the
-//! recorder has one staging area and one request in flight, so that request
-//! *is* the arbitration, decided where both readers are visible.
+//! What this window serves is the management channel, which ships ring bytes
+//! upstream — [`DownloadReader`] carries which coordinate an offset is in, and
+//! there is one. The word stays a field rather than becoming an implicit
+//! constant because it is **peer-written**: a request naming any other reader
+//! is refused as [`DownloadRefusal::NoSuchReader`], which is a decoded refusal
+//! rather than a coordinate silently read the wrong way.
 //!
 //! # Two regions, because a region is the unit of grant
 //!
@@ -134,14 +135,13 @@ pub enum DownloadSink {
 
 /// Which reader is asking, and so what [`DownloadDemand::offset`] counts from.
 ///
-/// Not a convenience: a snapshot offset resolves against an origin the recorder
-/// recomputes at every boot, so the same number names a different byte after a
-/// restart — unusable to a reader keeping a cursor across one.
+/// One variant, and still a type: the field is peer-written, so what a request
+/// naming anything else meets is a decode that refuses rather than a coordinate
+/// assumed. Its discriminant is unmoved by the reader that went with the HTTP
+/// download, so a request in that reader's coordinate — bit pattern zero, which
+/// is also what a zeroed region reads as — no longer decodes at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DownloadReader {
-    /// An operator downloading over HTTP: the offset counts from the start of
-    /// the snapshot pinned when the download began.
-    Snapshot,
     /// The management channel shipping the ring upstream: the offset is an
     /// absolute position in the ring's own append space, the coordinate its
     /// superblock keeps and the channel's cursors are in.
@@ -152,7 +152,6 @@ impl DownloadReader {
     #[must_use]
     pub const fn to_bits(self) -> u32 {
         match self {
-            Self::Snapshot => 0,
             Self::Ring => 1,
         }
     }
@@ -163,7 +162,6 @@ impl DownloadReader {
     #[must_use]
     pub const fn from_bits(bits: u32) -> Option<Self> {
         match bits {
-            0 => Some(Self::Snapshot),
             1 => Some(Self::Ring),
             _ => None,
         }
@@ -597,11 +595,11 @@ pub enum DownloadPoll<'buf> {
     /// already bounded by both what the window holds and what was asked for.
     Delivered {
         bytes: &'buf [u8],
-        /// The snapshot's length, so a caller knows when it has read it all.
+        /// How far the named recording is durable, so a caller knows when it
+        /// has read it all.
         total_len: u64,
         /// The oldest position of the named recording still on the medium, in the
         /// ring's own append space. Nothing here bounds it against `total_len`:
-        /// the two are the same coordinate only for [`DownloadReader::Ring`], and
         /// the reader that uses it acts on it only where it moves a cursor
         /// **forward**, which is a rule that holds whatever the recorder says.
         first: u64,
@@ -988,9 +986,10 @@ const _: () = {
     assert!(DownloadRefusal::from_status(DownloadStatus::Ok).is_none());
     assert!(DownloadStatus::from_bits(7).is_none());
     assert!(DownloadSink::from_bits(DownloadSink::COUNT as u32).is_none());
-    // Zero is the snapshot reader, so a zeroed region names the reader the HTTP
-    // download has always been rather than one nothing implements.
-    assert!(DownloadReader::Snapshot.to_bits() == 0);
+    // The one reader keeps the discriminant it always had, so zero — which is
+    // what a zeroed region reads as — names no reader and is refused.
+    assert!(DownloadReader::Ring.to_bits() == 1);
+    assert!(DownloadReader::from_bits(0).is_none());
     assert!(DownloadReader::from_bits(2).is_none());
 
     assert!(size_of::<DownloadRequest>() == 40);

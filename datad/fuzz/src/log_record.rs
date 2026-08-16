@@ -170,7 +170,8 @@ const DETAIL_RECORDING_FRESH: u8 = 54;
 const DETAIL_CHANNEL_SHIPPING: u8 = 55;
 const DETAIL_CHANNEL_ACKED: u8 = 56;
 const DETAIL_CONFIGURED: u8 = 57;
-const DETAIL_COUNT: u8 = 58;
+const DETAIL_LISTENS_FOR_NOTHING: u8 = 58;
+const DETAIL_COUNT: u8 = 59;
 
 /// How many ways a handshake on the management channel may end, and how many
 /// ways a delivered anchor may refuse the certificate a server presented.
@@ -815,6 +816,10 @@ fn domain_refusal(record: &LogRecord) -> Option<LogRecordError> {
         // which is a digest, so refusing one would refuse a fingerprint the
         // appliance really computed.
         DETAIL_NONE
+        // The port that answers for nobody joins it: the fact is the whole
+        // record and it carries no operand, so no bit pattern of one is
+        // refusable.
+        | DETAIL_LISTENS_FOR_NOTHING
         | DETAIL_FEATURES
         | DETAIL_RECEIVE_POSTED
         | DETAIL_RECEIVED

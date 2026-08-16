@@ -22,8 +22,8 @@ use lfw_clock::UtcNanos;
 use lfw_flow::{Classification, FlowCounters, FlowState, Occupancy, RefusalKind};
 use lfw_ip_endpoint::{Endpoint, TcpCounters, Unhandled};
 use lfw_metrics::{
-    ConfigSample, EndpointSample, FlowSample, ForwarderSample, HttpSample, LogSample,
-    ManagementSample, NeighbourSample, OnboardSample, OutboundSample, PipelineSample, PolicySample,
+    ConfigSample, EndpointSample, FlowSample, ForwarderSample, LogSample, ManagementSample,
+    NeighbourSample, OnboardSample, OutboundSample, PipelineSample, PolicySample,
     PolicySweepSample, PoolSample, ROUTE_DROP_REASONS, RecorderSample, SHARD_COUNT, SINKS,
     SinkSample, Snapshot, StatsShard, StoreSample, TapSample, TcpSample,
 };
@@ -234,8 +234,8 @@ pub fn forwarder_sample(counters: &ForwarderCounters<'_>) -> ForwarderSample {
 
 /// One transport's counters as the shard's fields.
 ///
-/// A function because the management port carries two stacks — the HTTP
-/// server's and the onboarding port's — and they are the same numbers about
+/// A function because the management port carries two stacks — the channel's and
+/// the onboarding port's — and they are the same numbers about
 /// two different tables. Written twice, the two could drift into disagreeing
 /// about which counter is which, and a reading keys its slots by position.
 fn tcp_sample(counters: TcpCounters) -> TcpSample {
@@ -281,7 +281,7 @@ pub fn management_sample(
     endpoint: Option<&Endpoint>,
     log: LogSample,
 ) -> ManagementSample {
-    let (endpoint_sample, neighbours, outbound, tcp, onboarding, http, onboard) = match endpoint {
+    let (endpoint_sample, neighbours, outbound, tcp, onboarding, onboard) = match endpoint {
         Some(endpoint) => {
             let counters = endpoint.counters();
             let mut unhandled = [0u64; Unhandled::ALL.len()];
@@ -292,7 +292,6 @@ pub fn management_sample(
             }
             let tcp = endpoint.tcp_counters();
             let onboarding = endpoint.onboarding_counters();
-            let served = endpoint.http_counters();
             let neighbours = endpoint.neighbour_counters();
             let dials = endpoint.outbound_counters();
             let stream = endpoint.stream_counters();
@@ -333,18 +332,6 @@ pub fn management_sample(
                 },
                 tcp_sample(tcp),
                 tcp_sample(onboarding),
-                HttpSample {
-                    requests: served.requests,
-                    responses: served.responses,
-                    response_bytes: served.response_bytes,
-                    overflowed: served.overflowed,
-                    bodies_refused: served.bodies_refused,
-                    bodies_taken: served.bodies_taken,
-                    bodies_timed_out: served.bodies_timed_out,
-                    bodies_overrun: served.bodies_overrun,
-                    retransmits_unavailable: served.retransmits_unavailable,
-                    slots_exhausted: served.slots_exhausted,
-                },
                 OnboardSample {
                     accepted: stream.accepted,
                     forgotten: stream.forgotten,
@@ -357,8 +344,8 @@ pub fn management_sample(
                 },
             )
         }
-        // An unaddressed port has no endpoint, so its endpoint, transport and
-        // server series read zero — which is what "no address yet" looks like
+        // An unaddressed port has no endpoint, so its endpoint and transport
+        // series read zero — which is what "no address yet" looks like
         // and is not the same as "addressed and idle": the stage's own
         // `frames`/`unaddressed` pair is what tells those apart.
         None => (
@@ -367,7 +354,6 @@ pub fn management_sample(
             OutboundSample::default(),
             TcpSample::default(),
             TcpSample::default(),
-            HttpSample::default(),
             OnboardSample::default(),
         ),
     };
@@ -400,7 +386,6 @@ pub fn management_sample(
         outbound,
         tcp,
         onboarding,
-        http,
         onboard,
         log,
     }
@@ -493,7 +478,6 @@ pub fn recorder_sample(
             wraps: counters.wraps,
             sectors_written: counters.sectors_written,
             padding_bytes: counters.padding_bytes,
-            download_overruns: counters.download_overruns,
         };
     }
     RecorderSample {

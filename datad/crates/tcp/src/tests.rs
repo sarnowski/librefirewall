@@ -779,6 +779,66 @@ fn a_segment_for_a_port_nothing_listens_on_is_dropped_in_silence() {
     assert_eq!(stack.connections(), 0);
 }
 
+/// A stack built to dial only refuses every `SYN` for its own port, and refuses
+/// it exactly as a segment for a port this stack never had.
+///
+/// The whole of a listener's exposure is the passive open — a slot, a sequence
+/// space and a challenge budget committed on a segment anybody can send — so
+/// this is the property withdrawing it exists for, and a flood is what would
+/// find it if the flag were read anywhere but here.
+#[test]
+fn a_dialling_stack_opens_nothing_for_a_peer() {
+    let mut stack: Bench = TcpStack::dialling(APPLIANCE, PORT, MSS_LIMIT, RECEIVE_WINDOW, secret());
+    assert!(!stack.listening());
+    let mut out = [0u8; 2048];
+    for index in 0..16u16 {
+        let mut peer = Peer::new(40_000 + index, 0x1000 * u32::from(index) + 1);
+        let syn = peer.segment(Flags::SYN, &[]);
+        let received = stack.receive(at(u64::from(index)), STATION, &syn, &mut out);
+        assert_eq!(
+            received.outcome,
+            Outcome::Rejected(Rejection::NotListening { port: PORT }),
+            "a SYN was answered by a stack that only dials"
+        );
+        // Dropped in silence, on the same terms a wrong port is: a `RST` would
+        // tell a station scanning the link that something is behind the number.
+        assert_eq!(received.emitted, 0);
+        assert_eq!(stack.connections(), 0);
+    }
+    assert_eq!(stack.counters().refused_not_listening, 16);
+    assert_eq!(stack.counters().connections_accepted, 0);
+    assert_eq!(stack.counters().resets_sent, 0);
+}
+
+/// And the port it refuses on is still the port it dials from, which is why the
+/// flag withdraws the passive open rather than the number.
+#[test]
+fn a_dialling_stack_still_composes_from_its_own_port() {
+    let mut stack: Bench = TcpStack::dialling(APPLIANCE, PORT, MSS_LIMIT, RECEIVE_WINDOW, secret());
+    let mut out = [0u8; 2048];
+    let dialled = stack
+        .connect(at(0), STATION, 4433, &mut out)
+        .expect("an empty table");
+    let syn = Segment::parse(APPLIANCE, STATION, &out[..dialled.len]).expect("a SYN");
+    assert_eq!(syn.source_port, PORT, "the dial left from another port");
+    assert_eq!(syn.destination_port, 4433);
+    assert!(syn.flags.contains(Flags::SYN));
+    assert_eq!(stack.connections(), 1);
+
+    // And the answer, which arrives addressed to that same port, reaches the
+    // connection rather than the refusal above: what was withdrawn is the open
+    // for a 4-tuple the table does not hold.
+    let mut peer = Peer::new(4433, 0x9000_0000);
+    peer.expect = syn.sequence.add(1);
+    let synack = peer.segment(Flags::SYN.with(Flags::ACK), &[]);
+    let received = stack.receive(at(1), STATION, &synack, &mut out);
+    assert_eq!(received.outcome, Outcome::Advanced);
+    assert_eq!(
+        stack.connection(dialled.connection).map(Connection::state),
+        Some(State::Established)
+    );
+}
+
 /// RFC 793 section 3.4: a segment naming a connection that does not exist is answered
 /// with a `RST`, so a peer holding half a connection learns to let go — but a
 /// `RST` itself never provokes one.

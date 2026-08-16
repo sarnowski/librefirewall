@@ -874,7 +874,6 @@ name = "lfw-ip-endpoint"
 version = "0.1.0"
 dependencies = [
  "lfw-clock",
- "lfw-http",
  "lfw-tcp",
  "net-headers",
  "proptest",

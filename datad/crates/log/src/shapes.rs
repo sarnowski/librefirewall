@@ -81,6 +81,7 @@ pub(crate) fn every_detail() -> Vec<DomainDetail> {
     let mut details = vec![
         DomainDetail::None,
         DomainDetail::Features(u64::MAX),
+        DomainDetail::ListensForNothing,
         DomainDetail::ReceivePosted(u32::MAX),
         established(u64::MAX, u64::MAX),
         DomainDetail::Received {

@@ -4,8 +4,8 @@
 //! `routing` decides what to do with a frame addressed to the appliance's MAC and
 //! destined for somebody else. This crate is the other half of that sentence — a
 //! frame destined for *us* — and answers three questions: "who holds this address"
-//! (ARP), "are you there" (ICMP echo), and whatever is asked over a TCP connection
-//! to its one listening port. Nothing here forwards.
+//! (ARP), "are you there" (ICMP echo), and what becomes of a TCP segment. Nothing
+//! here forwards.
 //!
 //! # Adversary
 //!
@@ -26,57 +26,39 @@
 //! idle link. The counters follow `pipeline::DropCounters` — saturating, never
 //! reset — because the rate is the attacker's to choose.
 //!
-//! # Two listening ports, and two different things on them
+//! # Two ports, and only one of them listens
 //!
-//! [`MANAGEMENT_PORT`] carries the HTTP surface described below.
-//! [`onboard::ONBOARDING_PORT`] carries a **byte stream** instead: an
+//! [`onboard::ONBOARDING_PORT`] carries a **byte stream**: an
 //! [`onboard::Stream`] that accepts one connection, hands what arrives to a
 //! consumer above this crate and puts what that consumer answers back on the
 //! wire. It is where a session another domain terminates reaches the network,
 //! and this crate never interprets a byte of it.
 //!
-//! Two transports rather than one, because a `lfw_tcp::TcpStack` answers on one
+//! [`MANAGEMENT_PORT`] **serves nothing**. Its transport is built by
+//! `lfw_tcp::TcpStack::dialling`, so a `SYN` for it is refused and counted as
+//! `not_listening`, exactly as one for a port this node never had. The number is
+//! still the appliance's, because the outbound session below composes its source
+//! port from it and the peer's answer arrives addressed to it — a port that
+//! dials and does not answer, which is the whole of the management plane's
+//! exposure to a station on the link.
+//!
+//! Two transports rather than one, because a `lfw_tcp::TcpStack` holds one
 //! port and matches a segment to a connection by the peer's address and port
 //! alone. So each port has its own table, its own sequence space and its own
 //! challenge budget, and a segment is handed to exactly one of them —
 //! `lfw_tcp::peeked_destination_port` reads the field before anything is
 //! verified, purely to choose which stack verifies it, and a segment too short
-//! to carry one goes to the HTTP stack, whose parse counts it as the malformed
-//! segment it is.
+//! to carry one goes to the management stack, whose parse counts it as the
+//! malformed segment it is.
 //!
 //! **The two stacks' connection handles are not comparable.** Each numbers its
 //! own slots, so the same `ConnectionId` may name a connection in both; nothing
 //! here holds one without knowing which table it came from, and the stream keeps
 //! its own return path rather than sharing the table below.
 //!
-//! # The transport, and the service on it
-//!
-//! `lfw_tcp` is the stack; on it sits [`http::Server`], which reads one HTTP/1.1
-//! request per connection and answers three shapes: a `GET` of a registered target
-//! with a body its caller renders whole; a `GET` of a target
-//! registered through [`Endpoint::serve_stream_at`] out of a body supplied a window
-//! at a time; and a `POST` to a target registered through
-//! [`Endpoint::serve_body_at`] by accumulating the request body and handing it to
-//! its caller to decide on. It holds the target strings and knows nothing behind
-//! them, so an appliance serves a recording off a block device and commits a
-//! configuration through an endpoint aware of neither. Everything else gets a
-//! status, and then it closes. So an
-//! endpoint carries state between frames and is not `Copy`, and it needs a
+//! An endpoint carries state between frames and is not `Copy`, and it needs a
 //! clock: with none, a segment is [`Outcome::Unclocked`] and ARP and ICMP go on
-//! as before. A response outgrows one segment by an order of magnitude, so
-//! [`Endpoint::poll_output`] is what a caller drives until a pass has nothing
-//! left to send.
-//!
-//! # A known, deliberate gap in the target design: the service is plain HTTP
-//!
-//! The target design requires the management API to carry encryption, authentication
-//! and read/write authorization through an mTLS certificate pair. None of it exists:
-//! there is no TLS in this appliance, this endpoint authenticates nobody, and
-//! **anything that can reach the management port can read every metric the node
-//! exposes, read any registered stream, and submit a body to any registered
-//! target** — which for the configuration surface is the authority to decide what
-//! the appliance forwards. `GET /logs` is absent and answers 404 rather than being
-//! stubbed. The gap is recorded.
+//! as before.
 //!
 //! # It reaches out as well as answering
 //!
@@ -111,17 +93,17 @@
 //! one** — a reply to an off-link station would leave under a next hop nothing
 //! chose, the gateway being for traffic this node *originates*, and a reply
 //! addressed to a group is a reflector. And there are **two TCP ports and no
-//! UDP**: one service each, and nothing listens anywhere else.
+//! UDP**: one of them listens, the other only dials, and nothing answers
+//! anywhere else.
 //!
 //! # No allocator, and every buffer a fixed array
 //!
 //! [`Endpoint::handle`] writes its reply into storage the caller owns, so the
 //! caller decides where a reply is composed — in the protection domain that runs
 //! this, a buffer it has just taken from a pool. Nothing here is allocated and
-//! nothing here is sized by anything a peer sends: the two connection tables,
-//! each connection's request slot, the one response staging buffer, and the two
-//! byte streams' two directions each are fixed arrays sized by the constants
-//! below, in [`http`], in [`outbound`] and in [`onboard`].
+//! nothing here is sized by anything a peer sends: the two connection tables and
+//! the two byte streams' two directions each are fixed arrays sized by the
+//! constants below, in [`outbound`] and in [`onboard`].
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -146,33 +128,29 @@ use net_headers::{
     ParseError, Protocol, ReplyError,
 };
 
-pub mod http;
 pub mod neighbour;
 pub mod onboard;
 pub mod outbound;
 pub mod route;
 
-use http::{HttpCounters, REQUEST_CAPACITY, Server};
 use neighbour::{Learned, NeighbourCache, NeighbourCounters, Resolution};
 use onboard::{INBOUND_CAPACITY, ONBOARD_CONNECTIONS, ONBOARDING_PORT, Stream, StreamCounters};
-use outbound::{Ended, OpenError, OutboundCounters, Phase, Resolutions, Session};
+use outbound::{Ended, OpenError, OutboundCounters, Phase, RECEIVE_CAPACITY, Resolutions, Session};
 use route::Port;
 
-/// Re-exported because a caller committing to a streamed body names one, and
-/// the bound behind it is `lfw_http`'s rather than this crate's.
-pub use lfw_http::{ContentType, Status};
-
-/// Connections one management port holds at once, and so the bound a connection
-/// flood is answered by.
+/// Slots the management port's transport holds.
 ///
-/// Eight rather than one, because a browser opens several at a time; rather than
-/// many, because each carries a [`REQUEST_CAPACITY`] slot.
+/// The endpoint runs one outbound session at a time and nothing opens a
+/// connection here from outside, so one is what the port uses. The slack is what
+/// a redial spends rather than waits for: a session gives its connection back
+/// when it ends, and a table with room does not make the next dial depend on
+/// that having happened yet.
 pub const TCP_CONNECTIONS: usize = 8;
 
-/// The port this endpoint listens on: the management HTTP port. A constant rather
-/// than a configured value because the service is the constant — the design puts
-/// the management surfaces on the management interface, and a port a document
-/// could move is one a client could not find.
+/// The port this endpoint's outbound session dials from, and answers nothing on.
+/// A constant rather than a configured value because it is the number a peer
+/// sees this appliance's channel arrive under, and the design puts the
+/// management plane on the management interface.
 pub const MANAGEMENT_PORT: u16 = 80;
 
 /// The largest payload this endpoint composes in one segment: the classic
@@ -416,8 +394,8 @@ pub struct EndpointCounters {
     /// Replies decided on and not written: a caller-side failure, and the one count
     /// here that is not about the wire.
     pub reply_refused: u64,
-    /// TCP segments handed to the HTTP port's transport, whatever it made of
-    /// them; what each became is counted in [`Endpoint::tcp_counters`], one
+    /// TCP segments handed to the management port's transport, whatever it made
+    /// of them; what each became is counted in [`Endpoint::tcp_counters`], one
     /// field per cause.
     pub tcp_segments: u64,
     /// TCP segments handed to the onboarding port's transport, on
@@ -530,11 +508,12 @@ pub struct Endpoint {
     /// frame: a reply is addressed to the station that sent it.
     gateway: Option<Ipv4Address>,
     counters: EndpointCounters,
+    /// The management port's transport. It dials and never accepts, so what it
+    /// holds is the outbound session's connection and nothing else.
     tcp: TcpStack<TCP_CONNECTIONS>,
-    http: Server<TCP_CONNECTIONS>,
     /// The onboarding port's own transport, and the stream on it. Two fields
-    /// rather than one because they are the same pairing as `tcp` and `http`
-    /// beside them: a transport, and the thing that decides what its bytes mean.
+    /// rather than one because they are a transport and the thing that decides
+    /// what its bytes mean.
     onboarding: TcpStack<ONBOARD_CONNECTIONS>,
     stream: Stream,
     paths: [Option<ReturnPath>; TCP_CONNECTIONS],
@@ -651,14 +630,16 @@ impl Endpoint {
             // on every dial rather than once at construction.
             gateway,
             counters: EndpointCounters::new(),
-            // The window starts at a request slot's whole capacity and is kept
-            // equal to its free space from then on, which is what makes it mean
-            // what a window means.
-            tcp: TcpStack::new(
+            // Dialling, not listening: a `SYN` for this port is refused by the
+            // transport itself, so nothing above it decides whether to answer.
+            // The window is the outbound session's own receive buffer, which is
+            // the only thing bytes arriving on this port are ever taken into,
+            // and is kept equal to its free space from then on.
+            tcp: TcpStack::dialling(
                 address,
                 MANAGEMENT_PORT,
                 TCP_MSS,
-                REQUEST_CAPACITY as u32,
+                RECEIVE_CAPACITY as u32,
                 secret.clone(),
             ),
             // The same secret and so the same unpredictable initial sequence
@@ -673,7 +654,6 @@ impl Endpoint {
                 secret,
             ),
             stream: Stream::new(),
-            http: Server::new(),
             paths: [None; TCP_CONNECTIONS],
             neighbours: NeighbourCache::new(),
             outbound: None,
@@ -848,12 +828,6 @@ impl Endpoint {
         self.tcp.counters()
     }
 
-    /// What the server above the transport has done, one field per cause.
-    #[must_use]
-    pub const fn http_counters(&self) -> HttpCounters {
-        self.http.counters()
-    }
-
     /// How many connections the port holds, in any state.
     #[must_use]
     pub fn connections(&self) -> usize {
@@ -879,12 +853,6 @@ impl Endpoint {
     /// regardless, and a TCP segment is refused as [`Outcome::Unclocked`]. `out`
     /// may be shorter than the reply, and the outcome then says so.
     pub fn handle(&mut self, now: Option<Monotonic>, frame: &[u8], out: &mut [u8]) -> Outcome {
-        // Before the frame is looked at, so a request for a shared-array surface
-        // arriving in this very frame is answered rather than refused by a body
-        // whose deadline had already passed.
-        if let Some(now) = now {
-            self.http.expire(now);
-        }
         let outcome = self.decide(now, frame, out);
         self.counters.record(outcome);
         outcome
@@ -914,15 +882,13 @@ impl Endpoint {
         // Read before the answer, because a connection the transport abandoned or
         // reaped is already gone from its table by the time it says so.
         let path = self.path_of(connection);
-        // A range of the outbound request is this end's to re-supply, and the
-        // server above the transport holds no slot for a connection it did not
-        // accept — so a timeout for the dial is answered here or it is answered
-        // by nothing.
+        // A range of the outbound stream is this end's to re-supply, and the
+        // dial is the only connection this port has — so a timeout is answered
+        // here or it is answered by nothing.
         let len = if self.is_outbound(connection) {
             self.answer_outbound(now, timeout, out)
         } else {
-            out.get_mut(Ipv4Frame::PAYLOAD_AT..)
-                .and_then(|segment| self.http.answer(&mut self.tcp, now, timeout, segment))
+            None
         };
         self.reconcile();
         match (path, len) {
@@ -930,126 +896,6 @@ impl Endpoint {
                 len: self.frame_around(path, len, out),
             },
             _ => Polled::Handled,
-        }
-    }
-
-    /// The target a completed request is waiting on a rendered body for.
-    ///
-    /// A caller answers it by producing whatever the body is *about* and then
-    /// calling [`supply_body`](Self::supply_body): the two steps exist because
-    /// the body's source belongs to the target's owner and not to this crate.
-    /// See [`http`]'s header. The target is answered too, because the owner of
-    /// one rendered target is not the owner of another.
-    #[must_use]
-    pub fn body_wanted(&self) -> Option<&'static str> {
-        self.http.pending_render().map(|(_, target)| target)
-    }
-
-    /// Answer the request waiting on a whole body with `status` and whatever
-    /// `render` writes. See [`http::Server::supply`].
-    pub fn supply_body(
-        &mut self,
-        status: Status,
-        content_type: Option<ContentType>,
-        render: impl FnOnce(&mut [u8]) -> Option<usize>,
-    ) {
-        self.http.supply(status, content_type, render);
-    }
-
-    /// The target a submitted request body is waiting on a decision about. See
-    /// [`http::Server::pending_submission`].
-    #[must_use]
-    pub fn submission_wanted(&self) -> Option<&'static str> {
-        self.http.pending_submission().map(|(_, target)| target)
-    }
-
-    /// The submitted body itself. See [`http::Server::submission`].
-    #[must_use]
-    pub fn submission(&self) -> Option<&[u8]> {
-        self.http.submission()
-    }
-
-    /// Register `target` as streamed, not `404`. See [`http::Server::serve_stream_at`].
-    pub fn serve_stream_at(&mut self, target: &'static str) -> bool {
-        self.http.serve_stream_at(target)
-    }
-
-    /// Register `target` as answered on `GET` with a rendered body. See
-    /// [`http::Server::serve_rendered_at`].
-    pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
-        self.http.serve_rendered_at(target)
-    }
-
-    /// Register `target` as accepting a request body on `POST`. See
-    /// [`http::Server::serve_body_at`].
-    pub fn serve_body_at(&mut self, target: &'static str) -> bool {
-        self.http.serve_body_at(target)
-    }
-
-    /// The target a request awaits a decision on. See [`http::Server::pending_stream`].
-    #[must_use]
-    pub fn pending_stream(&self) -> Option<(ConnectionId, &'static str)> {
-        self.http.pending_stream()
-    }
-
-    /// Answer it with a body of `total` bytes. See [`http::Server::supply_stream`].
-    pub fn begin_stream(&mut self, total: u64, content_type: ContentType) -> bool {
-        self.http.supply_stream(total, content_type)
-    }
-
-    /// The window a streamed response needs. See [`http::Server::window_wanted`].
-    #[must_use]
-    pub fn window_wanted(&self) -> Option<(ConnectionId, u64, usize)> {
-        self.http.window_wanted()
-    }
-
-    /// Hand over that window. See [`http::Server::supply_window`].
-    pub fn supply_window(&mut self, start: u64, bytes: &[u8]) -> bool {
-        self.http.supply_window(start, bytes)
-    }
-
-    /// Give up on the streamed response. See [`http::Server::abandon_stream`].
-    pub fn abandon_stream(&mut self) {
-        self.http.abandon_stream();
-    }
-
-    /// Compose the next segment any connection's response owes, writing it into
-    /// `out` and answering what became of it.
-    ///
-    /// Driven in a loop until it answers [`Polled::Idle`], which happens as soon
-    /// as every connection is done or blocked on its peer's window; a caller
-    /// woken by one frame would otherwise send one segment per frame received.
-    /// Each answer hands one range to the transport, so the loop is bounded by
-    /// the response length and by `lfw_tcp::MAX_UNACKED`.
-    ///
-    /// A connection the server chose and could not drive ends the pass: the
-    /// server takes the connections that *can* send first, so one that produced
-    /// nothing is waiting on a window or on its peer, and neither arrives inside
-    /// a pass. Cleanup runs either way, which is why the drive's answer is not
-    /// short-circuited.
-    pub fn poll_output(&mut self, now: Monotonic, out: &mut [u8]) -> Polled {
-        // And here, so a wakeup that carried no frame at all — a neighbouring
-        // domain's notification — still reclaims the array and puts the 408 that
-        // says so on the wire.
-        self.http.expire(now);
-        self.http.sweep(&self.tcp);
-        let Some(connection) = self.http.pending() else {
-            return Polled::Idle;
-        };
-        let path = self.path_of(connection);
-        let composed = out
-            .get_mut(Ipv4Frame::PAYLOAD_AT..)
-            .and_then(|segment| self.http.drive(&mut self.tcp, now, connection, segment));
-        self.reconcile();
-        match (path, composed) {
-            (Some(path), Some(len)) => Polled::Frame {
-                len: self.frame_around(path, len, out),
-            },
-            // A segment the transport took and this end has nowhere to send: the
-            // transport holds the range and will ask for it again, and the pass
-            // goes on rather than stopping on a connection with no return path.
-            (None, Some(_)) => Polled::Handled,
-            (_, None) => Polled::Idle,
         }
     }
 
@@ -1520,8 +1366,8 @@ impl Endpoint {
         if header.protocol == Protocol::TCP {
             // The one thing read out of a segment before anything about it has
             // been verified, and it decides only which transport verifies it.
-            // A segment too short to carry the field goes to the HTTP port's
-            // stack, whose parse counts it as the malformed segment it is —
+            // A segment too short to carry the field goes to the management
+            // port's stack, whose parse counts it as the malformed segment it is —
             // so no segment goes uncounted for being unreadable here.
             return match lfw_tcp::peeked_destination_port(packet.payload()) {
                 Some(ONBOARDING_PORT) => self.onboarding(now, ethernet.header.source, &packet, out),
@@ -1689,7 +1535,7 @@ impl Endpoint {
 
     /// What the onboarding port's transport has seen, one field per cause. Its
     /// own table and its own numbers: see [`tcp_counters`](Self::tcp_counters)
-    /// for the HTTP port's.
+    /// for the management port's.
     #[must_use]
     pub const fn onboarding_counters(&self) -> TcpCounters {
         self.onboarding.counters()
@@ -1728,7 +1574,7 @@ impl Endpoint {
             self.tcp.receive(now, source, packet.payload(), segment)
         };
         let outcome = received.outcome;
-        let mut len = received.emitted;
+        let len = received.emitted;
 
         // The transport frees connections on its own — an eviction under table
         // pressure being the one no timeout announces — so what this crate holds
@@ -1750,15 +1596,11 @@ impl Endpoint {
                 outcome,
             };
         };
-        // A connection this end dialled keeps the path the *resolution* chose:
-        // its frames' Ethernet source is whatever answered, so learning from one
+        // Nothing is learned from the frame. The dial is the only connection
+        // this port holds, and its path is the one the *resolution* chose: its
+        // frames' Ethernet source is whatever answered, so learning from one
         // would let a station on the link take over a conversation this node
-        // began by answering it once. A connection a peer opened has no other
-        // source of a path, and this is it.
-        if !self.is_outbound(connection) {
-            self.remember(connection, peer_mac, source);
-        }
-
+        // began by answering it once.
         if self.is_outbound(connection) {
             // Before anything is made of the segment: that one arrived at all is
             // the fact separating a station that said nothing from one that
@@ -1793,26 +1635,11 @@ impl Endpoint {
             {
                 session.note_peer_closed();
             }
-        } else {
-            if !received.data.is_empty() {
-                self.http.take(now, connection, received.data);
-            }
-            if received.peer_closed {
-                self.http.note_peer_closed(connection);
-            }
-        }
-        if let Some(segment) = out.get_mut(Ipv4Frame::PAYLOAD_AT..)
-            && let Some(composed) = self.http.drive(&mut self.tcp, now, connection, segment)
-        {
-            // A data segment or a `FIN` carries the acknowledgement a bare one
-            // would have, so replacing the transport's answer loses nothing.
-            len = composed;
         }
         // Read before the reconciliation, which frees the path of a connection
         // the exchange just ended.
         let path = self.path_of(connection).unwrap_or((peer_mac, source));
         self.reconcile();
-        self.http.sweep(&self.tcp);
         if len == 0 {
             return Outcome::Tcp { len: 0, outcome };
         }
@@ -1937,16 +1764,14 @@ impl Endpoint {
             .map(|path| (path.mac, path.address))
     }
 
-    /// Release everything this crate holds for connections the transport no
-    /// longer does: the return paths here, and the request and response state in
-    /// the server above.
+    /// Release the return paths of connections the transport no longer holds.
     ///
     /// Reconciliation rather than a notification per release, because the
     /// transport takes a slot back for reasons that produce no event at all —
-    /// an eviction under table pressure is a `SYN` answered, not a timeout — and
-    /// a release nobody was told about is a return path and a request slot lost
-    /// for the life of the domain. Bounded by the table, so it is a walk of
-    /// [`TCP_CONNECTIONS`] entries wherever it is called.
+    /// a reaping is not a timeout the caller sees — and a release nobody was
+    /// told about is a return path lost for the life of the domain. Bounded by
+    /// the table, so it is a walk of [`TCP_CONNECTIONS`] entries wherever it is
+    /// called.
     fn reconcile(&mut self) {
         for index in 0..TCP_CONNECTIONS {
             let held = self.paths.get(index).copied().flatten();
@@ -1957,7 +1782,6 @@ impl Endpoint {
                 *slot = None;
             }
         }
-        self.http.reconcile(&self.tcp);
     }
 
     /// The two rules that decide whether a reply can be addressed at all, applied

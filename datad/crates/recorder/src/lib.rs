@@ -237,23 +237,7 @@ impl Flush {
     }
 }
 
-/// A pinned view of what a download will deliver: the durable bytes at the
-/// moment the request arrived.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Snapshot {
-    first: u64,
-    total: u64,
-}
-
-impl Snapshot {
-    /// The body length the response commits to.
-    #[must_use]
-    pub const fn total_len(&self) -> u64 {
-        self.total
-    }
-}
-
-/// Where a byte of a snapshot lives on the device.
+/// Where a byte of a recording lives on the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     sector: u64,
@@ -292,12 +276,12 @@ impl Span {
     }
 }
 
-/// What a reader's position resolves to, in whichever coordinate it asked in.
+/// What a reader's position resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Locate {
     Live(Span),
-    /// Past the last byte the reader may have: the end of its snapshot, or of
-    /// what the medium took. Nothing there **yet**.
+    /// Past the last byte the reader may have: the end of what the medium took.
+    /// Nothing there **yet**.
     PastEnd,
     /// The ring wrapped over these bytes, so the caller must abandon what it was
     /// reading rather than continue from a byte it did not ask for.
@@ -318,7 +302,6 @@ pub struct SinkCounters {
     pub wraps: u64,
     pub sectors_written: u64,
     pub padding_bytes: u64,
-    pub download_overruns: u64,
 }
 
 /// Which reader the **management channel's** cursor is in the superblock's
@@ -812,24 +795,6 @@ impl Sink {
         self.reader
     }
 
-    /// Pin what a download will deliver.
-    #[must_use]
-    pub fn snapshot(&self) -> Snapshot {
-        let (first, _) = self.ring.readable();
-        // Empty rather than clamping the segment count: a clamp keeps
-        // `durable.offset` in the total and hands a reader that many bytes out of
-        // `first`, which is a different segment entirely.
-        if self.durable.sequence < first {
-            return Snapshot { first, total: 0 };
-        }
-        let segment = self.ring.geometry().segment_bytes() as u64;
-        let segments = self.durable.sequence - first;
-        let total = segments
-            .saturating_mul(segment)
-            .saturating_add(self.durable.offset as u64);
-        Snapshot { first, total }
-    }
-
     /// One past the last byte of this ring the medium has taken, as an absolute
     /// position in its own append space. The append cursor runs ahead by
     /// everything staged, which a reader must not cross: the sectors under those
@@ -853,7 +818,7 @@ impl Sink {
 
     /// Where absolute ring position `position` lives on the device. The
     /// coordinate is `sequence * segment_bytes + offset`, which a restart
-    /// preserves — unlike [`Self::locate`]'s recomputed origin.
+    /// preserves — which is why it is the only one this sink resolves.
     pub fn find(&mut self, position: u64) -> Locate {
         let durable = self.durable_position();
         if position >= durable {
@@ -879,34 +844,6 @@ impl Sink {
                 len: (placement.len() as u64).min(durable.saturating_sub(position)) as usize,
             }),
             Located::Overrun { .. } => Locate::Overrun,
-            Located::Unwritten => Locate::PastEnd,
-        }
-    }
-
-    /// Where body byte `offset` of `snapshot` lives on the device.
-    pub fn locate(&mut self, snapshot: &Snapshot, offset: u64) -> Locate {
-        if offset >= snapshot.total {
-            return Locate::PastEnd;
-        }
-        let segment = self.ring.geometry().segment_bytes() as u64;
-        let sequence = snapshot.first.saturating_add(offset / segment);
-        let within = (offset % segment) as usize;
-        match self.ring.locate(sequence, within) {
-            Located::Live(placement) => {
-                let remaining = snapshot.total - offset;
-                let len = (placement.len() as u64).min(remaining) as usize;
-                Locate::Live(Span {
-                    sector: placement
-                        .sector()
-                        .saturating_add((within / SECTOR_SIZE) as u64),
-                    skip: within % SECTOR_SIZE,
-                    len,
-                })
-            }
-            Located::Overrun { .. } => {
-                self.counters.download_overruns = self.counters.download_overruns.saturating_add(1);
-                Locate::Overrun
-            }
             Located::Unwritten => Locate::PastEnd,
         }
     }

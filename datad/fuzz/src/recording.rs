@@ -170,11 +170,7 @@ fn take_step(unstructured: &mut Unstructured<'_>) -> Option<Step> {
             },
         },
         1 => Step::Demand {
-            reader: if bool::arbitrary(unstructured).ok()? {
-                DownloadReader::Ring
-            } else {
-                DownloadReader::Snapshot
-            },
+            reader: DownloadReader::Ring,
             sink: if bool::arbitrary(unstructured).ok()? {
                 DownloadSink::Capture
             } else {
@@ -1480,9 +1476,9 @@ const MAX_SINK_STEPS: usize = 96;
 ///   never more than the staging buffer holds — what makes "no sector is
 ///   written twice" a property of the placement rather than of the encoder, and
 ///   what bounds the caller's own read out of the buffer. Unconditional.
-/// * **Nothing is promised that is not durable.** `snapshot().total_len()`
-///   never exceeds the bytes the device has actually been handed, so a download
-///   cannot commit to a body the medium does not hold. The one assertion here
+/// * **Nothing is promised that is not durable.** `durable_position()`
+///   never exceeds the bytes the device has actually been handed, so a reader
+///   cannot be committed to bytes the medium does not hold. The one assertion here
 ///   that is *scoped* rather than unconditional — see
 ///   [`assert_promises_only_durable_bytes`] for which caller contract it rests
 ///   on, which component enforces that contract, and why scoping it removes no
@@ -1635,23 +1631,19 @@ pub fn recorder_sink(data: &[u8]) {
             "{label}: the append cursor left its segment"
         );
 
-        let snapshot = sink.snapshot();
-        assert_promises_only_durable_bytes(&snapshot, flushed, contract_kept, label);
+        let durable = sink.durable_position();
+        assert_promises_only_durable_bytes(durable, flushed, contract_kept, label);
 
-        // A download reads the snapshot at an offset the management domain
-        // chose, so the offset is taken whole rather than reduced into it.
-        let offset = any_u64(&mut unstructured);
-        for at in [
-            offset,
-            snapshot.total_len(),
-            snapshot.total_len().saturating_sub(1),
-        ] {
-            if let Locate::Live(span) = sink.locate(&snapshot, at) {
+        // The channel reads an absolute ring position the management domain
+        // chose, so the position is taken whole rather than reduced into range.
+        let position = any_u64(&mut unstructured);
+        for at in [position, durable, durable.saturating_sub(1)] {
+            if let Locate::Live(span) = sink.find(at) {
                 assert_span_inside(&span, &geometry, label);
                 assert!(
-                    at < snapshot.total_len(),
-                    "{label}: offset {at} of a {}-byte snapshot resolved to live bytes",
-                    snapshot.total_len()
+                    at < durable,
+                    "{label}: position {at} of a recording durable to {durable} resolved to live \
+                     bytes"
                 );
             }
         }
@@ -1700,15 +1692,15 @@ pub fn recorder_sink(data: &[u8]) {
 ///
 /// # Why this one invariant is scoped, and the rest are not
 ///
-/// [`lfw_recorder::Snapshot::total_len`] is `(durable.sequence - oldest) *
+/// [`lfw_recorder::Sink::durable_position`] is `durable.sequence *
 /// segment_bytes + durable.offset`, so it counts every segment before the
 /// durable one as a *whole* segment of body. That is true exactly when each of
 /// them was padded to its end by `close_segment` and then flushed — which is
 /// the precondition `Sink::begin_segment` delegates to its caller ("call only
 /// once the closed segment's bytes are on the device"), and which
 /// `Deck::advance` is the component that enforces it: it reopens a segment only
-/// while `rolling && in_flight.is_none() && staged() == 0`. Roll a half-written segment instead and the snapshot counts
-/// the part nobody wrote, offering a download bytes the medium never received.
+/// while `rolling && in_flight.is_none() && staged() == 0`. Roll a half-written segment instead and the position counts
+/// the part nobody wrote, offering a reader bytes the medium never received.
 ///
 /// So the bound is asserted while the caller kept that contract, and not while
 /// it did not. The distinction that matters is that this **scopes an assertion,
@@ -1725,7 +1717,7 @@ pub fn recorder_sink(data: &[u8]) {
 /// did everything the API asks of it was still promised bytes the device does
 /// not hold.
 fn assert_promises_only_durable_bytes(
-    snapshot: &lfw_recorder::Snapshot,
+    durable: u64,
     flushed: u64,
     contract_kept: bool,
     label: &str,
@@ -1734,10 +1726,9 @@ fn assert_promises_only_durable_bytes(
         return;
     }
     assert!(
-        snapshot.total_len() <= flushed,
-        "{label}: a snapshot promises {} bytes of body where {flushed} have reached the device, \
-         and every segment was closed and flushed before the next was opened",
-        snapshot.total_len()
+        durable <= flushed,
+        "{label}: a recording is reported durable to {durable} where {flushed} bytes have reached \
+         the device, and every segment was closed and flushed before the next was opened"
     );
 }
 

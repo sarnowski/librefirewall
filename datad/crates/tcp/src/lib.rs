@@ -3,7 +3,8 @@
 //!
 //! # What this is for
 //!
-//! It is the stack the management endpoint answers on and dials out of, and the
+//! It is the stack the management endpoint dials out of and the onboarding port
+//! answers on, and the
 //! one the proxy dataplane will run on. That second use is what fixes every constraint
 //! below, so none of them is a management-endpoint economy: a proxy terminating
 //! traffic at the 10 Gbit/s-per-port-pair target cannot afford a copy, cannot
@@ -25,6 +26,17 @@
 //!   that attacker inject into a connection it cannot see; and the connection
 //!   table is bounded and reapable from both ends, because a flood of half-open
 //!   connections is the cheapest attack there is against a listener.
+//!
+//! # A stack need not listen at all
+//!
+//! [`TcpStack::dialling`] builds one that composes connections from its port and
+//! opens none for a peer. It is not a mode of the same thing: the passive open is
+//! the whole of a listener's exposure to the adversary above — a table slot, a
+//! sequence space and a challenge budget committed on a segment anybody can
+//! send — and withdrawing it leaves a port whose only connection is one this end
+//! chose to make. The port number stays, because a dial composes its source port
+//! from it and the answer arrives addressed to it; what a `SYN` now meets is the
+//! `not_listening` refusal, counted like any other.
 //!
 //! # It owns no buffers, and that is the whole design
 //!
@@ -267,7 +279,8 @@ pub enum Outcome {
 pub enum Rejection {
     /// Not a TCP segment, or not one whose checksum verifies.
     Malformed(SegmentError),
-    /// A port this stack does not listen on. Dropped in silence; see
+    /// A segment no listener answers: a port this stack does not hold, or its
+    /// own port on a stack built to dial only. Dropped in silence; see
     /// `connection`'s header on why RFC 793's `RST` is not sent.
     NotListening { port: u16 },
     /// A segment for a 4-tuple with no connection.
@@ -429,6 +442,11 @@ pub struct Sent {
 pub struct TcpStack<const CONNECTIONS: usize> {
     address: Ipv4Address,
     port: u16,
+    /// Whether a `SYN` for this port opens a connection. False on a stack built
+    /// to dial only: the port still owns a number — a dial composes its source
+    /// port from it, and the answer arrives back addressed to it — and nothing
+    /// behind it accepts. See the crate header.
+    listening: bool,
     /// The largest payload this end will put in one segment, and the clamp a
     /// peer's offered segment size is held to.
     mss_limit: u16,
@@ -461,9 +479,43 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         receive_window: u32,
         secret: IsnSecret,
     ) -> Self {
+        Self::build(address, port, mss_limit, receive_window, secret, true)
+    }
+
+    /// A stack that **dials only**: it composes connections from `port` and
+    /// refuses every `SYN` that arrives for it.
+    ///
+    /// The port is still this stack's, and that is the whole reason the two
+    /// constructors differ by a flag rather than by an `Option<u16>`: a dial
+    /// takes its source port from here, so a stack with no port could not
+    /// compose one, and the `SYN-ACK` that comes back is addressed to it and
+    /// must reach [`receive`](Self::receive) to advance the connection. What is
+    /// withdrawn is the passive open alone — a `SYN` is counted as
+    /// [`Rejection::NotListening`] and dropped, exactly as one for a port this
+    /// stack never had.
+    #[must_use]
+    pub fn dialling(
+        address: Ipv4Address,
+        port: u16,
+        mss_limit: u16,
+        receive_window: u32,
+        secret: IsnSecret,
+    ) -> Self {
+        Self::build(address, port, mss_limit, receive_window, secret, false)
+    }
+
+    fn build(
+        address: Ipv4Address,
+        port: u16,
+        mss_limit: u16,
+        receive_window: u32,
+        secret: IsnSecret,
+        listening: bool,
+    ) -> Self {
         Self {
             address,
             port,
+            listening,
             mss_limit,
             receive_window,
             isn: IsnGenerator::new(secret),
@@ -472,6 +524,12 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
             challenges: ChallengeBudget::new(),
             counters: TcpCounters::new(),
         }
+    }
+
+    /// Whether a `SYN` for this stack's port opens a connection.
+    #[must_use]
+    pub const fn listening(&self) -> bool {
+        self.listening
     }
 
     #[must_use]
@@ -565,7 +623,16 @@ impl<const CONNECTIONS: usize> TcpStack<CONNECTIONS> {
         }
         match self.find(source, parsed.source_port) {
             Some(slot) => self.advance(now, slot, source, &parsed, out),
-            None => self.open(now, source, &parsed, out),
+            None if self.listening => self.open(now, source, &parsed, out),
+            // The port is ours and nothing behind it accepts. Counted under the
+            // cause a wrong port already carries, because it is the same fact
+            // about this stack: no listener answers here.
+            None => {
+                TcpCounters::bump(&mut self.counters.refused_not_listening);
+                self.rejected(Rejection::NotListening {
+                    port: parsed.destination_port,
+                })
+            }
         }
     }
 

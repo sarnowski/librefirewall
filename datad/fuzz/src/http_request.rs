@@ -40,9 +40,10 @@ use lfw_http::{
 
 use crate::{any_index, any_u16};
 
-/// The body bound heads here are read against: the management server's own, so a
-/// declared length this harness accepts is one that server would accept.
-const BODY_LIMIT: usize = lfw_ip_endpoint::http::MAX_BODY_LEN;
+/// The body bound heads here are read against: the onboarding surface's own,
+/// that surface being the one caller this parser has, so a declared length this
+/// harness accepts is one it would accept.
+const BODY_LIMIT: usize = lfw_onboarding::MAX_UPLOAD_LEN;
 
 /// Segments one input is cut into, at most. A bound on the harness's own work
 /// rather than on the adversary's authority: the cut *points* are arbitrary and

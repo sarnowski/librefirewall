@@ -23,11 +23,16 @@
 //!   handed over, and the bytes past its length are never touched. This is the
 //!   claim the protection domain rests on: it writes that many bytes into a pool
 //!   buffer.
-//! * **Both listening ports are reachable, and the adversary reaches whichever
-//!   it names.** The endpoint answers on two ports and runs a transport per
-//!   port, so a harness that could only address one would model an adversary
-//!   that cannot reach the other. Every frame is offered to the demultiplexing
-//!   as it stands, and the flood below floods both.
+//! * **Both ports are reachable, and the adversary reaches whichever it names.**
+//!   The endpoint runs a transport per port, so a harness that could only
+//!   address one would model an adversary that cannot reach the other. Every
+//!   frame is offered to the demultiplexing as it stands, and the flood below
+//!   floods both.
+//! * **The management port opens nothing.** Its transport dials and never
+//!   accepts, so no `SYN` — well-formed, from any station, at any rate — puts a
+//!   connection in its table. That is the property the whole management plane's
+//!   exposure now rests on, and a flood is what would find it if it did not
+//!   hold.
 //! * **A reply is only ever produced for a frame addressed to us**, at L2 and at
 //!   L3, and it always leaves *as* us and *to* the station that asked. A reply to
 //!   a group address would make the port a reflector; a reply from an address
@@ -45,15 +50,20 @@
 //!   frame cannot reach that: random bytes never compose a segment whose
 //!   checksum verifies, so a single-frame harness never opens a connection and
 //!   never fills the table. A second phase therefore floods one endpoint with
-//!   *well-formed* handshakes from more sources than the table holds, injecting
-//!   the adversary's own frame between them, and holds the endpoint to the
-//!   invariant an eviction breaks: one return path per live connection, no more
-//!   and no fewer, and never a request slot the server could not find.
+//!   *well-formed* handshakes at both ports from more sources than either table
+//!   holds, injecting the adversary's own frame between them, and holds the
+//!   endpoint to the invariant an eviction breaks: one return path per live
+//!   connection, no more and no fewer.
+//! * **The outbound path is driven under the same frames.** The connection this
+//!   endpoint composes is the one it dialled, so a harness that only ever
+//!   answered would leave the whole dial — resolution, `SYN`, the session's
+//!   own reads of what arrives — unreached. A third phase opens a session and
+//!   polls it to exhaustion with the adversary's frame arriving throughout.
 
 use lfw_clock::{Calibration, Monotonic, Ticks};
 use lfw_ip_endpoint::{
-    ContentType, Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing,
-    SeqNumber, Status, TCP_CONNECTIONS, TCP_MSS, Unhandled,
+    Endpoint, Flags, IsnSecret, MANAGEMENT_PORT, Malformed, Outcome, Outgoing, SeqNumber,
+    TCP_CONNECTIONS, TCP_MSS, Unhandled,
     onboard::{INBOUND_CAPACITY as ONBOARD_INBOUND, ONBOARDING_PORT},
 };
 use net_headers::{
@@ -104,6 +114,7 @@ const UNTOUCHED: u8 = 0xa5;
 pub fn ip_endpoint_harness(data: &[u8]) {
     assert_one_frame_is_answered(data);
     assert_state_stays_bounded_under_a_connection_flood(data);
+    assert_the_dial_survives_whatever_arrives(data);
 }
 
 /// Hand one frame to an addressed endpoint and hold both the reply and the
@@ -117,23 +128,8 @@ fn assert_one_frame_is_answered(data: &[u8]) {
         IsnSecret::from_bytes(SECRET),
     )
     .expect("a unicast pair on a /24");
-    // The configuration surface, registered as a real domain registers it: with
-    // no rendered target at all the body path below is unreachable, and a
-    // harness that cannot reach a path reads as coverage of it.
-    assert!(endpoint.serve_rendered_at("/config"));
     let mut out = [UNTOUCHED; REPLY_CAPACITY];
     let outcome = endpoint.handle(Some(now()), data, &mut out);
-    // A body of stated bytes rather than a real one: this harness is about the
-    // frame path, and what a target's body says is its owner's business.
-    // Supplied so a request that reached the server does not leave a connection
-    // waiting on one for ever.
-    if endpoint.body_wanted().is_some() {
-        endpoint.supply_body(Status::Ok, Some(ContentType::Xml), |out| {
-            let body = b"<configuration/>";
-            out.get_mut(..body.len())?.copy_from_slice(body);
-            Some(body.len())
-        });
-    }
 
     // One frame, one recorded outcome: the counters are what a reading carries,
     // so a path that answered without recording would be invisible.
@@ -216,8 +212,10 @@ fn assert_one_frame_is_answered(data: &[u8]) {
             assert_eq!(echoed[2..], asked[2..], "the echo was not repeated");
             assert_eq!(endpoint.counters().echo_replies, 1);
         }
-        // A segment the transport composed: framed as this endpoint, addressed to
-        // the station that sent it, and carrying TCP. Everything *inside* it is
+        // A segment the management transport composed: framed as this endpoint,
+        // addressed to the station that sent it, and carrying TCP. It never
+        // opens anything — that port dials only — so what reaches here is an
+        // answer on a connection this end made. Everything *inside* it is
         // `crate::tcp`'s surface, driven there over whole operation streams
         // rather than one frame at a time.
         Outcome::Tcp { .. } => {
@@ -227,8 +225,8 @@ fn assert_one_frame_is_answered(data: &[u8]) {
             assert_eq!(packet.header().protocol, Protocol::TCP);
             assert_eq!(endpoint.counters().tcp_segments, 1);
         }
-        // The other listening port, whose answers are the same frame under the
-        // same two rules — and are counted apart, which is the whole reason the
+        // The listening port, whose answers are the same frame under the same
+        // two rules — and are counted apart, which is the whole reason the
         // outcome is its own variant.
         Outcome::Onboarding { .. } => {
             assert_eq!(sent.header.ether_type, EtherType::IPV4);
@@ -305,15 +303,20 @@ fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
             endpoint.stream().connection().is_none() || endpoint.stream().peer().is_some(),
             "an onboarding session was held with nowhere to answer it {where_}"
         );
+        // Nothing dials in this phase, so the management table is the whole of
+        // what a `SYN` could have put there — and a port that opens nothing
+        // leaves it empty however hard it is knocked on. Which makes the return
+        // paths an equality rather than a bound: with no connection there is
+        // nothing for one to belong to.
         assert_eq!(
-            endpoint.return_paths(),
             endpoint.connections(),
-            "a return path outlived its connection {where_}"
+            0,
+            "a SYN opened a connection on the port that dials only {where_}"
         );
         assert_eq!(
-            endpoint.http_counters().slots_exhausted,
+            endpoint.return_paths(),
             0,
-            "the server had no slot for a connection the transport made room for {where_}"
+            "a return path outlived its connection {where_}"
         );
     };
 
@@ -350,11 +353,93 @@ fn assert_state_stays_bounded_under_a_connection_flood(frame: &[u8]) {
             hold(&endpoint, "while the timers were draining");
         }
         for _ in 0..(8 * TCP_CONNECTIONS) {
-            if !endpoint.poll_output(at, &mut out).goes_on() {
+            if !endpoint.poll_onboarding(at, &mut out).goes_on() {
                 break;
             }
-            hold(&endpoint, "while the output was draining");
+            hold(&endpoint, "while the onboarding port was draining");
         }
+    }
+    hold(&endpoint, "once everything had settled");
+}
+
+/// Steps one pass of the outbound session is driven for. Bounded here rather
+/// than by the session, which is driven to exhaustion by a protection domain
+/// under a limit of its own.
+const DIAL_STEPS: usize = 64;
+
+/// Open the one session this endpoint reaches out with, drive it with `frame`
+/// arriving throughout, and hold what it keeps to the same bounds.
+///
+/// The dial is the only way a connection enters the management table at all, so
+/// this is where that table is exercised — and where the frame under test meets
+/// an endpoint that has a session in every phase a session passes through: the
+/// resolution, the `SYN` before an answer, and whatever the peer's bytes are
+/// taken into afterwards.
+fn assert_the_dial_survives_whatever_arrives(frame: &[u8]) {
+    let mut endpoint = Endpoint::new(
+        OUR_MAC,
+        OUR_ADDRESS,
+        PREFIX_LENGTH,
+        Some(GATEWAY),
+        IsnSecret::from_bytes(SECRET),
+    )
+    .expect("a unicast pair on a /24");
+    let mut out = [UNTOUCHED; REPLY_CAPACITY];
+
+    let hold = |endpoint: &Endpoint, where_: &str| {
+        // One session at a time, so one connection: the table's slack is what a
+        // redial spends and never a second conversation.
+        assert!(
+            endpoint.connections() <= 1,
+            "the port that dials only held more than the session's connection {where_}"
+        );
+        // A path never outlives its connection, and — unlike the listening
+        // port's — a dial's connection may legitimately have none: the `SYN` is
+        // composed whether or not the next hop is resolved, so the connection
+        // exists while the resolution runs and the segment is dropped rather
+        // than queued. So the bound is an inequality here and an equality only
+        // where nothing has dialled.
+        assert!(
+            endpoint.return_paths() <= endpoint.connections(),
+            "a return path outlived its connection {where_}"
+        );
+        assert!(
+            endpoint.outbound_send_room() <= lfw_ip_endpoint::outbound::SEND_CAPACITY,
+            "the session offered room past its own array {where_}"
+        );
+    };
+
+    endpoint
+        .open_outbound(STATION_ADDRESS, 4444)
+        .expect("a destination on this link");
+    hold(&endpoint, "once the session was opened");
+    // A second open is refused rather than served, whatever has arrived: two
+    // sessions would be two connections the consumer above cannot tell apart.
+    assert!(endpoint.open_outbound(STATION_ADDRESS, 4444).is_err());
+
+    for step in 0..8u64 {
+        let at = tick(1_000 + step * lfw_clock::NANOS_PER_SECOND);
+        endpoint.handle(Some(at), frame, &mut out);
+        hold(&endpoint, "after the frame under test");
+        for _ in 0..DIAL_STEPS {
+            if !endpoint.poll_outbound(at, &mut out).goes_on() {
+                break;
+            }
+            hold(&endpoint, "while the dial was advancing");
+        }
+        for _ in 0..DIAL_STEPS {
+            if !endpoint.poll_timeouts(at, &mut out).goes_on() {
+                break;
+            }
+            hold(&endpoint, "while the dial's timers were draining");
+        }
+        // Whatever the peer said is taken by the consumer above, exactly as the
+        // protection domain takes it: a session nobody drained would bound
+        // itself by filling up, which is not the bound being asserted.
+        let taken = endpoint
+            .outbound()
+            .map_or(0, |session| session.received().len());
+        endpoint.consume_outbound(taken);
     }
     hold(&endpoint, "once everything had settled");
 }

@@ -1,7 +1,6 @@
 use lfw_flow::FlowTable;
-use lfw_http::Status;
 use lfw_metrics::{
-    FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_STATES, HTTP_STATUSES, PIPELINES,
+    FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_STATES, PIPELINES,
     POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, ROUTE_STAGE_DROP_REASONS, SHARDS,
     STATS_SLOTS,
 };
@@ -40,18 +39,6 @@ fn the_unhandled_vocabulary_is_the_endpoints_own() {
     assert_eq!(series.len(), Unhandled::ALL.len());
     for (token, reason) in series.iter().zip(Unhandled::ALL) {
         assert_eq!(*token, reason.name(), "{reason:?}");
-    }
-}
-
-/// And for the statuses the server can answer with: the counter table's order is
-/// `lfw_http::Status::ALL`'s, so a slot is stable and a status added to one and
-/// not the other is a build-time mismatch here rather than a miscounted response.
-#[test]
-fn the_status_vocabulary_is_the_servers_own() {
-    assert_eq!(HTTP_STATUSES.len(), Status::ALL.len());
-    for (token, status) in HTTP_STATUSES.iter().zip(Status::ALL) {
-        assert_eq!(*token, status.token(), "{status:?}");
-        assert_eq!(HTTP_STATUSES[status.slot()], status.token());
     }
 }
 
@@ -206,7 +193,7 @@ fn an_unaddressed_port_publishes_its_stage_and_zeroes_the_rest() {
     assert_eq!(sample.stage_drops[3], 9);
     assert_eq!(sample.endpoint, lfw_metrics::EndpointSample::default());
     assert_eq!(sample.tcp, lfw_metrics::TcpSample::default());
-    assert_eq!(sample.http, lfw_metrics::HttpSample::default());
+    assert_eq!(sample.onboarding, lfw_metrics::TcpSample::default());
 }
 
 /// Every field of `TcpCounters` reaches a slot of its own. The transport has

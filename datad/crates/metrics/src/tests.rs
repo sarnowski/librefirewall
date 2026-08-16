@@ -273,9 +273,9 @@ fn every_sample_type_fills_exactly_its_declared_slots() {
             write_refused: 3,
             ..TcpSample::default()
         },
-        http: HttpSample {
-            bodies_refused: 4,
-            ..HttpSample::default()
+        onboarding: TcpSample {
+            write_refused: 4,
+            ..TcpSample::default()
         },
         log: LogSample {
             dropped: 0,
@@ -579,7 +579,7 @@ fn a_filled_block_lands_only_on_the_series_that_declare_it() {
 ///
 /// The discriminating label rather than the first one: the transport families
 /// carry `service` in front of the label that separates their series, so a first
-/// label would read `http` twenty-nine times and separate nothing.
+/// label would read `channel` twenty-nine times and separate nothing.
 fn lands_on_its_own_series(sample: &ManagementSample, owed: &[(&Metric, &str, u64)]) {
     let values = sample.values();
     let mut seen = Vec::new();

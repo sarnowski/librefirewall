@@ -69,12 +69,12 @@ pub use sample::{
     ConfigSample, ConsoleSample, CryptoSample, DRIVER_SLOTS, DriverSample, EndpointSample,
     FLOW_LIFECYCLE_EVENTS, FLOW_OUTCOMES, FLOW_REFUSALS, FLOW_SLOTS, FLOW_STATES,
     FORWARDER_SHARD_SLOTS, FORWARDER_SLOTS, FlowSample, ForwarderSample, GENERATION_OUTCOME_NAMES,
-    GENERATION_OUTCOMES, HARDWARE_PROBE_SLOTS, HTTP_STATUSES, HardwareProbeSample, HttpSample,
-    LogSample, MANAGEMENT_SLOTS, MAX_RULE_SERIES, ManagementSample, NeighbourSample, OnboardSample,
-    OutboundSample, PIPELINES, POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS,
-    POLICY_SWEEP_SLOTS, PipelineSample, PolicySample, PolicySweepSample, PoolSample,
-    RECORDER_SLOTS, ROUTE_DROP_REASONS, ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample,
-    SINKS, STORE_SLOTS, SinkSample, StoreSample, TapSample, TcpSample, UartSample,
+    GENERATION_OUTCOMES, HARDWARE_PROBE_SLOTS, HardwareProbeSample, LogSample, MANAGEMENT_SLOTS,
+    MAX_RULE_SERIES, ManagementSample, NeighbourSample, OnboardSample, OutboundSample, PIPELINES,
+    POLICY_SWEEP_OUTCOMES, POLICY_SWEEP_PROGRESS_KINDS, POLICY_SWEEP_SLOTS, PipelineSample,
+    PolicySample, PolicySweepSample, PoolSample, RECORDER_SLOTS, ROUTE_DROP_REASONS,
+    ROUTE_STAGE_DROP_REASONS, RULE_HITS_BASE, RecorderSample, SINKS, STORE_SLOTS, SinkSample,
+    StoreSample, TapSample, TcpSample, UartSample,
 };
 pub use snapshot::{
     CATALOGUE_FINGERPRINT, DecodeError as SnapshotDecodeError, EncodeError as SnapshotEncodeError,

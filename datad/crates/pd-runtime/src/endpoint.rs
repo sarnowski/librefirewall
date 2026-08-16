@@ -68,8 +68,7 @@ use lfw_clock::{
     Calibration, MAX_PLAUSIBLE_TSC_HZ, MIN_PLAUSIBLE_TSC_HZ, Monotonic, Ticks, UtcNanos,
 };
 use lfw_ip_endpoint::{
-    ConnectionId, ContentType, Endpoint, IsnSecret, Status,
-    http::{MAX_BODY_TARGETS, MAX_RENDERED_TARGETS},
+    ConnectionId, Endpoint, IsnSecret,
     onboard::{Ended as OnboardEnded, StreamCounters},
     outbound::{DialFacts, Ended, OpenError, Resolutions, Session},
     route::Hop,
@@ -94,17 +93,9 @@ use crate::{
 /// being able to owe at most a retransmission and a reaping in one instant.
 pub const TIMER_LIMIT: usize = 2 * lfw_ip_endpoint::TCP_CONNECTIONS;
 
-/// How many segments one pass may send out of the server above the transport.
-///
-/// A bound the peer does not choose, derived rather than picked: a
-/// connection may have at most `lfw_tcp::MAX_UNACKED` ranges outstanding before
-/// its window refuses another, so this is every connection saturated at once and
-/// the loop stops long before it on any real pass.
-pub const OUTPUT_LIMIT: usize = lfw_tcp_max_unacked() * lfw_ip_endpoint::TCP_CONNECTIONS;
-
 /// How many steps one pass may spend on the outbound session.
 ///
-/// A bound the peer does not choose, on [`OUTPUT_LIMIT`]'s terms: every answer
+/// A bound the peer does not choose, derived rather than picked: every answer
 /// from `Endpoint::poll_outbound` either moves the session's phase, hands a
 /// range to the transport, or puts a resolution request on the wire, so the loop
 /// terminates on its own. One session owes at most a resolution, a dial, its
@@ -114,7 +105,7 @@ pub const DIAL_LIMIT: usize = lfw_tcp_max_unacked() + 4;
 
 /// How many steps one pass may spend on the onboarding port.
 ///
-/// A bound the peer does not choose, on [`OUTPUT_LIMIT`]'s terms: every answer
+/// A bound the peer does not choose, on [`DIAL_LIMIT`]'s terms: every answer
 /// from `Endpoint::poll_onboarding` either hands a range to the transport, frees
 /// the connection or moves a deadline, so the loop terminates on its own. One
 /// session owes at most its answer in `MAX_UNACKED` ranges, a close, and the
@@ -281,12 +272,6 @@ pub struct EndpointStage<'ring> {
     /// picked up and an unchanged one is not re-read.
     clock_generation: u32,
     config: CommittedReader,
-    /// The targets this domain answers with a body it renders whole, and the ones
-    /// it accepts a request body on. Held here as well as in the endpoint because
-    /// a committed generation builds a **new** endpoint, and a registration this
-    /// domain did not keep would be lost with the old one.
-    rendered: [Option<&'static str>; MAX_RENDERED_TARGETS],
-    bodies: [Option<&'static str>; MAX_BODY_TARGETS],
     /// Every stats region this domain is granted: its own, written at the end of
     /// each pass, and the eleven it reads to compose a reading.
     stats: StatsRegions<'ring>,
@@ -346,8 +331,6 @@ impl<'ring> EndpointStage<'ring> {
             calibration: None,
             clock_generation: 0,
             config: CommittedReader::new(),
-            rendered: [None; MAX_RENDERED_TARGETS],
-            bodies: [None; MAX_BODY_TARGETS],
             stats,
             received: [0; BUFFER_SIZE],
             reply: [0; MAX_REPLY_LEN],
@@ -402,7 +385,6 @@ impl<'ring> EndpointStage<'ring> {
         match taken {
             Ok((generation, endpoint)) => {
                 self.adopt(endpoint);
-                self.apply_targets();
                 self.counters.generation = generation;
                 None
             }
@@ -490,101 +472,6 @@ impl<'ring> EndpointStage<'ring> {
         }
     }
 
-    /// Register `target` as one this domain answers on `GET` with a body it
-    /// renders whole, rather than with `404`.
-    ///
-    /// Called once at start-up: the registration outlives every committed
-    /// generation, because a new document replaces the endpoint and this is what
-    /// puts the target back on it. Answers `false` where the target is already
-    /// registered or where the table is full — answered rather than asserted, so
-    /// a caller learns of its own mistake.
-    pub fn serve_rendered_at(&mut self, target: &'static str) -> bool {
-        if self.rendered.iter().flatten().any(|it| *it == target) {
-            return false;
-        }
-        let Some(slot) = self.rendered.iter_mut().find(|slot| slot.is_none()) else {
-            return false;
-        };
-        *slot = Some(target);
-        self.apply_targets();
-        true
-    }
-
-    /// Register `target` as one this domain accepts a request body on, on the same
-    /// terms — except that a target already answered on `GET` is *not* refused:
-    /// one path that states a resource and replaces it is what the configuration
-    /// surface is.
-    pub fn serve_body_at(&mut self, target: &'static str) -> bool {
-        if self.bodies.iter().flatten().any(|it| *it == target) {
-            return false;
-        }
-        let Some(slot) = self.bodies.iter_mut().find(|slot| slot.is_none()) else {
-            return false;
-        };
-        *slot = Some(target);
-        self.apply_targets();
-        true
-    }
-
-    /// Put every registered target on the endpoint in force.
-    ///
-    /// Each registration takes: the endpoint's own tables are bounded by the same
-    /// constants these are and hold no duplicate, which is the whole of what they
-    /// refuse.
-    fn apply_targets(&mut self) {
-        let (rendered, bodies) = (self.rendered, self.bodies);
-        let Some(endpoint) = self.endpoint.as_mut() else {
-            return;
-        };
-        for target in rendered.iter().flatten() {
-            endpoint.serve_rendered_at(target);
-        }
-        for target in bodies.iter().flatten() {
-            endpoint.serve_body_at(target);
-        }
-    }
-
-    /// The target a request is waiting on a rendered body for, or `None`.
-    #[must_use]
-    pub fn body_wanted(&self) -> Option<&'static str> {
-        self.endpoint.as_ref()?.body_wanted()
-    }
-
-    /// The document a `POST` submitted, waiting on a decision.
-    #[must_use]
-    pub fn submission(&self) -> Option<&[u8]> {
-        self.endpoint.as_ref()?.submission()
-    }
-
-    /// Answer the request waiting on a whole body by copying `bytes` into the
-    /// endpoint's staging array.
-    ///
-    /// Copied rather than borrowed into the array, because the two live in
-    /// different places: the bytes come out of a shared region this domain reads and
-    /// the array is the endpoint's own. The copy is bounded by the array, which the
-    /// server's own reservation is what sizes.
-    pub fn supply_rendered(
-        &mut self,
-        status: Status,
-        content_type: Option<ContentType>,
-        bytes: &[u8],
-    ) {
-        let Some(endpoint) = self.endpoint.as_mut() else {
-            return;
-        };
-        endpoint.supply_body(status, content_type, |out| {
-            let mut written = 0usize;
-            for (cell, byte) in out.iter_mut().zip(bytes) {
-                *cell = *byte;
-                written = written.saturating_add(1);
-            }
-            // A body that does not fit is refused rather than truncated: the server
-            // counts it and answers `503`, which is the same answer a renderer that
-            // could not compose one gets.
-            (written == bytes.len()).then_some(written)
-        });
-    }
-
     /// The instant `now` names, or `None` while no calibration has been taken.
     #[must_use]
     pub fn monotonic(&self, now: Ticks) -> Option<Monotonic> {
@@ -651,39 +538,9 @@ impl<'ring> EndpointStage<'ring> {
         self.publish(log);
         if let Some(now) = now {
             self.drive_timers(now);
-            self.drive_output(now);
         }
         self.publish(log);
         frames
-    }
-
-    /// Send whatever the server above the transport now owes.
-    ///
-    /// A response spans many segments and a pass is woken by one frame, so
-    /// without this a response would advance one segment per acknowledgement
-    /// round trip. Bounded by [`OUTPUT_LIMIT`] as well as by the loop's own
-    /// termination — every answer hands a range to the transport, and a
-    /// connection blocks once `lfw_tcp::MAX_UNACKED` of them are outstanding.
-    fn drive_output(&mut self, now: Monotonic) {
-        for _ in 0..OUTPUT_LIMIT {
-            let Self {
-                endpoint, reply, ..
-            } = self;
-            let Some(endpoint) = endpoint.as_mut() else {
-                return;
-            };
-            // A pass that produced no frame is not a pass with nothing left to
-            // do: cleanup after a connection the transport freed produces
-            // nothing, and stopping there would leave every other connection's
-            // segments until the next wakeup.
-            let polled = endpoint.poll_output(now, reply);
-            if !polled.goes_on() {
-                return;
-            }
-            if let Some(len) = polled.frame() {
-                self.send(len);
-            }
-        }
     }
 
     /// Write this domain's own counters into the shard it owns.
@@ -825,9 +682,7 @@ impl<'ring> EndpointStage<'ring> {
 
     /// Send whatever the outbound session now owes.
     ///
-    /// [`drive_output`](Self::drive_output)'s shape on the half that dials
-    /// rather than answers, and bounded the same way: by [`DIAL_LIMIT`] as well
-    /// as by the loop's own termination. A step that produces no frame is not
+    /// Bounded by [`DIAL_LIMIT`] as well as by the loop's own termination. A step that produces no frame is not
     /// the end of a pass — a resolution that is still outstanding produces
     /// nothing and the step after it may.
     pub fn drive_dial(&mut self, now: Monotonic) {
@@ -933,7 +788,7 @@ impl<'ring> EndpointStage<'ring> {
 
     /// Send whatever the onboarding port now owes.
     ///
-    /// [`drive_output`](Self::drive_output)'s shape on the port that carries a
+    /// [`drive_dial`](Self::drive_dial)'s shape on the port that carries a
     /// byte stream, and bounded the same way: by [`ONBOARD_LIMIT`] as well as by
     /// the loop's own termination. A step that produces no frame is not the end
     /// of a pass — a reaping produces none and the step after it may.

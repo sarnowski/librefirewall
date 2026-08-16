@@ -333,6 +333,9 @@ pub enum LogDetailKind {
     /// Which configuration version the slot array holds as the running one, out of
     /// which slot, of what size, and whether it was read back. Appended.
     Configured,
+    /// The management port holds a number and answers on it for nobody.
+    /// Appended, and carrying no operand: the fact is the whole record.
+    ListensForNothing,
 }
 
 impl LogDetailKind {
@@ -397,6 +400,7 @@ impl LogDetailKind {
             Self::ChannelShipping => 55,
             Self::ChannelAcked => 56,
             Self::Configured => 57,
+            Self::ListensForNothing => 58,
         }
     }
 
@@ -461,6 +465,7 @@ impl LogDetailKind {
             55 => Some(Self::ChannelShipping),
             56 => Some(Self::ChannelAcked),
             57 => Some(Self::Configured),
+            58 => Some(Self::ListensForNothing),
             _ => None,
         }
     }
@@ -860,6 +865,7 @@ impl LogRecord {
                 });
             }
             Some(LogDetailKind::None) => CheckedDetail::None,
+            Some(LogDetailKind::ListensForNothing) => CheckedDetail::ListensForNothing,
             Some(LogDetailKind::Features) => CheckedDetail::Features(self.features),
             Some(LogDetailKind::ReceivePosted) => CheckedDetail::ReceivePosted(self.receive_posted),
             Some(LogDetailKind::Refusal) => CheckedDetail::Refusal {
@@ -1715,6 +1721,8 @@ pub enum CheckedOperands {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckedDetail {
     None,
+    /// The management port answers on its number for nobody.
+    ListensForNothing,
     Features(u64),
     ReceivePosted(u32),
     Refusal {

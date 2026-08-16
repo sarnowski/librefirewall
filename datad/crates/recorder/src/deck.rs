@@ -14,8 +14,9 @@
 //!
 //! Two adversaries at once. The **byzantine neighbour** is on both
 //! handovers: the tap ring's annotations arrive already checked by `wire::tap`,
-//! and a download's sink, offset and length are the management domain's claims,
-//! bounded here and nowhere else — only this side knows how long a snapshot is.
+//! and a download's reader, sink, offset and length are the management domain's
+//! claims, bounded here and nowhere else — only this side knows how far a
+//! recording is durable.
 //! The **hostile or malfunctioning device** is behind [`Medium`]: a completion
 //! may answer a job nothing is waiting on, may report failure, and may never
 //! arrive at all. None costs more than a counted refusal, and every bound here
@@ -57,7 +58,7 @@ use lfw_pcapng::MIN_CUSTOM_BLOCK_LEN;
 
 use crate::{
     Flush, InterfaceName, Locate, MAX_INTERFACES, Recorded, Sink, SinkConfig, SinkCounters,
-    SinkError, Snapshot, TAIL_RESERVE,
+    SinkError, TAIL_RESERVE,
 };
 
 /// Sectors at the front of the device neither recording may touch.
@@ -132,7 +133,7 @@ pub const LOG_STAGING_BYTES: usize = 64 * 1024;
 pub const CAPTURE_STAGING_OFFSET: usize = LOG_STAGING_OFFSET + LOG_STAGING_BYTES;
 pub const CAPTURE_STAGING_BYTES: usize = 128 * 1024;
 pub const DOWNLOAD_STAGING_OFFSET: usize = CAPTURE_STAGING_OFFSET + CAPTURE_STAGING_BYTES;
-/// A window's worth plus one sector: a snapshot offset need not be
+/// A window's worth plus one sector: a requested position need not be
 /// sector-aligned, so the read covers the bytes in front of the answer too.
 pub const DOWNLOAD_STAGING_BYTES: usize = DOWNLOAD_WINDOW_LEN + SECTOR_SIZE;
 pub const SUPERBLOCK_STAGING_OFFSET: usize = DOWNLOAD_STAGING_OFFSET + DOWNLOAD_STAGING_BYTES;
@@ -548,13 +549,6 @@ struct Pending {
 /// `wire::download` admits exactly one outstanding request.
 enum Download {
     Idle,
-    /// A new snapshot was asked for: the recording is being sealed so what a
-    /// reader is promised is what the medium actually holds.
-    Sealing {
-        demand: DownloadDemand,
-        which: Which,
-        sealed: bool,
-    },
     /// A read of the answer's sectors, out or waiting to go out; its bytes land
     /// in the download staging area.
     Fetching {
@@ -593,8 +587,8 @@ enum Download {
 /// reply — `wire::DownloadResponder` takes it by value for the same reason.
 pub enum Served<'window> {
     /// Answer with these bytes. Empty is a legitimate answer: it is what the
-    /// end of a snapshot looks like, under a `total_len` the reader compares
-    /// its own progress against.
+    /// end of what the medium has taken looks like, under a `total_len` the
+    /// reader compares its own progress against.
     Deliver {
         demand: DownloadDemand,
         bytes: &'window [u8],
@@ -689,9 +683,6 @@ impl<'region> Transcript<'region> {
 pub struct Deck {
     recordings: [Recording; 2],
     pending: Option<Pending>,
-    /// The snapshot a download is answered out of, pinned when the requester
-    /// asks for offset 0 and kept until it asks for one again.
-    pinned: Option<(Which, Snapshot)>,
     download: Download,
     /// The calibration the last pass was given, or `None` while the clock
     /// domain has published nothing this side would use.
@@ -764,7 +755,6 @@ impl Deck {
             Self {
                 recordings: [log, capture],
                 pending: None,
-                pinned: None,
                 download: Download::Idle,
                 clock: None,
                 checkpointing: Checkpointing::Idle,
@@ -1380,36 +1370,11 @@ impl Deck {
             };
             return;
         };
-        let which = Which::named(sink);
-        if matches!(reader, DownloadReader::Ring) {
-            self.find(demand, which);
-            return;
-        }
-        if demand.offset() == 0 {
-            self.download = Download::Sealing {
-                demand,
-                which,
-                sealed: false,
-            };
-            return;
-        }
-        match self.pinned {
-            Some((pinned, snapshot)) if pinned == which => {
-                self.locate(demand, which, snapshot);
-            }
-            // A later offset with nothing pinned, or pinned against the other
-            // recording: the requester never started this download, or started
-            // a different one. Refused rather than begun afresh, which would
-            // answer bytes from a snapshot it never asked about.
-            _ => {
-                self.download = Download::Answered {
-                    demand,
-                    reason: Some(DownloadRefusal::NotReady),
-                    total_len: 0,
-                    first: 0,
-                };
-            }
-        }
+        // One reader, and it is still read rather than assumed: the field is
+        // peer-written, so a request naming another coordinate is refused above
+        // rather than resolved in this one.
+        let DownloadReader::Ring = reader;
+        self.find(demand, Which::named(sink));
     }
 
     /// Give both recordings the positions the management server says it has
@@ -1502,44 +1467,6 @@ impl Deck {
     /// Move a sealing download along, and submit a read whose sectors are
     /// known.
     fn advance_download(&mut self, medium: &mut impl Medium) {
-        // Taken out rather than borrowed: a `DownloadDemand` is not `Copy`,
-        // because one demand may produce exactly one reply (`wire::download`).
-        if matches!(self.download, Download::Sealing { .. }) {
-            let Download::Sealing {
-                demand,
-                which,
-                sealed,
-            } = core::mem::replace(&mut self.download, Download::Idle)
-            else {
-                return;
-            };
-            let staging = medium.staging(which.area());
-            let Some(recording) = self.recordings.get_mut(which.index()) else {
-                // The demand was taken out of the state to be moved, so returning
-                // would consume it and answer nothing.
-                self.download = Download::Answered {
-                    demand,
-                    reason: Some(DownloadRefusal::NotReady),
-                    total_len: 0,
-                    first: 0,
-                };
-                return;
-            };
-            // A seal that will not fit waits for a flush to make room; nothing
-            // is lost by trying again next pass.
-            let sealed = sealed || recording.sink.seal(staging).is_ok();
-            if !sealed || recording.in_flight.is_some() || recording.sink.staged() != 0 {
-                self.download = Download::Sealing {
-                    demand,
-                    which,
-                    sealed,
-                };
-                return;
-            }
-            let snapshot = recording.sink.snapshot();
-            self.pinned = Some((which, snapshot));
-            self.locate(demand, which, snapshot);
-        }
         if let Download::Fetching {
             sector,
             sectors,
@@ -1572,13 +1499,13 @@ impl Deck {
     /// Resolve one absolute ring position and either answer it or put a read out
     /// for it.
     ///
-    /// Nothing is sealed and nothing is pinned. A seal pads the open sector so
-    /// that what a download promises is a whole file, and it is a **write** to
-    /// the recording — performed on the reader's account, and bounded only by
-    /// how often that reader asks. The channel reads whatever the medium has
-    /// already taken instead, so a ring cursor costs the recording nothing; what
-    /// it gives up is that a frame may end mid-block, which the wire does not
-    /// care about because what travels is a byte stream and not a block.
+    /// Nothing is sealed. A seal pads the open sector so that what a reader is
+    /// promised is a whole file, and it is a **write** to the recording —
+    /// performed on that reader's account, and bounded only by how often it
+    /// asks. The channel reads whatever the medium has already taken instead,
+    /// so a ring cursor costs the recording nothing; what it gives up is that a
+    /// frame may end mid-block, which the wire does not care about because what
+    /// travels is a byte stream and not a block.
     fn find(&mut self, demand: DownloadDemand, which: Which) {
         let Some(recording) = self.recordings.get_mut(which.index()) else {
             self.download = Download::Answered {
@@ -1606,68 +1533,6 @@ impl Deck {
             // Counted by the reader that lost its place rather than here: this
             // side knows a position went missing, and the domain holding the
             // cursor is the one that knows which reader it belonged to.
-            Locate::Overrun => {
-                self.download = Download::Answered {
-                    demand,
-                    reason: Some(DownloadRefusal::Overrun),
-                    total_len,
-                    first,
-                };
-            }
-            Locate::Live(span) => {
-                let len = span.len().min(demand.len());
-                if len == 0 {
-                    self.download = Download::Answered {
-                        demand,
-                        reason: None,
-                        total_len,
-                        first,
-                    };
-                    return;
-                }
-                self.download = Download::Fetching {
-                    demand,
-                    total_len,
-                    first,
-                    skip: span.skip(),
-                    len,
-                    sector: span.sector(),
-                    // `skip` is below a sector and `len` at most a window, so
-                    // the sum is at most `DOWNLOAD_STAGING_BYTES`.
-                    sectors: (span.skip().saturating_add(len)).div_ceil(SECTOR_SIZE) as u64,
-                    submitted: false,
-                };
-            }
-        }
-    }
-
-    /// Resolve one offset against a pinned snapshot and either answer it or put
-    /// a read out for it.
-    fn locate(&mut self, demand: DownloadDemand, which: Which, snapshot: Snapshot) {
-        let total_len = snapshot.total_len();
-        let Some(recording) = self.recordings.get_mut(which.index()) else {
-            self.download = Download::Answered {
-                demand,
-                reason: Some(DownloadRefusal::NotReady),
-                total_len,
-                first: 0,
-            };
-            return;
-        };
-        // The recording's own oldest position, which is what the word means
-        // whichever reader asked. A snapshot reader counts its offsets from a
-        // pinned origin instead and does not read it; publishing it anyway is
-        // what keeps one reply shape rather than two.
-        let first = recording.sink.first_position();
-        match recording.sink.locate(&snapshot, demand.offset()) {
-            Locate::PastEnd => {
-                self.download = Download::Answered {
-                    demand,
-                    reason: None,
-                    total_len,
-                    first,
-                };
-            }
             Locate::Overrun => {
                 self.download = Download::Answered {
                     demand,

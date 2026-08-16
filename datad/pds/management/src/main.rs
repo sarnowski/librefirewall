@@ -108,24 +108,23 @@
 //! mapper, so the walk that composes a reading crosses one uniform array rather
 //! than eleven regions plus a live read of its own counters.
 //!
-//! # Deviation from the design: the HTTP endpoint carries no TLS
+//! # Nothing on this port answers without authenticating
 //!
-//! The design requires the management API to carry encryption, authentication and
-//! read/write authorization through an mTLS certificate pair. **The HTTP surface
-//! on this port has none of it**: this domain authenticates nobody there, so
-//! **anything that can reach the management port can read this node's
-//! configuration and replace it** — which is to say, decide what this firewall
-//! forwards. The port must not be exposed to an untrusted network until the
-//! required TLS termination and certificate handling exist.
+//! The design requires the management plane to carry encryption, authentication
+//! and read/write authorization through an mTLS certificate pair, and the two
+//! connections this port carries both do: the onboarding session an
+//! administrator opens, and the channel this appliance dials. Both terminate
+//! where the keys are, which is not here.
 //!
-//! The two *other* connections this port carries do have it, and neither of them
-//! is that surface: the onboarding session an administrator opens, and the
-//! channel this appliance dials. Both terminate where the keys are, which is not
-//! here.
+//! The management port itself serves nothing. Its transport is built to dial
+//! only, so a `SYN` for it opens no connection and is counted as
+//! `not_listening`; the number is kept because the channel's dial composes its
+//! source port from it. This domain says so once at bring-up, that being a fact
+//! about the build rather than about anything a peer did.
 //!
 //! # It carries two sessions' ciphertext and decides nothing about either
 //!
-//! The port answers on a second listening port, and it dials out on a third
+//! The port answers on a listening port of its own, and it dials out on a
 //! connection of its own; what crosses either is not a protocol this domain
 //! speaks. Every byte is moved into a region the cryptography domain reads, and
 //! every byte that comes back is put on the wire unread: TLS terminates where the
@@ -969,6 +968,12 @@ fn init() -> Management {
     // the clock domain has published, and neither is a failure: both are states a
     // node passes through between boot and its first frame.
     announce(&sink, DomainState::Ready, DomainDetail::None);
+    // Once, here, and never again: it is a property of the build rather than of
+    // anything that happens afterwards. An operator who reaches the management
+    // port and gets nothing back reads this line and knows the node is up and
+    // serving nothing, rather than guessing between that and a node that never
+    // came up.
+    announce(&sink, DomainState::Ready, DomainDetail::ListensForNothing);
 
     Management::Running(Running {
         stage,

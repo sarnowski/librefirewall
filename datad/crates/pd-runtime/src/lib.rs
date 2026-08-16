@@ -538,8 +538,7 @@ pub use configuration::{MAX_ANSWER_LEN, Outcome, reject_reason_of, write_result_
 pub use download::{Downloads, Shipped};
 pub use endpoint::{
     CalibrationRefused, ConfigRefused, DIAL_LIMIT, EndpointRegions, EndpointStage,
-    EndpointStageCounters, MAX_REPLY_LEN, ONBOARD_LIMIT, OUTPUT_LIMIT, TIMER_LIMIT,
-    calibration_from,
+    EndpointStageCounters, MAX_REPLY_LEN, ONBOARD_LIMIT, TIMER_LIMIT, calibration_from,
 };
 // The two types a domain needs to name the channel it dials: the address it
 // dials and the outcome it reports, reached through this facade rather than

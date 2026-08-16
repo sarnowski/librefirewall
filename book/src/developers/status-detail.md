@@ -853,13 +853,12 @@ and wall-clock times. An independent parse of the two files established:
   crossing it, indefinitely, with no way to say otherwise. The filter rules are not that selector and
   cannot stand in for one — they decide what the appliance *forwards*, and a packet a rule dropped is
   recorded with its refusal exactly as a forwarded one is.
-- **The plain-HTTP recording downloads are gone.** The
-  [management design](../design/management.md) erased them — a recording
-  reaches the management server over the authenticated channel or not at all — and until that
-  replacement exists the gap stands at its full width ([detail](#full-port-role-model)): anyone who
-  can reach the management port is handed every packet the appliance recorded. The design makes
-  authorization a *condition* of the exception that lets a recording carry packet payloads at all;
-  the condition is unmet.
+- **A recording reaches the management server over the authenticated channel or not at all.** The
+  [management design](../design/management.md) erased the plain-HTTP downloads, and nothing on the
+  management port serves anything now ([detail](#full-port-role-model)) — so the condition the
+  design puts on the exception that lets a recording carry packet payloads at all, that a recording
+  is authorized rather than merely fetched, is what the channel's mutual authentication now
+  carries.
 - **One observation per frame.** The paired ingress and egress observation of one forwarded frame
   that the [recording design](../design/recording.md) intends — the thing a mirror port cannot give
   you — is not emitted: the packet identity that would relate them is minted and monotone, and only
@@ -1552,10 +1551,11 @@ cost it no code change — and its frames end at a `management` protection domai
 
 That domain answers three protocols and counts everything: an **ARP request** for its own address is
 answered with its own MAC; an **ICMP echo request** to it is answered with a reply carrying the same
-identifier, sequence and payload and both checksums recomputed; and a **TCP connection** to port 80
-is accepted, carried and closed by a first-party stack ([detail](#proxy-tcp-stack)), over which an
-HTTP/1.1 server now answers `404` to every request, every resource that was on it having moved to
-the authenticated channel ([detail](#configuration-management)). Everything else is refused
+identifier, sequence and payload and both checksums recomputed; and a **TCP segment** for port 80 is
+refused: that port's first-party stack ([detail](#proxy-tcp-stack)) is built to dial only, so a
+`SYN` for it opens nothing and is counted as `not_listening`, and what the port carries is the
+outbound channel this appliance dials its management server over
+([detail](#configuration-management)). Everything else is refused
 by name and counted — a frame addressed to somebody else, a VLAN tag, an EtherType or IP protocol it
 does not speak, a fragment, a non-unicast or off-link sender, a malformed header.
 
@@ -1564,9 +1564,9 @@ only; any other hardware type, protocol type, address length or operation is a t
 echo, parsing into fixed-size chunks so no accessor has a panicking path, plus the two reply builders
 and one checksum routine. `datad/crates/ip-endpoint` is the endpoint state machine — the appliance answering
 *for itself*, as against `datad/crates/pipeline`, which decides what to forward for others — with zero `unsafe`, a closed
-`Outcome` vocabulary, and a counter per outcome; it now owns a `datad/crates/tcp` stack and the HTTP
-server above it, and keeps the transport's advertised window equal to that server's free
-space. `pd_runtime::EndpointStage` joins it to the two pipelines: copy the frame out of the receive
+`Outcome` vocabulary, and a counter per outcome; it owns two `datad/crates/tcp` stacks — the
+onboarding port's, which listens, and the management port's, which dials and accepts nothing — and
+keeps each transport's advertised window equal to the free space of what reads from it. `pd_runtime::EndpointStage` joins it to the two pipelines: copy the frame out of the receive
 pool, decide, and where a reply was composed take a transmit buffer, write the reply into it and lend
 it to the driver.
 
@@ -1639,17 +1639,14 @@ a domain that faulted or lost its place under that could not report them all.
 
 **Missing.**
 
-- **The plain-HTTP server is still there and answers nothing.** Every resource that was on it is
-  gone — the two recording downloads, the metrics endpoint, and now `GET /config` and `POST /config`
-  ([detail](#configuration-management)) — and each of them reaches a management server over the
-  authenticated channel instead. What remains is the server itself: the port accepts TCP on 80 and
-  answers `404`, which carries no authority at all but is still an unauthenticated listener, and it
-  is the last piece the [management design](../design/management.md) erases. It is not a deletion
-  above the transport: `Endpoint::new` builds **one** `TcpStack` on the management port and uses it
-  both for that server and for the outbound dial the channel is opened through, so closing the
-  passive half is a change in the transport. Of the debug dump the
-  [observability reference](../reference/observability.md) describes, the two recordings are what a
-  node can be asked for, and they carry the log events and the metric readings inside them.
+- **Of the debug dump the [observability reference](../reference/observability.md) describes, the
+  two recordings are what a node can be asked for**, and they carry the log events and the metric
+  readings inside them. Nothing is served over plain HTTP: the resources went first — the two
+  recording downloads, the metrics endpoint, then `GET /config` and `POST /config`
+  ([detail](#configuration-management)) — and then the server itself, which is a change in the
+  transport rather than a deletion above it, `Endpoint::new` having built **one** `TcpStack` on the
+  management port for both the server and the outbound dial. What it builds now is
+  `TcpStack::dialling`, which keeps the port for the dial's source and withdraws the passive open.
 - **A neighbour cache exists and nothing on the port uses it yet.** `lfw_ip_endpoint::neighbour`
   holds the hardware address of a next hop and decides when to ask for one, under three rules that
   each remove a poisoning primitive rather than narrowing one: only a reply this end asked for is
@@ -1828,9 +1825,17 @@ What the stack implements, completely:
 - **MSS clamping** (the peer's offer against this end's own limit, with RFC 1122's default and
   floor), **window scaling** (RFC 7323, negotiated at the `SYN` and clamped to shift 14), and
   correct pseudo-header checksums both ways.
-- **The advertised window is the receiver's free space**, not a constant: `lfw_ip_endpoint`'s HTTP
-  server keeps it equal to the room it has left, so a peer is never told it may send more than the
-  endpoint can take.
+- **The advertised window is the receiver's free space**, not a constant: `lfw_ip_endpoint` keeps it
+  equal to the room whatever reads that connection has left — the onboarding stream's inbound array,
+  the outbound session's receive buffer — so a peer is never told it may send more than the endpoint
+  can take.
+- **A stack need not listen.** `TcpStack::dialling` builds one that composes connections from its
+  port and opens none for a peer, which is what the management port now runs: the passive open is
+  the whole of a listener's exposure — a table slot, a sequence space and a challenge budget
+  committed on a segment anybody can send — and withdrawing it leaves a port whose only connection
+  is one this end chose to make. The port number stays, because a dial composes its source port from
+  it and the peer's answer arrives addressed to it; a `SYN` meets `refused_not_listening` and is
+  dropped in silence, exactly as a segment for a port this stack never had.
 
 Every outcome is counted, one field per cause — twenty-nine of them — under the
 [metrics reference](../reference/metrics.md)'s attribution rule: what a peer sent that was refused,
@@ -1999,8 +2004,18 @@ staging buffer's dependence on a metric bound, the `RenderError`/`MAX_EXPOSITION
 `datad/crates/metrics`, and the `metrics_render` fuzz target. What went with them is stated rather
 than glossed: the HTTP head contract for that target, the assertion that two concurrent scrapes
 never contended for the staging buffer, and the ordering proof that a request was counted before the
-body it asked for was rendered. The first two are covered by `datad/crates/ip-endpoint`'s own unit
-tests against the surface that remains; the third has no replacement.
+body it asked for was rendered. None has a replacement, the server they were about having since
+gone with them.
+
+**And the server itself is now gone**, with `datad/crates/ip-endpoint`'s `http` module, the
+`Endpoint` methods that registered a target and answered one, and the ten `librefirewall_http_*`
+families that counted it. What went with it, stated rather than glossed: every assertion about a
+request being parsed, answered, timed out or refused on that port. Those were about a surface that
+no longer exists; what replaced them is one assertion in each of two places — that a `SYN` for the
+port opens nothing, at the transport in `datad/crates/tcp` and at the endpoint in
+`datad/crates/ip-endpoint`, the second under a flood. The `datad/crates/http` parser itself stays:
+the onboarding surface on 4443 is its caller now, and the `http_request` fuzz target reads heads
+against **that** surface's body bound rather than the removed server's.
 
 **`librefirewall_configuration_reads_total` is gone with `GET /config`.** It counted the one thing
 that endpoint did that the channel does not: state the running document out of the node. Nothing
@@ -2881,13 +2896,14 @@ pass that finds nothing waiting spends one saying so, and how many such passes t
 accelerator's decision, so an equality there would be a gate that passes on one machine and fails on
 the next.
 
-The **transport** under that port is published too, and separately from the HTTP server's. They are
-two stacks with two connection tables, and every `librefirewall_tcp_` family now carries a `service`
-label naming which — one family set rather than two, because a refused segment means the same thing
-whichever port it arrived on. Until that label existed the port's whole transport was invisible: the
-shard was built from the HTTP stack's counters alone, so a second administrator's handshake refused
-for want of a slot moved nothing an operator could see, and the reference chapter said it appeared
-under a series it did not.
+The **transport** under that port is published too, and separately from the channel's own. They are
+two stacks with two connection tables, and every `librefirewall_tcp_` family carries a `service`
+label naming which — `onboarding` for the port that listens, `channel` for the port the appliance
+dials out of — one family set rather than two, because a refused segment means the same thing
+whichever port it arrived on. Until that label existed the onboarding port's whole transport was
+invisible: the shard was built from the other stack's counters alone, so a second administrator's
+handshake refused for want of a slot moved nothing an operator could see. The label value was `http`
+while a server answered on that port; it is `channel` now that the port only dials.
 
 **The TLS server is wired in, and a real client has reached it on the image.** The cryptography
 domain opens one `lfw_tls::OnboardingServer` when the relay opens a session, drives it with each
@@ -3176,7 +3192,7 @@ breaks the framing is not one `s_server` can be made to play. What is still miss
 themselves is the flush cadence.
 
 **The read-only half of the onboarding protocol runs on that session.** `lfw_onboarding` reads a
-request head through the same bounded, fuzzed parser the plain-HTTP port uses and serves exactly two
+request head through the same bounded, fuzzed parser `datad/crates/http` provides and serves exactly two
 things. `GET /` is the page: no stylesheet, no script, no image, no font, because the page's whole
 job is to carry two strings an administrator compares character for character against a console and
 anything that made either harder to compare would be a defect. `GET /certificate.csr` is the PKCS#10

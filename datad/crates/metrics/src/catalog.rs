@@ -22,7 +22,7 @@
 //! about its own protocol ([`DEVICE_FAULTS`]), what a **device or peer sent**
 //! that a layer refused ([`INPUT_DROPS`], [`ROUTE_DROPS`], [`TCP_REFUSED`], …),
 //! and what **we** got wrong ([`INVARIANT_FAULTS`], [`TCP_WRITE_REFUSED`],
-//! [`HTTP_BODIES_REFUSED`], [`CONSOLE_RECORDS`]'s `unrenderable`). An alert can
+//! [`CONSOLE_RECORDS`]'s `unrenderable`). An alert can
 //! be written against the third class by name.
 
 use crate::sample::{
@@ -774,70 +774,6 @@ pub const TCP_WRITE_REFUSED: Metric = metric(
     "Segments the stack decided to send that did not fit its caller's storage; ours.",
 );
 
-// ── The management HTTP server ──────────────────────────────────────────────
-
-pub const HTTP_REQUESTS: Metric = metric(
-    "librefirewall_http_requests_total",
-    Kind::Counter,
-    "Requests the server read to their end and decided on.",
-);
-
-pub const HTTP_RESPONSES: Metric = metric(
-    "librefirewall_http_responses_total",
-    Kind::Counter,
-    "Responses composed, by status code.",
-);
-
-pub const HTTP_RESPONSE_BYTES: Metric = metric(
-    "librefirewall_http_response_bytes_total",
-    Kind::Counter,
-    "Response bytes handed to the transport, headers included.",
-);
-
-pub const HTTP_REQUESTS_OVERFLOWED: Metric = metric(
-    "librefirewall_http_requests_overflowed_total",
-    Kind::Counter,
-    "Requests that outgrew the bounded request buffer before their head ended.",
-);
-
-pub const HTTP_BODIES_REFUSED: Metric = metric(
-    "librefirewall_http_bodies_refused_total",
-    Kind::Counter,
-    "Response bodies a renderer would not fit in the staging buffer, whichever target asked; \
-     ours, expected to stay zero.",
-);
-
-pub const HTTP_BODIES_TAKEN: Metric = metric(
-    "librefirewall_http_bodies_taken_total",
-    Kind::Counter,
-    "Request bodies accumulated whole and handed to the domain that decides on them.",
-);
-
-pub const HTTP_BODIES_TIMED_OUT: Metric = metric(
-    "librefirewall_http_bodies_timed_out_total",
-    Kind::Counter,
-    "Request bodies given up on for not arriving whole in time, answered 408 and reset; each one \
-     is a stretch in which the other body-bearing surfaces answered 503.",
-);
-
-pub const HTTP_BODY_OVERRUNS: Metric = metric(
-    "librefirewall_http_body_overruns_total",
-    Kind::Counter,
-    "Request-body bytes a client sent past the length it declared, dropped unread.",
-);
-
-pub const HTTP_RETRANSMITS_UNAVAILABLE: Metric = metric(
-    "librefirewall_http_retransmits_unavailable_total",
-    Kind::Counter,
-    "Ranges the transport asked for again that no response buffer held; ours, expected to stay zero.",
-);
-
-pub const HTTP_SLOTS_EXHAUSTED: Metric = metric(
-    "librefirewall_http_slots_exhausted_total",
-    Kind::Counter,
-    "Connections the server had no slot for; ours, the tables being one size, expected to stay zero.",
-);
-
 // ── The recorder and its block device ───────────────────────────────────────
 
 pub const BLOCK_CAPACITY_SECTORS: Metric = metric(
@@ -968,12 +904,6 @@ pub const RECORDING_TRANSCRIPT_LINES: Metric = metric(
      appliance's log.",
 );
 
-pub const RECORDING_DOWNLOAD_OVERRUNS: Metric = metric(
-    "librefirewall_recording_download_overruns_total",
-    Kind::Counter,
-    "Downloads the ring wrapped past mid-read, by sink; a reader the traffic outran.",
-);
-
 // ── The console and its device ──────────────────────────────────────────────
 
 pub const CONSOLE_RECORDS: Metric = metric(
@@ -1077,16 +1007,6 @@ pub const ALL_METRICS: &[&Metric] = &[
     &TCP_RESETS,
     &TCP_URGENT_IGNORED,
     &TCP_WRITE_REFUSED,
-    &HTTP_REQUESTS,
-    &HTTP_RESPONSES,
-    &HTTP_RESPONSE_BYTES,
-    &HTTP_REQUESTS_OVERFLOWED,
-    &HTTP_BODIES_REFUSED,
-    &HTTP_BODIES_TAKEN,
-    &HTTP_BODIES_TIMED_OUT,
-    &HTTP_BODY_OVERRUNS,
-    &HTTP_RETRANSMITS_UNAVAILABLE,
-    &HTTP_SLOTS_EXHAUSTED,
     &BLOCK_CAPACITY_SECTORS,
     &BLOCK_REQUESTS,
     &BLOCK_BYTES,
@@ -1113,7 +1033,6 @@ pub const ALL_METRICS: &[&Metric] = &[
     &RECORDING_SNAPSHOTS,
     &RECORDING_TRANSCRIPTS,
     &RECORDING_TRANSCRIPT_LINES,
-    &RECORDING_DOWNLOAD_OVERRUNS,
     &RECORDING_RECORDS_UNCLOCKED,
     &CONSOLE_RECORDS,
     &CONSOLE_TRANSCRIPT_LINES,

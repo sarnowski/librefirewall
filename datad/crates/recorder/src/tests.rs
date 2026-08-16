@@ -231,13 +231,14 @@ impl Harness {
         lfw_capture_ring::decode_superblock(region).expect("what the sink wrote it reads")
     }
 
-    /// The snapshot's bytes, gathered the way the management domain gathers
-    /// them: one `locate` and one read at a time.
+    /// The recording's durable bytes, gathered the way the management domain
+    /// gathers them: one `find` and one read at a time.
     fn download(&mut self) -> Vec<u8> {
-        let snapshot = self.sink.snapshot();
+        let first = self.sink.first_position();
+        let durable = self.sink.durable_position();
         let mut body = Vec::new();
-        while (body.len() as u64) < snapshot.total_len() {
-            match self.sink.locate(&snapshot, body.len() as u64) {
+        while first.saturating_add(body.len() as u64) < durable {
+            match self.sink.find(first.saturating_add(body.len() as u64)) {
                 Locate::Live(span) => {
                     let bytes = self
                         .device
@@ -248,7 +249,7 @@ impl Harness {
                 Locate::Overrun => panic!("overrun during a quiescent download"),
             }
         }
-        assert_eq!(body.len() as u64, snapshot.total_len(), "short download");
+        assert_eq!(body.len() as u64, durable - first, "short download");
         body
     }
 }
@@ -759,25 +760,19 @@ fn a_wrap_evicts_the_oldest_segment_and_a_download_reports_it() {
     }
     harness.seal();
 
-    let snapshot = harness.sink.snapshot();
-    assert!(snapshot.total_len() > 0);
-    // Everything the snapshot names is still live.
+    let first = harness.sink.first_position();
+    assert!(first > 0, "the wrap left the oldest position behind");
+    // Everything still on the medium reads back whole.
     let body = harness.download();
-    assert_eq!(body.len() as u64, snapshot.total_len());
+    assert_eq!(body.len() as u64, harness.sink.durable_position() - first);
     parse(&body);
 
-    // A snapshot taken before the wrap is overrun by it.
-    let stale = Snapshot {
-        first: 0,
-        total: snapshot.total_len(),
-    };
-    let before = harness.sink.counters().download_overruns;
-    assert_eq!(harness.sink.locate(&stale, 0), Locate::Overrun);
-    assert_eq!(harness.sink.counters().download_overruns, before + 1);
+    // A cursor from before the wrap is overrun by it.
+    assert_eq!(harness.sink.find(0), Locate::Overrun);
 }
 
 #[test]
-fn locate_answers_the_ends_and_the_seam_between_two_segments() {
+fn find_answers_the_ends_and_the_seam_between_two_segments() {
     let mut harness = Harness::new(2048, 4);
     let bytes = frame(512, 4);
     while harness.sink.counters().segments_closed < 1 {
@@ -786,19 +781,16 @@ fn locate_answers_the_ends_and_the_seam_between_two_segments() {
     harness.record(&tap(2, 0, bytes.len() as u32), &bytes);
     harness.seal();
 
-    let snapshot = harness.sink.snapshot();
-    assert!(matches!(harness.sink.locate(&snapshot, 0), Locate::Live(_)));
-    let last = snapshot.total_len() - 1;
-    let Locate::Live(span) = harness.sink.locate(&snapshot, last) else {
+    let durable = harness.sink.durable_position();
+    assert_eq!(harness.sink.first_position(), 0, "nothing has wrapped yet");
+    assert!(matches!(harness.sink.find(0), Locate::Live(_)));
+    let Locate::Live(span) = harness.sink.find(durable - 1) else {
         panic!("the last byte is live");
     };
     assert_eq!(span.len(), 1, "one byte remains");
-    assert_eq!(
-        harness.sink.locate(&snapshot, snapshot.total_len()),
-        Locate::PastEnd
-    );
+    assert_eq!(harness.sink.find(durable), Locate::PastEnd);
     // The seam: the first byte of the second segment.
-    let Locate::Live(seam) = harness.sink.locate(&snapshot, SEGMENT as u64) else {
+    let Locate::Live(seam) = harness.sink.find(SEGMENT as u64) else {
         panic!("the seam is live");
     };
     assert_eq!(seam.skip(), 0, "a segment starts on a sector");
@@ -807,23 +799,22 @@ fn locate_answers_the_ends_and_the_seam_between_two_segments() {
 #[test]
 fn an_empty_recording_has_nothing_to_download() {
     let harness = Harness::new(2048, 4);
-    let snapshot = harness.sink.snapshot();
-    assert_eq!(snapshot.total_len(), 0);
+    assert_eq!(harness.sink.durable_position(), 0);
+    assert_eq!(harness.sink.first_position(), 0);
 }
 
 #[test]
 fn a_durable_cursor_older_than_the_live_history_promises_nothing() {
     // Flushing far enough behind the writer that the durable segment has been
-    // evicted. A snapshot that clamped the segment count to zero here would
-    // keep the durable offset in its total and hand a reader that many bytes out
-    // of a segment holding something else entirely.
+    // evicted. A durable position that named a segment nothing holds any more
+    // would hand a reader bytes out of a segment holding something else
+    // entirely.
     let mut harness = Harness::new(2048, 4);
     harness.record(&tap(1, 0, 300), &frame(300, 1));
     harness.record(&tap(2, 0, 300), &frame(300, 1));
     harness.drain();
-    let durable = harness.sink.snapshot();
     assert!(
-        durable.total_len() > 0,
+        harness.sink.durable_position() > 0,
         "the first segment has durable bytes to be left behind"
     );
 
@@ -840,13 +831,12 @@ fn a_durable_cursor_older_than_the_live_history_promises_nothing() {
         oldest > 0,
         "the oldest live segment is past the durable one at zero"
     );
-    assert_eq!(
-        harness.sink.snapshot().total_len(),
-        0,
-        "nothing durable is still on the medium, so nothing may be promised"
+    assert!(
+        harness.sink.first_position() > harness.sink.durable_position(),
+        "nothing durable is still on the medium, so nothing may be offered"
     );
     assert_eq!(
-        harness.sink.locate(&harness.sink.snapshot(), 0),
+        harness.sink.find(harness.sink.durable_position()),
         Locate::PastEnd
     );
 }
@@ -910,9 +900,9 @@ fn a_resumed_recording_keeps_every_byte_the_last_boot_made_durable() {
         "and begins where it began, nothing having wrapped"
     );
     assert_eq!(
-        resumed.sink.snapshot().total_len(),
+        resumed.sink.durable_position(),
         before,
-        "so a download offers the whole of what survived the restart"
+        "so a reader is offered the whole of what survived the restart"
     );
 }
 
@@ -1129,7 +1119,7 @@ fn nothing_to_flush_is_not_a_flush() {
 }
 
 #[test]
-fn the_span_a_locate_returns_names_the_sectors_a_caller_must_read() {
+fn the_span_a_find_returns_names_the_sectors_a_caller_must_read() {
     let span = Span {
         sector: 4,
         skip: 100,
@@ -1210,21 +1200,15 @@ fn a_tap_claiming_a_shorter_frame_than_it_carries_is_refused_by_name() {
 }
 
 #[test]
-fn a_snapshot_offset_the_ring_never_wrote_ends_the_download() {
-    // A snapshot longer than what the ring holds — the shape a forged or stale
-    // total takes — resolves to the end rather than to a span of nothing.
+fn a_position_the_ring_never_wrote_ends_the_download() {
+    // A position past everything the ring holds — the shape a forged or stale
+    // cursor takes — resolves to the end rather than to a span of nothing.
     let mut harness = Harness::new(2048, 4);
     harness.record(&tap(1, 0, 64), &frame(64, 0));
     harness.seal();
-    let real = harness.sink.snapshot();
-    let overstated = Snapshot {
-        first: 0,
-        total: real.total_len() + SEGMENT as u64 * 2,
-    };
+    let durable = harness.sink.durable_position();
     assert_eq!(
-        harness
-            .sink
-            .locate(&overstated, real.total_len() + SEGMENT as u64),
+        harness.sink.find(durable + SEGMENT as u64),
         Locate::PastEnd,
         "a position no segment holds"
     );
@@ -1291,7 +1275,10 @@ mod properties {
             }
             harness.seal();
             let body = harness.download();
-            prop_assert_eq!(body.len() as u64, harness.sink.snapshot().total_len());
+            prop_assert_eq!(
+                body.len() as u64,
+                harness.sink.durable_position() - harness.sink.first_position()
+            );
             let file = parse(&body);
             prop_assert_eq!(file.packets.len() as u64, placed);
             for (index, packet) in file.packets.iter().enumerate() {
@@ -1300,10 +1287,10 @@ mod properties {
             }
         }
 
-        /// A snapshot's length is exactly the durable bytes, and every offset
-        /// inside it resolves to a live span inside the extent.
+        /// Every position between the oldest the medium still holds and the
+        /// durable end resolves to a live span inside the extent.
         #[test]
-        fn every_offset_of_a_snapshot_resolves_inside_the_extent(
+        fn every_position_of_a_recording_resolves_inside_the_extent(
             count in 1usize..30,
         ) {
             let mut harness = Harness::new(2048, 4);
@@ -1312,11 +1299,11 @@ mod properties {
                 harness.record(&tap(index as u64 + 1, 0, 400), &bytes);
             }
             harness.seal();
-            let snapshot = harness.sink.snapshot();
+            let durable = harness.sink.durable_position();
             let extent = harness.sink.ring.geometry();
-            let mut offset = 0u64;
-            while offset < snapshot.total_len() {
-                match harness.sink.locate(&snapshot, offset) {
+            let mut offset = harness.sink.first_position();
+            while offset < durable {
+                match harness.sink.find(offset) {
                     Locate::Live(span) => {
                         prop_assert!(span.sector() >= extent.start_sector());
                         prop_assert!(
@@ -1330,7 +1317,7 @@ mod properties {
                     other => prop_assert!(false, "offset {} gave {:?}", offset, other),
                 }
             }
-            prop_assert_eq!(offset, snapshot.total_len());
+            prop_assert_eq!(offset, durable);
         }
     }
 }
@@ -1456,12 +1443,16 @@ fn a_ring_position_the_writer_wrapped_past_is_an_overrun_and_not_other_bytes() {
     // Position zero belongs to a segment two wraps ago. Answering it with
     // whatever occupies that segment now would be shipping one part of the
     // recording under another part's position.
+    //
+    // And the overrun is the reader's to count, not this side's: this end knows
+    // a position went missing, and the domain holding the cursor is the one
+    // that knows which reader it belonged to and says so on the console. So a
+    // reader asking again — which is what a stalled cursor does every pass —
+    // moves nothing here.
+    let before = harness.sink.counters();
     assert_eq!(harness.sink.find(0), Locate::Overrun);
-    // And the overrun is the reader's to count, not this side's: the download
-    // reader's own tally is untouched by a ring cursor losing its place.
-    let before = harness.sink.counters().download_overruns;
     assert_eq!(harness.sink.find(0), Locate::Overrun);
-    assert_eq!(harness.sink.counters().download_overruns, before);
+    assert_eq!(harness.sink.counters(), before);
 }
 
 #[test]

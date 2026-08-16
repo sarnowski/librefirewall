@@ -1,8 +1,8 @@
 //! The onboarding port: a **byte stream** rather than a request and a response.
 //!
-//! The other listening port of this endpoint serves HTTP — one request per
-//! connection, a body this crate's caller renders, and a close. This one serves
-//! nothing. It accepts a connection, hands whatever arrives to a consumer above
+//! It is the **only** port of this endpoint that listens: the management port
+//! beside it dials and accepts nothing. This one serves no protocol of its own
+//! either. It accepts a connection, hands whatever arrives to a consumer above
 //! it, puts whatever that consumer answers with on the wire, and closes when
 //! either end says the session is over. It does not know what the bytes are: it
 //! is the transport half of a session another domain terminates, and the whole
@@ -51,13 +51,13 @@ use net_headers::{Ipv4Address, MacAddress};
 
 /// The port this stream listens on.
 ///
-/// A first-party constant, and deliberately **not** the HTTP port beside it:
-/// that port answers a plain-HTTP surface with no authentication on it at all,
-/// and this one is where a session an administrator authenticates will be
-/// terminated. Two ports rather than one path on the first, because they are
-/// two different transports serving two different things — and because a client
-/// pointed at the first must not reach this one by asking for a target nobody
-/// registered.
+/// A first-party constant, and deliberately **not** the management port beside
+/// it: that port carries the channel this appliance dials out of and answers
+/// nothing, and this one is where a session an administrator authenticates is
+/// terminated. Two ports rather than one, because they are two different
+/// transports serving two different things, and because the number a peer may
+/// open a connection on is then not the number this appliance composes one
+/// from.
 pub const ONBOARDING_PORT: u16 = 4443;
 
 /// Connections the onboarding transport holds at once. See the module header on

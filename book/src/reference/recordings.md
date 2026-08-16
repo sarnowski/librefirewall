@@ -76,7 +76,7 @@ is where the lost cause goes.
 
 | condition | what it means | counted as |
 |---|---|---|
-| `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-read. Answers `Overwritten` to a range read, and moves a shipping cursor to where the medium now begins | `librefirewall_recording_download_overruns_total{sink}` |
+| `Overrun` | the writer wrapped past the point being read: traffic outran the reader mid-read. Answers `Overwritten` to a range read, and moves a shipping cursor to where the medium now begins | `librefirewall_recording_downloads_total{outcome="refused"}`, and the console record naming the recording that resynchronised |
 | `DeviceError` | the block device refused the read, or completed it having moved fewer bytes than were asked for — a short read is an error here and never bytes to serve | `librefirewall_recording_downloads_total{outcome="refused"}` |
 | `NotReady` / `OutOfRange` / `NoSuchSink` / `NoSuchReader` | the recorder has nothing to serve for that request; the last two are this appliance's own defect, since it composes the request | `librefirewall_recording_downloads_total{outcome="refused"}` |
 

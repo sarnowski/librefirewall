@@ -10,10 +10,6 @@ net-headers = { path = "../net-headers" }
 # one of its timers is stated against.
 lfw-tcp = { path = "../tcp" }
 lfw-clock = { path = "../clock" }
-# The request head parser and the response head builder the management server is
-# written against. It owns no buffer and knows no target; what a target means is
-# decided here.
-lfw-http = { path = "../http" }
 
 [dev-dependencies]
 proptest = { workspace = true }

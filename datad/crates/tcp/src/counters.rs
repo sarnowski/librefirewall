@@ -89,7 +89,8 @@ pub struct TcpCounters {
     pub refused_out_of_window: u64,
     /// `SYN`s refused because the table was full and nothing in it was reapable.
     pub refused_table_full: u64,
-    /// Segments for a port this stack does not listen on.
+    /// Segments this stack has no listener for: a port it never had, or its own
+    /// port on a stack built to dial only.
     pub refused_not_listening: u64,
     /// Segments for a 4-tuple with no connection, which are answered with a
     /// `RST` unless they carried one.
