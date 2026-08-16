@@ -3467,6 +3467,47 @@ impl TcpFrame {
     fn carries(&self, wanted: u8, forbidden: u8) -> bool {
         self.flags & wanted == wanted && self.flags & forbidden == 0
     }
+
+    /// How much sequence space this segment occupies: a payload byte each, and
+    /// one apiece for the two flags that are counted like a byte.
+    fn occupies(&self) -> u32 {
+        u32::try_from(self.payload.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(self.carries(TCP_SYN, 0)))
+            .saturating_add(u32::from(self.carries(TCP_FIN, 0)))
+    }
+
+    /// Whether this segment repeats sequence space the station judging it has
+    /// already taken, which is the appliance re-sending one it has not seen
+    /// acknowledged.
+    ///
+    /// The one rule every station on this wire recognises a retransmission by,
+    /// held in one place because it is the arithmetic and not the judgement that
+    /// is shared. What a station *does* with a re-send differs with what it is
+    /// carrying — the dial's acknowledges it again, the onboarding station's
+    /// answers its payload again or answers nothing — and so does what each
+    /// still refuses; but *whether* a segment is one is the same question
+    /// everywhere, and the wrapping it needs is exactly the part a second copy
+    /// of it would get subtly wrong.
+    ///
+    /// `taken_through` is the number the station next expects, so the space it
+    /// holds runs from the appliance's own initial number up to there and a
+    /// segment ending no later carries nothing the station does not already
+    /// have. Both ends are compared as offsets from that one origin, so the
+    /// arithmetic wraps with the sequence space rather than breaking across it:
+    /// `<` on raw sequence numbers would answer a segment either side of the
+    /// wrap with whatever the wrap made of it.
+    ///
+    /// Zero-length segments are deliberately never re-sends. They occupy no
+    /// sequence space at all, so *every* one of them would qualify, and the
+    /// acknowledgement a bare one carries is exactly what the steps judge a
+    /// connection by.
+    fn repeats_taken_space(&self, peer_isn: u32, taken_through: u32) -> bool {
+        let occupied = self.occupies();
+        let start = self.sequence.wrapping_sub(peer_isn);
+        let taken = taken_through.wrapping_sub(peer_isn);
+        occupied > 0 && start.saturating_add(occupied) <= taken
+    }
 }
 
 /// Read a TCP-over-IPv4 frame, refusing anything that is not one and verifying
@@ -4017,6 +4058,13 @@ enum OnboardStep {
     /// `SYN` sent; the appliance owes a `SYN-ACK`.
     AwaitSynAck,
     /// The payload is out; the appliance owes an acknowledgement covering it.
+    ///
+    /// Its passive open re-sent lands here and is not misbehaviour: this end
+    /// answers on a schedule, so the appliance's retransmission timer fires
+    /// while the handshake's third segment is still queued. That segment goes
+    /// back again and nothing in this station moves. A `SYN-ACK` at a number
+    /// the appliance never sat on, or one claiming to have taken more than
+    /// this station's `SYN`, is refused as it always was.
     AwaitAck,
     /// This end has closed its half; the appliance owes its own `FIN`.
     AwaitFin,
@@ -4032,6 +4080,13 @@ enum OnboardStep {
     /// sequence number past the space it had reached.
     Reset,
     /// The appliance's `FIN` has been acknowledged and both halves are closed.
+    ///
+    /// Terminal, and the appliance's own `FIN` re-sent crosses into it while
+    /// this end's acknowledgement of it is still queued: that is taken, counted
+    /// and answered with nothing. What is refused is a segment contradicting the
+    /// close — a `SYN`, on a connection whose handshake demonstrably completed,
+    /// or sequence space the appliance had not reached, which is a connection it
+    /// is still writing to.
     Closed,
 }
 
@@ -4086,6 +4141,12 @@ struct OnboardStation {
     /// Segments the appliance has sent on the session's connection, bounded by
     /// [`ONBOARD_SEGMENT_LIMIT`].
     segments: usize,
+    /// Of those, the ones that repeated sequence space this station had already
+    /// taken. Bounded by [`CONNECTION_REPEAT_LIMIT`], which is the tighter of the
+    /// two: a peer whose every segment is one it already sent is not finishing
+    /// the session, and it is worth saying so under its own name rather than
+    /// letting it run to the count of segments of any kind.
+    repeats: usize,
     /// Whether the second connection's `SYN` has gone out, and how many segments
     /// came back addressed to it.
     ///
@@ -4112,6 +4173,7 @@ impl OnboardStation {
             peer_isn: None,
             delivered: 0,
             segments: 0,
+            repeats: 0,
             crowded: false,
             crowd_answers: 0,
             owed: VecDeque::new(),
@@ -4142,6 +4204,40 @@ impl OnboardStation {
         ));
     }
 
+    /// The number this station's `SYN` occupied through, which is the whole of
+    /// what an appliance still offering the handshake can have taken — and the
+    /// sequence the handshake's third segment sits on, so a re-send of it is
+    /// composed from here rather than from a counter that has already moved past
+    /// the payload.
+    const fn sent_through_syn() -> u32 {
+        ONBOARD_STATION_ISN.wrapping_add(1)
+    }
+
+    /// Count one segment that repeated sequence space this station had already
+    /// taken, and refuse the connection once repeating is all the appliance does.
+    ///
+    /// A retransmission is a peer working, so each one is taken rather than
+    /// refused — but a peer that only ever repeats itself never finishes the
+    /// session, and a station that simply went on answering could not tell that
+    /// from a slow machine. Bounded on a count for that reason and never on an
+    /// interval, on [`CONNECTION_REPEAT_LIMIT`]'s terms.
+    ///
+    /// # Errors
+    /// The verdict, naming the count, once the appliance has done nothing else.
+    fn take_repeat(&mut self) -> Result<(), String> {
+        self.repeats = self.repeats.saturating_add(1);
+        if self.repeats > CONNECTION_REPEAT_LIMIT {
+            return Err(format!(
+                "the appliance has re-sent {} segments this station had already taken on the \
+                 onboarding connection, and a session of this shape is a handshake, one \
+                 acknowledgement and a close. A peer that only repeats itself is one that never \
+                 finishes",
+                self.repeats
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether this boot's station has finished everything it set out to do.
     ///
     /// The wire's half of the answer only: what the run waits on besides is the
@@ -4159,9 +4255,9 @@ impl OnboardStation {
         format!(
             "the onboarding station is {:?}; its connection is at {:?} and still owes {}; it \
              opened from port {ONBOARD_STATION_PORT} and the appliance answered with initial \
-             sequence {}, {} payload byte(s) went out, {} segment(s) came back, the second \
-             connection was {}opened and drew {} answer(s) — with this station having put nothing \
-             on the wire to carry any of it",
+             sequence {}, {} payload byte(s) went out, {} segment(s) came back and {} of them \
+             repeated space already taken, the second connection was {}opened and drew {} \
+             answer(s) — with this station having put nothing on the wire to carry any of it",
             self.behaviour,
             self.step,
             self.step.outstanding(),
@@ -4169,6 +4265,7 @@ impl OnboardStation {
                 .map_or_else(|| String::from("(none)"), |isn| isn.to_string()),
             self.delivered,
             self.segments,
+            self.repeats,
             if self.crowded { "" } else { "not " },
             self.crowd_answers
         )
@@ -4422,10 +4519,17 @@ impl ManagementProbe {
     /// judged against the step it belongs to, with the station's answer composed
     /// for it.
     ///
-    /// Every assertion is a field comparison, on [`judge_tcp`](Self::judge_tcp)'s
-    /// terms: the flags that must be set and the flags that must not, and the
-    /// acknowledgement against what this station actually sent. Nothing here
-    /// matches a substring.
+    /// Every assertion is a field comparison: the flags that must be set and the
+    /// flags that must not, the sequence against the space this station has
+    /// taken, and the acknowledgement against what it actually sent. Nothing
+    /// here matches a substring.
+    ///
+    /// A segment carrying sequence space this station has already taken is the
+    /// appliance re-sending one it has not seen acknowledged, which is a peer
+    /// working ([`TcpFrame::repeats_taken_space`]). The two steps that can meet
+    /// one take it, leave the station where it was, and count it against
+    /// [`CONNECTION_REPEAT_LIMIT`]; what each still refuses is named in the step
+    /// itself. Everything else belongs to a step as it always did.
     ///
     /// **A segment addressed to the second connection is refused wherever it
     /// arrives**, and that is the crowding scenario's whole claim: the port holds
@@ -4539,11 +4643,86 @@ impl ManagementProbe {
                 Ok(OnboardStep::AwaitAck)
             }
             OnboardStep::AwaitAck => {
+                // The passive open re-sent, which is a peer working rather than
+                // a peer misbehaving. This station answers on the run loop's
+                // schedule — one queued frame a pass — so the appliance's
+                // retransmission timer fires on its `SYN-ACK` while the third
+                // segment of the handshake is still in this end's queue, and a
+                // frame put on the wire faster than the port's driver refills is
+                // lost outright besides. What comes back is then the segment
+                // this station has already taken, recognised by its numbers
+                // rather than by its shape.
+                //
+                // What goes back is the handshake's third segment *again*, not a
+                // bare acknowledgement: that segment is the one carrying the
+                // payload, so a station that merely re-acknowledged would leave
+                // the appliance owed a payload nobody would send twice and spend
+                // the whole report budget waiting for an account of it. It is
+                // composed from [`OnboardStation::sent_through_syn`] rather than
+                // from `station.sequence`, which has already moved past the
+                // payload, and neither `delivered` nor `sequence` moves for it —
+                // the same bytes at the same numbers are not bytes delivered
+                // again, and both domains' `onboard-received=` is held to that
+                // number.
+                if let Some(peer_isn) = station.peer_isn
+                    && segment.repeats_taken_space(peer_isn, station.expect)
+                {
+                    station.take_repeat()?;
+                    // Everything the appliance can have re-sent here is its
+                    // passive open: it is the only segment it has put on this
+                    // connection, and it occupies the one number that is inside
+                    // the space this station has taken.
+                    if !segment.carries(TCP_SYN | TCP_ACK, TCP_FIN) {
+                        return Err(format!(
+                            "the appliance re-sent sequence {} with flags {:#04x}, and the only \
+                             segment it has put on this connection is its passive open, which \
+                             owes SYN and ACK together and no FIN",
+                            segment.sequence, segment.flags
+                        ));
+                    }
+                    // The station's `SYN` is the whole of what an appliance
+                    // still offering the handshake can have taken: the segment
+                    // that acknowledges the offer is the one carrying the
+                    // payload, so an appliance that had taken the payload would
+                    // have taken that acknowledgement with it and would owe no
+                    // passive open at all.
+                    let owed = OnboardStation::sent_through_syn();
+                    if segment.acknowledgement != owed {
+                        return Err(format!(
+                            "the re-sent onboarding SYN-ACK acknowledges {} and an appliance still \
+                             offering the handshake has taken this station's SYN alone, which \
+                             occupied {owed}",
+                            segment.acknowledgement
+                        ));
+                    }
+                    station.owed.push_back(onboard_segment(
+                        &self.port,
+                        ONBOARD_STATION_PORT,
+                        Numbers {
+                            sequence: owed,
+                            acknowledgement: station.expect,
+                        },
+                        TCP_ACK | TCP_PSH,
+                        ONBOARD_PAYLOAD,
+                    ));
+                    return Ok(OnboardStep::AwaitAck);
+                }
+                // A `SYN` reaching here is one the branch above did not account
+                // for: it sits on sequence space this connection never reached,
+                // so it is not the passive open being re-sent but a second one
+                // at a number of its own — a transport offering to establish a
+                // connection it is already carrying.
                 if !segment.carries(TCP_ACK, TCP_SYN) {
                     return Err(format!(
-                        "the appliance answered the onboarding payload with flags {:#04x}, and an \
-                         established connection owes an ACK with no SYN",
-                        segment.flags
+                        "the appliance answered the onboarding payload with flags {:#04x} at \
+                         sequence {}, and an established connection owes an ACK with no SYN. Its \
+                         passive open sat on {}, and re-sending that one is taken; this is another",
+                        segment.flags,
+                        segment.sequence,
+                        station.peer_isn.map_or_else(
+                            || String::from("(no number at all)"),
+                            |isn| isn.to_string()
+                        )
                     ));
                 }
                 if segment.acknowledgement != station.sequence {
@@ -4602,6 +4781,20 @@ impl ManagementProbe {
                 station.sequence = station.sequence.wrapping_add(1);
                 Ok(OnboardStep::AwaitFin)
             }
+            // No branch for a re-send here, and that is a conclusion rather than
+            // an omission. The only segment the appliance has left unanswered by
+            // this step is its own `SYN-ACK`, and one re-sent went onto the wire
+            // before this end's payload left it — so it arrives before the
+            // acknowledgement of that payload, which is the segment that reaches
+            // this step in the first place. This wire is an ordered socket to the
+            // emulator: it drops a frame, it never reorders one, so a segment
+            // cannot overtake one sent ahead of it. What does legitimately repeat
+            // here is a bare acknowledgement, and the branch below already leaves
+            // the step where it stands for one.
+            //
+            // A `SYN` is therefore refused as it always was, and correctly: this
+            // step is reached only once the appliance has acknowledged the
+            // payload, which is proof this end's own acknowledgement reached it.
             OnboardStep::AwaitFin => {
                 if !segment.carries(TCP_ACK, TCP_SYN) {
                     return Err(format!(
@@ -4690,11 +4883,80 @@ impl ManagementProbe {
                 // abandoned the connection, so it acknowledges nothing on it.
                 Ok(OnboardStep::Reset)
             }
-            OnboardStep::Closed => Err(format!(
-                "a segment came back after the onboarding connection closed: flags {:#04x}, \
-                 sequence {}",
-                segment.flags, segment.sequence
-            )),
+            // A close agrees what both ends exchanged and nothing about what is
+            // still travelling. This station's final acknowledgement is queued
+            // and released on the run loop's schedule, so the appliance's timer
+            // fires on the `FIN` it has not seen taken and re-sends it — the
+            // same peer working that the handshake step meets, one step later.
+            //
+            // Nothing goes back for it, and that is deliberate rather than an
+            // omission: the acknowledgement it is waiting for is already in this
+            // station's queue and will go out, so a second copy would agree
+            // nothing more and draw one more segment out of a connection this
+            // end has finished with.
+            OnboardStep::Closed => {
+                if let Some(peer_isn) = station.peer_isn
+                    && segment.repeats_taken_space(peer_isn, station.expect)
+                {
+                    station.take_repeat()?;
+                    // A `SYN` is a defect here whatever numbers carry it. This
+                    // connection demonstrably completed its handshake — the
+                    // appliance acknowledged the payload and then closed its own
+                    // half — so an offer to establish it is the appliance
+                    // answering an established connection with a passive open,
+                    // which is what this check exists to catch. It is caught
+                    // rather than made tolerable, and the arithmetic above would
+                    // otherwise reach it: by now the space this station holds is
+                    // two numbers wide, so a `SYN` on the second sits inside it.
+                    if segment.carries(TCP_SYN, 0) {
+                        return Err(format!(
+                            "the appliance set SYN on sequence {} after the onboarding connection \
+                             closed: flags {:#04x}. It had acknowledged the payload and closed its \
+                             own half, so this end's acknowledgement demonstrably reached it and an \
+                             offer to establish the connection again is a transport re-offering one \
+                             it has finished",
+                            segment.sequence, segment.flags
+                        ));
+                    }
+                    // Ahead of the acknowledgement's value, because a segment
+                    // with the flag clear has no acknowledgement to judge: the
+                    // field is there but means nothing, and reading it would
+                    // name the wrong thing.
+                    if !segment.carries(TCP_ACK, 0) {
+                        return Err(format!(
+                            "the appliance re-sent sequence {} with flags {:#04x} after the \
+                             onboarding connection closed, and every segment of an established \
+                             connection carries an ACK",
+                            segment.sequence, segment.flags
+                        ));
+                    }
+                    // The one field a re-send composes afresh rather than
+                    // repeats, held to the same span every other step holds it
+                    // to: this station sent its `SYN`, its payload and its
+                    // `FIN`, and an acknowledgement outside that is one for
+                    // bytes nobody sent. Offsets from this station's own initial
+                    // number, so the arithmetic wraps rather than breaking
+                    // across the wrap.
+                    let acknowledged = segment.acknowledgement.wrapping_sub(ONBOARD_STATION_ISN);
+                    let sent = station.sequence.wrapping_sub(ONBOARD_STATION_ISN);
+                    if acknowledged == 0 || acknowledged > sent {
+                        return Err(format!(
+                            "the appliance re-sent sequence {} acknowledging {} after the \
+                             onboarding connection closed, and this station has sent its SYN, its \
+                             payload and its FIN — {sent} numbers from {ONBOARD_STATION_ISN}. An \
+                             acknowledgement outside that is one for bytes nobody sent",
+                            segment.sequence, segment.acknowledgement
+                        ));
+                    }
+                    return Ok(OnboardStep::Closed);
+                }
+                Err(format!(
+                    "a segment came back after the onboarding connection closed carrying sequence \
+                     space the appliance had not reached: flags {:#04x}, sequence {}, and this \
+                     station had taken up to {}",
+                    segment.flags, segment.sequence, station.expect
+                ))
+            }
         }
     }
 
@@ -4751,10 +5013,10 @@ impl ManagementProbe {
     /// One segment of the connection the appliance dialled, judged against the
     /// step it belongs to, with the station's answer composed for it.
     ///
-    /// Every assertion is a field comparison, on [`judge_tcp`](Self::judge_tcp)'s
-    /// terms: the flags that must be set and the flags that must not, the
-    /// acknowledgement against what this station actually sent, and the probe
-    /// against the bytes the appliance is contracted to carry.
+    /// Every assertion is a field comparison: the flags that must be set and the
+    /// flags that must not, the acknowledgement against what this station
+    /// actually sent, and the probe against the bytes the appliance is
+    /// contracted to carry.
     ///
     /// # Errors
     /// The verdict, naming the field and the two values.
@@ -4980,43 +5242,43 @@ impl ManagementProbe {
                 // would let the appliance spend its retransmission budget and
                 // abandon a connection this boot judges as held open.
                 //
-                // Compared as offsets from the appliance's own initial number so
-                // the arithmetic wraps with the sequence space, and bounded on a
-                // count: a peer that only ever repeats itself is not carrying a
-                // channel, and a station that simply went on acknowledging could
-                // not tell that from a slow machine.
-                if let Some(peer_isn) = station.peer_isn {
-                    let occupied = segment.payload.len() as u32;
-                    let start = segment.sequence.wrapping_sub(peer_isn);
-                    let taken = station.expect.wrapping_sub(peer_isn);
-                    if occupied > 0 && start.saturating_add(occupied) <= taken {
-                        station.repeats = station.repeats.saturating_add(1);
-                        if station.repeats > DIAL_REPEAT_LIMIT {
-                            return Err(format!(
-                                "the appliance has re-sent {} segments this station had already \
-                                 taken and acknowledged, over the {} session(s) a boot may open. A \
-                                 peer that only repeats itself is one that never gets its flight \
-                                 across",
-                                station.repeats, DIAL_RESTART_LIMIT
-                            ));
-                        }
-                        station.owed.push_back(station_segment(
-                            &self.port,
-                            DIAL_DESTINATION,
-                            Ports {
-                                source: DIAL_PORT,
-                                destination: segment.source_port,
-                            },
-                            Numbers {
-                                sequence: station.sequence,
-                                acknowledgement: station.expect,
-                            },
-                            TCP_ACK,
-                            STATION_WINDOW,
-                            &[],
+                // Recognised by the one rule every station here recognises a
+                // re-send by ([`TcpFrame::repeats_taken_space`]), which compares
+                // as offsets from the appliance's own initial number so the
+                // arithmetic wraps with the sequence space. Bounded on a count: a
+                // peer that only ever repeats itself is not carrying a channel,
+                // and a station that simply went on acknowledging could not tell
+                // that from a slow machine. Nothing but a payload byte can occupy
+                // space here — a `SYN` and a `FIN` are both refused above — so
+                // what that rule counts is the flight's own bytes.
+                if let Some(peer_isn) = station.peer_isn
+                    && segment.repeats_taken_space(peer_isn, station.expect)
+                {
+                    station.repeats = station.repeats.saturating_add(1);
+                    if station.repeats > DIAL_REPEAT_LIMIT {
+                        return Err(format!(
+                            "the appliance has re-sent {} segments this station had already taken \
+                             and acknowledged, over the {} session(s) a boot may open. A peer that \
+                             only repeats itself is one that never gets its flight across",
+                            station.repeats, DIAL_RESTART_LIMIT
                         ));
-                        return Ok(DialStep::Handshaken);
                     }
+                    station.owed.push_back(station_segment(
+                        &self.port,
+                        DIAL_DESTINATION,
+                        Ports {
+                            source: DIAL_PORT,
+                            destination: segment.source_port,
+                        },
+                        Numbers {
+                            sequence: station.sequence,
+                            acknowledgement: station.expect,
+                        },
+                        TCP_ACK,
+                        STATION_WINDOW,
+                        &[],
+                    ));
+                    return Ok(DialStep::Handshaken);
                 }
                 // In order and with no gap, on the client's own terms: what runs
                 // over this connection is a stream, so a segment out of place is
@@ -9155,6 +9417,291 @@ mod tests {
             )
             .expect_err("sequence space the appliance had not reached");
         assert!(verdict.contains("composed no further"), "{verdict}");
+    }
+
+    /// The appliance's own initial sequence number for the connection the two
+    /// re-send steps are proved on, chosen at the very top of the space so every
+    /// number this station takes on it lies the other side of the wrap: an
+    /// implementation comparing raw sequence numbers passes none of what
+    /// follows.
+    const ONBOARD_WRAPPING_PEER_ISN: u32 = 0xffff_ffff;
+
+    /// The passive open the appliance re-sends because this end's
+    /// acknowledgement — the segment that carries the payload — has not reached
+    /// it yet.
+    fn onboard_passive_open(management: &ManagementPort) -> Vec<u8> {
+        onboard_answer(
+            management,
+            Numbers {
+                sequence: ONBOARD_WRAPPING_PEER_ISN,
+                acknowledgement: ONBOARD_STATION_ISN.wrapping_add(1),
+            },
+            TCP_SYN | TCP_ACK,
+        )
+    }
+
+    /// A station driven to the step where its payload is out and the appliance
+    /// owes an acknowledgement covering it: the open and the passive open
+    /// answering it, on a connection whose numbers wrap.
+    fn awaiting_the_onboarding_ack(probe: &ManagementProbe) -> OnboardStation {
+        let mut station = OnboardStation::new(OnboardBehaviour::Completes);
+        station.open(&probe.port);
+        station.step = probe
+            .judge_onboard_tcp(&onboard_passive_open(&probe.port), &mut station)
+            .expect("the passive open");
+        assert_eq!(station.step, OnboardStep::AwaitAck);
+        assert_eq!(station.expect, 0, "the connection's numbers do not wrap");
+        station
+    }
+
+    /// That station carried through to both halves closed, and the appliance's
+    /// own close it got there on.
+    fn closed_onboarding(probe: &ManagementProbe) -> (OnboardStation, Vec<u8>) {
+        let mut station = awaiting_the_onboarding_ack(probe);
+        station.step = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &probe.port,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(1),
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect("the acknowledgement of the payload");
+        assert_eq!(station.step, OnboardStep::AwaitFin);
+        let close = onboard_answer(
+            &probe.port,
+            Numbers {
+                sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(1),
+                acknowledgement: station.sequence,
+            },
+            TCP_FIN | TCP_ACK,
+        );
+        station.step = probe
+            .judge_onboard_tcp(&close, &mut station)
+            .expect("the appliance's own close");
+        assert_eq!(station.step, OnboardStep::Closed);
+        (station, close)
+    }
+
+    /// An appliance whose retransmission timer fires before the handshake's
+    /// third segment reaches it re-sends its passive open, and that is a peer
+    /// working — this step used to call it a peer answering an established
+    /// connection with an offer to establish it, and fail the boot on it.
+    #[test]
+    fn a_re_sent_onboarding_passive_open_is_answered_with_the_payload_again() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut station = awaiting_the_onboarding_ack(&probe);
+        let taken = station.expect;
+        let sent = station.sequence;
+        station.owed.clear();
+
+        assert_eq!(
+            probe.judge_onboard_tcp(&onboard_passive_open(&management), &mut station),
+            Ok(OnboardStep::AwaitAck)
+        );
+        assert_eq!(station.expect, taken, "a re-send moved the stream");
+        assert_eq!(station.sequence, sent, "a re-send moved what this end sent");
+        assert_eq!(
+            station.delivered,
+            ONBOARD_PAYLOAD.len() as u64,
+            "a re-send was counted as bytes delivered again"
+        );
+        assert_eq!(station.repeats, 1);
+
+        // And what goes back is the handshake's third segment again rather than
+        // a bare acknowledgement: the appliance never took the payload, so a
+        // station that merely completed the handshake would wait out the whole
+        // report budget for an account of bytes nobody holds.
+        let answer = decode_tcp(
+            &station.owed.pop_front().expect("the payload again"),
+            &management,
+        )
+        .expect("a well-formed segment");
+        assert_eq!(answer.payload, ONBOARD_PAYLOAD);
+        assert_eq!(answer.sequence, ONBOARD_STATION_ISN.wrapping_add(1));
+        assert_eq!(answer.acknowledgement, taken);
+        assert!(answer.carries(TCP_ACK | TCP_PSH, TCP_SYN | TCP_FIN));
+    }
+
+    /// And the shapes that are not the passive open re-sent, each of which is an
+    /// appliance offering to establish a connection it is already carrying or
+    /// has finished. This is what the checks at these two steps exist for, and
+    /// they still catch every one of them.
+    #[test]
+    fn an_onboarding_passive_open_that_is_not_the_one_already_seen_still_fails_the_boot() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+
+        // A second passive open at a number of its own: it is not a re-send of
+        // the one already seen, so it never reaches the branch that takes one.
+        let mut station = awaiting_the_onboarding_ack(&probe);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(3),
+                        acknowledgement: ONBOARD_STATION_ISN.wrapping_add(1),
+                    },
+                    TCP_SYN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("a passive open at a new number");
+        assert!(verdict.contains("owes an ACK with no SYN"), "{verdict}");
+
+        // A re-send claiming to have taken more than this station's own `SYN`,
+        // which an appliance still owing a passive open cannot have.
+        let mut station = awaiting_the_onboarding_ack(&probe);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN,
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_SYN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("a re-send acknowledging the payload");
+        assert!(
+            verdict.contains("still offering the handshake"),
+            "{verdict}"
+        );
+
+        // And a `SYN` on a connection that demonstrably completed its
+        // handshake: the appliance acknowledged the payload and closed its own
+        // half, so this end's acknowledgement reached it. The space it holds by
+        // then is wide enough for the arithmetic to call this a re-send, and it
+        // is refused by name instead.
+        let (mut station, _) = closed_onboarding(&probe);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(1),
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_SYN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("a SYN after the connection closed");
+        assert!(verdict.contains("set SYN on sequence"), "{verdict}");
+    }
+
+    /// The appliance's own close re-sent because this station's acknowledgement
+    /// of it is still queued is taken once, not twice, and draws nothing: the
+    /// acknowledgement it is waiting for is already on its way.
+    #[test]
+    fn a_re_sent_onboarding_close_is_taken_once_and_answered_with_nothing() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let (mut station, close) = closed_onboarding(&probe);
+        let taken = station.expect;
+        station.owed.clear();
+
+        assert_eq!(
+            probe.judge_onboard_tcp(&close, &mut station),
+            Ok(OnboardStep::Closed)
+        );
+        assert_eq!(station.expect, taken, "a re-send moved the stream");
+        assert_eq!(station.repeats, 1);
+        assert!(
+            station.owed.is_empty(),
+            "a station that has answered a close owes nothing more"
+        );
+
+        // The acknowledgement is the one field a re-send composes afresh, and it
+        // is held to what this station has actually sent.
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(1),
+                        acknowledgement: station.sequence.wrapping_add(1),
+                    },
+                    TCP_FIN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("a re-send acknowledging bytes nobody sent");
+        assert!(verdict.contains("bytes nobody sent"), "{verdict}");
+
+        // And a re-send is still a segment of an established connection.
+        let (mut station, _) = closed_onboarding(&probe);
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: ONBOARD_WRAPPING_PEER_ISN.wrapping_add(1),
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_FIN,
+                ),
+                &mut station,
+            )
+            .expect_err("a re-send carrying no acknowledgement");
+        assert!(verdict.contains("carries an ACK"), "{verdict}");
+    }
+
+    /// Sequence space the appliance had not reached still fails the boot after
+    /// the connection closed: that is a port still writing to it, and it is the
+    /// one thing a close genuinely contradicts.
+    #[test]
+    fn a_segment_past_the_closed_onboarding_connection_still_fails_the_boot() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let (mut station, _) = closed_onboarding(&probe);
+
+        let verdict = probe
+            .judge_onboard_tcp(
+                &onboard_answer(
+                    &management,
+                    Numbers {
+                        sequence: station.expect.wrapping_add(1),
+                        acknowledgement: station.sequence,
+                    },
+                    TCP_FIN | TCP_ACK,
+                ),
+                &mut station,
+            )
+            .expect_err("sequence space the appliance had not reached");
+        assert!(
+            verdict.contains("had not reached") && verdict.contains("taken up to"),
+            "{verdict}"
+        );
+    }
+
+    /// The tolerance is bounded on a count, which is what a peer that only ever
+    /// repeats itself is: it never finishes the session, and a station that
+    /// simply went on answering could not tell that from a slow machine.
+    #[test]
+    fn an_appliance_that_only_re_sends_the_onboarding_passive_open_fails_on_the_count() {
+        let management = bench().management();
+        let (probe, _) = ManagementProbe::new(management);
+        let mut station = awaiting_the_onboarding_ack(&probe);
+        let again = onboard_passive_open(&management);
+
+        for _ in 0..CONNECTION_REPEAT_LIMIT {
+            probe
+                .judge_onboard_tcp(&again, &mut station)
+                .expect("a re-send inside the bound");
+        }
+        let verdict = probe
+            .judge_onboard_tcp(&again, &mut station)
+            .expect_err("a peer that only repeats itself");
+        assert!(verdict.contains("never finishes"), "{verdict}");
     }
 
     /// Each reply is owed exactly once, and the port must answer both before a

@@ -2878,7 +2878,14 @@ those bytes, which on all three is a peer that went away before anything was dec
 judged on both domains' accounts of the one session — the ending they name, the bytes each way, and
 the items they exchanged, held to each other as well as to the expectation, so a handover one end
 made and the other never saw cannot read as a session that carried less — and on the port's own
-totals beside them.
+totals beside them. Segment by segment on the wire, each is held to the step of the exchange it
+belongs to, with one exception: a segment repeating sequence space the station has already taken is
+the appliance re-sending one whose acknowledgement has not reached it, and that is a peer working.
+The station takes it, answers as a peer answers one — the payload again where the passive open is
+what was repeated, and nothing at all where a close was — and leaves its own model where it stood.
+Those are counted, so an appliance that only ever repeats itself still fails the boot. What
+contradicts the state is refused as it always was: an offer to establish a connection already
+carried or already finished, and sequence space the appliance had not reached.
 
 The three assert what each is for. The first states that a session an administrator finished with is
 reported as ended by the peer at both ends. The second states that a connection neither end closed is
