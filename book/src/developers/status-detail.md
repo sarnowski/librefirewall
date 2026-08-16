@@ -2784,8 +2784,8 @@ The module is host-tested against a peer that keeps to none of the protocol — 
 refusal or a typed fault and nothing in it can panic.
 
 **Both ends of that channel now exist, and the port they serve is open.** The management endpoint
-listens on a second TCP port — a first-party constant, not the plain-HTTP one, which keeps its own
-surface — and what runs on it is a byte stream rather than a request and a response: one connection
+listens on a second TCP port — a first-party constant, not the one the channel is dialled out of,
+which serves nothing — and what runs on it is a byte stream rather than a request and a response: one connection
 at a time, a fixed array of what arrived and a fixed array of what goes back, and nothing in that
 crate that interprets a byte. The two ports are two transports on one address, because a stack
 answers on one port and matches a segment to a connection by the peer's address and port alone; a
