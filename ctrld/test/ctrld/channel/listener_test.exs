@@ -481,6 +481,17 @@ defmodule Ctrld.Channel.ListenerTest do
       assert {:ok, {:down_config_commit, 2, deadline}} = read_frame(socket, true)
       assert deadline > 0
 
+      # And nothing is recorded until the appliance says what it did with the
+      # commit: it can commit and then put the commit back, so the row moves on the
+      # answer rather than on the send.
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :staged
+
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=2 outcome=applied changes=3"}
+        )
+
       assert eventually(fn ->
                version(appliance, 2) |> ConfigurationVersion.state() == :committed
              end)
@@ -498,12 +509,63 @@ defmodule Ctrld.Channel.ListenerTest do
 
       assert {:ok, {:down_commit_confirm, 2}} = read_frame(second, true)
 
+      # The protocol has no acknowledgement of its own for a confirmation, so the
+      # result frame is the only place the fact exists — and until it arrives the
+      # row still says a commit is awaiting one.
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :committed
+
+      :ok =
+        send_frame(
+          second,
+          {:up_config_validate_result, "generation=2 outcome=confirmed changes=0"}
+        )
+
       assert eventually(fn ->
                version(appliance, 2) |> ConfigurationVersion.state() == :confirmed
              end)
 
       assert Appliances.awaiting_confirmation(appliance.device_id) == nil
       :ok = :ssl.close(second)
+    end
+
+    test "a commit the appliance puts back is not recorded as one", %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, actor: actor, certificate: certificate, key: key} = appliance_with()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :online end)
+
+      assert {:ok, _staged} =
+               Appliances.stage_configuration(reload(appliance), amended_document(), actor)
+
+      assert {:ok, {:down_config_stage, _document}} = read_frame(socket, true)
+
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=2 outcome=staged changes=3"}
+        )
+
+      assert {:ok, {:down_config_commit, 2, _deadline}} = read_frame(socket, true)
+
+      # The appliance committed it and put it back, because its own medium would
+      # not hold the version. That is not a commit, however briefly it was in
+      # force: recording one would leave this server confirming a provisional
+      # commit the appliance no longer has, and reporting a version as running that
+      # the next boot would silently drop.
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=1 outcome=reverted changes=3"}
+        )
+
+      # Nothing to confirm, and the version stays where the staging left it.
+      assert eventually(fn -> Appliances.awaiting_confirmation(appliance.device_id) == nil end)
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :staged
+      assert version(appliance, 2).committed_at == nil
+      :ok = :ssl.close(socket)
     end
 
     test "a refusal in the history sends the appliance's generation and records this server's",
@@ -558,6 +620,12 @@ defmodule Ctrld.Channel.ListenerTest do
       # datastore will commit.
       assert {:ok, {:down_config_commit, 2, _deadline}} = read_frame(socket, true)
 
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=2 outcome=applied changes=1"}
+        )
+
       # And the row that moves is this server's version 3 — the document that was
       # actually taken. Version 2 stays refused: a commit recorded against it
       # would report a document the appliance rejected as the one in force.
@@ -579,6 +647,12 @@ defmodule Ctrld.Channel.ListenerTest do
       :ok = send_frame(second, {:hello, :appliance})
 
       assert {:ok, {:down_commit_confirm, 2}} = read_frame(second, true)
+
+      :ok =
+        send_frame(
+          second,
+          {:up_config_validate_result, "generation=2 outcome=confirmed changes=0"}
+        )
 
       assert eventually(fn ->
                version(appliance, 3) |> ConfigurationVersion.state() == :confirmed

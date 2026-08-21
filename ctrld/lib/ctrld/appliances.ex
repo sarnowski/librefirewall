@@ -22,7 +22,9 @@ defmodule Ctrld.Appliances do
   one connection. `stage_configuration/3` writes the version and asks the live
   session to send it; the session reports the appliance's verdict back through
   `configuration_validated/4`, commits through `configuration_committed/3`, and
-  confirms over the *next* connection through `configuration_confirmed/3`.
+  confirms over the *next* connection through `configuration_confirmed/3`. The last
+  two are written from the appliance's own answer to each step rather than from the
+  send.
 
   **Every step is one transaction with its own audit record**, on the onboarding's
   reasoning exactly: a configuration that reached an appliance without a record of
@@ -395,12 +397,13 @@ defmodule Ctrld.Appliances do
   end
 
   @doc """
-  Record that this server committed `generation` provisionally.
+  Record that the appliance committed `generation` provisionally.
 
-  There is no acknowledgement to wait for and none to record: the appliance ends
-  the session on a commit, which is how the protocol makes the confirmation
-  arrive over a fresh connection. So what this writes is the send, and what
-  evidences the commit landing is the appliance coming back at all.
+  Written from the appliance's own answer to the commit and never from the send: an
+  appliance whose medium will not hold the version commits it and then puts it
+  back, so a row written when the frame left would name a provisional commit that
+  no longer exists — and this server would then spend the next connection
+  confirming it.
   """
   @spec configuration_committed(String.t(), pos_integer(), DateTime.t()) ::
           {:ok, ConfigurationVersion.t()} | {:error, :no_such_version | Ecto.Changeset.t()}
@@ -409,7 +412,15 @@ defmodule Ctrld.Appliances do
     advance(device_id, generation, %{committed_at: DateTime.truncate(at, :second)})
   end
 
-  @doc "Record that this server confirmed `generation` over a fresh connection."
+  @doc """
+  Record that the appliance confirmed `generation` over a fresh connection.
+
+  Written from the appliance's own answer, for `configuration_committed/3`'s
+  reason and one of its own: the protocol has no acknowledgement for a
+  confirmation, so before the appliance answered these the audit trail could only
+  say what this server sent — which is a claim an appliance that had already
+  reverted the commit would have denied.
+  """
   @spec configuration_confirmed(String.t(), pos_integer(), DateTime.t()) ::
           {:ok, ConfigurationVersion.t()} | {:error, :no_such_version | Ecto.Changeset.t()}
   def configuration_confirmed(device_id, generation, %DateTime{} = at)

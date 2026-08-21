@@ -1277,14 +1277,40 @@ claims.
   deadline the server asks for is clamped between five seconds and ten minutes, so neither a commit
   that could never be confirmed nor an indefinite hold is expressible from the wire, and a reversal
   consumes the commit it undoes, so an unreachable server costs one reversal rather than a loop.
-- **No boot proves the sequence.** What is held is host-level — the datastore's provisional commit,
-  confirmation and reversal, the report layer's records, and the widened submission ABI in both
-  directions — plus the boot every scenario still takes with the new region pair and the new
-  notification channel in place. A scenario that stages a document over the channel from the harness's
-  management server, reads the validation result, commits, reconnects and confirms, and a second that
-  lets the deadline pass, do not exist: `openssl s_server` sends what it reads on standard input, and
-  driving a multi-step exchange across a reconnect needs the harness to write into that pipe on what
-  it sees in the transcript rather than once before the boot.
+  **The session ends exactly when a commit awaits confirmation**, which is that rule stated once
+  rather than at each exit of the code that makes one.
+- **A commit the medium will not hold is put back rather than reported as in force.** The version
+  history is written after the configuration is in force, so the write can refuse a commit that has
+  already happened. Leaving it standing was wrong in two ways at once: the appliance enforced and
+  reported a configuration no reboot would reload, and the session did not end — so the
+  fresh-connection rule could not be met and the commit was guaranteed to revert while the appliance
+  said it was running. Both follow from the same decision, which is that such a commit is not one:
+  the appliance reverses it at once, the two domains come back to one answer, and nothing awaits a
+  confirmation, so the rule has nothing left to satisfy. The alternative is worse than a refusal —
+  the server would confirm it over the next connection, the displaced configuration would be given
+  up, and the reboot after that would silently return to the older version with the management plane
+  certain of the newer one. Two console tokens keep the cases apart:
+  `channel-config-not-durable` is the reversal, and `channel-config-not-durable-unreverted` is the
+  graver line where the reversal itself could not be made, which leaves the confirmation deadline
+  armed so the appliance tries again on its own.
+- **Every configuration operation is answered, and the server records the answer rather than the
+  ask.** Staging was already answered by a result frame; a commit and a confirmation were answered by
+  silence, and the server inferred a commit from the session ending and recorded a confirmation from
+  the *send* — which was a claim about something the protocol gives no acknowledgement of, and one an
+  appliance that had already reverted the commit would have denied. All three now carry a result line
+  in the same frame and the same field vocabulary, whose outcome tokens `applied`, `reverted` and
+  `confirmed` existed for exactly these and had never been written. `ctrld` writes both the commit and
+  the confirmation from those lines, and stops asking for a confirmation once the appliance's own
+  deadline has certainly passed — past that a confirmation can only be refused, and asking on every
+  connection would be a retry of something that can no longer happen.
+- **No boot proves the sequence past the commit.** Three scenarios push the whole
+  staging-and-commit transaction down a session the appliance greeted first, and a pair proves a
+  committed version is durable across a reboot. What no boot yet reaches is a **confirmation** — the
+  scenario that commits asks for a deadline far past any budget the gate takes and never confirms —
+  and no boot commits again after a reboot that restored a version, which is the sequence that would
+  have caught the generation counter not being seeded from the medium. So the confirmation, the
+  reversal on an expired deadline, and a commit that could not be made durable are held together by
+  host-level cover and by the console vocabulary rather than by a booted node.
 - **A submission is answered when it is committed, not when the dataplane has switched.** The
   configuration domain holds no timer, so it cannot bound a wait on the forwarding domain's
   acknowledgement — and a refusal by that domain is the *absence* of one, so waiting would hang a
@@ -3855,17 +3881,30 @@ delivered anchor and matches the profile in every field.
   *appliance* stated rather than the one this server proposed. **The commit ends the session, and
   that is the protocol working**: the confirmation is sent from the greeting of the *next*
   connection, out of the row the commit wrote, which is what makes it evidence that this server is
-  still reachable. A result line for a version this session is not staging is dropped and counted
-  like any other unanswerable frame — the appliance is semi-trusted, and a peer able to move a
-  version's state by asserting a verdict nobody asked for would be a peer that commits its own
-  configuration.
+  still reachable. A result line for a version this session is neither staging nor awaiting an
+  answer on is dropped and counted like any other unanswerable frame — the appliance is
+  semi-trusted, and a peer able to move a version's state by asserting a verdict nobody asked for
+  would be a peer that commits its own configuration.
+
+  **The commit and the confirmation are recorded from the appliance's answer and never from the
+  send.** All three operations are answered by a result frame, and the two later ones can each fail
+  in a way a send cannot see: an appliance whose medium will not hold a version commits it and puts
+  it back, answering `reverted`, and a confirmation naming a commit it no longer holds is refused
+  outright. So the commit row moves on `applied` or `unchanged`, the confirmation row on
+  `confirmed`, and an outcome this build does not know moves neither — a version is never advanced
+  on a verdict this end misread. A confirmation is also no longer asked for once the deadline this
+  server named has certainly passed: past that the appliance has reverted the commit and can only
+  refuse, so asking on every connection would be a retry of something that cannot happen.
 
   The five instants are the whole record and the lifecycle is **derived** from them, on the same
   reasoning the inventory derives an appliance's status: a stored state is a value that can
   disagree with the facts under it. There is deliberately no rollback instant — an unconfirmed
   commit is undone by the appliance's own deadline, over no frame this server sends and with none
   coming back — so a version that was committed and never confirmed says exactly that, which is
-  the honest answer. One transaction at a time per appliance, because the appliance holds one
+  the honest answer. **Missing:** a commit the appliance answered `reverted` leaves its row where
+  the staging left it and the reason only in this server's log, so the trail says the version was
+  never committed rather than that the appliance could not make it durable; carrying that needs a
+  sixth instant or a state of its own. One transaction at a time per appliance, because the appliance holds one
   candidate and a second staged document would displace the first while this server still showed
   both.
 - **The web interface is plain HTTP**, a recorded deliberate temporary state: it will take an

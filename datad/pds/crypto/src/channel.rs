@@ -84,7 +84,7 @@ use pd_runtime::{
 };
 use wire::{DownloadSink, RangeOutcome, RangeWant};
 
-use crate::configuration::{ChannelConfig, ConfigFailure, StageResult};
+use crate::configuration::{Answer, ChannelConfig, ConfigFailure};
 use crate::delegate::{HeldAnchor, HeldCertificate};
 
 /// The most console records one pass leaves.
@@ -637,9 +637,9 @@ impl ManagementChannel {
         let reverted = self.revert_if_expired();
         Answered {
             sent: second.sent,
-            // A commit ends the session, and that **is** the fresh-connection
-            // rule: closing makes a later connection the only place a
-            // confirmation can arrive. A revert ends it because the
+            // A commit awaiting confirmation ends the session, and that **is** the
+            // fresh-connection rule: closing makes a later connection the only
+            // place a confirmation can arrive. A revert ends it because the
             // configuration under the session just changed.
             finished: second.finished || refused.is_some() || carried.committed || reverted,
             agreed,
@@ -1201,33 +1201,43 @@ impl Dialogue<'_> {
 struct Carried {
     /// The one configuration operation that did not happen, where one did not.
     failure: Option<ConfigFailure>,
-    /// Whether a commit was made, which ends the session.
+    /// Whether a commit awaits confirmation, which is what ends the session.
     committed: bool,
-    /// Whether the reading is over for this pass.
     done: bool,
+}
+
+impl Carried {
+    /// What one configuration operation produced, as the frame it is owed back.
+    fn take(&mut self, answer: Answer) -> Acted {
+        self.failure = answer.failure;
+        self.committed = answer.committed;
+        self.done = true;
+        Acted::Result {
+            line: answer.line,
+            len: answer.len,
+        }
+    }
 }
 
 /// What acting on one frame produced.
 enum Acted {
-    /// The server's greeting, and where it says each recording is to resume.
     Greeted {
         log: u64,
         capture: u64,
     },
-    /// How far the server says it has durably taken each recording, for the
-    /// session to bound against what it actually sent.
+    /// How far the server says it has durably taken each recording, for the session
+    /// to bound against what it actually sent.
     Acknowledged {
         log: u64,
         capture: u64,
     },
-    /// An extent the server asked for, taken by the end that holds the one
-    /// request in flight because that request bounds every frame of the answer.
+    /// An extent the server asked for, taken by the end holding the one request in
+    /// flight, that request bounding every frame of the answer.
     RangeRead {
         ring: Ring,
         start: u64,
         length: u64,
     },
-    /// A result line owed back, framed by the caller.
     Result {
         line: [u8; MAX_ANSWER_LEN],
         len: usize,
@@ -1239,8 +1249,8 @@ enum Acted {
 ///
 /// A free function because of the borrow: a decoded frame borrows the decoder
 /// inside the session, so a method on the session could not also take the
-/// delegation that lives outside it. Every frame is named rather than folded into
-/// a wildcard, so one added to the protocol is a compile error here.
+/// delegation that lives outside it. Every frame is named rather than folded into a
+/// wildcard, so one added to the protocol is a compile error here.
 fn act(
     frame: Frame<'_>,
     config: &mut ChannelConfig,
@@ -1250,37 +1260,18 @@ fn act(
 ) -> Acted {
     match frame {
         Frame::Hello(Hello::Server { log, capture }) => Acted::Greeted { log, capture },
-        Frame::DownConfigStage { document } => {
-            let (StageResult { line, len }, failure) = config.stage(document);
-            carried.failure = failure;
-            carried.done = true;
-            Acted::Result { line, len }
-        }
+        Frame::DownConfigStage { document } => carried.take(config.stage(document)),
         Frame::DownConfigCommit {
             generation,
             confirm_deadline_secs,
-        } => {
-            match config.commit(generation, confirm_deadline_secs, now, serial) {
-                Ok(_) => carried.committed = true,
-                Err(failure) => carried.failure = Some(failure),
-            }
-            carried.done = true;
-            Acted::Nothing
-        }
-        Frame::DownCommitConfirm { generation } => {
-            if let Err(failure) = config.confirm(generation, serial) {
-                carried.failure = Some(failure);
-            }
-            carried.done = true;
-            Acted::Nothing
-        }
-        // The acknowledgement's cursors are the session's own state — it is the
-        // end that knows what it sent, and so the only end that can bound a
-        // claim against it — so they go back to it rather than being taken here.
+        } => carried.take(config.commit(generation, confirm_deadline_secs, now, serial)),
+        Frame::DownCommitConfirm { generation } => carried.take(config.confirm(generation, serial)),
+        // The acknowledgement's cursors and the range request alike are the
+        // session's own state: it is the end that knows what it sent and the end
+        // that decoded the ask, so it is the only end that can bound either
+        // against what actually happened. Both go back to it rather than being
+        // acted on here.
         Frame::Ack { log, capture } => Acted::Acknowledged { log, capture },
-        // The request is the session's own state, for the acknowledgement's
-        // reason: it is the end that decoded it, and so the only end that can
-        // hold a neighbour's later frames to what was actually asked for.
         Frame::DownRangeRead {
             ring,
             start,
@@ -1290,9 +1281,8 @@ fn act(
             start,
             length,
         },
-        // Frames this end sends. A server that sent one is refused by the
-        // decoder's own direction check before it becomes a value, so these arms
-        // exist to keep the match total rather than to be reached.
+        // Frames this end sends: the decoder's direction check refuses one from a
+        // server before it becomes a value, so these arms keep the match total.
         Frame::Hello(Hello::Appliance)
         | Frame::UpRecords { .. }
         | Frame::UpCapture { .. }

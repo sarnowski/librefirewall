@@ -80,11 +80,91 @@ const MIN_CONFIRM_SECONDS: u64 = 5;
 // that no peer reaches.
 const _: () = assert!(MIN_CONFIRM_SECONDS < MAX_CONFIRM_SECONDS);
 
-/// What staging a document produced, as the result line needs it.
-pub struct StageResult {
+/// What one configuration operation produced.
+///
+/// One type for all three, because the server is owed the same thing about each:
+/// a result line saying what happened. `committed` is what the caller turns into
+/// ending the session, and it is true **exactly** when a provisional commit came
+/// out of the operation awaiting confirmation — which is the fresh-connection rule
+/// stated once rather than at each of this file's exits.
+pub struct Answer {
     /// The line to put in the up frame, without a line ending.
     pub line: [u8; MAX_ANSWER_LEN],
     pub len: usize,
+    /// The console token where the operation did not happen.
+    pub failure: Option<ConfigFailure>,
+    /// Whether a provisional commit now stands and so awaits a confirmation over
+    /// a connection opened afterwards.
+    pub committed: bool,
+}
+
+impl Answer {
+    /// A line naming an outcome that carries a generation and a change count.
+    fn stated(generation: u32, outcome: Outcome, changes: u32) -> Self {
+        let mut line = [0_u8; MAX_ANSWER_LEN];
+        let len = write_result_line(&mut line, generation, outcome, changes, None);
+        Self {
+            line,
+            len,
+            failure: None,
+            committed: false,
+        }
+    }
+
+    /// A line naming a refusal the deciding domain composed, which carries its own
+    /// reason and offset.
+    fn rejected(generation: u32, reason: u32, detail: u32) -> Self {
+        let mut line = [0_u8; MAX_ANSWER_LEN];
+        let len = write_result_line(
+            &mut line,
+            generation,
+            Outcome::Refused,
+            0,
+            Some((reject_reason_of(reason), detail)),
+        );
+        Self {
+            line,
+            len,
+            failure: None,
+            committed: false,
+        }
+    }
+
+    /// A line for an operation this end could not complete at all.
+    ///
+    /// Generation zero, which is no configuration: an exchange that did not
+    /// complete is one this end learnt nothing from, and a number here would be a
+    /// claim about what is running that this domain holds no copy of. And
+    /// `malformed` as the reason, which is the honest token — what the server is
+    /// told is that the appliance could not make sense of the exchange about its
+    /// document. Which part of the appliance could not is a console token and never
+    /// a thing to put on the wire.
+    fn unresolved(failure: ConfigFailure) -> Self {
+        let mut line = [0_u8; MAX_ANSWER_LEN];
+        let len = write_result_line(
+            &mut line,
+            0,
+            Outcome::Refused,
+            0,
+            Some((lfw_log::RejectReason::Malformed, 0)),
+        );
+        Self {
+            line,
+            len,
+            failure: Some(failure),
+            committed: false,
+        }
+    }
+
+    const fn with(mut self, failure: ConfigFailure) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+
+    const fn awaiting_confirmation(mut self) -> Self {
+        self.committed = true;
+        self
+    }
 }
 
 /// Why a configuration operation over the channel did not happen, as a console
@@ -120,10 +200,18 @@ pub enum ConfigFailure {
     /// A confirmation on the very session that made the commit, which proves
     /// nothing about a configuration that breaks new connections.
     NotAFreshConnection,
-    /// The configuration is in force and the holder of the medium would not make
-    /// it durable, so it will not survive a reboot. **Reported, not reverted**:
-    /// undoing a commit would leave two domains disagreeing.
+    /// The holder of the medium would not make the commit durable, so it has been
+    /// **put back**: a configuration in force that no reboot would reload is one
+    /// the appliance cannot honour, and confirming it would leave the management
+    /// plane believing a version is running that the next boot silently drops.
+    /// The reversal is what brings the two domains back into agreement, and it is
+    /// the same one the confirmation deadline makes.
     NotDurable,
+    /// The same, and the reversal did not happen either — so a configuration the
+    /// medium does not hold **is** in force. Its own token because it is a
+    /// different thing to go and look at: the deciding domain stopped answering,
+    /// and the confirmation deadline is left armed to try the reversal again.
+    NotDurableUnreverted,
     /// A commit whose document this domain never staged where the holder reads:
     /// unreachable, and its own token rather than [`Self::Faulted`].
     NothingStaged,
@@ -143,6 +231,7 @@ impl ConfigFailure {
             Self::GenerationTooWide => "channel-config-generation-too-wide",
             Self::NotAFreshConnection => "channel-config-confirm-not-fresh",
             Self::NotDurable => "channel-config-not-durable",
+            Self::NotDurableUnreverted => "channel-config-not-durable-unreverted",
             Self::NothingStaged => "channel-config-nothing-staged",
         }
     }
@@ -237,10 +326,8 @@ impl ChannelConfig {
     /// this appliance could not reach its own deciding domain is reported as a
     /// refusal with a reason rather than as silence. The console token beside it is
     /// what tells the two apart on the node itself.
-    pub fn stage(&mut self, document: &[u8]) -> (StageResult, Option<ConfigFailure>) {
-        let poll = self.exchange(|requester| requester.stage(document));
-        let mut line = [0_u8; MAX_ANSWER_LEN];
-        match poll {
+    pub fn stage(&mut self, document: &[u8]) -> Answer {
+        match self.exchange(|requester| requester.stage(document)) {
             Ok(Answered::Staged { generation }) => {
                 // Where the holder can read them, and only for a document the
                 // deciding domain accepted: a region holding a refused one would
@@ -248,25 +335,15 @@ impl ChannelConfig {
                 let mut cursor = self.staging.upload().cursor();
                 let took = cursor.write(document);
                 self.staged = (took == document.len()).then(|| cursor.finish());
-                let len = write_result_line(&mut line, generation, Outcome::Staged, 0, None);
-                (StageResult { line, len }, None)
+                Answer::stated(generation, Outcome::Staged, 0)
             }
             Ok(Answered::Rejected {
                 generation,
                 reason,
                 detail,
-            }) => {
-                let len = write_result_line(
-                    &mut line,
-                    generation,
-                    Outcome::Refused,
-                    0,
-                    Some((reject_reason_of(reason), detail)),
-                );
-                (StageResult { line, len }, None)
-            }
-            Ok(_) => self.stage_failed(line, ConfigFailure::Faulted),
-            Err(failure) => self.stage_failed(line, failure),
+            }) => Answer::rejected(generation, reason, detail),
+            Ok(_) => Answer::unresolved(ConfigFailure::Faulted),
+            Err(failure) => Answer::unresolved(failure),
         }
     }
 
@@ -285,12 +362,15 @@ impl ChannelConfig {
         deadline_secs: u16,
         now: u64,
         session: u64,
-    ) -> Result<u32, ConfigFailure> {
+    ) -> Answer {
         let Ok(named) = u32::try_from(generation) else {
-            return Err(ConfigFailure::GenerationTooWide);
+            return Answer::unresolved(ConfigFailure::GenerationTooWide);
         };
         match self.exchange(|requester| requester.commit(named)) {
-            Ok(Answered::Applied { generation }) => {
+            Ok(Answered::Applied {
+                generation,
+                changes,
+            }) => {
                 let allowed =
                     u64::from(deadline_secs).clamp(MIN_CONFIRM_SECONDS, MAX_CONFIRM_SECONDS);
                 self.awaiting = Some(Awaiting {
@@ -298,45 +378,74 @@ impl ChannelConfig {
                     session,
                 });
                 // The history, after the configuration is in force: nothing names
-                // a version until the deciding domain has. A failure is answered
-                // and not undone — see `NotDurable`.
-                self.persist(generation)?;
-                Ok(generation)
+                // a version until the deciding domain has.
+                match self.persist(generation) {
+                    Ok(()) => Answer::stated(generation, Outcome::Applied, changes)
+                        .awaiting_confirmation(),
+                    Err(failure) => self.undo(failure),
+                }
             }
             // The content was already running, so nothing was displaced and there
             // is nothing to confirm. Not a failure — the server asked for a
             // configuration and that configuration is in force — and deliberately
             // *not* armed: a deadline over a commit that changed nothing would
             // revert a configuration that never moved.
-            Ok(Answered::Unchanged { generation }) => Ok(generation),
-            Ok(_) => Err(ConfigFailure::Faulted),
-            Err(failure) => Err(failure),
+            Ok(Answered::Unchanged { generation }) => {
+                Answer::stated(generation, Outcome::Unchanged, 0)
+            }
+            Ok(_) => Answer::unresolved(ConfigFailure::Faulted),
+            Err(failure) => Answer::unresolved(failure),
+        }
+    }
+
+    /// Put back a commit the medium would not take, and answer what is running.
+    ///
+    /// A commit that cannot be made durable is one the appliance cannot honour: it
+    /// would be confirmed over the next connection, given up as permanent, and
+    /// then silently dropped by the reboot after that, leaving the management plane
+    /// certain of a version the appliance no longer runs. So it is reversed here
+    /// rather than left in force, and the server is told `reverted` — which is the
+    /// outcome vocabulary's own word for what happened and names the configuration
+    /// now deciding frames.
+    ///
+    /// The deadline is given up **only** where the reversal happened. Where it did
+    /// not, the commit is still in force and still provisional, so leaving it armed
+    /// is what makes the deadline the retry.
+    fn undo(&mut self, failure: ConfigFailure) -> Answer {
+        match self.exchange(ConfigRequester::roll_back) {
+            Ok(Answered::RolledBack { generation }) => {
+                self.awaiting = None;
+                Answer::stated(generation, Outcome::Reverted, 0).with(failure)
+            }
+            Ok(_) | Err(_) => {
+                Answer::unresolved(ConfigFailure::NotDurableUnreverted).awaiting_confirmation()
+            }
         }
     }
 
     /// Keep the commit `generation` names, which is admissible only on a session
     /// other than the one that made it.
-    pub fn confirm(&mut self, generation: u64, session: u64) -> Result<u32, ConfigFailure> {
+    pub fn confirm(&mut self, generation: u64, session: u64) -> Answer {
         let Some(awaiting) = self.awaiting else {
-            return Err(ConfigFailure::NotProvisional);
+            return Answer::unresolved(ConfigFailure::NotProvisional);
         };
         // Before the generation is even looked at, because it is the stronger
         // refusal: a server confirming over the session it committed on has not
         // demonstrated the one property the confirmation exists to demonstrate,
         // whichever generation it names.
         if awaiting.session == session {
-            return Err(ConfigFailure::NotAFreshConnection);
+            return Answer::unresolved(ConfigFailure::NotAFreshConnection);
         }
         let Ok(named) = u32::try_from(generation) else {
-            return Err(ConfigFailure::GenerationTooWide);
+            return Answer::unresolved(ConfigFailure::GenerationTooWide);
         };
         match self.exchange(|requester| requester.confirm(named)) {
             Ok(Answered::Confirmed { generation }) => {
                 self.awaiting = None;
-                Ok(generation)
+                Answer::stated(generation, Outcome::Confirmed, 0)
             }
-            Ok(_) => Err(ConfigFailure::Faulted),
-            Err(failure) => Err(failure),
+            Ok(_) => Answer::unresolved(ConfigFailure::Faulted),
+            Err(failure) => Answer::unresolved(failure),
         }
     }
 
@@ -344,7 +453,9 @@ impl ChannelConfig {
     /// version history, under the generation the deciding domain assigned.
     ///
     /// The token is consumed either way, so a second commit with nothing staged is
-    /// refused by name rather than writing what is there.
+    /// refused by name rather than writing what is there. Both refusals leave a
+    /// commit in force that no reboot would reload, so both are answered by
+    /// [`ChannelConfig::undo`].
     ///
     /// # Errors
     /// [`ConfigFailure::NothingStaged`] and [`ConfigFailure::NotDurable`].
@@ -400,8 +511,14 @@ impl ChannelConfig {
                     pending = outstanding;
                     core::hint::spin_loop();
                 }
-                ConfigPoll::Applied { generation, .. } => {
-                    return Ok(Answered::Applied { generation });
+                ConfigPoll::Applied {
+                    generation,
+                    changes,
+                } => {
+                    return Ok(Answered::Applied {
+                        generation,
+                        changes,
+                    });
                 }
                 ConfigPoll::Unchanged { generation } => {
                     return Ok(Answered::Unchanged { generation });
@@ -441,30 +558,6 @@ impl ChannelConfig {
         }
         Err(ConfigFailure::Unanswered)
     }
-
-    /// Compose the refusal line a staging that could not be decided answers with,
-    /// and count it.
-    fn stage_failed(
-        &mut self,
-        mut line: [u8; MAX_ANSWER_LEN],
-        failure: ConfigFailure,
-    ) -> (StageResult, Option<ConfigFailure>) {
-        // Generation zero, which is no configuration: an exchange that did not
-        // complete is one this end learnt nothing from, and a number here would be
-        // a claim about what is running that this domain holds no copy of. And
-        // `malformed` as the reason, which is the honest token — what the server is
-        // told is that the appliance could not make sense of the exchange about its
-        // document. Which part of the appliance could not is a console token and
-        // never a thing to put on the wire.
-        let len = write_result_line(
-            &mut line,
-            0,
-            Outcome::Refused,
-            0,
-            Some((lfw_log::RejectReason::Malformed, 0)),
-        );
-        (StageResult { line, len }, Some(failure))
-    }
 }
 
 /// The answers a configuration exchange can carry, once the failures are out of
@@ -474,6 +567,7 @@ impl ChannelConfig {
 enum Answered {
     Applied {
         generation: u32,
+        changes: u32,
     },
     Unchanged {
         generation: u32,

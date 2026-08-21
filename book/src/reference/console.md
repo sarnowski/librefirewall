@@ -808,14 +808,14 @@ node: an operator holding a silent appliance still has only the external act.
 Every `cause=` token is listed below and the nine tables together are the complete set: 23 the
 `nic-driver` domain raises, 30 the `clock` domain raises, 35 the `management` domain raises, 1 the
 `config` domain raises, 47
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 185 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 186 the `crypto` domain
 raises, and 175 the `store` domain raises. A token outside all nine is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **One of those nine tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
-raise, so its table names both and its tokens are counted in each domain's total — 87 of the 185
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 186
 and 87 of the 175. Listing it twice would make a reader learn one vocabulary twice; attributing it
 to one domain would leave the other's records looking unnamed.
 
@@ -1095,7 +1095,7 @@ of a vector's contents.
 | a frame of a range answer this end would not compose, which ends the session (none carries a `detail=`) | `channel-range-unasked`, `channel-range-position-moved`, `channel-range-chunk-too-long`, `channel-range-not-taken` |
 | an acknowledgement claiming more of a recording than this end has sent (`detail=` is the position claimed and the position sent) | `channel-ack-past-sent` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
-| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-not-durable`, `channel-config-nothing-staged` |
+| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-not-durable`, `channel-config-not-durable-unreverted`, `channel-config-nothing-staged` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
 server's.** `channel-identity-absent` is a node whose store published somewhere to dial and whose
@@ -1187,16 +1187,31 @@ budget — a wedged or faulted domain, whose own records are what to read next �
 `channel-config-faulted` is it answering something the request cannot be answered with, which should
 never appear.
 
-`channel-config-not-durable` is the one token here that is **not** a refused operation. The commit
-happened — the deciding domain is enforcing the new document and the fleet has been told so — and
-the domain that owns the medium would not write it into the version history, so the configuration in
-force will not survive a reboot. It is reported rather than reverted, because undoing a commit here
-would leave two domains disagreeing about what is running; **which** rule the holder refused it
-under is on that holder's console, under a `document-` or `config-` token beside the slot and the
-generation. `channel-config-nothing-staged` is a commit whose document this domain never placed in
+**`channel-config-not-durable` is a commit that was made and then put back.** The deciding domain
+committed it, and the domain that owns the medium would not write it into the version history — so
+the appliance reversed it rather than enforcing a configuration no reboot would reload. The reason it
+is not left in force is that the alternative is worse than a refusal: the commit is provisional, so
+the server would confirm it over the next connection, the appliance would give up the configuration
+it displaced, and the reboot after that would silently return to the older version with the
+management plane certain of the newer one. The reversal is what puts the two domains back on one
+answer, and it is the same reversal the confirmation deadline makes. The server is told: the commit
+is answered `outcome=reverted` naming the configuration now deciding frames, so it learns that the
+version it asked for did not stand rather than inferring anything from a session that stayed up.
+**Which** rule the holder refused the write under is on that holder's console, under a `document-` or
+`config-` token beside the slot and the generation.
+
+**`channel-config-not-durable-unreverted` is the same thing with the reversal itself unavailable**,
+and it is the graver line of the two: a configuration the medium does not hold **is** in force,
+because the deciding domain stopped answering when it was asked to put the previous one back. The
+confirmation deadline is left armed on purpose, so the appliance tries the reversal again on its own;
+the session ends, since a commit still stands. The deciding domain's own records are what to read
+next — this token says which reversal was owed and that domain says why it did not happen.
+
+`channel-config-nothing-staged` is a commit whose document this domain never placed in
 the region the holder reads, which the deciding domain's own refusal of a commit with nothing staged
 makes unreachable — reaching it means the two stagings have come apart, and it is that and not the
-delegation an operator should be sent to.
+delegation an operator should be sent to. It is answered exactly as a commit the medium refused is,
+the commit being equally undurable either way.
 
 **The twelve framing tokens are the server, and they carry no number on purpose.** Each of them is a
 rule of the channel's own protocol that the far end broke, and the context the code has for each —

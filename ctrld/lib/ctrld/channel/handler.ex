@@ -77,11 +77,21 @@ defmodule Ctrld.Channel.Handler do
   the confirmation is sent from `greeted/2` on the *next* connection, out of the
   row the commit wrote, and this session's ending is expected.
 
-  A validate result that arrives for a version this server is not staging is
-  counted and dropped like any other unanswerable frame. It has to be: the
-  appliance is semi-trusted, so an unsolicited result is a frame a peer chose to
-  send, and acting on one would let it move a version's state by asserting a
-  verdict nobody asked for.
+  **Every step is recorded from the appliance's own answer and never from the
+  send.** All three operations are answered by a result frame, so there is
+  something to wait for in each case, and the two later steps can both fail in ways
+  a send cannot see: a commit the appliance's medium will not hold is put back by
+  the appliance and answered `reverted`, and a confirmation naming a commit it no
+  longer holds is refused outright. A row written when the frame left would
+  therefore assert what this server asked for rather than what happened — and a
+  confirmation is the one step the protocol gives no acknowledgement of its own, so
+  the result line is the only place that fact exists.
+
+  A validate result that arrives for a version this server is neither staging nor
+  awaiting an answer on is counted and dropped like any other unanswerable frame.
+  It has to be: the appliance is semi-trusted, so an unsolicited result is a frame
+  a peer chose to send, and acting on one would let it move a version's state by
+  asserting a verdict nobody asked for.
   """
 
   use ThousandIsland.Handler
@@ -161,6 +171,7 @@ defmodule Ctrld.Channel.Handler do
           acked_at: integer() | nil,
           acked_after: non_neg_integer(),
           staging: pos_integer() | nil,
+          pending: {:commit | :confirm, pos_integer()} | nil,
           ending: term() | nil
         }
 
@@ -422,6 +433,20 @@ defmodule Ctrld.Channel.Handler do
     validated(socket, %{state | staging: nil}, generation, line)
   end
 
+  # And the appliance's answer to the commit or the confirmation this session
+  # sent, on exactly the same terms. Each is recorded from the answer rather than
+  # from the send: the appliance may commit and then put the commit back — it does
+  # so when its medium will not hold the version — and it may refuse a
+  # confirmation outright, so a row written when the frame left would assert what
+  # this server asked for rather than what the appliance did.
+  defp receive_frame(
+         {:up_config_validate_result, line},
+         _socket,
+         %{pending: {step, generation}} = state
+       ) do
+    {:ok, settled(%{state | pending: nil}, step, generation, line)}
+  end
+
   # Legal, and unanswerable by this build. Counted rather than logged per frame,
   # so a peer cannot drive this server's records: the tally goes out once, when
   # the session ends.
@@ -436,13 +461,29 @@ defmodule Ctrld.Channel.Handler do
   # still reachable.
   #
   # A version with no confirmation owed is the ordinary case and says nothing.
+  #
+  # A commit older than the deadline this server asked for is owed nothing either,
+  # and that is not an omission: the appliance reverts an unconfirmed commit on its
+  # own clock, so past that point a confirmation would be refused as naming no
+  # provisional commit — and asking again on every connection would be this server
+  # retrying, for the life of the row, something that can no longer happen.
   defp greeted(socket, state) do
     case Appliances.awaiting_confirmation(state.device_id) do
       nil ->
         {:ok, state}
 
-      %ConfigurationVersion{} = version ->
-        confirm(socket, state, version)
+      %ConfigurationVersion{committed_at: %DateTime{} = at} = version ->
+        if DateTime.diff(DateTime.utc_now(), at) <= @confirm_deadline_secs do
+          confirm(socket, state, version)
+        else
+          Logger.info(
+            "ctrld: not confirming generation #{version.generation} on appliance " <>
+              "#{state.device_id}: the appliance's own deadline has passed, so it has already " <>
+              "put the commit back"
+          )
+
+          {:ok, state}
+        end
     end
   end
 
@@ -455,19 +496,12 @@ defmodule Ctrld.Channel.Handler do
 
     case send_frame(socket, {:down_commit_confirm, stated}) do
       :ok ->
-        {:ok, _version} =
-          Appliances.configuration_confirmed(
-            state.device_id,
-            version_generation,
-            DateTime.utc_now()
-          )
-
         Logger.info(
-          "ctrld: confirmed generation #{version_generation} on appliance #{state.device_id} " <>
-            "as its generation #{stated}, over a fresh connection"
+          "ctrld: asked appliance #{state.device_id} to confirm generation " <>
+            "#{version_generation} as its generation #{stated}, over a fresh connection"
         )
 
-        {:ok, state}
+        {:ok, %{state | pending: {:confirm, version_generation}}}
 
       # A peer that hung up between the greeting and this frame. Its own ending,
       # and the version stays awaiting a confirmation: the next connection owes
@@ -496,6 +530,51 @@ defmodule Ctrld.Channel.Handler do
       )
 
       {:ok, state}
+    end
+  end
+
+  # What the appliance answered a commit or a confirmation with, recorded as the
+  # step it settles — and only where the appliance says the step happened.
+  #
+  # `applied` and `unchanged` are both a commit that stands: the first moved the
+  # configuration, the second found it already running, and neither leaves anything
+  # for this server to undo. `reverted` is the appliance putting a commit back
+  # because its medium would not hold the version, which is a commit that did not
+  # happen however briefly it was in force. Anything else — a refusal, or a token
+  # this build does not know — leaves the row where it was, so an unrecognised
+  # outcome never advances a version on a verdict this end misread.
+  defp settled(state, step, generation, line) do
+    outcome = ConfigurationVersion.outcome(line)
+
+    case {step, outcome} do
+      {:commit, token} when token in ["applied", "unchanged"] ->
+        {:ok, _version} =
+          Appliances.configuration_committed(state.device_id, generation, DateTime.utc_now())
+
+        Logger.info(
+          "ctrld: appliance #{state.device_id} committed generation #{generation} " <>
+            "provisionally: #{line}"
+        )
+
+        state
+
+      {:confirm, "confirmed"} ->
+        {:ok, _version} =
+          Appliances.configuration_confirmed(state.device_id, generation, DateTime.utc_now())
+
+        Logger.info(
+          "ctrld: appliance #{state.device_id} confirmed generation #{generation} over a fresh " <>
+            "connection: #{line}"
+        )
+
+        state
+
+      {step, _other} ->
+        Logger.warning(
+          "ctrld: appliance #{state.device_id} did not #{step} generation #{generation}: #{line}"
+        )
+
+        state
     end
   end
 
@@ -557,20 +636,13 @@ defmodule Ctrld.Channel.Handler do
   defp commit(socket, state, version_generation, stated) do
     case send_frame(socket, {:down_config_commit, stated, @confirm_deadline_secs}) do
       :ok ->
-        {:ok, _version} =
-          Appliances.configuration_committed(
-            state.device_id,
-            version_generation,
-            DateTime.utc_now()
-          )
-
         Logger.info(
-          "ctrld: committed generation #{version_generation} on appliance #{state.device_id} " <>
-            "as its generation #{stated}, provisionally, to be confirmed within " <>
-            "#{@confirm_deadline_secs}s over a fresh connection"
+          "ctrld: asked appliance #{state.device_id} to commit generation " <>
+            "#{version_generation} as its generation #{stated}, provisionally, to be confirmed " <>
+            "within #{@confirm_deadline_secs}s over a fresh connection"
         )
 
-        {:ok, state}
+        {:ok, %{state | pending: {:commit, version_generation}}}
 
       {:error, reason} ->
         {:close, %{state | ending: {:commit_not_sent, reason}}}
@@ -677,6 +749,7 @@ defmodule Ctrld.Channel.Handler do
       acked_at: nil,
       acked_after: 0,
       staging: nil,
+      pending: nil,
       ending: nil
     }
   end
