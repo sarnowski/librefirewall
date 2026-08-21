@@ -408,10 +408,10 @@ impl ManagementChannel {
     /// The instant a chain is judged against on the next open, and the reading a
     /// confirmation deadline is measured against on this pass.
     ///
-    /// Refreshed on every pass rather than only at the open, because the deadline
-    /// is what it drives: a reading taken once per session would leave an appliance
-    /// whose server greeted it and then went quiet holding an unconfirmed
-    /// configuration for as long as the session stayed up.
+    /// **Every pass must refresh it, not only the open.** A commit arms its
+    /// deadline from this reading, so one taken once per session spends the time
+    /// between the open and the commit out of the allowance — and a server whose
+    /// confirmation beat the deadline it named still finds the commit reverted.
     pub const fn at(&mut self, now: u64) {
         self.now = now;
     }

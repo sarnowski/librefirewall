@@ -1721,7 +1721,10 @@ impl Terminator for Management {
 
     fn advance(&mut self, received: &[u8], answer: &mut [u8]) -> Answered {
         match self.carrying {
-            Some(Carrying::Channel) => self.channel.advance(received, answer),
+            Some(Carrying::Channel) => {
+                self.channel.at(wall_seconds(&self.clock));
+                self.channel.advance(received, answer)
+            }
             Some(Carrying::Onboarding) => {
                 let answered = self.onboarding.advance(received, answer);
                 // The one moment an appliance changes hands within a boot, taken
@@ -1760,6 +1763,7 @@ impl Terminator for Management {
             DownloadSink::Log => Ring::Log,
             DownloadSink::Capture => Ring::Capture,
         };
+        self.channel.at(wall_seconds(&self.clock));
         self.channel.ship(
             Shipment {
                 ring,
@@ -1781,6 +1785,7 @@ impl Terminator for Management {
         bytes: &[u8],
         answer: &mut [u8],
     ) -> Answered {
+        self.channel.at(wall_seconds(&self.clock));
         self.channel.answer_range(outcome, position, bytes, answer)
     }
 
