@@ -109,6 +109,19 @@ use crate::topology::{Endpoint, ManagementPort, PORTS, PortPolicy, Topology};
 /// two polling virtio drivers is slow, hence the generous ceiling.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+// The longest single step of a driven configuration transaction is the wait for
+// the appliance to dial again after a commit, and it has to be able to report
+// inside a boot: a step whose own budget outlived the run's would never be
+// reached, and every such boot would fail on the outer timer with nothing said
+// about which step had not finished. Every step before it is bounded by a result
+// line the appliance answers within a round trip, so this is the one that has to
+// fit.
+const _: () = assert!(
+    crate::channel_configuration::RECONNECT_POLLS as u128
+        * crate::channel_configuration::POLL_INTERVAL.as_millis()
+        < BOOT_TEST_TIMEOUT.as_millis()
+);
+
 /// The same budget for a boot whose station leaves the appliance's `SYN`
 /// unanswered.
 ///
@@ -6851,8 +6864,8 @@ fn run_boot(
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.is_none()
-                            && test.channel.drives_a_transaction()
-                            && transacted.is_none() =>
+                            && transacted.is_none()
+                            && let Some(transaction) = test.channel.transaction() =>
                     {
                         let Some(server) = test.server.as_mut() else {
                             break 'run Err(String::from(
@@ -6866,6 +6879,7 @@ fn run_boot(
                             // pushes, so the two boots stage the same bytes and the
                             // fast gate reads them as one file.
                             crate::channel_configuration::SUBMITTED,
+                            transaction,
                             // Drained afresh each time the transaction asks, on the
                             // reconfiguration arm's terms: it is also what keeps the
                             // guest's serial pipe moving while this is under way.
@@ -7385,7 +7399,7 @@ fn run_boot(
     // about it, and a boot whose second wave was never injected would otherwise
     // pass on the first wave's verdicts alone.
     let outcome = outcome.and_then(|()| {
-        if test.channel.drives_a_transaction() && transacted.is_none() {
+        if test.channel.transaction().is_some() && transacted.is_none() {
             return Err(format!(
                 "the boot's contract drives a configuration transaction over the channel it \
                  dials and none was driven, so nothing was proved about a commit, a \

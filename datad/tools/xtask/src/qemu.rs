@@ -2304,6 +2304,36 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         store: StoreMedium::CarriedFrom("channel-configuration-committed"),
         data: DataMedium::Fresh,
     },
+    // And the far end of commit-confirm, which every boot above stops short of:
+    // one that commits, has its session ended by the appliance, is dialled again
+    // by it, and keeps the version over that second connection.
+    //
+    // Its own boot rather than a step added to one of those, because the two are
+    // about different things. Those are about the medium and end on the slot they
+    // wrote; this is about the rule — a confirmation is admissible only over a
+    // connection opened after the commit — and cannot be judged until the
+    // appliance has closed a connection and opened another. The reconnection costs
+    // the appliance a `TIME_WAIT` before its schedule so much as draws a wait, so
+    // the second session is given passes derived from that interval rather than
+    // the first session's.
+    //
+    // A copy of the owned medium and not the file the three boots above share:
+    // this boot needs an owner to dial out and nothing else off that medium, and
+    // inserting it into their chain would change what they prove.
+    Scenario {
+        name: "channel-configuration-confirmed",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::ConfirmsACommit,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        store: StoreMedium::CopiedFrom("onboarding-adopted"),
+        data: DataMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.

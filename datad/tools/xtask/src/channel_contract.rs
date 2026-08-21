@@ -63,6 +63,7 @@ use std::process::{Child, Command, Stdio};
 
 use lfw_log::{ChannelOutcome, Domain, DomainState, TlsCertificateRefusal};
 
+use crate::channel_configuration::Transaction;
 use crate::console_records::{field, lifecycle_records, value};
 use crate::forward_harness::{DIAL_DESTINATION, DIAL_PORT};
 use crate::util::run_command;
@@ -170,6 +171,31 @@ pub(crate) enum ChannelContract {
     /// It is held to the store domain's own records, both of them: the version it
     /// read back off the medium, and the **new** slot it wrote afterwards.
     RecommitsAfterAReload,
+    /// A boot that commits and then **confirms**, over the connection the
+    /// appliance dials after the commit ended the session.
+    ///
+    /// The other half of every committing boot above, and the only one that
+    /// reaches the far end of commit-confirm: those leave a commit provisional and
+    /// stop, because what they are about is the medium. What this one is about is
+    /// the rule — a confirmation is admissible only over a connection opened after
+    /// the commit — so it has to see the appliance close a connection, come back
+    /// on a new one, and keep the version it had made provisional.
+    ///
+    /// **The reconnection is the subject and it is not free.** A commit closes the
+    /// connection from this appliance's end, so the endpoint holds the session
+    /// until the transport gives that connection's slot back; only then does the
+    /// redial schedule draw a wait, below a bound the agreed greeting has reset to
+    /// its floor. A boot that gave the second session no more passes than the
+    /// first lands inside that interval and reads an appliance that was about to
+    /// dial as one that never would — which is what
+    /// [`crate::channel_configuration::RECONNECT_POLLS`] exists to answer, out of
+    /// the appliance's own two intervals rather than a number chosen here.
+    ///
+    /// A copy of the owned medium and not a carried one, deliberately: what this
+    /// boot states is about two connections of its own, and inserting it into the
+    /// chain of boots that share one file would change what *those* prove about a
+    /// version's durability.
+    ConfirmsACommit,
 }
 
 impl ChannelContract {
@@ -183,18 +209,43 @@ impl ChannelContract {
                 | Self::CommitsAConfiguration
                 | Self::ReconfiguresARunningNode
                 | Self::RecommitsAfterAReload
+                | Self::ConfirmsACommit
         )
     }
 
-    /// Whether the whole configuration transaction is driven mid-boot, out of the
-    /// pipe the boot holds open, rather than written into the stream before QEMU
-    /// starts.
+    /// The transaction this boot drives mid-boot, out of the pipe it holds open,
+    /// rather than writing into the stream before QEMU starts — and `None` where
+    /// the boot's subject is something else.
     ///
-    /// It has to be for this one: the boot is judged on the generation its commit
-    /// is *answered* with, which means reading each result line before the next
-    /// frame goes out rather than writing the whole exchange up front.
-    pub(crate) const fn drives_a_transaction(self) -> bool {
-        matches!(self, Self::RecommitsAfterAReload)
+    /// It has to be driven for these two: one is judged on the generation its
+    /// commit is *answered* with and the other on a confirmation crossing a
+    /// connection that does not exist yet, and both mean reading each result line
+    /// before the next frame goes out rather than writing the whole exchange up
+    /// front.
+    pub(crate) const fn transaction(self) -> Option<Transaction> {
+        match self {
+            Self::RecommitsAfterAReload => Some(Transaction {
+                generation: RECOMMITTED_GENERATION,
+                confirms: false,
+            }),
+            Self::ConfirmsACommit => Some(Transaction {
+                generation: PUSHED_GENERATION,
+                confirms: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this boot writes frames down the pipe **after** QEMU has started,
+    /// so the stream the server is handed at spawn has to end on a frame boundary.
+    ///
+    /// Derived from what the boot does rather than stated beside it: the two ways
+    /// a boot pushes mid-run are a transaction driven step by step and a running
+    /// node being reconfigured, and both are already said elsewhere. A third
+    /// statement of the same fact is one a new boot can be left out of, and being
+    /// left out of it costs a framing violation rather than an obvious failure.
+    const fn pushes_frames_mid_boot(self) -> bool {
+        self.transaction().is_some() || matches!(self, Self::ReconfiguresARunningNode)
     }
 
     /// Whether the boot reads the appliance's own record of the channel.
@@ -360,6 +411,22 @@ impl ChannelContract {
                     OwedRecord::channel(&established_session()),
                     OwedRecord::store(&reloaded),
                     OwedRecord::store(&was_restored),
+                    OwedRecord::store(&placed),
+                    OwedRecord::store(&restored),
+                ]
+            }
+            // The session and the slot the commit produced, on
+            // [`Self::CommitsAConfiguration`]'s terms — and **not** the second
+            // attempt this boot is really about. What is owed here is what the
+            // *wait* rests on, and nothing here counts attempts; the confirmation
+            // is driven step by step and answered by a result line, so the
+            // reconnection is bounded by the greeting that reaches the server
+            // rather than by a record the console may write at any moment.
+            Self::ConfirmsACommit => {
+                let [placed, restored] = configured(PUSHED_GENERATION, PUSHED_SLOT, false);
+                vec![
+                    OwedRecord::dial("established"),
+                    OwedRecord::channel(&established_session()),
                     OwedRecord::store(&placed),
                     OwedRecord::store(&restored),
                 ]
@@ -612,6 +679,26 @@ pub(crate) fn commit_frame(generation: u64) -> Vec<u8> {
     frame
 }
 
+/// The confirmation frame: 0x08, and the generation being kept. Eight bytes of
+/// payload, which is what the encoder puts there.
+pub(crate) fn confirm_frame(generation: u64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(16);
+    frame.extend_from_slice(&8_u32.to_be_bytes());
+    frame.extend_from_slice(&[0x08, 0, 0, 0]);
+    frame.extend_from_slice(&generation.to_be_bytes());
+    frame
+}
+
+/// The server's greeting on a frame boundary, for a session opened mid-boot.
+///
+/// The greeting **proper** and not the whole array, on [`configuration_push`]'s
+/// terms: the four trailing bytes are a deliberate partial second frame, and a
+/// real frame written after them would be read as the continuation of that
+/// fragment rather than as itself.
+pub(crate) fn server_greeting() -> Vec<u8> {
+    Vec::from(&SERVER_GREETING[..GREETING_LEN])
+}
+
 /// Start the management server this boot's contract asks for.
 ///
 /// # Errors
@@ -655,14 +742,15 @@ pub(crate) fn serve(
                 .map_err(|error| format!("read {}: {error}", crate::image::SUBMITTED_DOCUMENT))?;
             configuration_push(&document)?
         }
-        // The greeting **proper** and nothing after it: every boot that writes its
-        // own frames mid-run needs them to land on a frame boundary, and the
-        // four-byte fragment the greeting array carries after it — a deliberate
-        // partial second frame, and another boot's whole subject — would be read
-        // as the beginning of the first of them.
-        ChannelContract::ReconfiguresARunningNode | ChannelContract::RecommitsAfterAReload => {
-            Vec::from(&SERVER_GREETING[..GREETING_LEN])
-        }
+        // The greeting **proper** and nothing after it, asked of the contract
+        // rather than listed here: every boot that writes its own frames mid-run
+        // needs them to land on a frame boundary, and the four-byte fragment the
+        // greeting array carries after it — a deliberate partial second frame, and
+        // another boot's whole subject — would be read as the beginning of the
+        // first of them. A list would have to be kept in step with the boots that
+        // push, and a boot left off it fails as a framing violation the appliance
+        // was right to raise.
+        _ if contract.pushes_frames_mid_boot() => server_greeting(),
         _ => Vec::from(SERVER_GREETING),
     };
     fs::write(&greeting, &stream)
@@ -1048,6 +1136,38 @@ pub(crate) fn judge(
                  above"
             ))
         }
+        ChannelContract::ConfirmsACommit => {
+            let Some(server) = server else {
+                return Err(String::from(
+                    "this boot's contract confirms a commit over a second connection and no \
+                     management server was started for it",
+                ));
+            };
+            let (transcript, verification) = server.finish()?;
+            expect_dial(log, "established")?;
+            expect_channel(log, &established_session())?;
+            expect_certificate(&verification, device)?;
+            expect_greeting(&transcript)?;
+            for owed in configured(PUSHED_GENERATION, PUSHED_SLOT, false) {
+                expect_store(log, &owed)?;
+            }
+            // And the appliance's own account of the second connection, which is
+            // the fact the confirmation rests on and the one nothing else here
+            // reads: the result line says the appliance believed the connection
+            // was a fresh one, the server's second greeting says one arrived, and
+            // this says the appliance opened it and reported doing so. A boot with
+            // the first two and not this one would be asserting the protocol
+            // without the transport underneath it.
+            expect_attempt(log, 2, "established")?;
+            Ok(format!(
+                "  answered   configuration         appliance->server  {}:{DIAL_PORT}  the \
+                 appliance committed generation {PUSHED_GENERATION} into slot {PUSHED_SLOT} \
+                 provisionally, ended the session that committed it, dialled a second time and \
+                 kept that version over the connection it opened — which is the only place a \
+                 confirmation is admissible",
+                ipv4(DIAL_DESTINATION)
+            ))
+        }
         ChannelContract::AnchorRejectsTheServer => {
             let _ = server.map(Server::finish).transpose()?;
             expect_channel(log, &anchor_refused_the_server())?;
@@ -1201,6 +1321,29 @@ fn expect_dial(log: &str, outcome: &str) -> Result<(), String> {
     Err(format!(
         "the appliance never reported {owed} for the channel it dialled. What it did report:\n  {}",
         dial_records(log).join("\n  ")
+    ))
+}
+
+/// One **numbered** attempt of the appliance's own, and how it went.
+///
+/// Its own reader beside [`expect_dial`] because it asks a different question: that
+/// one asks whether an outcome was ever reported, which is what every boot whose
+/// subject is a single attempt wants, and this one asks whether a *particular*
+/// attempt was — which is only ever the right question where the protocol itself
+/// requires a second connection.
+fn expect_attempt(log: &str, attempt: u64, outcome: &str) -> Result<(), String> {
+    let attempts = field("dial-attempts", &attempt.to_string());
+    let owed = field("dial-outcome", outcome);
+    if management(log)
+        .iter()
+        .any(|record| record.contains(&attempts) && record.contains(&owed))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the appliance never reported {attempts}{owed} for the channel it dialled. What it did \
+         report about the attempts it made:\n  {}",
+        or_nothing(dial_records(log))
     ))
 }
 

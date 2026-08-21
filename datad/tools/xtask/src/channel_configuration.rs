@@ -24,6 +24,15 @@
 //! 4. **The commit** — which puts it in force and ends the session, a
 //!    confirmation being admissible only over a connection opened afterwards.
 //!
+//! # And the transactions driven for their own sake
+//!
+//! Two boots have no dataplane wave to order against and are about the
+//! transaction itself: one is judged on the generation its commit is *answered*
+//! with, and the other goes on to **confirm** that commit. The confirmation is
+//! why the second connection is a subject here rather than a detail — it is
+//! admissible nowhere else, so that boot has to see the appliance close the
+//! session it committed on and come back on one of its own.
+//!
 //! # Why nothing here is timed, and why the push cannot race
 //!
 //! The server is listening before QEMU starts, and the appliance dials when it is
@@ -65,7 +74,7 @@
 use std::time::Duration;
 
 use crate::channel_contract::{
-    PUSHED_GENERATION, RECOMMITTED_GENERATION, Server, commit_frame, stage_frame,
+    PUSHED_GENERATION, Server, commit_frame, confirm_frame, server_greeting, stage_frame,
 };
 
 /// How many passes each step is given, and how long the harness waits between
@@ -83,7 +92,49 @@ use crate::channel_contract::{
 const SESSION_POLLS: usize = 240;
 const RESULT_POLLS: usize = 120;
 const SWITCH_POLLS: usize = 240;
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const POLL_MILLIS: u64 = 250;
+pub const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
+
+/// How many passes the **second** session is given, which is a different number
+/// from the first for a reason of the appliance's own.
+///
+/// A commit ends the session by closing the connection from this appliance's end,
+/// so the connection it closed sits in `TIME_WAIT` — and the endpoint above the
+/// transport holds the session until the transport gives the slot back, which is
+/// what keeps the ending it reports answerable for as long as anybody asks. Only
+/// then does the redial schedule draw its next wait, below a bound the agreed
+/// greeting has just reset to its floor. So the second connection is owed
+/// `TIME_WAIT` plus at most one floor-length wait, and neither figure is a guess:
+/// both are read out of the crates that hold them.
+///
+/// Twice that, so a boot is not decided by where in an interval it happened to
+/// land and so the handshake the second connection still owes — which is neither
+/// of the two intervals — is inside rather than beside the figure: the number is
+/// the point past which the harness stops looking, and a run that reaches it has
+/// found an appliance that never dialled again rather than a machine that was
+/// slow. [`crate::forward_harness`] holds it to fitting inside a
+/// boot's own budget, so the step that fails is this one and not the outer timer.
+pub const RECONNECT_POLLS: usize = reconnect_polls();
+
+/// The pass count above, from the appliance's own two intervals.
+///
+/// Milliseconds throughout: the two intervals are read out of the crates that
+/// hold them and the pace is this file's own, so one unit for all three costs no
+/// cast and leaves nothing to truncate.
+const fn reconnect_polls() -> usize {
+    /// The two intervals in the pace's own unit.
+    const fn millis(nanos: u64) -> u64 {
+        nanos / 1_000_000
+    }
+    let owed = millis(lfw_tcp::TIME_WAIT_DURATION.as_nanos())
+        .saturating_add(millis(pd_runtime::INITIAL_BACKOFF.as_nanos()));
+    (owed.saturating_mul(2) / POLL_MILLIS) as usize
+}
+
+// The divisor above, which is a literal of this file and reached by no peer. A
+// zero pace would make the division the one panic a const evaluation can raise,
+// so it is a build that does not happen rather than a check inside the function.
+const _: () = assert!(POLL_MILLIS > 0);
 
 /// The generation a node that booted a document is running before anything
 /// reaches it over the channel.
@@ -215,7 +266,7 @@ pub fn reconfigure(
     // what says there is a session at this end to write into — and it is the
     // server's account rather than the appliance's, a console record being the
     // far end speaking about a session that may since have gone.
-    await_greeting(server, &mut console)?;
+    await_greetings(server, &mut console, 1, SESSION_POLLS, FIRST_SESSION)?;
 
     // The fail-closed half first, while the node is running the document its
     // image was built from and the first wave's verdicts have already been
@@ -276,23 +327,48 @@ pub fn reconfigure(
     })
 }
 
-/// Wait until the appliance has greeted the server this run started.
+/// What a wait for a greeting is about, for the verdict it leaves behind: the two
+/// absences send a reader to different places, so each says which it is.
+const FIRST_SESSION: &str = "It dials out, so a session it never opened is one nothing here can \
+                             push a configuration down";
+const FRESH_SESSION: &str = "The commit ended the session, which is the whole of how the \
+                             fresh-connection rule is enforced, so the appliance owes a second \
+                             connection of its own — it closed the first, waits for the transport \
+                             to give that connection's slot back, and then draws the next wait off \
+                             a schedule the agreed greeting reset. A confirmation is admissible \
+                             nowhere else, so a node that does not come back is one whose commit \
+                             can only revert";
+
+/// Wait until `owed` appliance greetings have reached the server this run started.
+///
+/// The server's own account and never the appliance's, on
+/// [`Server::sessions_greeted`]'s terms: what a push needs to know is that there
+/// is a session at this end to write into.
 ///
 /// # Errors
-/// The verdict, on a boot whose appliance never opened a session at all — which
-/// is a channel that did not come up rather than one that is slow.
-fn await_greeting(server: &Server, console: &mut impl FnMut() -> Vec<u8>) -> Result<(), String> {
-    for _ in 0..=SESSION_POLLS {
+/// The verdict, naming how many greetings arrived, how many were owed, and — in
+/// `absence` — what the missing one would have been.
+fn await_greetings(
+    server: &Server,
+    console: &mut impl FnMut() -> Vec<u8>,
+    owed: usize,
+    polls: usize,
+    absence: &str,
+) -> Result<(), String> {
+    for _ in 0..=polls {
         let _ = console();
-        if server.sessions_greeted()? > 0 {
+        if server.sessions_greeted()? >= owed {
             return Ok(());
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    let seen = server.sessions_greeted()?;
+    if seen >= owed {
+        return Ok(());
+    }
     Err(format!(
-        "the appliance never greeted the management server this run started, after \
-         {SESSION_POLLS} passes over its transcript. It dials out, so a session it never opened \
-         is one nothing here can push a configuration down"
+        "the management server this run started has seen {seen} appliance greeting(s) and this \
+         step needs {owed}, after {polls} passes over its transcript. {absence}"
     ))
 }
 
@@ -441,6 +517,23 @@ fn refuse(
     }
 }
 
+/// Which transaction a boot drives down the channel it dialled: the generation it
+/// commits, and whether it goes on to confirm that commit.
+///
+/// A descriptor rather than two predicates on the contract, because the two facts
+/// are one decision — a boot that confirms is a boot whose commit is provisional,
+/// and the generation is the number both halves are about. One value also means
+/// the driver takes the whole transaction from its caller rather than deriving
+/// half of it from a constant beside itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transaction {
+    /// The generation the staging is answered at and the commit puts in force.
+    pub generation: u64,
+    /// Whether a confirmation follows, over the connection the appliance dials
+    /// after the commit ended the session.
+    pub confirms: bool,
+}
+
 /// What the whole configuration transaction produced on a boot whose subject it is,
 /// as evidence a reader wants beside the verdict.
 #[derive(Clone, Debug)]
@@ -449,6 +542,9 @@ pub struct Transacted {
     pub staged: String,
     /// The line the commit was answered with.
     pub committed: String,
+    /// The line the confirmation was answered with, on a boot that confirms.
+    /// `None` on one that leaves the commit provisional.
+    pub confirmed: Option<String>,
     /// Appliance greetings the server had seen by the end, which is one per
     /// session.
     pub sessions: usize,
@@ -458,11 +554,18 @@ impl Transacted {
     /// The transcript a reader wants beside a scenario's verdict.
     #[must_use]
     pub fn render(&self) -> String {
+        let confirmation = match &self.confirmed {
+            Some(line) => format!(
+                "\n\x20   confirm       -> {line}, over the connection the appliance dialled after \
+                 the commit had ended the session"
+            ),
+            None => String::new(),
+        };
         format!(
             "  the configuration transaction, driven step by step over the channel the appliance \
              dialled:\n\
              \x20   stage         -> {}\n\
-             \x20   commit        -> {}\n\
+             \x20   commit        -> {}{confirmation}\n\
              \x20   the server saw {} appliance greeting(s)",
             self.staged, self.committed, self.sessions,
         )
@@ -481,39 +584,80 @@ impl Transacted {
 pub fn transact(
     server: &mut Server,
     document: &[u8],
+    transaction: Transaction,
     mut console: impl FnMut() -> Vec<u8>,
 ) -> Result<Transacted, String> {
-    await_greeting(server, &mut console)?;
+    let Transaction {
+        generation,
+        confirms,
+    } = transaction;
+    await_greetings(server, &mut console, 1, SESSION_POLLS, FIRST_SESSION)?;
 
     let staged = stage(server, &mut console, document)?;
     expect(
         &staged,
         "stage",
         lfw_log::GenerationOutcome::Staged.name(),
-        RECOMMITTED_GENERATION,
+        generation,
     )?;
 
     // The commit, which is answered like every other configuration operation: the
     // appliance may commit and then put the commit back where its medium will not
     // hold the version, so `applied` is read rather than inferred from anything.
-    let committed = answered(
-        server,
-        &mut console,
-        "commit",
-        &commit_frame(RECOMMITTED_GENERATION),
-    )?;
+    let committed = answered(server, &mut console, "commit", &commit_frame(generation))?;
     expect(
         &committed,
         "commit",
         lfw_log::GenerationOutcome::Applied.name(),
-        RECOMMITTED_GENERATION,
+        generation,
     )?;
+
+    let confirmed = if confirms {
+        Some(confirm(server, &mut console, generation)?)
+    } else {
+        None
+    };
 
     Ok(Transacted {
         staged,
         committed,
+        confirmed,
         sessions: server.sessions_greeted()?,
     })
+}
+
+/// Confirm the commit `generation` names, over the connection the appliance
+/// dialled **after** the commit ended the session.
+///
+/// The commit is what closed the first connection, so nothing can be pushed until
+/// the appliance has come back: this waits for a **second** appliance greeting to
+/// reach the server — the server's own account of there being a session at this
+/// end to write into — and only then writes anything. A confirmation written
+/// before that would go down a pipe whose reader is between connections, and the
+/// appliance would be judged on a frame it was never sent.
+///
+/// The server's own greeting goes first, because the second session is a session
+/// like the first: the appliance is owed the far end's protocol version and
+/// cursors before a configuration frame arrives on it.
+///
+/// # Errors
+/// The verdict, on an appliance that never dialled again and on a confirmation
+/// answered as anything but kept.
+fn confirm(
+    server: &mut Server,
+    console: &mut impl FnMut() -> Vec<u8>,
+    generation: u64,
+) -> Result<String, String> {
+    await_greetings(server, console, 2, RECONNECT_POLLS, FRESH_SESSION)?;
+    server.push(&server_greeting())?;
+    let line = answered(server, console, "confirmation", &confirm_frame(generation))?;
+    expect(
+        &line,
+        "confirmation",
+        lfw_log::GenerationOutcome::Confirmed.name(),
+        generation,
+    )?;
+    Ok(line)
 }
 
 /// Hold one result line to the outcome and the generation the step owes.
