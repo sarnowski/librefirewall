@@ -78,10 +78,10 @@
 //! works in both.
 
 use config::{
-    CommitReport, Datastore, MAX_DOCUMENT_BYTES, ProvisionalReport, StageReport,
+    CommitReport, Datastore, DurableFloor, MAX_DOCUMENT_BYTES, ProvisionalReport, StageReport,
     commit_provisionally_and_report, confirm_and_report, revert_and_report, stage_and_report,
 };
-use lfw_log::{Domain, DomainDetail, DomainState, Event, RingSink, Sink};
+use lfw_log::{Domain, DomainDetail, DomainState, Event, Refusal, RefusalDetail, RingSink, Sink};
 use lfw_metrics::StatsShard;
 use pd_runtime::{
     ConfigAck, ConfigHandover, ConfigPublisher, ConfigReply, ConfigRequest, PdClock,
@@ -89,8 +89,8 @@ use pd_runtime::{
 };
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, protection_domain};
 use wire::{
-    ClockCalibration, ConfigAnswer, ConfigDemand, ConfigOperation, ConfigResponder, LogConsume,
-    LogRecords,
+    ClockCalibration, ConfigAnswer, ConfigDemand, ConfigOperation, ConfigResponder,
+    DurableGeneration, LogConsume, LogRecords,
 };
 
 /// The configuration document this appliance boots with, as bytes.
@@ -127,6 +127,8 @@ fn init() -> ConfigDomain {
     let log_consume: &'static LogConsume = attach_region!(log_consume_vaddr: LogConsume);
     let stats: &'static StatsShard = attach_region!(stats_vaddr: StatsShard);
     let clock: &'static ClockCalibration = attach_region!(clock_vaddr: ClockCalibration);
+    let durable: &'static DurableGeneration =
+        attach_region!(durable_generation_vaddr: DurableGeneration);
     let sink = RingSink::new(log.writer(log_consume), PdClock::new(clock));
     announce(&sink, DomainState::Starting);
 
@@ -171,6 +173,8 @@ fn init() -> ConfigDomain {
         sink,
         submissions: submission_of(report),
         generation: report.generation(),
+        durable,
+        widened: false,
     };
     domain.publish();
     domain
@@ -181,6 +185,18 @@ fn announce(sink: &dyn Sink, state: DomainState) {
         domain: Domain::Config,
         state,
         detail: DomainDetail::None,
+    });
+}
+
+/// Put a refusal of this domain's on the console.
+///
+/// `Ready` and not `Refused`: this domain came up and goes on deciding documents,
+/// so a `refused` record would read as a node that never started.
+fn announce_refusal(sink: &dyn Sink, cause: Refusal) {
+    sink.emit(&Event::Domain {
+        domain: Domain::Config,
+        state: DomainState::Ready,
+        detail: DomainDetail::Refusal(cause),
     });
 }
 
@@ -234,6 +250,15 @@ struct ConfigDomain {
     submissions: SubmissionCounters,
     /// The newest generation this domain has committed.
     generation: u32,
+    /// The region the holder of the medium states the newest version its slot
+    /// array records in, which every version this domain numbers has to be past.
+    ///
+    /// Read on wakeups and not at bring-up: the holder establishes its identity in
+    /// its own start-up, so a reading taken here would precede one existing.
+    durable: &'static DurableGeneration,
+    /// Whether the mark beyond this counter's width has been reported, so the
+    /// console carries it once. A peer paces the wakeups, not the records.
+    widened: bool,
 }
 
 impl ConfigDomain {
@@ -247,6 +272,32 @@ impl ConfigDomain {
             log_sample(self.sink.dropped(), self.sink.refused()),
         );
         self.stats.publish(&sample.values());
+    }
+
+    /// Take the newest version the medium records and number past it from here on.
+    ///
+    /// **The mark moves the numbering and never the running generation**: what
+    /// this domain enforces is the document it committed, and what the mark says is
+    /// which versions the medium has already spoken for. A mark wider than the
+    /// counter is reported once — every later commit is then refused as exhausted,
+    /// which an operator would otherwise read as a counter that ran out on its own.
+    fn observe_the_medium(&mut self) {
+        match self.store.observe_durable(self.durable.recorded()) {
+            DurableFloor::Unchanged | DurableFloor::Raised { .. } => {}
+            DurableFloor::BeyondWidth { recorded } => {
+                if !self.widened {
+                    self.widened = true;
+                    announce_refusal(
+                        &self.sink,
+                        Refusal {
+                            cause: "durable-generation-too-wide",
+                            detail: RefusalDetail::One(recorded),
+                            signalled: false,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Answer whatever the cryptography domain has asked on the management
@@ -470,6 +521,9 @@ impl Handler for ConfigDomain {
         {
             CONSUMER.notify();
         }
+        // Before the channel, so a submission that arrived on this wakeup is
+        // numbered against the medium as it stands.
+        self.observe_the_medium();
         self.serve_channel();
         self.publish();
         Ok(())

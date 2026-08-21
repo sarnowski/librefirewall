@@ -687,6 +687,77 @@
          somewhere. -->
     <memory_region name="endpoint" size="0x1000" />
 
+    <!-- THE HIGH-WATER MARK OF THE CONFIGURATION VERSION HISTORY: one word, one
+         writer, one reader, and the same shape as `owner` and `endpoint` above
+         for the same reasons.
+
+         WHY THIS REGION EXISTS AT ALL, which is a defect and not a design
+         preference. Two different notions of "the current configuration" live in
+         two different domains. The store domain's slot array records the version
+         HISTORY, and its high-water mark is what a later version has to advance
+         past — the array is a replay defence, so a version that did not advance
+         is refused. The configuration domain holds the RUNNING document, and it
+         restarts from nothing on every boot, because what a booted appliance is
+         enforcing is the document its own image carries and that document is on
+         no medium. With no word between them the second numbered its first commit
+         of a boot from a counter that had just restarted, the first refused it as
+         a version that did not advance, and an appliance that had ever been
+         reconfigured could never be reconfigured again.
+
+         WHAT IT CARRIES, and what it deliberately does not. The highest
+         generation any slot holds — not the version the table names as running,
+         which is a different number whenever a candidate slot holds a newer one,
+         and it is the high-water mark that the refusal above compares against.
+         The reader's only use for it is to number the next configuration ABOVE
+         it, so it is a floor on the numbering and never the number of anything in
+         force. Nothing else in the record crosses: not the trust anchor, not the
+         endpoint, not the key, not a byte of any document.
+
+         WHY THE CONFIGURATION DOMAIN IS THE READER, having been refused the
+         `endpoint` grant two rows up. That refusal is about a value a document
+         could move — an appliance whose management address could be changed by
+         uploading a file. This is the opposite direction: the number is one the
+         holder of the medium states and this domain may only count past, so a
+         document cannot move it and reading it lets the parser decide nothing it
+         did not already decide. The WRITE grant stays the store domain's alone,
+         which is what keeps the domain that parses an attacker's document from
+         stating what its own medium holds.
+
+         WHAT A COMPROMISED WRITER ACHIEVES, stated plainly because the reader
+         maps this read-only and may assume nothing about the writer: a larger
+         number costs the reader generations, and a number wider than the reader's
+         counter costs it all of them — every later commit is refused as
+         exhausted, under a token of the reader's own so an operator is told
+         which of the two happened. That is not new authority. The writer is the
+         holder of the medium, so it already decides whether any version becomes
+         durable at all and could refuse every one of them by saying nothing.
+
+         NO CHANNEL, in either direction, on `owner`'s reasoning. The reader is
+         woken by every submission the management channel carries, so it reads
+         this word on a wakeup it was going to have — and it reads it on the
+         wakeup rather than at bring-up for a reason of order: the writer
+         establishes its identity in its own start-up, and this domain is declared
+         first, so a reading taken at bring-up would be taken before there was one
+         to take. A notify direction from the domain that holds the private key
+         into the domain that parses documents would buy a latency nothing
+         measures.
+
+         ONE WORD AND NO SEQLOCK, unlike `clock` above: a naturally aligned `u64`
+         store is one access, so there is no torn read for a counter to bracket.
+         Size is `wire::DURABLE_GENERATION_REGION_SIZE`, its type's `size_of`
+         rounded up to the mapping granularity and held to it by `xtask::sysdesc`
+         like every constant here; eight bytes round to one page, which is what a
+         region costs when a region is the unit of grant.
+
+         No phys_addr, on `owner`'s reasoning exactly — and the zeroing that
+         follows from it is load-bearing here rather than merely sound: a version
+         is minted at one, so zero is not a version, and a zeroed word therefore
+         reads as a medium recording nothing and a numbering constrained by
+         nothing. That is exactly what an appliance no management plane has pushed
+         a configuration to has, so a reader that runs before the store domain has
+         published anything numbers configurations as a fresh appliance does. -->
+    <memory_region name="durable_generation" size="0x1000" />
+
     <!-- THE CAPTURE TAP, one region per direction, and the third handover in
          this system built the way the log ring and the configuration handover
          are.
@@ -1392,6 +1463,7 @@
         <map mr="chan_cfg_request" vaddr="0x3_300_000" perms="r" cached="true" setvar_vaddr="chan_cfg_request_vaddr" />
         <map mr="chan_cfg_reply" vaddr="0x3_400_000" perms="rw" cached="true" setvar_vaddr="chan_cfg_reply_vaddr" />
         <map mr="clock" vaddr="0x3_009_000" perms="r" cached="true" setvar_vaddr="clock_vaddr" />
+        <map mr="durable_generation" vaddr="0x3_00c_000" perms="r" cached="true" setvar_vaddr="durable_generation_vaddr" />
         <map mr="log_config" vaddr="0x4_000_000" perms="rw" cached="true" setvar_vaddr="log_records_vaddr" />
         <map mr="log_config_consume" vaddr="0x4_010_000" perms="r" cached="true" setvar_vaddr="log_consume_vaddr" />
         <map mr="stats_config" vaddr="0x5_000_000" perms="rw" cached="true" setvar_vaddr="stats_vaddr" />
@@ -2258,6 +2330,7 @@
         <map mr="install_staging" vaddr="0x7_400_000" perms="r" cached="true" setvar_vaddr="install_staging_vaddr" />
         <map mr="owner" vaddr="0x3_00a_000" perms="rw" cached="true" setvar_vaddr="owner_vaddr" />
         <map mr="endpoint" vaddr="0x3_00b_000" perms="rw" cached="true" setvar_vaddr="endpoint_vaddr" />
+        <map mr="durable_generation" vaddr="0x3_00c_000" perms="rw" cached="true" setvar_vaddr="durable_generation_vaddr" />
         <setvar symbol="bar_paddr" region_paddr="bar4" />
         <setvar symbol="dma_paddr" region_paddr="blk2_dma" />
         <setvar symbol="io_paddr" region_paddr="blk2_io" />

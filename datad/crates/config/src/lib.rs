@@ -79,7 +79,7 @@ pub use report::{
 pub use rule::{AddressMatch, IcmpTypeMatch, InterfaceMatch, PortMatch, ProtocolMatch, RuleAction};
 pub use runtime::{BuildError, image_from};
 pub use schema::parse;
-pub use store::{CommitError, CommitOutcome, Datastore, Generation, Staged};
+pub use store::{CommitError, CommitOutcome, Datastore, DurableFloor, Generation, Staged};
 pub use validate::{SemanticError, validate};
 pub use value::ValueError;
 pub use xml::{

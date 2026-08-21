@@ -194,6 +194,11 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
         "pds/crypto/src/delegate.rs",
         Vocabulary::Causes(&["crypto"]),
     ),
+    // The one refusal the deciding domain has: a version mark on the medium wider
+    // than the counter it numbers configurations with. Its own token because every
+    // later commit is then refused as exhausted, which is a different thing to go
+    // and look at from a counter that ran out on its own.
+    ("pds/config/src/main.rs", Vocabulary::Causes(&["config"])),
     ("pds/store/src/main.rs", Vocabulary::Causes(&["store"])),
     // The onboarding package's own refusals, named where the variants are:
     // `lfw_package`'s error types are the only place a match over them can be
@@ -274,13 +279,14 @@ const LITERAL_SITES: &[(&str, Vocabulary)] = &[
     ),
 ];
 
-/// The seven domains whose refusal tokens the console chapter tabulates, in the
+/// The eight domains whose refusal tokens the console chapter tabulates, in the
 /// order it presents them. Derived from [`LITERAL_SITES`] would be circular —
 /// the book's own headings are what this list is compared against.
 const REFUSING_DOMAINS: &[&str] = &[
     "nic-driver",
     "clock",
     "management",
+    "config",
     "recorder",
     "hardware-probe",
     "crypto",

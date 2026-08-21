@@ -58,6 +58,21 @@ impl Generation {
     }
 }
 
+/// What observing the medium's newest recorded version did to the numbering. Three
+/// outcomes and not a `bool`: the third is one an operator has to be told about, as
+/// every later commit is then refused as exhausted for a reason nothing says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableFloor {
+    Unchanged,
+    Raised {
+        recorded: Generation,
+    },
+    /// Wider than a [`Generation`], so nothing is left above it: the exhausted state.
+    BeyondWidth {
+        recorded: u64,
+    },
+}
+
 /// A candidate a document became, and the generation a commit would assign it.
 ///
 /// Handed back by [`Datastore::stage`] rather than fetched again afterwards, so
@@ -146,6 +161,11 @@ pub struct Datastore {
     ///
     /// At most one; the provisional module's header is why.
     pub(crate) displaced: Option<Displaced>,
+    /// The newest version some medium already records, which every generation this
+    /// store assigns must be past. **Not a second running generation:** setting the
+    /// counter to it would claim the document being enforced is the one on the
+    /// medium, which after a boot it is not.
+    pub(crate) durable: Generation,
 }
 
 impl Datastore {
@@ -157,12 +177,42 @@ impl Datastore {
             model: Model::EMPTY,
             candidate: None,
             displaced: None,
+            durable: Generation::ZERO,
         }
     }
 
     #[must_use]
     pub const fn running(&self) -> Generation {
         self.generation
+    }
+
+    /// Raise the floor to the newest version `recorded` on a medium, so the next
+    /// configuration is numbered past every version that already exists. Monotone,
+    /// so a reading that went backwards cannot walk the numbering back onto
+    /// versions already spoken for. A version wider than a [`Generation`] is
+    /// answered rather than narrowed: a truncated mark would be a floor *below*
+    /// versions the medium holds, which is the numbering this prevents.
+    pub fn observe_durable(&mut self, recorded: u64) -> DurableFloor {
+        let Ok(bits) = u32::try_from(recorded) else {
+            self.durable = Generation::from_bits(u32::MAX);
+            return DurableFloor::BeyondWidth { recorded };
+        };
+        let recorded = Generation::from_bits(bits);
+        if recorded <= self.durable {
+            return DurableFloor::Unchanged;
+        }
+        self.durable = recorded;
+        DurableFloor::Raised { recorded }
+    }
+
+    /// The one running or the one a medium records, whichever is further on —
+    /// private, so no caller may mistake it for what the appliance enforces.
+    pub(crate) const fn latest(&self) -> Generation {
+        if self.durable.to_bits() > self.generation.to_bits() {
+            self.durable
+        } else {
+            self.generation
+        }
     }
 
     #[must_use]
@@ -186,7 +236,7 @@ impl Datastore {
         let model = load(document)?;
         self.candidate = Some(model);
         Ok(Staged {
-            generation: self.generation.next(),
+            generation: self.latest().next(),
             model,
         })
     }
@@ -234,11 +284,10 @@ impl Datastore {
                 generation: self.generation,
             });
         }
-        let generation = self.generation.next();
-        if generation == self.generation {
-            return Err(CommitError::GenerationsExhausted {
-                latest: self.generation,
-            });
+        let latest = self.latest();
+        let generation = latest.next();
+        if generation == latest {
+            return Err(CommitError::GenerationsExhausted { latest });
         }
 
         let changes = diff(&self.model, &next, records);
@@ -609,6 +658,97 @@ mod tests {
         assert!(changes.0.is_empty());
     }
 
+    /// The defect this floor exists for, stated as the sequence that produced it:
+    /// a boot comes up on the document its image carries and numbers it one, while
+    /// a medium it reloaded already records four. Without the floor the next
+    /// commit offers two, which the holder of the medium refuses as a version that
+    /// does not advance — so the commit never becomes durable and the appliance
+    /// can never be reconfigured again.
+    #[test]
+    fn a_reloaded_medium_numbers_the_next_commit_past_every_version_it_records() {
+        let mut store = store();
+        // The boot document, which is not on the medium and is numbered as the
+        // running configuration it is.
+        assert_eq!(
+            commit(&mut store, &one()).generation(),
+            Generation::from_bits(1)
+        );
+
+        assert_eq!(
+            store.observe_durable(4),
+            DurableFloor::Raised {
+                recorded: Generation::from_bits(4)
+            }
+        );
+        // The running generation is untouched: what is in force is still the
+        // document the image carries, and the floor says nothing about it.
+        assert_eq!(store.running(), Generation::from_bits(1));
+
+        let staged = store.stage(document(2, true).as_bytes()).expect("sound");
+        assert_eq!(staged.generation, Generation::from_bits(5));
+        assert_eq!(
+            store
+                .commit(&mut discard())
+                .expect("a candidate")
+                .generation(),
+            Generation::from_bits(5)
+        );
+    }
+
+    /// The floor only rises. A reading that went backwards — a medium whose array
+    /// a factory reset emptied, a peer publishing a smaller number — must not walk
+    /// the numbering back onto versions that already exist.
+    #[test]
+    fn the_floor_only_rises_and_a_second_reading_of_it_does_nothing() {
+        let mut store = store();
+        assert_eq!(
+            store.observe_durable(9),
+            DurableFloor::Raised {
+                recorded: Generation::from_bits(9)
+            }
+        );
+        assert_eq!(store.observe_durable(9), DurableFloor::Unchanged);
+        assert_eq!(store.observe_durable(0), DurableFloor::Unchanged);
+        assert_eq!(store.observe_durable(3), DurableFloor::Unchanged);
+        assert_eq!(store.next_generation(), Some(Generation::from_bits(10)));
+    }
+
+    /// A medium recording no version constrains nothing, which is every appliance
+    /// no management plane has pushed a configuration to.
+    #[test]
+    fn a_medium_recording_no_version_numbers_from_the_beginning() {
+        let mut store = store();
+        assert_eq!(store.observe_durable(0), DurableFloor::Unchanged);
+        assert_eq!(
+            commit(&mut store, &one()).generation(),
+            Generation::from_bits(1)
+        );
+    }
+
+    /// A version wider than the counter is refused rather than narrowed: a
+    /// truncated mark would be a floor *below* versions the medium holds, which is
+    /// exactly the numbering the floor exists to prevent. What is left is a store
+    /// with no number to assign, which is the exhausted state and is reported as
+    /// one.
+    #[test]
+    fn a_recorded_version_wider_than_the_counter_exhausts_it_rather_than_narrowing() {
+        let mut store = store();
+        let recorded = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            store.observe_durable(recorded),
+            DurableFloor::BeyondWidth { recorded }
+        );
+        assert_eq!(store.next_generation(), None);
+
+        store.stage(one().as_bytes()).expect("sound");
+        assert_eq!(
+            store.commit(&mut discard()),
+            Err(CommitError::GenerationsExhausted {
+                latest: Generation::from_bits(u32::MAX),
+            })
+        );
+    }
+
     #[test]
     fn a_generation_survives_the_round_trip_through_its_bits() {
         for bits in [0, 1, 7, u32::MAX] {
@@ -701,6 +841,45 @@ mod tests {
                     Err(_) => {}
                 }
                 prop_assert_eq!(store.running(), seen);
+            }
+        }
+
+        /// The floor's whole contract over the space a peer can put in the region
+        /// it is read out of: whatever sequence of readings arrives, the number a
+        /// commit would assign is past every one of them, and past what is
+        /// running. Nothing panics and nothing narrows.
+        #[test]
+        fn any_sequence_of_readings_leaves_the_numbering_past_all_of_them(
+            readings in proptest::collection::vec(0u64..=u64::MAX, 0..12),
+        ) {
+            let mut store = store();
+            commit(&mut store, &one());
+            let mut highest = 0u64;
+            let mut widened = false;
+            for reading in readings {
+                match store.observe_durable(reading) {
+                    DurableFloor::Unchanged => {}
+                    DurableFloor::Raised { recorded } => {
+                        prop_assert_eq!(u64::from(recorded.to_bits()), reading);
+                    }
+                    DurableFloor::BeyondWidth { recorded } => {
+                        prop_assert_eq!(recorded, reading);
+                        prop_assert!(recorded > u64::from(u32::MAX));
+                        widened = true;
+                    }
+                }
+                highest = highest.max(reading);
+            }
+            match store.next_generation() {
+                Some(next) => {
+                    prop_assert!(!widened);
+                    prop_assert!(u64::from(next.to_bits()) > highest);
+                    prop_assert!(next > store.running());
+                }
+                // The only way there is no successor: a reading wider than the
+                // counter, which leaves the store exhausted rather than numbering
+                // below what the medium holds.
+                None => prop_assert!(widened),
             }
         }
 

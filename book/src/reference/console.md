@@ -805,14 +805,15 @@ node: an operator holding a silent appliance still has only the external act.
 
 ## `LFW-PD` refusal causes
 
-Every `cause=` token is listed below and the eight tables together are the complete set: 23 the
-`nic-driver` domain raises, 30 the `clock` domain raises, 35 the `management` domain raises, 47
+Every `cause=` token is listed below and the nine tables together are the complete set: 23 the
+`nic-driver` domain raises, 30 the `clock` domain raises, 35 the `management` domain raises, 1 the
+`config` domain raises, 47
 the `recorder` domain raises, 11 the `hardware-probe` domain raises, 185 the `crypto` domain
-raises, and 175 the `store` domain raises. A token outside all eight is a defect, not an extension.
+raises, and 175 the `store` domain raises. A token outside all nine is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
-**One of those eight tables belongs to two domains, and the counts above already include it.** The
+**One of those nine tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
 raise, so its table names both and its tokens are counted in each domain's total — 87 of the 185
 and 87 of the 175. Listing it twice would make a reader learn one vocabulary twice; attributing it
@@ -1033,6 +1034,20 @@ reading the recorder cannot write is a build that does not exist, not a node tha
 a running node can say about them is in a [metric reading](metrics.md):
 `librefirewall_recording_snapshots_total` counts the readings framed and the readings the publisher
 had moved on from before a settled copy could be taken.
+
+**`config`.** One token, and it is about the *numbering* rather than about any document. This domain
+holds the running configuration and numbers each new version from a counter that restarts on every
+boot, because what a booted appliance enforces is the document its own image carries. The versions
+that already exist live on the medium, and the domain that holds it states the newest of them in a
+region this one reads — so every version this domain assigns is numbered past that mark as well as
+past what is running. A mark wider than the counter leaves no number above it to assign, and every
+later commit is then refused as `channel-config-generations-exhausted` on the channel: this token is
+what tells that apart from a counter that ran out on its own. `signalled=` is always `false`: there
+is no device here to be told anything.
+
+| group | tokens |
+|---|---|
+| the version mark the medium records (`detail=` is the mark itself) | `durable-generation-too-wide` |
 
 **`hardware-probe`.** The first three groups are the CPUID feature gate, run before the first probe
 instruction: a part below the product's compile-time CPU baseline refuses with the feature word an

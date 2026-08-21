@@ -1252,6 +1252,22 @@ claims.
   implemented of the design's versioning is monotonic generations, the content comparison beside them
   that makes re-committing what is already running an `unchanged` outcome, this one-step reversal,
   and now the durable array behind them.
+- **The generation counter is seeded from the medium, and the two notions of *current* are kept
+  apart.** The store medium's slot array records the version *history*; the configuration domain
+  holds the *running* document, and it starts each boot from nothing because what a booted appliance
+  enforces is the document its own image carries — which is on no medium. Numbering a new version
+  from the running counter alone therefore collided with a version the array already held, and the
+  domain that owns the medium refused it as one that does not advance: an appliance that had ever
+  been reconfigured could not be reconfigured again after a reboot, the first commit answering
+  `document-generation-not-newest` and never becoming durable. What closes it is one word of a region
+  the store domain writes and the configuration domain reads — the highest generation any slot holds,
+  which is the number that refusal compares against, and deliberately not the version the table
+  names as running, a candidate slot being free to hold a newer one. The counter is not *set* to it:
+  the store carries it as a floor, so every version it assigns is past both what is running and what
+  the medium records, and the running generation goes on describing the document in force. The floor
+  only rises, so a reading that went backwards cannot walk the numbering onto versions already
+  spoken for; a mark wider than the counter is refused rather than narrowed and says so on the
+  console as `durable-generation-too-wide`, every later commit then being refused as exhausted.
 - **Commit-confirm exists over the management channel and nowhere else.** A commit the channel makes
   is provisional; the appliance ends the session; a confirmation on a session opened afterwards makes
   it permanent; and a deadline the appliance arms from its own clock reverts it where none arrives. The

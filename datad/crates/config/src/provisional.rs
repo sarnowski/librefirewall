@@ -138,8 +138,9 @@ impl Datastore {
     /// generation the staging named, and one fact beats two.
     #[must_use]
     pub const fn next_generation(&self) -> Option<Generation> {
-        let next = self.generation.next();
-        if next.to_bits() == self.generation.to_bits() {
+        let latest = self.latest();
+        let next = latest.next();
+        if next.to_bits() == latest.to_bits() {
             None
         } else {
             Some(next)
@@ -175,11 +176,10 @@ impl Datastore {
     /// successor — which keeps the provisional commit, so nothing is lost.
     pub fn roll_back(&mut self, records: &mut dyn Records) -> Result<RolledBack, ProvisionalError> {
         let displaced = self.displaced.ok_or(ProvisionalError::NotProvisional)?;
-        let generation = self.generation.next();
-        if generation == self.generation {
-            return Err(ProvisionalError::GenerationsExhausted {
-                latest: self.generation,
-            });
+        let latest = self.latest();
+        let generation = latest.next();
+        if generation == latest {
+            return Err(ProvisionalError::GenerationsExhausted { latest });
         }
         let changes = diff(&self.model, &displaced.model, records);
         self.generation = generation;

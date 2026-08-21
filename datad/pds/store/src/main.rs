@@ -251,10 +251,10 @@ use sel4_microkit::{
 };
 use virtio::pci::PciConfig;
 use wire::{
-    ApplianceOwnership, ClockCalibration, DeviceIdentity, InstallStaging, LogConsume, LogRecords,
-    MAX_CERTIFICATE_LEN, MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE, MAX_SIGNATURE_LEN,
-    ManagementDestination, ManagementEndpoint, SignDemand, SignOperation, SignRefusal, SignReply,
-    SignRequest, SignResponder, StagedArchive,
+    ApplianceOwnership, ClockCalibration, DeviceIdentity, DurableGeneration, InstallStaging,
+    LogConsume, LogRecords, MAX_CERTIFICATE_LEN, MAX_INSTALL_ARCHIVE, MAX_SIGN_MESSAGE,
+    MAX_SIGNATURE_LEN, ManagementDestination, ManagementEndpoint, SignDemand, SignOperation,
+    SignRefusal, SignReply, SignRequest, SignResponder, StagedArchive,
 };
 
 /// Bytes both copies of the state record occupy, and so the one transfer this
@@ -929,6 +929,8 @@ struct Established {
     /// kept apart anyway, because a mint on a *first* boot is the same event with
     /// an entirely different cause.
     reset: Option<Cleared>,
+    /// The newest version any slot holds, not the one named running below.
+    recorded: u64,
     /// Which configuration version the slot array names as running, read back off
     /// the medium and held to the digest the record carries for it.
     ///
@@ -978,6 +980,8 @@ fn init() -> Store {
     // and the handle taken here has no store on it.
     let staging: &'static InstallStaging = attach_region!(install_staging_vaddr: InstallStaging);
     let owner: &'static ApplianceOwnership = attach_region!(owner_vaddr: ApplianceOwnership);
+    let durable: &'static DurableGeneration =
+        attach_region!(durable_generation_vaddr: DurableGeneration);
     let endpoint: &'static ManagementEndpoint = attach_region!(endpoint_vaddr: ManagementEndpoint);
 
     announce(&sink, DomainState::Starting, DomainDetail::None);
@@ -992,7 +996,7 @@ fn init() -> Store {
     // The keypair is moved out of the verdict rather than borrowed from it: what
     // signs after this function returns is the handler's, and a copy left behind
     // would be a second holder of the scalar inside this domain.
-    let (identity, key, published) = match verdict {
+    let (identity, key, published, recorded) = match verdict {
         Ok(established) => {
             // What was given up, before what replaced it: a reset is the one
             // event on this surface that destroys rather than establishes, and an
@@ -1079,6 +1083,7 @@ fn init() -> Store {
                 },
                 established.key,
                 established.endpoint,
+                established.recorded,
             )
         }
         Err(cause) => {
@@ -1090,7 +1095,7 @@ fn init() -> Store {
             // cannot tell that from a domain that is merely slow. And no record,
             // so nowhere to dial: a boot that established nothing publishes the
             // absence rather than leaving whatever the region held.
-            (StoreIdentity::default(), None, StoredEndpoint::ABSENT)
+            (StoreIdentity::default(), None, StoredEndpoint::ABSENT, 0)
         }
     };
     let store = Store {
@@ -1109,6 +1114,7 @@ fn init() -> Store {
         config_records: 0,
         owner,
         endpoint,
+        durable,
     };
     // The one fact the dataplane needs off this medium, published before the
     // shard and before a peer can ask for anything: the forwarding domain
@@ -1126,6 +1132,10 @@ fn init() -> Store {
     // zeroed region already says and is stated anyway — the region's own reading
     // and this domain's must not differ by an omission.
     store.publish_endpoint(published);
+    // And the high-water mark of the version history, without which the domain that
+    // numbers configurations numbers a boot's first commit onto a version this one
+    // holds — see `wire::DurableGeneration`.
+    store.publish_durable(recorded);
     // The shard as this boot established it, before a signature has been asked
     // for. It moves again on every wakeup that serves one, which is the change
     // this delegation makes to a shard that used to be written once.
@@ -1249,6 +1259,7 @@ fn establish(medium: &mut Medium<'_>, now: i64) -> Result<Established, Establish
                 endpoint: state.get().endpoint(),
                 minted: false,
                 reset: None,
+                recorded: state.get().slots().newest_generation(),
                 configuration,
             })
         }
@@ -1369,8 +1380,7 @@ impl<'region> Medium<'region> {
             endpoint: minted.state.endpoint(),
             minted: true,
             reset: None,
-            // A minted record's array holds nothing, so there is no running
-            // version to have read back.
+            recorded: 0,
             configuration: None,
         })
     }
@@ -1873,6 +1883,13 @@ struct Store {
     /// domain maps read-only. Written by this domain alone, at the three moments
     /// the record it comes out of can change: a mint, a reload, and an install.
     endpoint: &'static ManagementEndpoint,
+    /// The region carrying the newest configuration version this medium records,
+    /// which the domain that numbers configurations maps read-only.
+    ///
+    /// Written at bring-up and again on every version this boot records, which
+    /// are the only two moments the array's high-water mark can move: nothing
+    /// else here writes a slot.
+    durable: &'static DurableGeneration,
 }
 
 /// What one accepted configuration document became, as the record an operator
@@ -1943,6 +1960,11 @@ impl Store {
             address: endpoint.address,
             port: endpoint.port,
         });
+    }
+
+    /// State the newest version any slot holds: at bring-up, and on each recorded.
+    fn publish_durable(&self, recorded: u64) {
+        self.durable.publish(recorded);
     }
 
     /// Answer one demand, and exactly one: every path below consumes it, because
@@ -2294,6 +2316,9 @@ impl Store {
                         restored: false,
                     },
                 );
+                // Before the answer, or the next version is numbered against this
+                // one's predecessor.
+                self.publish_durable(recorded.generation);
                 self.responder.config_recorded(demand);
             }
             Err(refusal) => {

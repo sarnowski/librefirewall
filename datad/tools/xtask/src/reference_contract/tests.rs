@@ -117,6 +117,7 @@ fn sound_sites() -> Vec<(&'static str, &'static [&'static str])> {
             &["channel-config-unanswered"],
         ),
         ("crates/pd-runtime/src/range.rs", &["channel-range-empty"]),
+        ("pds/config/src/main.rs", &["durable-generation-too-wide"]),
         ("pds/store/src/main.rs", &["store-medium-too-small"]),
         (
             "crates/package/src/refusal.rs",
@@ -149,6 +150,7 @@ fn sound_console() -> String {
             ),
             ("clock", &["hpet-not-present"][..]),
             ("management", &["rdrand-exhausted"][..]),
+            ("config", &["durable-generation-too-wide"][..]),
             (
                 "recorder",
                 &[
@@ -187,6 +189,7 @@ fn sound_console() -> String {
             ),
             (vec!["clock"], &["hpet-not-present"][..]),
             (vec!["management"], &["rdrand-exhausted"][..]),
+            (vec!["config"], &["durable-generation-too-wide"][..]),
             (
                 vec!["recorder"],
                 &[
@@ -304,6 +307,7 @@ fn a_token_two_domains_share_is_not_a_finding() {
         ),
         ("clock", &["hpet-not-present"]),
         ("management", &["rdrand-exhausted"]),
+        ("config", &["durable-generation-too-wide"]),
         (
             "recorder",
             &[
@@ -394,14 +398,14 @@ fn a_stated_per_domain_count_that_disagrees_with_its_own_table_is_a_finding() {
 #[test]
 fn a_stated_table_count_that_disagrees_with_the_tables_present_is_a_finding() {
     let console = sound_console().replace(
-        "eight tables together are the complete set",
         "nine tables together are the complete set",
+        "ten tables together are the complete set",
     );
     let findings = cause_findings(&sound_sites(), &console);
     let joined = findings.join("\n");
-    assert!(joined.contains("8 refusal-cause table(s)"), "{joined}");
+    assert!(joined.contains("9 refusal-cause table(s)"), "{joined}");
     assert!(
-        joined.contains("the eight tables together are the complete set"),
+        joined.contains("the nine tables together are the complete set"),
         "{joined}"
     );
 }

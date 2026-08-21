@@ -106,11 +106,12 @@ use virtio::pci::PCI_CONFIG_LEN;
 use wire::{
     CLOCK_CALIBRATION_REGION_SIZE, CONFIG_ACK_REGION_SIZE, CONFIG_REGION_SIZE,
     CONFIG_REPLY_REGION_SIZE, CONFIG_REQUEST_REGION_SIZE, DOWNLOAD_REPLY_REGION_SIZE,
-    DOWNLOAD_REQUEST_REGION_SIZE, ENDPOINT_REGION_SIZE, INSTALL_STAGING_REGION_SIZE,
-    LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE, LOG_RELAY_CONSUME_REGION_SIZE,
-    LOG_RELAY_REGION_SIZE, OWNERSHIP_REGION_SIZE, RELAY_REPLY_REGION_SIZE,
-    RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE, SIGN_REQUEST_REGION_SIZE,
-    STATS_RELAY_REGION_SIZE, TAP_CONSUME_REGION_SIZE, TAP_RECORDS_REGION_SIZE,
+    DOWNLOAD_REQUEST_REGION_SIZE, DURABLE_GENERATION_REGION_SIZE, ENDPOINT_REGION_SIZE,
+    INSTALL_STAGING_REGION_SIZE, LOG_CONSUME_REGION_SIZE, LOG_RECORDS_REGION_SIZE,
+    LOG_RELAY_CONSUME_REGION_SIZE, LOG_RELAY_REGION_SIZE, OWNERSHIP_REGION_SIZE,
+    RELAY_REPLY_REGION_SIZE, RELAY_REQUEST_REGION_SIZE, SIGN_REPLY_REGION_SIZE,
+    SIGN_REQUEST_REGION_SIZE, STATS_RELAY_REGION_SIZE, TAP_CONSUME_REGION_SIZE,
+    TAP_RECORDS_REGION_SIZE,
 };
 
 use crate::{image::SYSTEM_DESCRIPTION, util::Error};
@@ -514,6 +515,21 @@ const ENDPOINT_WITHHELD: &str = "the store domain is the ONLY writer of the addr
      port and nothing else — values the management server publishes to every appliance it owns \
      and that appear in the clear on the wire — so the grant is narrow because what it carries \
      authenticates nothing. No `phys_addr`, so no device reaches it by DMA either";
+
+/// What the configuration version mark withholds, which is an authority and not a
+/// mapping: exactly one domain may say what its own medium records.
+const DURABLE_GENERATION_WITHHELD: &str = "the store domain is the ONLY writer of the high-water \
+     mark of the configuration version history, and the configuration domain the only reader. The \
+     write grant is withheld from every other domain including the reader, because a domain that \
+     could write it could number a version past whatever it chose — and the reader is the domain \
+     that parses an attacker's document, so a write grant here would let a document decide which \
+     versions the medium is said to hold. The read grant is withheld from every domain that has no \
+     use for it: the forwarder decides frames under whatever generation it is handed and never \
+     numbers one, the management and cryptography domains carry an operation naming a generation \
+     rather than choosing it, and a grant nobody needs is one that outlives its reason. What a \
+     read here confers is one number — not the trust anchor, not the endpoint, not the key, not a \
+     byte of any document — and the reader's only use for it is to count past it. No `phys_addr`, \
+     so no device reaches it by DMA either";
 
 /// What the capture tap's two regions withhold — the mirrored permissions that
 /// make a stored capture the forwarder's testimony rather than the recorder's.
@@ -1029,6 +1045,22 @@ const REGIONS: &[RegionRule] = &[
             read_only("crypto"),
         ],
         withheld: Some(ENDPOINT_WITHHELD),
+    },
+    // The high-water mark of the configuration version history: one writer, one
+    // reader, and no channel — the reader is woken by every submission the
+    // management channel carries, so it reads this on a wakeup it was going to
+    // have. As with `owner`, what this rule withholds is an authority rather than
+    // a mapping, so the perms carry the argument and `withheld` states the
+    // exclusion they cannot.
+    RegionRule {
+        name: "durable_generation",
+        size: ExpectedSize {
+            rust_name: "wire::DURABLE_GENERATION_REGION_SIZE",
+            bytes: DURABLE_GENERATION_REGION_SIZE,
+        },
+        cacheability: Cacheability::Cached,
+        grants: &[read_write("store"), read_only("config")],
+        withheld: Some(DURABLE_GENERATION_WITHHELD),
     },
     RegionRule {
         name: "cfgack",

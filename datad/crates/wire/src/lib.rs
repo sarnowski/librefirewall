@@ -91,6 +91,7 @@
 mod clock;
 mod config_rule;
 mod download;
+mod durable_generation;
 mod endpoint;
 mod image;
 mod install;
@@ -119,6 +120,7 @@ pub use download::{
     DownloadFault, DownloadPoll, DownloadReader, DownloadRefusal, DownloadReply, DownloadRequest,
     DownloadRequester, DownloadResponder, DownloadSink, DownloadStatus, PendingDownload,
 };
+pub use durable_generation::{DURABLE_GENERATION_REGION_SIZE, DurableGeneration};
 pub use endpoint::{ENDPOINT_REGION_SIZE, ENDPOINT_TAG, ManagementDestination, ManagementEndpoint};
 pub use install::{
     ArchiveUpload, INSTALL_STAGING_REGION_SIZE, InstallStaging, MAX_INSTALL_ARCHIVE, StagedArchive,

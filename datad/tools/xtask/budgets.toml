@@ -39,7 +39,7 @@
 "crates/config/src/rule.rs" = 0.2115
 "crates/config/src/runtime.rs" = 0.1317
 "crates/config/src/schema.rs" = 0.3145
-"crates/config/src/store.rs" = 0.3309
+"crates/config/src/store.rs" = 0.3302
 "crates/config/src/validate.rs" = 0.2017
 "crates/config/src/value.rs" = 0.2419
 "crates/config/src/xml.rs" = 0.2310
@@ -157,10 +157,11 @@
 "crates/wire/src/clock.rs" = 0.5407
 "crates/wire/src/config_rule.rs" = 0.3961
 "crates/wire/src/download.rs" = 0.3628
+"crates/wire/src/durable_generation.rs" = 0.5810
 "crates/wire/src/endpoint.rs" = 0.5663
 "crates/wire/src/image.rs" = 0.3106
 "crates/wire/src/install.rs" = 0.5164
-"crates/wire/src/lib.rs" = 0.2670
+"crates/wire/src/lib.rs" = 0.2667
 "crates/wire/src/log_record.rs" = 0.2650
 "crates/wire/src/log_relay.rs" = 0.4204
 "crates/wire/src/log_ring.rs" = 0.4271
@@ -180,22 +181,22 @@
 "pds/clock/src/cmos.rs" = 0.6615
 "pds/clock/src/hpet_mmio.rs" = 0.7222
 "pds/clock/src/main.rs" = 0.4663
-"pds/config/src/main.rs" = 0.3795
+"pds/config/src/main.rs" = 0.3785
 "pds/console/src/com1.rs" = 0.6400
 "pds/console/src/main.rs" = 0.4884
 "pds/crypto/src/arena.rs" = 0.4863
 "pds/crypto/src/channel.rs" = 0.4022
 "pds/crypto/src/configuration.rs" = 0.4061
 "pds/crypto/src/delegate.rs" = 0.5343
-"pds/crypto/src/main.rs" = 0.4056
+"pds/crypto/src/main.rs" = 0.4046
 "pds/crypto/src/upload.rs" = 0.4205
 "pds/forwarder/src/main.rs" = 0.4752
 "pds/hardware-probe/src/main.rs" = 0.4226
 "pds/management/src/entropy.rs" = 0.6627
-"pds/management/src/main.rs" = 0.4441
+"pds/management/src/main.rs" = 0.4436
 "pds/nic-driver/src/main.rs" = 0.4571
 "pds/recorder/src/main.rs" = 0.3015
-"pds/store/src/main.rs" = 0.4455
+"pds/store/src/main.rs" = 0.4454
 
 [unsafe-blocks]
 "crates/blk" = 8
