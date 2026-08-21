@@ -506,6 +506,89 @@ defmodule Ctrld.Channel.ListenerTest do
       :ok = :ssl.close(second)
     end
 
+    test "a refusal in the history sends the appliance's generation and records this server's",
+         %{anchor: anchor} do
+      port = start_listener()
+      %{appliance: appliance, actor: actor, certificate: certificate, key: key} = appliance_with()
+
+      assert {:ok, socket} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(socket)
+      :ok = send_frame(socket, {:hello, :appliance})
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :online end)
+
+      # First a document the appliance refuses. It advances THIS server's version
+      # counter to 2 and leaves the appliance's where it was, which is the whole
+      # setup: from here on the two numbers differ, and every later step has to
+      # say which of them it means.
+      assert {:ok, _refused} =
+               Appliances.stage_configuration(reload(appliance), amended_document(), actor)
+
+      assert {:ok, {:down_config_stage, _}} = read_frame(socket, true)
+
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result,
+           "generation=1 outcome=refused rejected=unknown-element offset=41"}
+        )
+
+      assert eventually(fn ->
+               version(appliance, 2) |> ConfigurationVersion.state() == :refused
+             end)
+
+      # Then one it takes. This server calls it generation 3; the appliance, whose
+      # counter never moved for the refusal, calls it its generation 2.
+      assert {:ok, accepted} =
+               Appliances.stage_configuration(
+                 reload(appliance),
+                 amended_document() <> "\n<!-- again -->",
+                 actor
+               )
+
+      assert accepted.generation == 3
+      assert {:ok, {:down_config_stage, _}} = read_frame(socket, true)
+
+      :ok =
+        send_frame(
+          socket,
+          {:up_config_validate_result, "generation=2 outcome=staged changes=1"}
+        )
+
+      # The frame carries the appliance's number, which is the only one its
+      # datastore will commit.
+      assert {:ok, {:down_config_commit, 2, _deadline}} = read_frame(socket, true)
+
+      # And the row that moves is this server's version 3 — the document that was
+      # actually taken. Version 2 stays refused: a commit recorded against it
+      # would report a document the appliance rejected as the one in force.
+      assert eventually(fn ->
+               version(appliance, 3) |> ConfigurationVersion.state() == :committed
+             end)
+
+      assert version(appliance, 2) |> ConfigurationVersion.state() == :refused
+      assert version(appliance, 2).committed_at == nil
+      assert Appliances.awaiting_confirmation(appliance.device_id).generation == 3
+
+      # The confirmation splits the same way: the appliance's number on the wire,
+      # this server's on the row.
+      :ok = :ssl.close(socket)
+      assert eventually(fn -> Appliances.status(reload(appliance)) == :offline end)
+
+      assert {:ok, second} = connect(port, certificate, key, anchor)
+      assert {:ok, {:hello, {:server, 0, 0}}} = read_frame(second)
+      :ok = send_frame(second, {:hello, :appliance})
+
+      assert {:ok, {:down_commit_confirm, 2}} = read_frame(second, true)
+
+      assert eventually(fn ->
+               version(appliance, 3) |> ConfigurationVersion.state() == :confirmed
+             end)
+
+      assert version(appliance, 2).confirmed_at == nil
+      assert Appliances.awaiting_confirmation(appliance.device_id) == nil
+      :ok = :ssl.close(second)
+    end
+
     test "a document the appliance refuses is not committed", %{anchor: anchor} do
       port = start_listener()
       %{appliance: appliance, actor: actor, certificate: certificate, key: key} = appliance_with()

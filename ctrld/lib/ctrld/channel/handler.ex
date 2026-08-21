@@ -99,12 +99,18 @@ defmodule Ctrld.Channel.Handler do
   # server keeps: the appliance arms it off its own clock, because it is the end
   # that has to act when it expires.
   #
-  # Sixty seconds. The appliance closes the session on the commit and re-dials on
-  # a backoff that starts short, so a minute is several attempts' worth of room —
-  # and the whole point of the bound is that an appliance whose management plane
-  # has genuinely gone away undoes the change while somebody is still watching,
-  # rather than hours later.
-  @confirm_deadline_secs 60
+  # Five minutes, and the number is the re-dial's and not a round one. A commit
+  # ends the session, and the appliance does not re-dial the instant it does: it
+  # reports the closed connection about a minute later and opens the next one just
+  # after, so a confirmation cannot reach it sooner than that. A deadline at that
+  # latency is a deadline every change loses — the appliance reverts and then
+  # refuses the confirmation as naming no provisional commit — so this has to be
+  # a multiple of it rather than a match for it. Five minutes is roughly five
+  # times the observed round trip and half the ten-minute bound the appliance
+  # clamps to, which keeps the other half of the point intact: an appliance whose
+  # management plane has genuinely gone away undoes the change while somebody is
+  # still watching, rather than hours later.
+  @confirm_deadline_secs 300
 
   # How long an appliance has to answer the server's greeting with its own. The
   # session is authenticated by this point, so this is not the flood bound — that
@@ -435,20 +441,30 @@ defmodule Ctrld.Channel.Handler do
       nil ->
         {:ok, state}
 
-      %ConfigurationVersion{generation: generation} ->
-        confirm(socket, state, generation)
+      %ConfigurationVersion{} = version ->
+        confirm(socket, state, version)
     end
   end
 
-  defp confirm(socket, state, generation) do
-    case send_frame(socket, {:down_commit_confirm, generation}) do
+  # Both numbers again, for `commit/4`'s reason: the frame carries the generation
+  # the appliance assigned and the row is found by this server's own, and a
+  # confirmation that named the row's number would be refused by every appliance
+  # whose counter has ever diverged from it.
+  defp confirm(socket, state, %ConfigurationVersion{generation: version_generation} = version) do
+    stated = staged_generation(version, version_generation)
+
+    case send_frame(socket, {:down_commit_confirm, stated}) do
       :ok ->
         {:ok, _version} =
-          Appliances.configuration_confirmed(state.device_id, generation, DateTime.utc_now())
+          Appliances.configuration_confirmed(
+            state.device_id,
+            version_generation,
+            DateTime.utc_now()
+          )
 
         Logger.info(
-          "ctrld: confirmed generation #{generation} on appliance #{state.device_id} " <>
-            "over a fresh connection"
+          "ctrld: confirmed generation #{version_generation} on appliance #{state.device_id} " <>
+            "as its generation #{stated}, over a fresh connection"
         )
 
         {:ok, state}
@@ -472,7 +488,7 @@ defmodule Ctrld.Channel.Handler do
       Appliances.configuration_validated(state.device_id, generation, line, DateTime.utc_now())
 
     if ConfigurationVersion.accepted?(line) do
-      commit(socket, state, staged_generation(version, generation))
+      commit(socket, state, generation, staged_generation(version, generation))
     else
       Logger.info(
         "ctrld: appliance #{state.device_id} refused the document staged as generation " <>
@@ -529,16 +545,29 @@ defmodule Ctrld.Channel.Handler do
     end
   end
 
-  defp commit(socket, state, generation) do
-    case send_frame(socket, {:down_config_commit, generation, @confirm_deadline_secs}) do
+  # Two generations, because there are two counters and they are not the same one.
+  # `version_generation` numbers this server's own versions of one appliance's
+  # configuration and is what identifies the row to stamp; `stated` is the number
+  # the appliance's datastore assigned and is the only number the frame may carry.
+  # They agree only while every document this server staged was accepted — one the
+  # appliance refused advances this server's counter and not the appliance's — so
+  # using either for both would, after a single refusal, either commit a row the
+  # appliance never took or ask the appliance to commit a generation it would
+  # refuse.
+  defp commit(socket, state, version_generation, stated) do
+    case send_frame(socket, {:down_config_commit, stated, @confirm_deadline_secs}) do
       :ok ->
         {:ok, _version} =
-          Appliances.configuration_committed(state.device_id, generation, DateTime.utc_now())
+          Appliances.configuration_committed(
+            state.device_id,
+            version_generation,
+            DateTime.utc_now()
+          )
 
         Logger.info(
-          "ctrld: committed generation #{generation} on appliance #{state.device_id} " <>
-            "provisionally, to be confirmed within #{@confirm_deadline_secs}s over a fresh " <>
-            "connection"
+          "ctrld: committed generation #{version_generation} on appliance #{state.device_id} " <>
+            "as its generation #{stated}, provisionally, to be confirmed within " <>
+            "#{@confirm_deadline_secs}s over a fresh connection"
         )
 
         {:ok, state}
