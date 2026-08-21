@@ -662,14 +662,27 @@ pub(crate) fn stage_frame(document: &[u8]) -> Result<Vec<u8>, String> {
 /// The commit frame: 0x07, a generation and the seconds a confirmation has. Ten
 /// bytes of payload, which is what the encoder puts there.
 pub(crate) fn commit_frame(generation: u64) -> Vec<u8> {
-    /// The longest this appliance will hold an unconfirmed commit for. The number
-    /// is clamped by the appliance to its own bound whatever is asked, so what it
-    /// decides is only how long a boot has before the revert. It is an order of
-    /// magnitude past the budget any boot in this gate takes, so the configuration
-    /// a commit puts in force is still in force when the guest stops, and every
-    /// boot is bounded by the records and the result frames it waits for rather
-    /// than by this.
+    /// The longest this appliance will hold an unconfirmed commit for, which is
+    /// the top of the band it accepts. The appliance takes this number as asked
+    /// and refuses one outside the band rather than moving it into range, so a
+    /// figure chosen here that fell outside would be a commit that never happens
+    /// — which is why it is the bound itself rather than a round number near it.
+    /// It is an order of magnitude past the budget any boot in this gate takes, so
+    /// the configuration a commit puts in force is still in force when the guest
+    /// stops, and every boot is bounded by the records and the result frames it
+    /// waits for rather than by this.
     const CONFIRM_SECONDS: u16 = 600;
+
+    // Every committing scenario sends this frame, so a number the appliance would
+    // refuse would turn all of them into boots that assert a commit which never
+    // happened. The floor the appliance derives is not reachable from this crate,
+    // so what is held here is the term it is derived from: a deadline must outlast
+    // the re-dial a commit costs, and comfortably — the doubling the appliance
+    // applies is its own.
+    const _: () = assert!(
+        (CONFIRM_SECONDS as u64).saturating_mul(1_000_000_000)
+            > pd_runtime::REDIAL_CEILING.as_nanos().saturating_mul(2)
+    );
 
     let mut frame = Vec::with_capacity(18);
     frame.extend_from_slice(&10_u32.to_be_bytes());

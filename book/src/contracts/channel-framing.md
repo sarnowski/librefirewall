@@ -223,7 +223,18 @@ field vocabulary the console's configuration records use — `generation=<n> out
 `rejected=<reason> offset=<n>` on a refusal — so the channel invents no second result vocabulary.
 
 DOWN_CONFIG_COMMIT names the staged generation and a confirm deadline. The appliance commits it —
-the ordinary atomic candidate-to-running swap — and the commit arms the deadline. **The confirmation
+the ordinary atomic candidate-to-running swap — and the commit arms the deadline **at exactly the
+number the frame carried**. That number is part of the contract and is bounded at both ends: it must
+be at least 122 seconds and at most 600, and a commit naming anything outside that band is refused
+with nothing staged, committed or written — the appliance never adjusts it into range, because a
+commit armed under a deadline the server did not choose leaves the two ends disagreeing about when
+the configuration reverts with neither able to see the difference. The floor is not a round number:
+it is twice what a re-dial costs the appliance, since a commit ends the session and the appliance's
+own transport holds the connection it closed for a full 60-second `TIME_WAIT` before the redial
+schedule so much as draws its first wait — so a shorter window is one no correctness at either end
+can meet, and the doubling is what leaves the new session's handshake and greeting inside the figure.
+The ceiling is how long an appliance will enforce a configuration nobody has answered for.
+**The confirmation
 must arrive over a fresh connection**: after committing, the appliance closes the session and
 re-dials under the configuration it just committed, and the server sends DOWN_COMMIT_CONFIRM for
 that generation on the new session. Confirming over the pre-existing session would prove nothing

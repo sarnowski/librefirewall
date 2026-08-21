@@ -79,12 +79,7 @@ lfw-blk = { path = "../../crates/blk" }
 # `recording_contract` judges a downloaded body against the same snap lengths,
 # so the appliance's placement and the thing judging it are one statement.
 lfw-recorder = { path = "../../crates/recorder" }
-# How long a closed connection is held before its slot is given back. A boot
-# that waits for the appliance to dial a second time is waiting for exactly
-# that interval, and a number written out here would be a harness deciding how
-# long its own subject takes: the drift every dependency above exists to close,
-# in the one place a flaky boot would look like a slow machine.
-lfw-tcp = { path = "../../crates/tcp" }
+
 # The state record's magic and version, for the one thing the host may say about
 # the store medium without reading what it holds. Those two fields are the only
 # ones on that medium that are neither the appliance's secret nor derived from

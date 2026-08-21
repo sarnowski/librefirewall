@@ -3,7 +3,7 @@ use core::num::NonZeroU64;
 use lfw_clock::{Calibration, Duration, Monotonic, NANOS_PER_SECOND, Ticks};
 use proptest::prelude::*;
 
-use super::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
+use super::{INITIAL_BACKOFF, MAX_BACKOFF, REDIAL_CEILING, Reconnect, Wait};
 
 /// An instant, through the one path a `Monotonic` is reachable by — so a test
 /// states one the way a caller of this crate would.
@@ -94,6 +94,31 @@ fn a_wait_reports_the_delay_it_drew_and_the_bound_it_drew_below() {
         .bound_millis(),
         300_000
     );
+}
+
+/// What a re-dial costs is the transport's hold plus the first wait, and it is
+/// read out of both rather than restated. A caller derives a promise from it —
+/// the shortest confirmation window this appliance will accept — so a term
+/// dropped from the sum, or a sum that stopped being their total, is what this
+/// holds it to.
+#[test]
+fn a_redial_costs_the_transport_hold_and_one_wait_below_the_floor() {
+    assert_eq!(
+        REDIAL_CEILING.as_nanos(),
+        lfw_tcp::TIME_WAIT_DURATION.as_nanos() + INITIAL_BACKOFF.as_nanos()
+    );
+    // And the schedule really does draw that first wait below the term the sum
+    // used: the reset a greeting makes is what puts it back there, so a re-dial
+    // after a working channel is bounded by the floor and not by whatever the
+    // backoff had doubled to.
+    let mut schedule = Reconnect::new(0x5eed_0000_0000_0001);
+    let now = at(0);
+    for _ in 0..8 {
+        let _ = schedule.failed(now);
+    }
+    assert!(schedule.bound() > INITIAL_BACKOFF);
+    schedule.established();
+    assert_eq!(schedule.failed(now).bound, INITIAL_BACKOFF);
 }
 
 /// Two appliances seeded differently do not redial together, which is the whole

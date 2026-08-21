@@ -1161,8 +1161,10 @@ is the fresh-connection rule made structural. The deadline lives with the domain
 sessions and not with the datastore, because "no confirmation over a connection opened after the
 commit" is a fact about connections and the deciding domain has none; that domain holds the store and
 the two operations over it, and needs no clock and no wakeup for either. Every way an operation can
-fail has a console token of its own — nine of them, telling a server that named the wrong generation
-apart from one confirming a commit nobody made, from a confirmation on the committing session, from a
+fail has a console token of its own — fourteen of them, telling a server that named the wrong
+generation apart from one confirming a commit nobody made, from a confirmation on the committing
+session, from a commit whose confirmation deadline lies outside the band this appliance works in
+(a token per direction), from a commit the medium would not hold, and from a
 deciding domain that stopped answering — and what *happened* to a configuration stays the deciding
 domain's own `LFW-CFG` record, under `outcome=staged`, `outcome=confirmed` or `outcome=reverted`
 beside the generation.
@@ -1273,16 +1275,35 @@ claims.
   it permanent; and a deadline the appliance arms from its own clock reverts it where none arrives. The
   fresh-connection rule is enforced by construction rather than hoped for — the commit closes the
   session, and a confirmation that somehow arrives on the committing session is refused under
-  `channel-config-confirm-not-fresh`, the session serial being a number this appliance assigns. The
-  deadline the server asks for is clamped between five seconds and ten minutes, so an indefinite hold
-  is not expressible from the wire, and a reversal consumes the commit it undoes, so an unreachable
-  server costs one reversal rather than a loop. The bottom of that band is meant to make a commit
-  that could never be confirmed inexpressible as well, and it does not reach: closing the session is
-  how the fresh-connection rule is enforced, and a connection this appliance closed costs it about a
-  minute before it dials again, so every deadline below roughly that is one it reverts before any
-  confirmation can arrive.
+  `channel-config-confirm-not-fresh`, the session serial being a number this appliance assigns. A
+  reversal consumes the commit it undoes, so an unreachable server costs one reversal rather than a
+  loop.
   **The session ends exactly when a commit awaits confirmation**, which is that rule stated once
   rather than at each exit of the code that makes one.
+- **The deadline a commit names is accepted as asked or refused by name, and the band it is held to
+  is derived from what a re-dial costs.** The ceiling is ten minutes, past which the appliance would
+  enforce a configuration nobody has answered for indefinitely — the state commit-confirm exists to
+  end. The floor is **122 seconds**, and it is arithmetic rather than a choice: a commit ends the
+  session, the appliance's own transport holds the connection it closed for a 60-second `TIME_WAIT`
+  before the endpoint above it releases the session, and only then does the redial schedule draw the
+  one wait it draws after a channel that had agreed a greeting — a second at most. That sum is
+  `pd_runtime::REDIAL_CEILING`, read out of `lfw_tcp::TIME_WAIT_DURATION` and
+  `pd_runtime::INITIAL_BACKOFF` rather than restated, and the floor is twice it: what the sum does
+  not carry is the handshake, the greeting exchange and the confirmation frame the second connection
+  still owes, no constant anywhere bounds those, and the doubling is what puts them inside the figure
+  instead of beside it. A const assertion holds the floor above the interval it is derived from, so a
+  change to either term fails the build rather than quietly putting the floor back under the cost.
+  **Neither bound clamps.** The number used to be raised or lowered into the band, and that was the
+  wrong answer to it: the deadline is a field of a protocol, so a commit armed under a different one
+  leaves the server's record of when it must confirm — or of how long it has bought — disagreeing
+  with the appliance's, with neither end able to see the difference. So a commit outside the band is
+  refused before anything is staged, committed or written, under a token per direction:
+  `channel-config-deadline-too-short` below the floor and `channel-config-deadline-too-long` above
+  the ceiling. Refusing is also the safer answer at both ends — too short is a commit certain to
+  revert while the server is told it applied, and too long is exactly the indefinite hold the ceiling
+  exists to refuse. `ctrld` asks for five minutes, which is inside the band and unchanged; the gate's
+  own server asks for the ceiling, and a const assertion in the harness holds that frame to outlasting
+  a re-dial so a number it could not meet would fail the build rather than a boot.
 - **A commit the medium will not hold is put back rather than reported as in force.** The version
   history is written after the configuration is in force, so the write can refuse a commit that has
   already happened. Leaving it standing was wrong in two ways at once: the appliance enforced and
@@ -1337,14 +1358,18 @@ claims.
   appliance nor the management server was ever the problem — that server accepts connection after
   connection — and the wait is now derived from the appliance's own two intervals rather than from a
   number chosen beside it.
-- **Missing: a confirmation deadline the appliance can actually meet at the bottom of its band.**
-  The five-second floor on what a server may ask for was chosen to keep a commit from reverting
-  before the appliance has finished re-dialling, and re-dialling costs it about a minute, so every
-  deadline under roughly that is unconfirmable however correctly both ends behave. The gate's own
-  server asks for the top of the band, so no boot meets it. What it needs is a floor derived from the
-  reconnection rather than chosen against it — a decision about the appliance, and one for a human.
-- **What is still unobserved on a booted node** is the reversal on an expired deadline and a commit
-  the medium refused; both are held by host-level cover and by the console vocabulary instead.
+- **And the floor on that deadline now reaches.** It was five seconds, chosen to keep a commit from
+  reverting before the appliance had finished re-dialling and short of doing it by more than an order
+  of magnitude — re-dialling costs about a minute, so every deadline under roughly that was
+  unconfirmable however correctly both ends behaved, which is the exact class of commit the floor
+  exists to make inexpressible. It is now derived from the reconnection rather than chosen against
+  it, and the clamp that hid the mismatch is gone with it: the band is enforced by refusal, so a
+  server asking for something unmeetable is told so instead of being silently corrected into a
+  window it never asked for.
+- **What is still unobserved on a booted node** is the reversal on an expired deadline, a commit the
+  medium refused, and a commit whose deadline the appliance refuses at either end of the band; all
+  three are held by host-level cover, by the two const assertions and by the console vocabulary
+  instead.
 - **A submission is answered when it is committed, not when the dataplane has switched.** The
   configuration domain holds no timer, so it cannot bound a wait on the forwarding domain's
   acknowledgement — and a refusal by that domain is the *absence* of one, so waiting would hang a

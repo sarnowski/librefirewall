@@ -808,14 +808,14 @@ node: an operator holding a silent appliance still has only the external act.
 Every `cause=` token is listed below and the nine tables together are the complete set: 23 the
 `nic-driver` domain raises, 30 the `clock` domain raises, 35 the `management` domain raises, 1 the
 `config` domain raises, 47
-the `recorder` domain raises, 11 the `hardware-probe` domain raises, 186 the `crypto` domain
+the `recorder` domain raises, 11 the `hardware-probe` domain raises, 188 the `crypto` domain
 raises, and 175 the `store` domain raises. A token outside all nine is a defect, not an extension.
 The `forwarder` and `console` domains raise none, having no
 `refused` record.
 
 **One of those nine tables belongs to two domains, and the counts above already include it.** The
 onboarding package's rules are one catalogue that both the cryptography domain and the store domain
-raise, so its table names both and its tokens are counted in each domain's total — 87 of the 186
+raise, so its table names both and its tokens are counted in each domain's total — 87 of the 188
 and 87 of the 175. Listing it twice would make a reader learn one vocabulary twice; attributing it
 to one domain would leave the other's records looking unnamed.
 
@@ -1095,7 +1095,7 @@ of a vector's contents.
 | a frame of a range answer this end would not compose, which ends the session (none carries a `detail=`) | `channel-range-unasked`, `channel-range-position-moved`, `channel-range-chunk-too-long`, `channel-range-not-taken` |
 | an acknowledgement claiming more of a recording than this end has sent (`detail=` is the position claimed and the position sent) | `channel-ack-past-sent` |
 | a rule of the channel's framing that a management server broke (none carries a `detail=`) | `channel-reserved-non-zero`, `channel-unknown-frame-type`, `channel-payload-too-long`, `channel-wrong-direction`, `channel-first-frame-not-hello`, `channel-version-mismatch`, `channel-payload-length`, `channel-unknown-ring`, `channel-unknown-range-status`, `channel-bytes-on-ended-range`, `channel-document-too-long`, `channel-result-line-not-printable` |
-| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-not-durable`, `channel-config-not-durable-unreverted`, `channel-config-nothing-staged` |
+| a configuration operation the channel carried that did not happen (none carries a `detail=`) | `channel-config-unanswered`, `channel-config-faulted`, `channel-config-no-such-operation`, `channel-config-generation-mismatch`, `channel-config-no-candidate`, `channel-config-not-provisional`, `channel-config-generations-exhausted`, `channel-config-generation-too-wide`, `channel-config-confirm-not-fresh`, `channel-config-deadline-too-short`, `channel-config-deadline-too-long`, `channel-config-not-durable`, `channel-config-not-durable-unreverted`, `channel-config-nothing-staged` |
 
 **The two `channel-*` tokens above the framing's are this appliance's own state and not a
 server's.** `channel-identity-absent` is a node whose store published somewhere to dial and whose
@@ -1167,25 +1167,44 @@ this appliance, not one breaking the protocol's framing, and ending the session 
 disagreement about a number into an outage the server chooses the timing of. It is clamped, counted
 against the session it happened on, and shipping goes on.
 
-**The nine `channel-config-*` tokens are how a configuration operation the server pushed failed, and
-they are the only place the failure is visible on this node.** What *happened* to a configuration is
-the deciding domain's own `LFW-CFG` record — `outcome=staged`, `outcome=applied`, `outcome=confirmed`,
-`outcome=reverted` — carrying the generation, under `domain=config`; these say that the exchange
-about it did not complete, and each names a different party. Four are the server's mistake:
-`channel-config-generation-mismatch` is a commit or a confirmation naming a generation this
+**The eleven `channel-config-*` tokens are how a configuration operation the server pushed failed,
+and they are the only place the failure is visible on this node.** What *happened* to a configuration
+is the deciding domain's own `LFW-CFG` record — `outcome=staged`, `outcome=applied`,
+`outcome=confirmed`, `outcome=reverted` — carrying the generation, under `domain=config`; these say
+that the exchange about it did not complete, and each names a different party. Six are the server's
+mistake: `channel-config-generation-mismatch` is a commit or a confirmation naming a generation this
 appliance would not act on, and the generation it *would* is on the `domain=config` record beside it;
 `channel-config-no-candidate` is a commit with nothing staged; `channel-config-not-provisional` is a
-confirmation of a commit nobody made, or of one already settled; and
+confirmation of a commit nobody made, or of one already settled;
 `channel-config-generation-too-wide` is a generation past the width a configuration generation has,
-refused rather than narrowed because a truncated number names a different commit.
+refused rather than narrowed because a truncated number names a different commit; and the two
+`channel-config-deadline-*` tokens are a commit whose confirmation deadline lies outside the band
+this appliance will accept, described below.
 `channel-config-confirm-not-fresh` is the fresh-connection rule: a confirmation arriving on the very
 session that made the commit proves nothing about a configuration that breaks *new* connections, so
 it is refused and the deadline still runs. `channel-config-generations-exhausted` is this appliance
-out of generations, which no resubmission helps. And the remaining two are this appliance's own
+out of generations, which no resubmission helps. And the remaining three are this appliance's own
 halves disagreeing: `channel-config-unanswered` is the deciding domain not answering inside the
-budget — a wedged or faulted domain, whose own records are what to read next — and
-`channel-config-faulted` is it answering something the request cannot be answered with, which should
-never appear.
+budget — a wedged or faulted domain, whose own records are what to read next —
+`channel-config-faulted` is it answering something the request cannot be answered with, and
+`channel-config-no-such-operation` is it answering that it does not have the operation that was
+asked for at all. Neither of the last two should ever appear.
+
+**The two `channel-config-deadline-*` tokens are a confirmation deadline this appliance refuses to
+work under, and the commit does not happen.** A commit names how long it may stay unconfirmed, and
+the appliance accepts that number as asked or refuses it — it is never quietly moved into the band,
+because a commit carried out under a deadline the server did not choose leaves the two ends holding
+different accounts of when the configuration reverts, and neither end can see the difference.
+`channel-config-deadline-too-short` is a window shorter than a re-dial takes this appliance: a commit
+ends the session, the transport holds the connection it closed for a minute before the slot comes
+back, and only then is a redial wait drawn — so a shorter window is one the commit is certain to
+outlive whatever both ends do correctly, and the floor sits at twice that interval to leave the new
+session's handshake and greeting inside it. `channel-config-deadline-too-long` is the opposite fault
+in the same field: a window past the bound on how long this appliance will enforce a configuration
+nobody has answered for, which is the state commit-confirm exists to end. Both are refused before
+anything is staged, committed or written, so nothing has moved when a server reads one; the band is
+in the [channel framing contract](../contracts/channel-framing.md#downstream-configuration-operations),
+and a server that asks inside it gets exactly the number it asked for.
 
 **`channel-config-not-durable` is a commit that was made and then put back.** The deciding domain
 committed it, and the domain that owns the medium would not write it into the version history — so

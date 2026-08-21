@@ -104,8 +104,9 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
 /// what keeps the ending it reports answerable for as long as anybody asks. Only
 /// then does the redial schedule draw its next wait, below a bound the agreed
 /// greeting has just reset to its floor. So the second connection is owed
-/// `TIME_WAIT` plus at most one floor-length wait, and neither figure is a guess:
-/// both are read out of the crates that hold them.
+/// `TIME_WAIT` plus at most one floor-length wait, which is not a guess: it is
+/// `pd_runtime::REDIAL_CEILING`, the figure that appliance derives its own
+/// shortest confirmation window from.
 ///
 /// Twice that, so a boot is not decided by where in an interval it happened to
 /// land and so the handshake the second connection still owes — which is neither
@@ -116,18 +117,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(POLL_MILLIS);
 /// boot's own budget, so the step that fails is this one and not the outer timer.
 pub const RECONNECT_POLLS: usize = reconnect_polls();
 
-/// The pass count above, from the appliance's own two intervals.
+/// The pass count above, from the interval a re-dial takes the appliance.
 ///
-/// Milliseconds throughout: the two intervals are read out of the crates that
-/// hold them and the pace is this file's own, so one unit for all three costs no
-/// cast and leaves nothing to truncate.
+/// Milliseconds throughout: the interval is read out of the crate that holds it
+/// and the pace is this file's own, so one unit for both costs no cast and leaves
+/// nothing to truncate.
 const fn reconnect_polls() -> usize {
-    /// The two intervals in the pace's own unit.
-    const fn millis(nanos: u64) -> u64 {
-        nanos / 1_000_000
-    }
-    let owed = millis(lfw_tcp::TIME_WAIT_DURATION.as_nanos())
-        .saturating_add(millis(pd_runtime::INITIAL_BACKOFF.as_nanos()));
+    let owed = pd_runtime::REDIAL_CEILING.as_nanos() / 1_000_000;
     (owed.saturating_mul(2) / POLL_MILLIS) as usize
 }
 

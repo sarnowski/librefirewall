@@ -67,6 +67,23 @@ pub const MAX_BACKOFF: Duration = Duration::from_millis(300_000);
 const _: () = assert!(INITIAL_BACKOFF.as_nanos() > 0);
 const _: () = assert!(MAX_BACKOFF.as_nanos() >= INITIAL_BACKOFF.as_nanos());
 
+/// What a re-dial costs: the longest between a session this appliance ended and
+/// the next attempt opening.
+///
+/// A session this end closed is held by the endpoint above the transport until
+/// the transport gives the connection's slot back, so no wait is drawn until that
+/// `TIME_WAIT` is over; then one is, below [`INITIAL_BACKOFF`] rather than a
+/// doubled bound — a re-dial being promised only of a channel that was working.
+pub const REDIAL_CEILING: Duration = Duration::from_nanos(
+    lfw_tcp::TIME_WAIT_DURATION
+        .as_nanos()
+        .saturating_add(INITIAL_BACKOFF.as_nanos()),
+);
+
+// A sum that had saturated would read as *shorter* than a term it is built from,
+// which is the dangerous direction for a figure a floor is derived from.
+const _: () = assert!(REDIAL_CEILING.as_nanos() > lfw_tcp::TIME_WAIT_DURATION.as_nanos());
+
 /// The delay drawn for one wait, and the bound it was drawn below.
 ///
 /// Both travel because neither alone says where the schedule stands: the delay

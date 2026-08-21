@@ -115,11 +115,18 @@ defmodule Ctrld.Channel.Handler do
   # after, so a confirmation cannot reach it sooner than that. A deadline at that
   # latency is a deadline every change loses — the appliance reverts and then
   # refuses the confirmation as naming no provisional commit — so this has to be
-  # a multiple of it rather than a match for it. Five minutes is roughly five
-  # times the observed round trip and half the ten-minute bound the appliance
-  # clamps to, which keeps the other half of the point intact: an appliance whose
-  # management plane has genuinely gone away undoes the change while somebody is
-  # still watching, rather than hours later.
+  # a multiple of it rather than a match for it.
+  #
+  # The appliance holds the same reasoning as a band it will not work outside:
+  # the framing contract puts the floor at twice a re-dial and the ceiling at ten
+  # minutes, and a commit naming anything outside it is **refused by name** rather
+  # than adjusted into range — so a value chosen here that the appliance could not
+  # meet is a commit that does not happen, and never a change silently armed on a
+  # deadline this server did not ask for. Five minutes sits well inside that band:
+  # roughly five times the observed round trip, and half the ceiling, which keeps
+  # the other half of the point intact — an appliance whose management plane has
+  # genuinely gone away undoes the change while somebody is still watching, rather
+  # than hours later.
   @confirm_deadline_secs 300
 
   # How long an appliance has to answer the server's greeting with its own. The

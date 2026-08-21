@@ -21,12 +21,13 @@
 //! domain**. The server chooses the document bytes, the generation each operation
 //! names, the deadline it asks for, and the pacing of all of it.
 //!
-//! So: the deadline the server asks for is clamped to a bound of this file's
-//! before it is believed, the generation it names is narrowed to the width the
-//! datastore uses and refused rather than truncated where it does not fit, and
-//! every exchange with the deciding domain is one request answered inside a
-//! bounded read. Nothing here parses a document — the deciding domain does that,
-//! against an arbitrary byte string, which is what it was written for.
+//! So: the deadline it asks for is held to a band of this file's and refused by
+//! name outside it rather than adjusted into it, the generation it names is
+//! narrowed to the width the datastore uses and refused rather than truncated
+//! where it does not fit, and every exchange with the deciding domain is one
+//! request answered inside a bounded read. Nothing here parses a document — the
+//! deciding domain does that, against an arbitrary byte string, which is what it
+//! was written for.
 //!
 //! # What a compromised server achieves, and one rollback per commit
 //!
@@ -59,25 +60,49 @@ use crate::delegate::Delegated;
 /// it is a constant of this file rather than anything a peer can lengthen.
 const POLL_BUDGET: u32 = 1024;
 
-/// The longest a commit may stay unconfirmed, whatever the server asks for.
+/// The longest a commit may stay unconfirmed.
 ///
-/// Ten minutes, as a **clamp and not a default**: the server's number is used
-/// where it is shorter, and this is the bound past which an appliance would hold a
-/// configuration nobody has taken responsibility for indefinitely — the state
-/// commit-confirm exists to end.
+/// Ten minutes: the bound past which an appliance would hold a configuration
+/// nobody has taken responsibility for indefinitely — the state commit-confirm
+/// exists to end.
 const MAX_CONFIRM_SECONDS: u64 = 600;
 
-/// The shortest, for a server that asks for none at all.
+/// The shortest a commit may stay unconfirmed: twice what a re-dial costs this
+/// appliance, read out of the crate holding that figure rather than chosen here.
 ///
-/// A deadline of zero seconds would be a commit reverted before the appliance had
-/// finished re-dialling, which is a commit that can never be confirmed — so it is
-/// raised rather than honoured, a peer being unable to ask this appliance to
-/// defeat its own mechanism.
-const MIN_CONFIRM_SECONDS: u64 = 5;
+/// A commit ends the session, so a confirmation cannot arrive until a whole
+/// re-dial has passed, and a deadline under it is one no correctness at either end
+/// can meet. **The doubling is the margin**: that figure does not carry the
+/// handshake, the greeting and the confirmation frame the second connection still
+/// owes, and no constant bounds those — they are a round trip across a network
+/// this appliance does not choose — so they go inside it rather than beside it.
+const MIN_CONFIRM_SECONDS: u64 = confirm_floor_seconds();
 
-// The two bounds are in the order `clamp` requires, which is what makes the clamp
-// below total: its one panic is `min > max`, and these are constants of this file
-// that no peer reaches.
+/// The floor above, from the interval a re-dial takes.
+const fn confirm_floor_seconds() -> u64 {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+    let owed = pd_runtime::REDIAL_CEILING.as_nanos();
+    let whole = owed / NANOS_PER_SECOND;
+    // Rounded up, so an interval that is not a whole number of seconds is covered
+    // rather than very nearly covered; saturating, a figure that had saturated
+    // reading as *shorter* than what it is built from.
+    let seconds = if owed.is_multiple_of(NANOS_PER_SECOND) {
+        whole
+    } else {
+        whole.saturating_add(1)
+    };
+    seconds.saturating_mul(2)
+}
+
+// The floor must clear what a re-dial costs, or the band still admits the one
+// thing a floor on this field exists to make inexpressible: a commit that reverts
+// before any confirmation could reach it. Both terms of that interval belong to
+// other crates, so a change to either fails this build. And the band must be a
+// band — both ends being constants of this file that no peer reaches.
+const _: () = assert!(
+    MIN_CONFIRM_SECONDS.saturating_mul(1_000_000_000) > pd_runtime::REDIAL_CEILING.as_nanos()
+);
 const _: () = assert!(MIN_CONFIRM_SECONDS < MAX_CONFIRM_SECONDS);
 
 /// What one configuration operation produced.
@@ -200,6 +225,12 @@ pub enum ConfigFailure {
     /// A confirmation on the very session that made the commit, which proves
     /// nothing about a configuration that breaks new connections.
     NotAFreshConnection,
+    /// A confirmation window shorter than a re-dial takes: certain to revert.
+    DeadlineTooShort,
+    /// The same field past the other end of the band — longer than this appliance
+    /// will hold a configuration nobody has answered for. Its own token because
+    /// the server asked for too much rather than too little.
+    DeadlineTooLong,
     /// The holder of the medium would not make the commit durable, so it has been
     /// **put back**: a configuration in force that no reboot would reload is one
     /// the appliance cannot honour, and confirming it would leave the management
@@ -230,6 +261,8 @@ impl ConfigFailure {
             Self::Exhausted => "channel-config-generations-exhausted",
             Self::GenerationTooWide => "channel-config-generation-too-wide",
             Self::NotAFreshConnection => "channel-config-confirm-not-fresh",
+            Self::DeadlineTooShort => "channel-config-deadline-too-short",
+            Self::DeadlineTooLong => "channel-config-deadline-too-long",
             Self::NotDurable => "channel-config-not-durable",
             Self::NotDurableUnreverted => "channel-config-not-durable-unreverted",
             Self::NothingStaged => "channel-config-nothing-staged",
@@ -352,10 +385,16 @@ impl ChannelConfig {
     ///
     /// `session` is kept so a confirmation on that same session is refused, `now`
     /// is this appliance's own reading of the wall clock, and `deadline_secs` is
-    /// the server's request clamped between [`MIN_CONFIRM_SECONDS`] and
-    /// [`MAX_CONFIRM_SECONDS`]. Answering the generation is what the caller turns
-    /// into ending the session, closing being how this appliance makes a later
-    /// connection the only place a confirmation can arrive.
+    /// the server's request, armed **as asked** inside
+    /// [`MIN_CONFIRM_SECONDS`]..=[`MAX_CONFIRM_SECONDS`] and refused by name
+    /// outside it. Answering the generation is what the caller turns into ending
+    /// the session, closing being how a later connection becomes the only place a
+    /// confirmation can arrive.
+    ///
+    /// Refused rather than adjusted into the band, the number being a field of a
+    /// protocol: a commit armed under a different one leaves the server's record of
+    /// when it must confirm disagreeing with this appliance's, neither end able to
+    /// see it — the server having been told the commit applied.
     pub fn commit(
         &mut self,
         generation: u64,
@@ -363,6 +402,16 @@ impl ChannelConfig {
         now: u64,
         session: u64,
     ) -> Answer {
+        // Ahead of the generation and moving nothing: both refusals are read off
+        // the frame, and the deadline's bound is a property of this appliance
+        // rather than of its datastore.
+        let asked = u64::from(deadline_secs);
+        if asked < MIN_CONFIRM_SECONDS {
+            return Answer::unresolved(ConfigFailure::DeadlineTooShort);
+        }
+        if asked > MAX_CONFIRM_SECONDS {
+            return Answer::unresolved(ConfigFailure::DeadlineTooLong);
+        }
         let Ok(named) = u32::try_from(generation) else {
             return Answer::unresolved(ConfigFailure::GenerationTooWide);
         };
@@ -371,10 +420,8 @@ impl ChannelConfig {
                 generation,
                 changes,
             }) => {
-                let allowed =
-                    u64::from(deadline_secs).clamp(MIN_CONFIRM_SECONDS, MAX_CONFIRM_SECONDS);
                 self.awaiting = Some(Awaiting {
-                    deadline: now.saturating_add(allowed),
+                    deadline: now.saturating_add(asked),
                     session,
                 });
                 // The history, after the configuration is in force: nothing names

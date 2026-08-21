@@ -648,6 +648,7 @@ dependencies = [
  "lfw-log",
  "lfw-metrics",
  "lfw-recorder",
+ "lfw-tcp",
  "net-headers",
  "packet-buffer",
  "pipeline",

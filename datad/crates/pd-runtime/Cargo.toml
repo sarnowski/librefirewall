@@ -36,6 +36,11 @@ lfw-blk = { path = "../blk" }
 # The recording pass's counters, whose conversion into the recorder's shard
 # lives here for the same reason every other conversion does.
 lfw-recorder = { path = "../recorder" }
+# `TIME_WAIT_DURATION`, which is one of the two terms in what a re-dial of the
+# management channel costs (`reconnect`). The transport is already here under
+# `lfw-ip-endpoint`; naming it directly is what lets a const assertion hold that
+# figure to the interval it is built from rather than to a copy of the number.
+lfw-tcp = { path = "../tcp" }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -43,7 +48,6 @@ proptest = { workspace = true }
 # `lfw_http::Status::ALL` by a test in `stats` — the crate that owns neither
 # alone.
 lfw-http = { path = "../http" }
-lfw-tcp = { path = "../tcp" }
 # The types a configuration commit's call frame holds, for the test that keeps
 # `pds/config`'s declared stack ahead of them. A dev dependency and not a real
 # one: nothing in this crate reads a document.

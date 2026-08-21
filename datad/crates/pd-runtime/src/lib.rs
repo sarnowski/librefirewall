@@ -567,7 +567,7 @@ pub use pipeline::{Configuration, Ownership, PolicySweep, Tracking};
 pub use range::{
     MAX_RANGE_FRAMES, MAX_RANGE_LENGTH, RANGE_ANSWER_BYTES, RangeRefusal, RangeRequest, RangeTaken,
 };
-pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, Reconnect, Wait};
+pub use reconnect::{INITIAL_BACKOFF, MAX_BACKOFF, REDIAL_CEILING, Reconnect, Wait};
 pub use relay::{
     ANSWER_TIMEOUT as RELAY_ANSWER_TIMEOUT, Acknowledged, Answered, ChannelStream,
     DEMANDS_PER_WAKEUP as RELAY_DEMANDS_PER_WAKEUP, Half, Relay, RelayFailure, RelayPass,
