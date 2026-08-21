@@ -6018,6 +6018,10 @@ pub struct Booted {
     /// one. `None` everywhere else, and a scenario that should have made one and
     /// did not has already failed above.
     pub applied: Option<crate::channel_configuration::Reconfigured>,
+    /// What the whole configuration transaction produced, on the boots whose
+    /// subject it is. `None` everywhere else, and a boot that should have driven
+    /// one and did not has already failed above.
+    pub transacted: Option<crate::channel_configuration::Transacted>,
     /// What the harness spent working off the re-decision that commit armed, on
     /// the one scenario that drives one. `None` everywhere else.
     ///
@@ -6162,6 +6166,7 @@ fn run_boot(
     // the submission and then failed later still observed what it observed.
     let mut applied: Option<crate::channel_configuration::Reconfigured> = None;
     let mut drove: Option<crate::channel_configuration::Driven> = None;
+    let mut transacted: Option<crate::channel_configuration::Transacted> = None;
     // What the onboarding station observed, on the three scenarios that open a
     // session. Outside the run block for the same reason, and read by the
     // contract that holds the console's account of that session to this one.
@@ -6834,6 +6839,47 @@ fn run_boot(
                     // record. `total_timeout` below is what bounds it, so an
                     // appliance that genuinely never reports fails on the budget
                     // every other boot takes rather than hanging here.
+                    // A boot whose subject is the configuration transaction itself,
+                    // with no dataplane wave to order it against. The whole
+                    // exchange is driven from here, out of the pipe this boot holds
+                    // open: each step is bounded by the result line the appliance
+                    // answers it with, and the reconnection a confirmation needs is
+                    // bounded by a second greeting reaching the server. Placed
+                    // before the terminator below because the records that boot
+                    // owes do not exist until this has run, so its own guard is
+                    // what keeps the run going until they do.
+                    Some(since)
+                        if since.elapsed() >= SETTLE_WINDOW
+                            && management.is_none()
+                            && test.channel.drives_a_transaction()
+                            && transacted.is_none() =>
+                    {
+                        let Some(server) = test.server.as_mut() else {
+                            break 'run Err(String::from(
+                                "a boot that drives a configuration transaction does so over the \
+                                 channel it dials, and this boot started no management server",
+                            ));
+                        };
+                        match crate::channel_configuration::transact(
+                            server,
+                            // The document the boot that writes its frames up front
+                            // pushes, so the two boots stage the same bytes and the
+                            // fast gate reads them as one file.
+                            crate::channel_configuration::SUBMITTED,
+                            // Drained afresh each time the transaction asks, on the
+                            // reconfiguration arm's terms: it is also what keeps the
+                            // guest's serial pipe moving while this is under way.
+                            || {
+                                drain(&serial_receiver, &mut output);
+                                output.clone()
+                            },
+                        ) {
+                            Ok(proved) => transacted = Some(proved),
+                            Err(verdict) => {
+                                break 'run Err(format!("{verdict}; see {}", log_path.display()));
+                            }
+                        }
+                    }
                     Some(since)
                         if since.elapsed() >= SETTLE_WINDOW
                             && management.is_none()
@@ -7339,6 +7385,14 @@ fn run_boot(
     // about it, and a boot whose second wave was never injected would otherwise
     // pass on the first wave's verdicts alone.
     let outcome = outcome.and_then(|()| {
+        if test.channel.drives_a_transaction() && transacted.is_none() {
+            return Err(format!(
+                "the boot's contract drives a configuration transaction over the channel it \
+                 dials and none was driven, so nothing was proved about a commit, a \
+                 confirmation or a version numbered past what the medium already held; see {}",
+                log_path.display()
+            ));
+        }
         if probes.iter().any(|probe| probe.wave == Wave::Submitted) && applied.is_none() {
             return Err(format!(
                 "the boot met its routed contract under the document it was built from and no \
@@ -7417,6 +7471,7 @@ fn run_boot(
         installs,
         applied,
         drove,
+        transacted,
         onboard: onboarded,
         injected: probes
             .iter()

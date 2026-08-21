@@ -156,6 +156,20 @@ pub(crate) enum ChannelContract {
     /// disk, and a boot that had to reach a management plane to demonstrate it
     /// would be proving something else.
     RestoresACommittedConfiguration,
+    /// A boot that **restored** a version and is then reconfigured again, over a
+    /// transaction driven step by step out of the pipe it holds open.
+    ///
+    /// This is the boot the gate did not have, and its absence is why a defect
+    /// reached a demonstration. A restored appliance runs the document its own
+    /// image carries, so its running generation is one while its medium holds two —
+    /// and the next commit has to be numbered past both. Numbered from the running
+    /// counter alone it was two, which the holder of the medium refuses as a version
+    /// that does not advance, so the commit never became durable and the appliance
+    /// could not be reconfigured again for the rest of its life.
+    ///
+    /// It is held to the store domain's own records, both of them: the version it
+    /// read back off the medium, and the **new** slot it wrote afterwards.
+    RecommitsAfterAReload,
 }
 
 impl ChannelContract {
@@ -168,7 +182,19 @@ impl ChannelContract {
                 | Self::RejectsTheAppliance
                 | Self::CommitsAConfiguration
                 | Self::ReconfiguresARunningNode
+                | Self::RecommitsAfterAReload
         )
+    }
+
+    /// Whether the whole configuration transaction is driven mid-boot, out of the
+    /// pipe the boot holds open, rather than written into the stream before QEMU
+    /// starts.
+    ///
+    /// It has to be for this one: the boot is judged on the generation its commit
+    /// is *answered* with, which means reading each result line before the next
+    /// frame goes out rather than writing the whole exchange up front.
+    pub(crate) const fn drives_a_transaction(self) -> bool {
+        matches!(self, Self::RecommitsAfterAReload)
     }
 
     /// Whether the boot reads the appliance's own record of the channel.
@@ -186,7 +212,10 @@ impl ChannelContract {
     /// back by the next — and says so here rather than leaving the run to conclude
     /// the pair proves nothing.
     pub(crate) const fn states_the_carried_medium(self) -> bool {
-        matches!(self, Self::RestoresACommittedConfiguration)
+        matches!(
+            self,
+            Self::RestoresACommittedConfiguration | Self::RecommitsAfterAReload
+        )
     }
 
     /// Whether the capture already carries every console record this contract is
@@ -295,7 +324,7 @@ impl ChannelContract {
             // records rather than instead of them: a slot written without a
             // session behind it would be a claim about a medium nothing pushed to.
             Self::CommitsAConfiguration => {
-                let [placed, restored] = configured(false);
+                let [placed, restored] = configured(PUSHED_GENERATION, PUSHED_SLOT, false);
                 vec![
                     OwedRecord::dial("established"),
                     OwedRecord::channel(&established_session()),
@@ -315,8 +344,25 @@ impl ChannelContract {
             // boot is about is the disk, and holding it to a dial outcome would
             // make a restored version depend on where the appliance was pointed.
             Self::RestoresACommittedConfiguration => {
-                let [placed, restored] = configured(true);
+                let [placed, restored] = configured(PUSHED_GENERATION, PUSHED_SLOT, true);
                 vec![OwedRecord::store(&placed), OwedRecord::store(&restored)]
+            }
+            // Both slots, and the pair is the whole claim: the version this boot
+            // read back off its medium, and the one it wrote afterwards. A boot
+            // that produced only the first is one whose commit was refused as a
+            // version that does not advance.
+            Self::RecommitsAfterAReload => {
+                let [reloaded, was_restored] = configured(PUSHED_GENERATION, PUSHED_SLOT, true);
+                let [placed, restored] =
+                    configured(RECOMMITTED_GENERATION, RECOMMITTED_SLOT, false);
+                vec![
+                    OwedRecord::dial("established"),
+                    OwedRecord::channel(&established_session()),
+                    OwedRecord::store(&reloaded),
+                    OwedRecord::store(&was_restored),
+                    OwedRecord::store(&placed),
+                    OwedRecord::store(&restored),
+                ]
             }
         }
     }
@@ -329,6 +375,19 @@ impl ChannelContract {
 /// next thing the datastore admits. Stated here once so the frame that names it
 /// and the record that must report it cannot come apart.
 pub(crate) const PUSHED_GENERATION: u64 = 2;
+
+/// The generation a boot that **restored** a version numbers its next commit at,
+/// and the slot that one takes.
+///
+/// Three, and it is arithmetic over two counters rather than a choice: the medium
+/// carries generation two, the boot document is committed as the running one, and
+/// the next version has to be past everything either of them holds. A commit
+/// numbered anywhere below three is the defect this pair exists for — the holder of
+/// the medium refuses a version that does not advance, so the commit never becomes
+/// durable at all. The slot is one because slot zero already holds the version this
+/// boot restored.
+pub(crate) const RECOMMITTED_GENERATION: u64 = 3;
+const RECOMMITTED_SLOT: u64 = 1;
 
 /// The slot the pushed document takes.
 ///
@@ -344,12 +403,12 @@ const PUSHED_SLOT: u64 = 0;
 /// contract that named it would be a boot asserting how many bytes the gate's
 /// second document happens to be. What the pair of boots is about is the
 /// generation, the slot and where the answer came from.
-fn configured(restored: bool) -> [String; 2] {
+fn configured(generation: u64, slot: u64, restored: bool) -> [String; 2] {
     [
         format!(
             "{}{}",
-            field("configured-generation", &PUSHED_GENERATION.to_string()),
-            field("configured-slot", &PUSHED_SLOT.to_string()),
+            field("configured-generation", &generation.to_string()),
+            field("configured-slot", &slot.to_string()),
         ),
         field(
             "configured-restored",
@@ -515,7 +574,7 @@ fn configuration_push(document: &[u8]) -> Result<Vec<u8>, String> {
     // next, so it says it on a frame boundary.
     let mut stream = Vec::from(&SERVER_GREETING[..GREETING_LEN]);
     stream.extend_from_slice(&stage_frame(document)?);
-    stream.extend_from_slice(&commit_frame());
+    stream.extend_from_slice(&commit_frame(PUSHED_GENERATION));
     Ok(stream)
 }
 
@@ -535,21 +594,20 @@ pub(crate) fn stage_frame(document: &[u8]) -> Result<Vec<u8>, String> {
 
 /// The commit frame: 0x07, a generation and the seconds a confirmation has. Ten
 /// bytes of payload, which is what the encoder puts there.
-pub(crate) fn commit_frame() -> Vec<u8> {
-    /// The longest this appliance will hold an unconfirmed commit for. The
-    /// number is clamped by the appliance to its own bound whatever is asked,
-    /// and no confirmation follows on this connection — a commit ends the
-    /// session — so what it decides is only how long a boot has before the
-    /// revert. It is an order of magnitude past the budget any boot in this
-    /// gate takes, so the configuration a commit puts in force is still in
-    /// force when the guest stops, and every boot is bounded by the records it
-    /// waits for rather than by this.
+pub(crate) fn commit_frame(generation: u64) -> Vec<u8> {
+    /// The longest this appliance will hold an unconfirmed commit for. The number
+    /// is clamped by the appliance to its own bound whatever is asked, so what it
+    /// decides is only how long a boot has before the revert. It is an order of
+    /// magnitude past the budget any boot in this gate takes, so the configuration
+    /// a commit puts in force is still in force when the guest stops, and every
+    /// boot is bounded by the records and the result frames it waits for rather
+    /// than by this.
     const CONFIRM_SECONDS: u16 = 600;
 
     let mut frame = Vec::with_capacity(18);
     frame.extend_from_slice(&10_u32.to_be_bytes());
     frame.extend_from_slice(&[0x07, 0, 0, 0]);
-    frame.extend_from_slice(&PUSHED_GENERATION.to_be_bytes());
+    frame.extend_from_slice(&generation.to_be_bytes());
     frame.extend_from_slice(&CONFIRM_SECONDS.to_be_bytes());
     frame
 }
@@ -597,11 +655,14 @@ pub(crate) fn serve(
                 .map_err(|error| format!("read {}: {error}", crate::image::SUBMITTED_DOCUMENT))?;
             configuration_push(&document)?
         }
-        // The greeting **proper** and nothing after it: this boot's frames are
-        // written once the appliance has greeted, and they have to land on a
-        // frame boundary. The four-byte fragment every other boot's greeting
-        // carries would swallow the first of them.
-        ChannelContract::ReconfiguresARunningNode => Vec::from(&SERVER_GREETING[..GREETING_LEN]),
+        // The greeting **proper** and nothing after it: every boot that writes its
+        // own frames mid-run needs them to land on a frame boundary, and the
+        // four-byte fragment the greeting array carries after it — a deliberate
+        // partial second frame, and another boot's whole subject — would be read
+        // as the beginning of the first of them.
+        ChannelContract::ReconfiguresARunningNode | ChannelContract::RecommitsAfterAReload => {
+            Vec::from(&SERVER_GREETING[..GREETING_LEN])
+        }
         _ => Vec::from(SERVER_GREETING),
     };
     fs::write(&greeting, &stream)
@@ -908,7 +969,7 @@ pub(crate) fn judge(
             // this boot is for. It is read off the domain that owns the medium:
             // the session records above say the document arrived, and only this
             // one says it became durable.
-            for owed in configured(false) {
+            for owed in configured(PUSHED_GENERATION, PUSHED_SLOT, false) {
                 expect_store(log, &owed)?;
             }
             Ok(format!(
@@ -951,13 +1012,40 @@ pub(crate) fn judge(
             // boot before it wrote, and reaching a management plane to show it
             // would be proving something else.
             let _ = server.map(Server::finish).transpose()?;
-            for owed in configured(true) {
+            for owed in configured(PUSHED_GENERATION, PUSHED_SLOT, true) {
                 expect_store(log, &owed)?;
             }
             Ok(format!(
                 "  answered   configuration         medium->appliance  slot {PUSHED_SLOT}  the \
                  appliance came back on generation {PUSHED_GENERATION} read off the medium the \
                  boot before it committed to, held to the digest its own record names that slot by"
+            ))
+        }
+        ChannelContract::RecommitsAfterAReload => {
+            let Some(server) = server else {
+                return Err(String::from(
+                    "this boot's contract reconfigures an appliance that restored a version and \
+                     no management server was started for it",
+                ));
+            };
+            let (transcript, verification) = server.finish()?;
+            expect_dial(log, "established")?;
+            expect_channel(log, &established_session())?;
+            expect_certificate(&verification, device)?;
+            expect_greeting(&transcript)?;
+            for owed in configured(PUSHED_GENERATION, PUSHED_SLOT, true) {
+                expect_store(log, &owed)?;
+            }
+            for owed in configured(RECOMMITTED_GENERATION, RECOMMITTED_SLOT, false) {
+                expect_store(log, &owed)?;
+            }
+            Ok(format!(
+                "  answered   configuration         medium->appliance  slot {PUSHED_SLOT}  the \
+                 appliance came back on generation {PUSHED_GENERATION} read off the medium the \
+                 boot before it confirmed, and then took a further commit at generation \
+                 {RECOMMITTED_GENERATION} into slot {RECOMMITTED_SLOT} — which is only numbered \
+                 there because the version its medium already held is what the numbering starts \
+                 above"
             ))
         }
         ChannelContract::AnchorRejectsTheServer => {

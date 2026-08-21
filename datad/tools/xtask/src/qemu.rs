@@ -2270,6 +2270,40 @@ pub(crate) const SCENARIOS: &[Scenario] = &[
         store: StoreMedium::CarriedFrom("channel-configuration-committed"),
         data: DataMedium::Fresh,
     },
+    // And the boot whose absence let a defect reach a demonstration: an appliance
+    // that **restored** a version and is reconfigured again.
+    //
+    // A restored appliance runs the document its own image carries, so its running
+    // generation is one while its medium holds two — and the next commit has to be
+    // numbered past both. Numbered from the running counter alone it collides with
+    // the version the medium already holds, which that medium refuses as one that
+    // does not advance: the commit never becomes durable, and the appliance cannot
+    // be reconfigured again for the rest of its life. Nothing in the gate reached
+    // that, because the boot that restores a version never commits again and the
+    // boot that commits starts from a medium with no history.
+    //
+    // It boots the medium the pair above wrote — the shared file and not a copy,
+    // which is the whole mechanism — and must both report the version it read back
+    // and write a new slot beside it.
+    Scenario {
+        name: "channel-configuration-recommitted",
+        document: image::CONFIGURATION_DOCUMENT,
+        image: ImageUnderTest::Published,
+        console: Console::JudgedOnTheDialledChannelSession,
+        management: ManagementRole::Client,
+        traffic: Traffic::Routed,
+        dial: DialContract::Answered,
+        onboard: OnboardContract::Untouched,
+        channel: ChannelContract::RecommitsAfterAReload,
+        accelerator: Accelerator::WhateverTheMachineOffers,
+        // The very medium the pair above wrote and read back — named by the boot
+        // that created the file, which is the one that committed, so this is the
+        // third boot of one disk rather than a copy of it. Both must precede this
+        // one in the table, and `StoreDisk::carried` says so by name when they do
+        // not.
+        store: StoreMedium::CarriedFrom("channel-configuration-committed"),
+        data: DataMedium::Fresh,
+    },
 ];
 
 /// What one boot was observed to do, beyond meeting its contract.
@@ -2823,6 +2857,16 @@ fn run_scenario(
                 append_evidence(
                     &log,
                     "the configuration this boot pushed, and what the node said about it",
+                    &transcript,
+                )
+                .map_err(|error| format!("scenario {name}: {error}"))?;
+            }
+            if let Some(transacted) = &booted.transacted {
+                let transcript = transacted.render();
+                println!("{transcript}");
+                append_evidence(
+                    &log,
+                    "the configuration transaction this boot drove, step by step",
                     &transcript,
                 )
                 .map_err(|error| format!("scenario {name}: {error}"))?;

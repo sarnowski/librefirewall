@@ -64,7 +64,9 @@
 
 use std::time::Duration;
 
-use crate::channel_contract::{PUSHED_GENERATION, Server, commit_frame, stage_frame};
+use crate::channel_contract::{
+    PUSHED_GENERATION, RECOMMITTED_GENERATION, Server, commit_frame, stage_frame,
+};
 
 /// How many passes each step is given, and how long the harness waits between
 /// two of them.
@@ -258,7 +260,7 @@ pub fn reconfigure(
     // one, and nothing needs to — the deadline the frame asks for is far past any
     // budget a boot in this gate takes, so what the commit put in force is still
     // in force when the guest stops.
-    server.push(&commit_frame())?;
+    server.push(&commit_frame(PUSHED_GENERATION))?;
 
     // Only now is the dataplane waited for. The configuration domain commits when
     // *it* has committed; the forwarding domain switches between two polls, and
@@ -437,6 +439,130 @@ fn refuse(
         )),
         None => Err(format!("a refused document was answered {line:?}")),
     }
+}
+
+/// What the whole configuration transaction produced on a boot whose subject it is,
+/// as evidence a reader wants beside the verdict.
+#[derive(Clone, Debug)]
+pub struct Transacted {
+    /// The line the document was staged with.
+    pub staged: String,
+    /// The line the commit was answered with.
+    pub committed: String,
+    /// Appliance greetings the server had seen by the end, which is one per
+    /// session.
+    pub sessions: usize,
+}
+
+impl Transacted {
+    /// The transcript a reader wants beside a scenario's verdict.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "  the configuration transaction, driven step by step over the channel the appliance \
+             dialled:\n\
+             \x20   stage         -> {}\n\
+             \x20   commit        -> {}\n\
+             \x20   the server saw {} appliance greeting(s)",
+            self.staged, self.committed, self.sessions,
+        )
+    }
+}
+
+/// Drive the transaction on a boot whose subject is the generation its commit is
+/// numbered at, and hold every step to the outcome and the number it owes.
+///
+/// Nothing here is timed. Each step waits for the **result line** the appliance
+/// answers it with, found by arrival rather than by content, which is what makes a
+/// step's verdict the appliance's own statement about it.
+///
+/// # Errors
+/// The verdict, naming which step failed and what the appliance answered.
+pub fn transact(
+    server: &mut Server,
+    document: &[u8],
+    mut console: impl FnMut() -> Vec<u8>,
+) -> Result<Transacted, String> {
+    await_greeting(server, &mut console)?;
+
+    let staged = stage(server, &mut console, document)?;
+    expect(
+        &staged,
+        "stage",
+        lfw_log::GenerationOutcome::Staged.name(),
+        RECOMMITTED_GENERATION,
+    )?;
+
+    // The commit, which is answered like every other configuration operation: the
+    // appliance may commit and then put the commit back where its medium will not
+    // hold the version, so `applied` is read rather than inferred from anything.
+    let committed = answered(
+        server,
+        &mut console,
+        "commit",
+        &commit_frame(RECOMMITTED_GENERATION),
+    )?;
+    expect(
+        &committed,
+        "commit",
+        lfw_log::GenerationOutcome::Applied.name(),
+        RECOMMITTED_GENERATION,
+    )?;
+
+    Ok(Transacted {
+        staged,
+        committed,
+        sessions: server.sessions_greeted()?,
+    })
+}
+
+/// Hold one result line to the outcome and the generation the step owes.
+fn expect(line: &str, step: &str, outcome: &str, generation: u64) -> Result<(), String> {
+    if token(line, "outcome").as_deref() != Some(outcome) {
+        return Err(format!(
+            "the {step} was answered {line:?} rather than `outcome={outcome}`"
+        ));
+    }
+    let owed = u32::try_from(generation).unwrap_or(u32::MAX);
+    match field(line, "generation") {
+        Some(named) if named == owed => Ok(()),
+        Some(named) => Err(format!(
+            "the {step} was answered generation {named} and {owed} is the number this step is \
+             about. A commit numbered below the newest version the appliance's own medium holds \
+             is one that medium refuses as a version that does not advance, so it never becomes \
+             durable: {line:?}"
+        )),
+        None => Err(format!(
+            "the {step} was answered {line:?}, which names no generation"
+        )),
+    }
+}
+
+/// Push `frames` and answer the result line the appliance sends back, on
+/// [`stage`]'s terms: the line is identified by arrival and never by content.
+fn answered(
+    server: &mut Server,
+    console: &mut impl FnMut() -> Vec<u8>,
+    step: &str,
+    frames: &[u8],
+) -> Result<String, String> {
+    let before = server.validate_results()?.len();
+    server.push(frames)?;
+    for _ in 0..=RESULT_POLLS {
+        let _ = console();
+        let results = server.validate_results()?;
+        if results.len() > before
+            && let Some(line) = results.last()
+        {
+            return Ok(line.clone());
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Err(format!(
+        "the appliance answered no result frame for the {step} sent over the channel, after \
+         {RESULT_POLLS} passes over the server's transcript. Every configuration operation is \
+         owed one, so this is an appliance that stopped reading its channel"
+    ))
 }
 
 /// What the harness did to work the re-decision a commit armed off, so the
